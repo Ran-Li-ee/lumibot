@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Replay</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="workflow-shell">
+      <header class="replay-sticky-header">
+        <section class="workflow-map-shell" aria-label="Workflow">
+          <div class="workflow-map-heading">
+            <div>
+              <h1>Workflow</h1>
+              <p id="statusMessage" class="sr-only" role="status">Loading replay dataset...</p>
+            </div>
+            <div class="workflow-controls" aria-label="Replay selectors">
+              <label for="strategySelect">
+                Strategy
+                <select id="strategySelect" disabled>
+                  <option>Loading...</option>
+                </select>
+              </label>
+              <label for="backtestRunSelect">
+                Backtest Run
+                <select id="backtestRunSelect" disabled>
+                  <option>Loading...</option>
+                </select>
+              </label>
+              <label for="systemRunSelect">
+                System Run
+                <select id="systemRunSelect" disabled>
+                  <option>Loading...</option>
+                </select>
+              </label>
+              <button id="toggleWorkflowGraphButton" class="secondary-button" type="button">Hide Graph</button>
+              <button id="overviewButton" class="secondary-button" type="button">System Overview</button>
+            </div>
+          </div>
+          <div id="workflowMapViewport" class="workflow-map-viewport">
+            <div id="workflowGraph" class="workflow-graph" role="list"></div>
+          </div>
+        </section>
+      </header>
+
+      <section class="detail-panel" aria-label="Selected replay details">
+        <div id="overviewArea" class="detail-region"></div>
+        <div id="inputArea" class="detail-region" hidden></div>
+        <div id="toolArea" class="detail-region" hidden></div>
+        <div id="summaryArea" class="detail-region" hidden></div>
+      </section>
+    </main>
+    <script src="/static/vendor/elk.bundled.js" defer></script>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

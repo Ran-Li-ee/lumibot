@@ -1,0 +1,576 @@
+:root {
+  color-scheme: light;
+  --bg: #f6f7f8;
+  --panel: #ffffff;
+  --panel-muted: #f0f4f2;
+  --border: #cfd8d3;
+  --border-strong: #9aa8a1;
+  --text: #202522;
+  --muted: #59645f;
+  --accent: #2f6f61;
+  --accent-muted: #dcebe6;
+  --warning: #8a4f12;
+  --error: #9a2f2f;
+  --code-bg: #f8faf9;
+  --row: #fbfcfc;
+  --shadow: 0 1px 2px rgba(32, 37, 34, 0.08);
+  font-family: "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.workflow-shell {
+  width: min(1440px, 100%);
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.replay-sticky-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: grid;
+  padding-bottom: 10px;
+  background: var(--bg);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+h1 {
+  font-size: 22px;
+  font-weight: 650;
+}
+
+h2 {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+h3 {
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.workflow-controls {
+  display: grid;
+  grid-template-columns: minmax(160px, 280px) minmax(160px, 280px) minmax(220px, 420px) auto auto;
+  gap: 12px;
+  align-items: end;
+  min-width: 0;
+}
+
+label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+select {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: #ffffff;
+  color: var(--text);
+  font: inherit;
+}
+
+select:disabled {
+  color: var(--muted);
+  background: var(--panel-muted);
+}
+
+.detail-panel {
+  min-width: 0;
+}
+
+.workflow-map-shell,
+.detail-region {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.workflow-map-shell {
+  padding: 12px;
+}
+
+.workflow-map-heading {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(0, auto);
+  gap: 16px;
+  align-items: end;
+}
+
+.workflow-map-viewport {
+  width: 100%;
+  margin-top: 10px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.workflow-map-shell.graph-hidden .workflow-map-viewport {
+  display: none;
+}
+
+.detail-panel {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.detail-region {
+  min-height: 160px;
+  padding: 14px;
+  overflow: hidden;
+}
+
+.panel-heading {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.secondary-button {
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: #ffffff;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.secondary-button:hover,
+.secondary-button:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.workflow-graph {
+  display: block;
+  min-height: 190px;
+}
+
+.graph-node {
+  width: 100%;
+  min-height: 58px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--row);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.graph-node:hover,
+.graph-node:focus-visible,
+.graph-node.connected {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.graph-node.active {
+  border-color: var(--accent);
+  background: var(--accent-muted);
+}
+
+.graph-node.warning {
+  border-color: var(--warning);
+}
+
+.workflow-diagram {
+  position: relative;
+  min-width: 100%;
+  min-height: 170px;
+  padding: 12px 4px 8px;
+}
+
+.workflow-diagram.elk-layout {
+  display: block;
+  padding: 0;
+}
+
+.workflow-diagram.fallback-layout {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 26px;
+}
+
+.workflow-diagram.elk-layout .graph-node {
+  position: absolute;
+  z-index: 2;
+}
+
+.workflow-arrow-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+
+#workflow-arrowhead path {
+  fill: var(--muted);
+}
+
+#workflow-arrowhead-connected path {
+  fill: var(--accent);
+}
+
+.workflow-arrow {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.6;
+  opacity: 0.74;
+}
+
+.workflow-arrow.connected {
+  stroke: var(--accent);
+  stroke-width: 2.4;
+  opacity: 1;
+}
+
+.workflow-stage {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.workflow-stage,
+.workflow-stage-title,
+.workflow-stage-nodes {
+  display: contents;
+}
+
+.workflow-stage-title {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.workflow-stage-nodes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
+  gap: 8px;
+  align-items: stretch;
+}
+
+.overview-card {
+  display: grid;
+  gap: 12px;
+}
+
+.overview-agent-list {
+  display: grid;
+  gap: 8px;
+}
+
+.workflow-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.agent-button {
+  width: 100%;
+  min-height: 58px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--row);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-button:hover,
+.agent-button:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.agent-button.active {
+  border-color: var(--accent);
+  background: var(--accent-muted);
+}
+
+.agent-name {
+  display: block;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.agent-meta {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.dependency-list,
+.empty-state,
+.notice {
+  margin-top: 10px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.dependency-item,
+.warning-item {
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--row);
+  overflow-wrap: anywhere;
+}
+
+.dependency-item + .dependency-item,
+.warning-item + .warning-item {
+  margin-top: 8px;
+}
+
+.section-header {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.section-header span {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.collapsible-section,
+.collapsible-subsection {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.collapsible-section + .collapsible-section,
+.collapsible-subsection + .collapsible-subsection {
+  margin-top: 10px;
+}
+
+.collapsible-subsection {
+  margin-top: 10px;
+  background: var(--row);
+}
+
+.collapsible-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.collapsible-summary:hover,
+.collapsible-summary:focus-visible {
+  background: var(--panel-muted);
+  outline: none;
+}
+
+.collapsible-title {
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.collapsible-meta {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.collapsible-body {
+  padding: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.metadata-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.metadata-item {
+  min-height: 64px;
+  padding: 9px;
+  border: 1px solid var(--border);
+  background: var(--row);
+  overflow-wrap: anywhere;
+}
+
+.metadata-label {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.metadata-value {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.prompt-block,
+.json-block,
+.summary-block {
+  margin-top: 12px;
+}
+
+.prompt-block strong,
+.json-block strong,
+.summary-block strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+pre,
+.prewrap {
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.tool-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.tool-table {
+  width: 100%;
+  min-width: 760px;
+  table-layout: fixed;
+  border-collapse: collapse;
+  border: 1px solid var(--border);
+}
+
+.tool-table th,
+.tool-table td {
+  padding: 9px;
+  border: 1px solid var(--border);
+  vertical-align: top;
+  text-align: left;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.tool-table th {
+  background: var(--panel-muted);
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.tool-table td:first-child,
+.tool-table th:first-child {
+  width: 76px;
+}
+
+.tool-table td {
+  background: #ffffff;
+}
+
+.warnings {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.warnings h4 {
+  margin: 0 0 8px;
+  color: var(--warning);
+  font-size: 13px;
+  text-transform: uppercase;
+}
+
+@media (max-width: 900px) {
+  .workflow-shell {
+    padding: 10px;
+  }
+
+  .workflow-map-heading,
+  .workflow-controls,
+  .metadata-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-region {
+    min-height: auto;
+  }
+
+  .workflow-diagram {
+    gap: 22px;
+  }
+}
