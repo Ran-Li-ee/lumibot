@@ -113,6 +113,10 @@ setuptools.setup(
     package_data={
         "lumibot": [
             "resources/conf.yaml",
+            "components/agents/replay_ui/static/index.html",
+            "components/agents/replay_ui/static/app.js",
+            "components/agents/replay_ui/static/styles.css",
+            "components/agents/replay_ui/static/vendor/elk.bundled.js",
         ] + (["resources/ThetaTerminal.jar"] if theta_jar_path.exists() else []),
     },
     extras_require={
