@@ -570,6 +570,53 @@ pre,
   border-color: #1f6f63;
 }
 
+.available-tool-surface {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.available-tool-chip {
+  align-items: center;
+  background: #f8faf9;
+  border: 1px solid #ccd8d2;
+  border-radius: 4px;
+  color: #12221b;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  gap: 0.35rem;
+  max-width: 100%;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.available-tool-chip.used {
+  border-color: #27745f;
+}
+
+.available-tool-chip.unused {
+  color: #56635d;
+}
+
+.available-tool-chip.active,
+.available-tool-chip:hover,
+.available-tool-chip:focus {
+  background: #e7f3ef;
+  border-color: #1d5f4d;
+  outline: none;
+}
+
+.available-tool-name {
+  overflow-wrap: anywhere;
+}
+
+.available-tool-count {
+  color: #56635d;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
 .tool-definition-panel {
   margin-top: 14px;
   padding: 12px;

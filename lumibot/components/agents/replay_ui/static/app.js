@@ -266,10 +266,14 @@
   }
 
   function attachToolNameHandlers() {
-    elements.toolArea.querySelectorAll(".tool-name-button[data-tool-name]").forEach((button) => {
+    document.querySelectorAll("[data-tool-name]").forEach((button) => {
       button.addEventListener("click", () => {
         state.selectedToolName = button.getAttribute("data-tool-name");
         render();
+        const panel = elements.inputArea.querySelector(".tool-definition-panel");
+        if (panel) {
+          panel.scrollIntoView({ block: "nearest" });
+        }
       });
     });
   }
@@ -908,6 +912,38 @@
     renderInputArea(agent);
     renderToolArea(agent);
     renderSummaryArea(agent, systemRun);
+    attachToolNameHandlers();
+  }
+
+  function renderAvailableToolSurface(agent, toolNames) {
+    if (!toolNames.length) {
+      return `<div class="empty-state">None</div>`;
+    }
+
+    const chips = toolNames.map((toolName) => {
+      const usage = toolUsageForAgent(agent, toolName);
+      const activeClass = state.selectedToolName === toolName ? " active" : "";
+      const usedClass = usage.used ? " used" : " unused";
+      const countLabel = usage.used ? ` x${usage.callCount}` : " unused";
+      return `
+        <button
+          type="button"
+          class="available-tool-chip${activeClass}${usedClass}"
+          data-tool-name="${escapeHtml(toolName)}"
+          aria-label="Show tool definition for ${escapeHtml(toolName)}"
+        >
+          <span class="available-tool-name">${escapeHtml(toolName)}</span>
+          <span class="available-tool-count">${escapeHtml(countLabel)}</span>
+        </button>
+      `;
+    });
+
+    return `
+      <div class="available-tool-surface">
+        ${chips.join("")}
+      </div>
+      ${renderToolDefinitionPanel(agent)}
+    `;
   }
 
   function setDetailMode(mode) {
@@ -936,8 +972,8 @@
       ${renderCollapsibleSubsection(
         "Available Tool Names",
         `${toolNames.length} tool${toolNames.length === 1 ? "" : "s"}`,
-        `<div class="prewrap">${escapeHtml(toolNames.length ? toolNames.join(", ") : "None")}</div>`,
-        false,
+        renderAvailableToolSurface(agent, toolNames),
+        Boolean(state.selectedToolName),
       )}
       ${renderCollapsibleSubsection(
         "Base System Prompt",
@@ -969,7 +1005,7 @@
       "Input Material",
       `${agent.name || "Unnamed agent"} | ${summary}`,
       body,
-      false,
+      Boolean(state.selectedToolName),
     );
   }
 
@@ -990,17 +1026,13 @@
       return;
     }
 
-    const body = `
-      ${batches.map((batch, index) => renderToolBatch(batch, index === 0)).join("")}
-      ${renderToolDefinitionPanel(agent)}
-    `;
+    const body = batches.map((batch, index) => renderToolBatch(batch, index === 0)).join("");
     elements.toolArea.innerHTML = renderCollapsibleSection(
       "Tool Calls",
       `${batches.length} batch${batches.length === 1 ? "" : "es"} | ${totalCalls} recorded call${totalCalls === 1 ? "" : "s"}`,
       body,
       true,
     );
-    attachToolNameHandlers();
   }
 
   function renderToolBatch(batch, isOpen) {
@@ -1036,6 +1068,10 @@
       return "";
     }
 
+    const usage = toolUsageForAgent(agent, state.selectedToolName);
+    const usageNote = usage.used
+      ? `Called in batch${usage.batches.length === 1 ? "" : "es"} ${usage.batches.join(", ")}.`
+      : "Available to the LLM but not called in this agent run.";
     const definition = findToolDefinition(agent, state.selectedToolName);
     if (!definition) {
       return `
@@ -1043,7 +1079,11 @@
           <h4>Tool Definition</h4>
           <div class="metadata-grid">
             ${metadataItem("Tool name", state.selectedToolName)}
+            ${metadataItem("Used in this agent run", usage.used ? "Yes" : "No")}
+            ${metadataItem("Call count", String(usage.callCount))}
+            ${metadataItem("Batches", usage.batches.length ? usage.batches.join(", ") : "None")}
           </div>
+          <div class="notice">${escapeHtml(usageNote)}</div>
           <div class="empty-state">No tool definition was recorded for this tool in the trace.</div>
         </section>
       `;
@@ -1062,7 +1102,11 @@
         <div class="tool-definition-grid">
           ${metadataItem("Tool name", name)}
           ${metadataItem("Source", source)}
+          ${metadataItem("Used in this agent run", usage.used ? "Yes" : "No")}
+          ${metadataItem("Call count", String(usage.callCount))}
+          ${metadataItem("Batches", usage.batches.length ? usage.batches.join(", ") : "None")}
         </div>
+        <div class="notice">${escapeHtml(usageNote)}</div>
         <h5>Model-Facing Description</h5>
         <pre class="tool-definition-pre">${formatValue(description)}</pre>
         <h5>Recorded Function / Parameter Data</h5>
@@ -1079,6 +1123,27 @@
     const input = agent && agent.input_material ? agent.input_material : {};
     const tools = Array.isArray(input.available_tools) ? input.available_tools : [];
     return tools.find((tool) => tool && tool.name === toolName) || null;
+  }
+
+  function toolUsageForAgent(agent, toolName) {
+    const batches = Array.isArray(agent && agent.tool_batches) ? agent.tool_batches : [];
+    const batchNumbers = [];
+    let callCount = 0;
+
+    batches.forEach((batch) => {
+      const calls = Array.isArray(batch.calls) ? batch.calls : [];
+      const matches = calls.filter((call) => call && call.tool_name === toolName);
+      if (matches.length > 0) {
+        callCount += matches.length;
+        batchNumbers.push(batch.batch_index ?? "");
+      }
+    });
+
+    return {
+      used: callCount > 0,
+      callCount,
+      batches: batchNumbers.filter((value) => value !== "").map((value) => String(value)),
+    };
   }
 
   function firstRecordedField(definition, keys) {
