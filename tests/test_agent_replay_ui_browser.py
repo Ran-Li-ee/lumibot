@@ -36,7 +36,17 @@ def _agent_trace(agent_name: str, context: dict, summary: str) -> dict:
                 "current_datetime": "2026-04-07T09:30:00-04:00",
                 "strategy_name": "NonDemoWorkflow",
             },
-            "tool_surface": [{"name": "market_last_price"}],
+            "tool_surface": [
+                {
+                    "name": "market_last_price",
+                    "description": (
+                        "Get the current last price for one asset. "
+                        "Example: market_last_price(symbol='SPY')."
+                    ),
+                    "source": "local",
+                    "metadata": {"kind": "builtin"},
+                }
+            ],
         },
         "events": [
             {
@@ -261,6 +271,65 @@ def test_default_view_shows_workflow_overview_without_agent_detail(page, replay_
     expect(page.locator("#inputArea")).to_be_hidden()
     expect(page.locator("#toolArea")).to_be_hidden()
     expect(page.locator("#summaryArea")).to_be_hidden()
+
+
+def test_clicking_tool_name_shows_tool_definition_panel(page, replay_url):
+    page.goto(replay_url)
+
+    page.locator(".graph-node", has_text="macro_agent").click()
+    page.locator(".tool-name-button", has_text="market_last_price").click()
+
+    expect(page.locator(".tool-definition-panel")).to_contain_text("Tool Definition")
+    expect(page.locator(".tool-definition-panel")).to_contain_text("market_last_price")
+    expect(page.locator(".tool-definition-panel")).to_contain_text(
+        "Get the current last price for one asset."
+    )
+    expect(page.locator(".tool-definition-panel")).to_contain_text("Replay Metadata")
+    expect(page.locator(".tool-definition-panel")).to_contain_text("Not recorded in this trace.")
+
+
+def test_missing_tool_definition_renders_clear_empty_state(page, replay_url):
+    agent = _public_agent("macro_agent")
+    agent["input_material"]["available_tool_names"] = ["market_last_price"]
+    agent["input_material"]["available_tool_count"] = 1
+    agent["input_material"]["available_tools"] = []
+    agent["tool_batches"] = [
+        {
+            "batch_index": 1,
+            "calls": [
+                {
+                    "tool_name": "market_last_price",
+                    "arguments": {"symbol": "SPY"},
+                    "raw_result": {"price": 500},
+                    "error": None,
+                    "human_explanation": "Looked up SPY price.",
+                    "timestamp": "2026-04-07T09:30:01-04:00",
+                }
+            ],
+        }
+    ]
+    page.route("**/api/dataset", lambda route: route.fulfill(json=_public_dataset([agent], [])))
+
+    page.goto(replay_url)
+
+    page.locator(".graph-node", has_text="macro_agent").click()
+    page.locator(".tool-name-button", has_text="market_last_price").click()
+
+    expect(page.locator(".tool-definition-panel")).to_contain_text(
+        "No tool definition was recorded for this tool in the trace."
+    )
+
+
+def test_selecting_another_agent_clears_selected_tool_definition(page, replay_url):
+    page.goto(replay_url)
+
+    page.locator(".graph-node", has_text="macro_agent").click()
+    page.locator(".tool-name-button", has_text="market_last_price").click()
+    expect(page.locator(".tool-definition-panel")).to_contain_text("market_last_price")
+
+    page.locator(".graph-node", has_text="news_agent").click()
+
+    expect(page.locator(".tool-definition-panel")).to_have_count(0)
 
 
 def test_workflow_graph_can_be_hidden_without_hiding_selectors_or_details(page, replay_url):
