@@ -46,6 +46,17 @@ def test_static_javascript_mentions_required_detail_regions_and_tool_columns():
     assert "Human Explanation" in javascript
 
 
+def test_static_javascript_renders_tool_definition_panel():
+    javascript = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "selectedToolName" in javascript
+    assert "renderToolDefinitionPanel" in javascript
+    assert "findToolDefinition" in javascript
+    assert "tool-name-button" in javascript
+    assert "Tool Definition" in javascript
+    assert "No tool definition was recorded for this tool in the trace." in javascript
+
+
 def test_static_javascript_surfaces_dataset_run_and_system_warnings():
     javascript = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
@@ -73,6 +84,16 @@ def test_static_css_keeps_tool_table_readable_on_mobile():
     assert "min-width:" in css
     assert "760px" in css
     assert "overflow-x: auto" in css
+
+
+def test_static_css_defines_tool_definition_panel_styles():
+    css = (STATIC_ROOT / "styles.css").read_text(encoding="utf-8")
+
+    assert ".tool-name-button" in css
+    assert ".tool-definition-panel" in css
+    assert ".tool-definition-grid" in css
+    assert ".tool-definition-pre" in css
+    assert "overflow-wrap: anywhere" in css
 
 
 def test_static_files_are_visible_as_package_resources():

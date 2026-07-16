@@ -7,6 +7,7 @@
     selectedBacktestRunId: null,
     selectedSystemRunId: null,
     selectedAgentId: null,
+    selectedToolName: null,
     workflowGraphHidden: false,
     workflowLayoutRequestId: 0,
     workflowRelayoutFrame: null,
@@ -31,6 +32,7 @@
 
     elements.overviewButton.addEventListener("click", () => {
       state.selectedAgentId = null;
+      state.selectedToolName = null;
       render();
     });
 
@@ -49,6 +51,7 @@
       state.selectedBacktestRunId = run ? run.id : null;
       state.selectedSystemRunId = systemRun ? systemRun.id : null;
       state.selectedAgentId = null;
+      state.selectedToolName = null;
       render();
     });
 
@@ -59,12 +62,14 @@
         || null;
       state.selectedSystemRunId = systemRun ? systemRun.id : null;
       state.selectedAgentId = null;
+      state.selectedToolName = null;
       render();
     });
 
     elements.systemRunSelect.addEventListener("change", () => {
       state.selectedSystemRunId = elements.systemRunSelect.value;
       state.selectedAgentId = null;
+      state.selectedToolName = null;
       render();
     });
 
@@ -106,6 +111,7 @@
     state.selectedBacktestRunId = run ? run.id : null;
     state.selectedSystemRunId = systemRun ? systemRun.id : null;
     state.selectedAgentId = null;
+    state.selectedToolName = null;
   }
 
   function render() {
@@ -121,6 +127,7 @@
 
     if (state.selectedAgentId && !selectedAgent(systemRun)) {
       state.selectedAgentId = null;
+      state.selectedToolName = null;
     }
 
     setStatus(datasetStatusText(run, systemRun));
@@ -252,6 +259,16 @@
     elements.workflowGraph.querySelectorAll(".graph-node[data-agent-id]").forEach((button) => {
       button.addEventListener("click", () => {
         state.selectedAgentId = button.getAttribute("data-agent-id");
+        state.selectedToolName = null;
+        render();
+      });
+    });
+  }
+
+  function attachToolNameHandlers() {
+    elements.toolArea.querySelectorAll(".tool-name-button[data-tool-name]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.selectedToolName = button.getAttribute("data-tool-name");
         render();
       });
     });
@@ -973,13 +990,17 @@
       return;
     }
 
-    const body = batches.map((batch, index) => renderToolBatch(batch, index === 0)).join("");
+    const body = `
+      ${batches.map((batch, index) => renderToolBatch(batch, index === 0)).join("")}
+      ${renderToolDefinitionPanel(agent)}
+    `;
     elements.toolArea.innerHTML = renderCollapsibleSection(
       "Tool Calls",
       `${batches.length} batch${batches.length === 1 ? "" : "es"} | ${totalCalls} recorded call${totalCalls === 1 ? "" : "s"}`,
       body,
       true,
     );
+    attachToolNameHandlers();
   }
 
   function renderToolBatch(batch, isOpen) {
@@ -1008,6 +1029,65 @@
       `,
       isOpen,
     );
+  }
+
+  function renderToolDefinitionPanel(agent) {
+    if (!state.selectedToolName) {
+      return "";
+    }
+
+    const definition = findToolDefinition(agent, state.selectedToolName);
+    if (!definition) {
+      return `
+        <section class="tool-definition-panel" aria-live="polite">
+          <h4>Tool Definition</h4>
+          <div class="metadata-grid">
+            ${metadataItem("Tool name", state.selectedToolName)}
+          </div>
+          <div class="empty-state">No tool definition was recorded for this tool in the trace.</div>
+        </section>
+      `;
+    }
+
+    const name = definition.name || state.selectedToolName;
+    const description = definition.description || "Not recorded in this trace.";
+    const signature = firstRecordedField(definition, ["signature", "parameters", "schema", "input_schema"]);
+    const annotations = definition.annotations === undefined ? "Not recorded in this trace." : definition.annotations;
+    const metadata = definition.metadata === undefined ? "Not recorded in this trace." : definition.metadata;
+    const source = definition.source || "Not recorded in this trace.";
+
+    return `
+      <section class="tool-definition-panel" aria-live="polite">
+        <h4>Tool Definition</h4>
+        <div class="tool-definition-grid">
+          ${metadataItem("Tool name", name)}
+          ${metadataItem("Source", source)}
+        </div>
+        <h5>Model-Facing Description</h5>
+        <pre class="tool-definition-pre">${formatValue(description)}</pre>
+        <h5>Recorded Function / Parameter Data</h5>
+        <pre class="tool-definition-pre">${formatValue(signature)}</pre>
+        <h5>Recorded Annotations</h5>
+        <pre class="tool-definition-pre">${formatValue(annotations)}</pre>
+        <h5>Replay Metadata</h5>
+        <pre class="tool-definition-pre">${formatValue(metadata)}</pre>
+      </section>
+    `;
+  }
+
+  function findToolDefinition(agent, toolName) {
+    const input = agent && agent.input_material ? agent.input_material : {};
+    const tools = Array.isArray(input.available_tools) ? input.available_tools : [];
+    return tools.find((tool) => tool && tool.name === toolName) || null;
+  }
+
+  function firstRecordedField(definition, keys) {
+    for (const key of keys) {
+      if (definition && definition[key] !== undefined) {
+        return definition[key];
+      }
+    }
+    return "Not recorded in this trace.";
   }
 
   function renderSummaryArea(agent, systemRun) {
@@ -1099,10 +1179,30 @@
     return `
       <tr>
         <td>${escapeHtml(String(row.batchIndex ?? ""))}</td>
-        <td><pre>${formatValue(inputPayload)}</pre></td>
+        <td>
+          ${renderToolNameButton(call.tool_name)}
+          <pre>${formatValue(inputPayload)}</pre>
+        </td>
         <td><pre>${formatValue(outputPayload)}</pre></td>
         <td><pre>${formatValue(call.human_explanation)}</pre></td>
       </tr>
+    `;
+  }
+
+  function renderToolNameButton(toolName) {
+    if (!toolName) {
+      return "";
+    }
+    const activeClass = state.selectedToolName === toolName ? " active" : "";
+    return `
+      <button
+        type="button"
+        class="tool-name-button${activeClass}"
+        data-tool-name="${escapeHtml(toolName)}"
+        aria-label="Show tool definition for ${escapeHtml(toolName)}"
+      >
+        ${escapeHtml(toolName)}
+      </button>
     `;
   }
 

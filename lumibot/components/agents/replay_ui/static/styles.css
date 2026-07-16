@@ -542,6 +542,64 @@ pre,
   background: #ffffff;
 }
 
+.tool-name-button {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  margin: 0 0 8px;
+  padding: 3px 6px;
+  border: 1px solid #9fb3ad;
+  border-radius: 4px;
+  background: #f7fbfa;
+  color: #102522;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.tool-name-button:hover,
+.tool-name-button:focus {
+  border-color: #1f6f63;
+  outline: none;
+}
+
+.tool-name-button.active {
+  background: #dceee9;
+  border-color: #1f6f63;
+}
+
+.tool-definition-panel {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #c6d2cf;
+  background: #fbfdfc;
+}
+
+.tool-definition-panel h4,
+.tool-definition-panel h5 {
+  margin: 0 0 8px;
+}
+
+.tool-definition-panel h5 {
+  margin-top: 12px;
+  font-size: 13px;
+}
+
+.tool-definition-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.tool-definition-pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+
 .warnings {
   margin-top: 12px;
   padding-top: 12px;
