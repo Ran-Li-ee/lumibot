@@ -45,6 +45,17 @@ def _agent_trace(agent_name: str, context: dict, summary: str) -> dict:
                     ),
                     "source": "local",
                     "metadata": {"kind": "builtin"},
+                },
+                {
+                    "name": "duckdb_query",
+                    "description": "Run SQL against tables loaded during this agent run.",
+                    "source": "local",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"sql": {"type": "string"}},
+                        "required": ["sql"],
+                    },
+                    "metadata": {"kind": "builtin"},
                 }
             ],
         },
@@ -273,19 +284,55 @@ def test_default_view_shows_workflow_overview_without_agent_detail(page, replay_
     expect(page.locator("#summaryArea")).to_be_hidden()
 
 
-def test_clicking_tool_name_shows_tool_definition_panel(page, replay_url):
+def test_clicking_available_tool_name_shows_input_tool_definition_panel(page, replay_url):
     page.goto(replay_url)
 
     page.locator(".graph-node", has_text="macro_agent").click()
-    page.locator(".tool-name-button", has_text="market_last_price").click()
 
-    expect(page.locator(".tool-definition-panel")).to_contain_text("Tool Definition")
-    expect(page.locator(".tool-definition-panel")).to_contain_text("market_last_price")
-    expect(page.locator(".tool-definition-panel")).to_contain_text(
-        "Get the current last price for one asset."
+    input_card = page.locator("#inputArea details.collapsible-section").filter(has_text="Input Material")
+    input_card.locator("summary").first.click()
+
+    available_tools = page.locator("#inputArea details.collapsible-subsection").filter(
+        has_text="Available Tool Names"
     )
-    expect(page.locator(".tool-definition-panel")).to_contain_text("Replay Metadata")
-    expect(page.locator(".tool-definition-panel")).to_contain_text("Not recorded in this trace.")
+    available_tools.locator("summary").click()
+    available_tools.get_by_role("button", name=re.compile("market_last_price")).click()
+
+    panel = page.locator("#inputArea .tool-definition-panel")
+    expect(panel).to_contain_text("Tool Definition")
+    expect(panel).to_contain_text("market_last_price")
+    expect(panel).to_contain_text("Get the current last price for one asset.")
+    expect(panel).to_contain_text("Used in this agent run")
+    expect(panel).to_contain_text("Yes")
+    expect(panel).to_contain_text("Call count")
+    expect(panel).to_contain_text("1")
+    expect(panel).to_contain_text("Batches")
+    expect(panel).to_contain_text("1")
+    expect(page.locator("#toolArea .tool-definition-panel")).to_have_count(0)
+
+
+def test_clicking_unused_available_tool_shows_available_but_unused_status(page, replay_url):
+    page.goto(replay_url)
+
+    page.locator(".graph-node", has_text="macro_agent").click()
+
+    input_card = page.locator("#inputArea details.collapsible-section").filter(has_text="Input Material")
+    input_card.locator("summary").first.click()
+
+    available_tools = page.locator("#inputArea details.collapsible-subsection").filter(
+        has_text="Available Tool Names"
+    )
+    available_tools.locator("summary").click()
+    available_tools.get_by_role("button", name=re.compile("duckdb_query")).click()
+
+    panel = page.locator("#inputArea .tool-definition-panel")
+    expect(panel).to_contain_text("duckdb_query")
+    expect(panel).to_contain_text("Run SQL against tables loaded during this agent run.")
+    expect(panel).to_contain_text("Used in this agent run")
+    expect(panel).to_contain_text("No")
+    expect(panel).to_contain_text("Call count")
+    expect(panel).to_contain_text("0")
+    expect(panel).to_contain_text("Available to the LLM but not called in this agent run.")
 
 
 def test_missing_tool_definition_renders_clear_empty_state(page, replay_url):
@@ -313,11 +360,34 @@ def test_missing_tool_definition_renders_clear_empty_state(page, replay_url):
     page.goto(replay_url)
 
     page.locator(".graph-node", has_text="macro_agent").click()
-    page.locator(".tool-name-button", has_text="market_last_price").click()
 
-    expect(page.locator(".tool-definition-panel")).to_contain_text(
+    input_card = page.locator("#inputArea details.collapsible-section").filter(has_text="Input Material")
+    input_card.locator("summary").first.click()
+    available_tools = page.locator("#inputArea details.collapsible-subsection").filter(
+        has_text="Available Tool Names"
+    )
+    available_tools.locator("summary").click()
+    available_tools.get_by_role("button", name=re.compile("market_last_price")).click()
+
+    expect(page.locator("#inputArea .tool-definition-panel")).to_contain_text(
         "No tool definition was recorded for this tool in the trace."
     )
+
+
+def test_clicking_tool_call_name_selects_input_tool_definition_panel(page, replay_url):
+    page.goto(replay_url)
+
+    page.locator(".graph-node", has_text="macro_agent").click()
+
+    page.locator("#toolArea .tool-name-button", has_text="market_last_price").click()
+
+    input_card = page.locator("#inputArea details.collapsible-section").filter(has_text="Input Material")
+    panel = page.locator("#inputArea .tool-definition-panel")
+    expect(input_card).to_have_attribute("open", "")
+    expect(panel).to_be_visible()
+    expect(panel).to_contain_text("market_last_price")
+    expect(panel).to_contain_text("Used in this agent run")
+    expect(page.locator("#toolArea .tool-definition-panel")).to_have_count(0)
 
 
 def test_selecting_another_agent_clears_selected_tool_definition(page, replay_url):
@@ -325,11 +395,11 @@ def test_selecting_another_agent_clears_selected_tool_definition(page, replay_ur
 
     page.locator(".graph-node", has_text="macro_agent").click()
     page.locator(".tool-name-button", has_text="market_last_price").click()
-    expect(page.locator(".tool-definition-panel")).to_contain_text("market_last_price")
+    expect(page.locator("#inputArea .tool-definition-panel")).to_contain_text("market_last_price")
 
     page.locator(".graph-node", has_text="news_agent").click()
 
-    expect(page.locator(".tool-definition-panel")).to_have_count(0)
+    expect(page.locator("#inputArea .tool-definition-panel")).to_have_count(0)
 
 
 def test_workflow_graph_can_be_hidden_without_hiding_selectors_or_details(page, replay_url):
