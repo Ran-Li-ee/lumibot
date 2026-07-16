@@ -917,7 +917,10 @@
 
   function renderAvailableToolSurface(agent, toolNames) {
     if (!toolNames.length) {
-      return `<div class="empty-state">None</div>`;
+      return `
+        <div class="empty-state">None</div>
+        ${renderToolDefinitionPanel(agent)}
+      `;
     }
 
     const chips = toolNames.map((toolName) => {

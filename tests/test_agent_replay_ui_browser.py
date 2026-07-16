@@ -390,6 +390,46 @@ def test_clicking_tool_call_name_selects_input_tool_definition_panel(page, repla
     expect(page.locator("#toolArea .tool-definition-panel")).to_have_count(0)
 
 
+def test_tool_call_name_shows_input_panel_when_available_tool_names_empty(page, replay_url):
+    agent = _public_agent("macro_agent")
+    agent["input_material"]["available_tool_names"] = []
+    agent["input_material"]["available_tool_count"] = 0
+    agent["input_material"]["available_tools"] = []
+    agent["tool_batches"] = [
+        {
+            "batch_index": 1,
+            "calls": [
+                {
+                    "tool_name": "market_last_price",
+                    "arguments": {"symbol": "SPY"},
+                    "raw_result": {"price": 500},
+                    "error": None,
+                    "human_explanation": "Looked up SPY price.",
+                    "timestamp": "2026-04-07T09:30:01-04:00",
+                }
+            ],
+        }
+    ]
+    page.route("**/api/dataset", lambda route: route.fulfill(json=_public_dataset([agent], [])))
+
+    page.goto(replay_url)
+
+    page.locator(".graph-node", has_text="macro_agent").click()
+    page.locator("#toolArea .tool-name-button", has_text="market_last_price").click()
+
+    input_card = page.locator("#inputArea details.collapsible-section").filter(has_text="Input Material")
+    available_tools = page.locator("#inputArea details.collapsible-subsection").filter(
+        has_text="Available Tool Names"
+    )
+    panel = page.locator("#inputArea .tool-definition-panel")
+    expect(input_card).to_have_attribute("open", "")
+    expect(available_tools).to_have_attribute("open", "")
+    expect(panel).to_be_visible()
+    expect(panel).to_contain_text("market_last_price")
+    expect(panel).to_contain_text("No tool definition was recorded for this tool in the trace.")
+    expect(page.locator("#toolArea .tool-definition-panel")).to_have_count(0)
+
+
 def test_selecting_another_agent_clears_selected_tool_definition(page, replay_url):
     page.goto(replay_url)
 
