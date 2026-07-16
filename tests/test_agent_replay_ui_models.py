@@ -135,6 +135,75 @@ def test_agent_replay_public_dict_contains_three_detail_areas():
     assert "raw_trace" not in public
 
 
+def test_agent_replay_public_dict_includes_redacted_available_tools():
+    agent = AgentReplay(
+        id="trader-1",
+        name="trader",
+        model="openai/gpt-5.4-mini",
+        trace_path="C:/trace/trader.json",
+        request={
+            "tool_surface": [
+                {
+                    "name": "orders_submit_order",
+                    "description": "Use api_key=sk-test-secret only in test fixtures.",
+                    "source": "local",
+                    "metadata": {
+                        "kind": "builtin",
+                        "Authorization": "Bearer abc123",
+                    },
+                },
+                {
+                    "name": "market_last_price",
+                    "description": "Get the current last price.",
+                    "source": "builtin",
+                    "metadata": {"kind": "market"},
+                },
+            ],
+        },
+    )
+
+    public = agent.to_public_dict()
+
+    assert public["input_material"]["available_tool_count"] == 2
+    assert public["input_material"]["available_tool_names"] == [
+        "orders_submit_order",
+        "market_last_price",
+    ]
+    assert public["input_material"]["available_tools"] == [
+        {
+            "name": "orders_submit_order",
+            "description": "Use api_key=[REDACTED] only in test fixtures.",
+            "source": "local",
+            "metadata": {
+                "kind": "builtin",
+                "Authorization": "[REDACTED]",
+            },
+        },
+        {
+            "name": "market_last_price",
+            "description": "Get the current last price.",
+            "source": "builtin",
+            "metadata": {"kind": "market"},
+        },
+    ]
+
+
+def test_agent_replay_public_dict_handles_missing_tool_surface():
+    agent = AgentReplay(
+        id="old-agent-1",
+        name="old_agent",
+        model="openai/gpt-5.4-mini",
+        trace_path="C:/trace/old.json",
+        request={},
+    )
+
+    public = agent.to_public_dict()
+
+    assert public["input_material"]["available_tool_count"] == 0
+    assert public["input_material"]["available_tool_names"] == []
+    assert public["input_material"]["available_tools"] == []
+
+
 def test_agent_replay_input_material_redacts_runtime_context_fields():
     agent = AgentReplay(
         id="growth-agent-1",

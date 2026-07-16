@@ -18,6 +18,36 @@ def _tool_name(tool: Any) -> str | None:
     return name if isinstance(name, str) and name else None
 
 
+def _public_tool_surface(tool_surface: Any) -> list[dict[str, Any]]:
+    if not isinstance(tool_surface, list):
+        return []
+
+    public_tools: list[dict[str, Any]] = []
+    for tool in tool_surface:
+        if not isinstance(tool, dict):
+            continue
+        name = _tool_name(tool)
+        if name is None:
+            continue
+
+        public_tool: dict[str, Any] = {"name": redact_sensitive(name)}
+        for key in (
+            "description",
+            "signature",
+            "annotations",
+            "parameters",
+            "schema",
+            "input_schema",
+            "source",
+            "metadata",
+        ):
+            if key in tool:
+                public_tool[key] = redact_sensitive(tool.get(key))
+        public_tools.append(public_tool)
+
+    return public_tools
+
+
 @dataclass
 class ToolCallReplay:
     tool_name: str
@@ -87,7 +117,8 @@ class AgentReplay:
         context = self.request.get("context") or {}
         runtime_context = self.request.get("runtime_context") or {}
         tool_surface = self.request.get("tool_surface") or []
-        tool_names = [name for name in (_tool_name(tool) for tool in tool_surface) if name is not None]
+        available_tools = _public_tool_surface(tool_surface)
+        tool_names = [str(tool["name"]) for tool in available_tools if tool.get("name")]
         context_keys = sorted(str(key) for key in context.keys()) if isinstance(context, dict) else []
 
         return {
@@ -104,6 +135,7 @@ class AgentReplay:
             else None,
             "available_tool_count": len(tool_names),
             "available_tool_names": tool_names,
+            "available_tools": available_tools,
         }
 
     def to_public_dict(self) -> dict[str, Any]:
