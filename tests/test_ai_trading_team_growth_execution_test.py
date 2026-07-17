@@ -163,6 +163,32 @@ def test_decision_prompt_requests_structured_exit_and_entry_plan():
         assert field in decision_prompt
 
 
+def test_prompts_frame_strategy_as_relative_strength_rotation_test(monkeypatch):
+    _strategy_module, strategy_class = load_strategy_module()
+    monkeypatch.setenv("AI_TRADING_TEAM_MODEL", "test-model")
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+    strategy.on_trading_iteration()
+
+    prompt_text = json.dumps(agent_manager.created)
+    for agent in agent_manager._agents.values():
+        prompt_text += json.dumps(agent.calls)
+    prompt_text = prompt_text.lower().replace('\\"', '"')
+
+    for required_phrase in (
+        "relative-strength rotation test",
+        "do not assume qqq is the default",
+        "materially outperforms the current holding",
+        'plan_type="rotate"',
+        'side="sell"',
+        'side="buy"',
+        "sell or reduce the current holding first",
+    ):
+        assert required_phrase in prompt_text
+
+
 def test_benchmark_runner_import_does_not_require_backtesting_stack(monkeypatch):
     sys.modules.pop("scripts.run_ai_trading_team_examples_benchmark", None)
     real_import = __import__
