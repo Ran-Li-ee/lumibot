@@ -154,6 +154,60 @@ def test_load_agent_trace_falls_back_to_flat_tool_calls(tmp_path):
     assert "SQL" in agent.tool_batches[1].calls[0].human_explanation
 
 
+def test_loader_preserves_event_tool_result_diagnostics(tmp_path):
+    trace_path = tmp_path / "agent_runtime" / "traces" / "trader" / "trace.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "trader",
+            "model": "stub",
+            "request": {},
+            "events": [
+                {
+                    "kind": "tool_call",
+                    "tool_name": "orders_submit_order",
+                    "payload": {"symbol": "TIP"},
+                },
+                {
+                    "kind": "tool_result",
+                    "tool_name": "orders_submit_order",
+                    "payload": {"ok": False},
+                    "diagnostics": {"ok": False, "error_type": "ORDER_READINESS_REQUIRED"},
+                },
+            ],
+        },
+    )
+
+    replay = load_agent_trace(trace_path)
+
+    call = replay.tool_batches[0].calls[0]
+    assert call.diagnostics["error_type"] == "ORDER_READINESS_REQUIRED"
+
+
+def test_loader_preserves_flat_tool_result_diagnostics(tmp_path):
+    trace_path = tmp_path / "agent_runtime" / "traces" / "flat_agent" / "flat.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "flat_agent",
+            "request": {},
+            "tool_calls": [{"tool_name": "orders_submit_order", "payload": {"symbol": "TIP"}}],
+            "tool_results": [
+                {
+                    "tool_name": "orders_submit_order",
+                    "payload": {"ok": False},
+                    "diagnostics": {"ok": False, "error_type": "ORDER_READINESS_REQUIRED"},
+                }
+            ],
+        },
+    )
+
+    replay = load_agent_trace(trace_path)
+
+    call = replay.tool_batches[0].calls[0]
+    assert call.diagnostics["error_type"] == "ORDER_READINESS_REQUIRED"
+
+
 def test_discover_trace_files_only_reads_trace_json_files(tmp_path):
     root = tmp_path / "agent_runtime"
     _write_trace(root / "traces" / "growth_agent" / "growth.json", {"agent": "growth_agent"})

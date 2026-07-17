@@ -188,6 +188,55 @@ def test_agent_replay_public_dict_includes_redacted_available_tools():
     ]
 
 
+def test_input_material_exposes_tool_availability_and_rich_tool_fields():
+    replay = AgentReplay(
+        id="agent-1",
+        name="trader",
+        model="stub",
+        trace_path="trace.json",
+        request={
+            "tool_surface": [
+                {
+                    "name": "orders_submit_order",
+                    "description": "Submit.",
+                    "signature": "(symbol: str)",
+                    "annotations": {"symbol": "str"},
+                    "defaults": {"quantity": 1},
+                    "source": "local",
+                    "metadata": {"kind": "builtin", "mutates_trading": True},
+                    "safety_requirements": ["Call account_portfolio first."],
+                }
+            ],
+            "tool_availability": {
+                "available": [{"name": "account_positions", "reason": "available"}],
+                "filtered": [
+                    {
+                        "name": "orders_submit_order",
+                        "reason": "filtered because allow_trading is false",
+                    }
+                ],
+            },
+        },
+    )
+
+    material = replay.input_material()
+
+    tool = material["available_tools"][0]
+    assert tool["defaults"] == {"quantity": 1}
+    assert tool["safety_requirements"] == ["Call account_portfolio first."]
+    assert material["tool_availability"]["available"][0]["name"] == "account_positions"
+    assert material["tool_availability"]["filtered"][0]["name"] == "orders_submit_order"
+
+
+def test_tool_call_replay_public_dict_exposes_diagnostics():
+    call = ToolCallReplay(
+        tool_name="orders_submit_order",
+        diagnostics={"ok": False, "error_type": "ORDER_READINESS_REQUIRED"},
+    )
+
+    assert call.to_public_dict()["diagnostics"]["error_type"] == "ORDER_READINESS_REQUIRED"
+
+
 def test_agent_replay_public_dict_handles_missing_tool_surface():
     agent = AgentReplay(
         id="old-agent-1",

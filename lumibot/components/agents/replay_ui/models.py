@@ -40,12 +40,26 @@ def _public_tool_surface(tool_surface: Any) -> list[dict[str, Any]]:
             "input_schema",
             "source",
             "metadata",
+            "defaults",
+            "safety_requirements",
         ):
             if key in tool:
                 public_tool[key] = redact_sensitive(tool.get(key))
         public_tools.append(public_tool)
 
     return public_tools
+
+
+def _public_tool_availability(tool_availability: Any) -> dict[str, Any]:
+    if not isinstance(tool_availability, dict):
+        return {"available": [], "filtered": []}
+
+    available = tool_availability.get("available")
+    filtered = tool_availability.get("filtered")
+    return {
+        "available": redact_sensitive(available) if isinstance(available, list) else [],
+        "filtered": redact_sensitive(filtered) if isinstance(filtered, list) else [],
+    }
 
 
 @dataclass
@@ -56,6 +70,7 @@ class ToolCallReplay:
     error: Any = None
     human_explanation: str | None = None
     timestamp: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +80,7 @@ class ToolCallReplay:
             "error": redact_public_preview(self.error),
             "human_explanation": redact_sensitive(self.human_explanation),
             "timestamp": self.timestamp,
+            "diagnostics": redact_public_preview(self.diagnostics),
         }
 
 
@@ -136,6 +152,7 @@ class AgentReplay:
             "available_tool_count": len(tool_names),
             "available_tool_names": tool_names,
             "available_tools": available_tools,
+            "tool_availability": _public_tool_availability(self.request.get("tool_availability")),
         }
 
     def to_public_dict(self) -> dict[str, Any]:

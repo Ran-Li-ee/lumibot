@@ -318,6 +318,7 @@ def _tool_batches_from_events(events: Any) -> list[ToolBatch]:
             error = _result_error(event, raw_result)
             call.raw_result = raw_result
             call.error = error
+            call.diagnostics = _diagnostics_payload(event)
             call.human_explanation = explain_tool_result(call.tool_name, call.arguments, call.raw_result, call.error)
 
     if current_calls:
@@ -349,6 +350,7 @@ def _tool_batches_from_flat_lists(tool_calls: Any, tool_results: Any) -> list[To
             error=error,
             human_explanation=explain_tool_result(tool_name, _arguments_payload(call_item), raw_result, error),
             timestamp=_timestamp(call_item),
+            diagnostics=_diagnostics_payload(result_item),
         )
         _append_batch(batches, [replay_call])
 
@@ -423,6 +425,13 @@ def _result_error(item: dict[str, Any] | None, raw_result: Any) -> str | None:
     if explicit_error is not None:
         return str(explicit_error)
     return None
+
+
+def _diagnostics_payload(item: dict[str, Any] | None) -> dict[str, Any]:
+    if item is None:
+        return {}
+    diagnostics = item.get("diagnostics")
+    return diagnostics if isinstance(diagnostics, dict) else {}
 
 
 def _timestamp(item: dict[str, Any]) -> str | None:
