@@ -7,7 +7,7 @@ from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify
 
-from .loader import build_replay_dataset
+from .loader import build_replay_dataset_from_roots
 
 STATIC_ALLOWLIST = {
     "app.js",
@@ -16,15 +16,16 @@ STATIC_ALLOWLIST = {
 }
 
 
-def create_app(trace_root: str | Path) -> Flask:
+def create_app(trace_root: str | Path | list[str | Path]) -> Flask:
     """Create a read-only replay UI Flask application."""
 
     app = Flask(__name__, static_folder=None)
-    app.config["TRACE_ROOT"] = Path(trace_root)
+    trace_roots = trace_root if isinstance(trace_root, list) else [trace_root]
+    app.config["TRACE_ROOTS"] = [Path(root) for root in trace_roots]
 
     @app.get("/api/dataset")
     def dataset() -> Response:
-        replay_dataset = build_replay_dataset(app.config["TRACE_ROOT"])
+        replay_dataset = build_replay_dataset_from_roots(app.config["TRACE_ROOTS"])
         return jsonify(replay_dataset.to_public_dict())
 
     @app.get("/healthz")

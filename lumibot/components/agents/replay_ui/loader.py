@@ -41,7 +41,30 @@ def discover_trace_files(trace_root: str | Path) -> list[Path]:
 def build_replay_dataset(trace_root: str | Path) -> ReplayDataset:
     """Build a replay dataset from all trace files under a runtime directory."""
 
-    root = Path(trace_root)
+    return _build_replay_dataset_for_root(Path(trace_root))
+
+
+def build_replay_dataset_from_roots(trace_roots: list[str | Path]) -> ReplayDataset:
+    """Build one replay dataset by merging all trace files under multiple runtime directories."""
+
+    datasets = [_build_replay_dataset_for_root(Path(trace_root)) for trace_root in trace_roots]
+    runs: list[ReplayRun] = []
+    warnings: list[Any] = []
+    source_paths: list[str] = []
+    for dataset in datasets:
+        runs.extend(dataset.runs)
+        warnings.extend(dataset.warnings)
+        if dataset.source_path:
+            source_paths.append(dataset.source_path)
+
+    runs.sort(key=lambda run: (run.strategy_name, run.label, run.id))
+    return ReplayDataset(runs=runs, source_path="; ".join(source_paths), warnings=warnings)
+
+
+def _build_replay_dataset_for_root(root: Path) -> ReplayDataset:
+    """Build a replay dataset from one runtime directory."""
+
+    root = Path(root)
     agents: list[AgentReplay] = []
     warnings: list[dict[str, str]] = []
     for trace_path in discover_trace_files(root):
@@ -162,7 +185,17 @@ def _system_run_backtest_key(root: Path, system_run: SystemRun) -> tuple[str, st
             explicit_id,
         )
         return strategy_name, explicit_id, label
-    return strategy_name, _backtest_run_id(root, strategy_name), root.name or "agent_runtime"
+    return strategy_name, _backtest_run_id(root, strategy_name), _trace_root_label(root)
+
+
+def _trace_root_label(root: Path) -> str:
+    parts = root.parts
+    marker = "ai_trading_team_example_benchmarks"
+    if marker in parts:
+        index = parts.index(marker)
+        if len(parts) > index + 2:
+            return f"{parts[index + 1]} / {parts[index + 2]}"
+    return root.name or "agent_runtime"
 
 
 def _system_run_runtime_context(system_run: SystemRun) -> dict[str, Any]:

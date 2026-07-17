@@ -1,6 +1,11 @@
 import json
 
-from lumibot.components.agents.replay_ui.loader import build_replay_dataset, discover_trace_files, load_agent_trace
+from lumibot.components.agents.replay_ui.loader import (
+    build_replay_dataset,
+    build_replay_dataset_from_roots,
+    discover_trace_files,
+    load_agent_trace,
+)
 
 
 def _write_trace(path, payload):
@@ -288,6 +293,78 @@ def test_build_replay_dataset_splits_same_strategy_by_backtest_run_id(tmp_path):
         "2026-04-07T09:30:00-04:00",
         "2026-04-08T09:30:00-04:00",
     ]
+
+
+def test_build_replay_dataset_from_roots_merges_multiple_roots(tmp_path):
+    first = tmp_path / "first" / "agent_runtime"
+    second = tmp_path / "second" / "agent_runtime"
+    _write_trace(
+        first / "traces" / "one" / "trace.json",
+        {
+            "agent": "agent_one",
+            "request": {
+                "runtime_context": {
+                    "mode": "backtesting",
+                    "current_datetime": "2024-09-05T09:30:00-04:00",
+                    "strategy_name": "StrategyOne",
+                }
+            },
+            "events": [],
+            "summary": "one",
+        },
+    )
+    _write_trace(
+        second / "traces" / "two" / "trace.json",
+        {
+            "agent": "agent_two",
+            "request": {
+                "runtime_context": {
+                    "mode": "backtesting",
+                    "current_datetime": "2024-09-06T09:30:00-04:00",
+                    "strategy_name": "StrategyTwo",
+                }
+            },
+            "events": [],
+            "summary": "two",
+        },
+    )
+
+    public = build_replay_dataset_from_roots([first, second]).to_public_dict()
+
+    assert [run["strategy_name"] for run in public["runs"]] == ["StrategyOne", "StrategyTwo"]
+    assert "first" in public["source_path"]
+    assert "second" in public["source_path"]
+
+
+def test_benchmark_artifact_trace_root_gets_readable_label(tmp_path):
+    root = (
+        tmp_path
+        / "artifacts"
+        / "ai_trading_team_example_benchmarks"
+        / "20260717_185016_461584"
+        / "growth-execution-test"
+        / "cache"
+        / "agent_runtime"
+    )
+    _write_trace(
+        root / "traces" / "execution_agent" / "trace.json",
+        {
+            "agent": "execution_agent",
+            "request": {
+                "runtime_context": {
+                    "mode": "backtesting",
+                    "current_datetime": "2024-09-05T09:30:00-04:00",
+                    "strategy_name": "AITradingTeamGrowthExecutionTestStrategy",
+                }
+            },
+            "events": [],
+            "summary": "execution",
+        },
+    )
+
+    public = build_replay_dataset(root).to_public_dict()
+
+    assert public["runs"][0]["label"] == "20260717_185016_461584 / growth-execution-test"
 
 
 def test_build_replay_dataset_marks_ambiguous_summary_sources(tmp_path):
