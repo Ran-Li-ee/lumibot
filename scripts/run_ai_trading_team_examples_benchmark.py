@@ -19,27 +19,27 @@ os.environ.setdefault("BACKTESTING_DATA_SOURCE", "none")
 os.environ.setdefault("LUMIBOT_DISABLE_DOTENV", "1")
 os.environ.setdefault("LUMIBOT_DISABLE_BACKTEST_PERFORMANCE_TRACKING", "1")
 
-from lumibot.backtesting import YahooDataBacktesting
-from lumibot.entities import Asset
-from lumibot.example_strategies.ai_trading_team_bill_ackman_concentrated import (
+from lumibot.example_strategies.ai_trading_team_bill_ackman_concentrated import (  # noqa: E402
     AITradingTeamBillAckmanConcentratedStrategy,
 )
-from lumibot.example_strategies.ai_trading_team_bull_bear_large_cap_stocks import (
+from lumibot.example_strategies.ai_trading_team_bull_bear_large_cap_stocks import (  # noqa: E402
     AITradingTeamBullBearLargeCapStocksStrategy,
 )
-from lumibot.example_strategies.ai_trading_team_bull_bear_leveraged_etf import (
+from lumibot.example_strategies.ai_trading_team_bull_bear_leveraged_etf import (  # noqa: E402
     AITradingTeamBullBearLeveragedETFStrategy,
 )
-from lumibot.example_strategies.ai_trading_team_citadel_sector_pods import (
+from lumibot.example_strategies.ai_trading_team_citadel_sector_pods import (  # noqa: E402
     AITradingTeamCitadelSectorPodsStrategy,
 )
-from lumibot.example_strategies.ai_trading_team_ray_dalio_idea_meritocracy import (
+from lumibot.example_strategies.ai_trading_team_growth_execution_test import (  # noqa: E402
+    AITradingTeamGrowthExecutionTestStrategy,
+)
+from lumibot.example_strategies.ai_trading_team_ray_dalio_idea_meritocracy import (  # noqa: E402
     AITradingTeamRayDalioIdeaMeritocracyStrategy,
 )
-from lumibot.example_strategies.ai_trading_team_warren_buffett_value import (
+from lumibot.example_strategies.ai_trading_team_warren_buffett_value import (  # noqa: E402
     AITradingTeamWarrenBuffettValueStrategy,
 )
-
 
 ARTIFACT_ROOT = Path("artifacts") / "ai_trading_team_example_benchmarks"
 STRATEGIES = {
@@ -49,6 +49,7 @@ STRATEGIES = {
     "warren-buffett-value": AITradingTeamWarrenBuffettValueStrategy,
     "bill-ackman-concentrated": AITradingTeamBillAckmanConcentratedStrategy,
     "citadel-sector-pods": AITradingTeamCitadelSectorPodsStrategy,
+    "growth-execution-test": AITradingTeamGrowthExecutionTestStrategy,
 }
 
 
@@ -87,6 +88,9 @@ def _slug(value: str) -> str:
 
 
 def _run_one_strategy(name: str, args: argparse.Namespace, root: str) -> dict[str, Any]:
+    from lumibot.backtesting import YahooDataBacktesting
+    from lumibot.entities import Asset
+
     strategy_class = STRATEGIES[name]
     run_dir = Path(root) / _slug(name)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -179,7 +183,13 @@ def main() -> None:
         for future in as_completed(futures):
             payload = future.result()
             results.append(payload)
-            print(json.dumps({k: payload.get(k) for k in ("strategy", "status", "wall_ms", "artifact_dir")}, sort_keys=True), flush=True)
+            print(
+                json.dumps(
+                    {k: payload.get(k) for k in ("strategy", "status", "wall_ms", "artifact_dir")},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     summary = {
         "artifact_dir": str(root.resolve()),
@@ -187,7 +197,13 @@ def main() -> None:
         "results": sorted(results, key=lambda item: item["strategy"]),
     }
     (root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps({"artifact_dir": str(root.resolve()), "summary": str((root / "summary.json").resolve())}, indent=2), flush=True)
+    print(
+        json.dumps(
+            {"artifact_dir": str(root.resolve()), "summary": str((root / "summary.json").resolve())},
+            indent=2,
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

@@ -836,7 +836,9 @@ class AgentHandle:
             "For ETFs, indexes, or broad-market trades, use SEC financial/filing tools on the most relevant single-stock candidates, holdings, or alternatives you are considering; do not skip the category just because the final instrument is an ETF.",
             "Do not repeat identical read-only evidence calls if the current task context already includes fresh results from another agent; reference those results and call again only when they are missing, stale, or conflicting.",
             "If the user asks for an aggressive or concentrated strategy, let that user strategy prompt override the default investor style, but still ground the decision in tool evidence, position sizing, broker constraints, and backtesting look-ahead safety.",
-            "When querying DuckDB tables, use datetime for timestamp columns and close for price columns unless the loaded sample rows clearly show different column names.",
+            "When querying DuckDB tables, use the exact column names returned by market_load_history_table or pragma_table_info.",
+            "For history tables loaded by market_load_history_table, the timestamp column is often named Date, not datetime. Do not assume datetime exists unless returned columns explicitly include it.",
+            "Use close for price columns when the returned columns include close.",
             "When you have access to external MCP tools, explore what they offer and use them. You do not need to be told which specific tool to call.",
             "Finish every run with a short summary sentence starting with RESULT: that explains what you did and why.",
         ]
