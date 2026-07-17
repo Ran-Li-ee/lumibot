@@ -17,6 +17,13 @@ from .tool_context import agent_tool_context
 from .tools import bind_callable_tool
 
 
+_MUTATING_TRADING_TOOL_NAMES = frozenset(
+    {
+        "orders_submit_order",
+        "orders_cancel_order",
+        "orders_modify_order",
+    }
+)
 _TIMESTAMP_HINT_RE = re.compile(
     r"(time|date|datetime|published|updated|created|accepted|released|release|as_of|realtime)",
     re.IGNORECASE,
@@ -608,6 +615,19 @@ def _stable_tool_metadata_for_cache(tool: BoundTool) -> dict[str, Any]:
     return {key: value for key, value in stable.items() if value is not None}
 
 
+def _trace_safe_tool_metadata(tool: BoundTool) -> dict[str, Any]:
+    metadata = dict(tool.metadata or {})
+    if tool.name in _MUTATING_TRADING_TOOL_NAMES:
+        metadata["mutates_trading"] = True
+    try:
+        from .replay_ui.redaction import redact_sensitive
+
+        redacted = redact_sensitive(_normalize_json(metadata))
+    except Exception:
+        redacted = _stable_tool_metadata_for_cache(tool)
+    return redacted if isinstance(redacted, dict) else {}
+
+
 def _json_safe_annotation(value: Any) -> str:
     if value is inspect.Signature.empty:
         return ""
@@ -672,7 +692,7 @@ def _tool_surface_entry_for_trace(tool: BoundTool) -> dict[str, Any]:
         "signature": signature_text,
         "annotations": annotations,
         "defaults": defaults,
-        "metadata": dict(tool.metadata or {}),
+        "metadata": _trace_safe_tool_metadata(tool),
         "safety_requirements": _tool_safety_requirements_for_trace(tool.name),
     }
 
@@ -1201,7 +1221,7 @@ class AgentHandle:
             {
                 "name": tool.name,
                 "source": tool.source,
-                "metadata": dict(tool.metadata or {}),
+                "metadata": _trace_safe_tool_metadata(tool),
                 "reason": "available",
             }
             for tool in bound_tools

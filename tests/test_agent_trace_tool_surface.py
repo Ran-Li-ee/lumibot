@@ -75,6 +75,40 @@ def test_tool_surface_entry_handles_tools_without_annotations_or_defaults():
     assert entry["safety_requirements"] == []
 
 
+def test_tool_surface_entry_redacts_sensitive_metadata():
+    tool = BoundTool(
+        name="mcp_tool",
+        description="MCP.",
+        function=sample_tool,
+        source="mcp",
+        metadata={
+            "kind": "mcp",
+            "url": "https://example.test/tool?api_key=sk-secret123",
+            "authorization": "Bearer secret-token",
+        },
+    )
+
+    entry = _tool_surface_entry_for_trace(tool)
+
+    assert "sk-secret123" not in json.dumps(entry["metadata"])
+    assert "secret-token" not in json.dumps(entry["metadata"])
+    assert entry["metadata"]["authorization"] == "[REDACTED]"
+
+
+def test_order_tool_trace_metadata_marks_mutating_trading_even_when_bound_metadata_omits_it():
+    tool = BoundTool(
+        name="orders_submit_order",
+        description="Submit.",
+        function=sample_tool,
+        source="local",
+        metadata={"kind": "builtin", "replay_on_cache": True},
+    )
+
+    entry = _tool_surface_entry_for_trace(tool)
+
+    assert entry["metadata"]["mutates_trading"] is True
+
+
 class _ReplayCache:
     def compute_key(self, payload):
         return "cache-key"
