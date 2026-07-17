@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from lumibot.components.agents import AgentManager
 from lumibot.components.agents.manager import (
+    _tool_result_diagnostics_for_trace,
     _tool_safety_requirements_for_trace,
     _tool_surface_entry_for_trace,
 )
-from lumibot.components.agents.schemas import BoundTool, ToolDefinition
+from lumibot.components.agents.schemas import AgentRunResult, AgentTraceEvent, BoundTool, ToolDefinition
 
 
 class _Vars(dict):
@@ -91,6 +94,30 @@ class _DuckDBQueryLayer:
         return {}
 
 
+class _DiagnosticsRuntime:
+    def run(self, request):
+        error_payload = {
+            "ok": False,
+            "error": {
+                "type": "ValueError",
+                "message": (
+                    "ORDER_READINESS_REQUIRED: Before submitting an order, call "
+                    "account_portfolio, account_positions, market_last_price(symbol='TIP') "
+                    "in this same agent run."
+                ),
+            },
+        }
+        return AgentRunResult(
+            summary="Diagnostics recorded.",
+            model=request.model,
+            events=[
+                AgentTraceEvent(kind="tool_call", tool_name="orders_submit_order", payload={"symbol": "TIP"}),
+                AgentTraceEvent(kind="tool_result", tool_name="orders_submit_order", payload=error_payload),
+                AgentTraceEvent(kind="text", text="Diagnostics recorded."),
+            ],
+        )
+
+
 def test_filter_tools_returns_filtered_mutating_tools_with_reasons(monkeypatch):
     monkeypatch.setattr(
         "lumibot.components.agents.manager._get_replay_imports",
@@ -161,3 +188,66 @@ def test_trace_request_payload_uses_rich_tool_surface_without_mutating_cache_pay
         {"name": "custom_tool", "source": "custom", "metadata": {}, "reason": "available"}
     ]
     assert trace_payload["tool_availability"]["filtered"] == []
+
+
+def test_order_readiness_error_diagnostics_extract_missing_requirements():
+    payload = {
+        "ok": False,
+        "error": {
+            "type": "ValueError",
+            "message": (
+                "ORDER_READINESS_REQUIRED: Before submitting an order, call "
+                "account_portfolio, account_positions, market_last_price(symbol='TIP') "
+                "in this same agent run."
+            ),
+        },
+    }
+
+    diagnostics = _tool_result_diagnostics_for_trace(payload)
+
+    assert diagnostics["ok"] is False
+    assert diagnostics["error_type"] == "ORDER_READINESS_REQUIRED"
+    assert diagnostics["missing_requirements"] == [
+        "account_portfolio",
+        "account_positions",
+        "market_last_price(symbol='TIP')",
+    ]
+
+
+def test_successful_tool_result_diagnostics_is_ok():
+    assert _tool_result_diagnostics_for_trace({"ok": True}) == {"ok": True}
+
+
+def test_trace_payload_records_tool_result_diagnostics_on_results_and_events(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(
+        "lumibot.components.agents.manager._get_replay_imports",
+        lambda: (_ReplayCache, lambda value: value),
+    )
+    monkeypatch.setattr(
+        "lumibot.components.agents.manager._get_duckdb_query_layer_class",
+        lambda: _DuckDBQueryLayer,
+    )
+    manager = AgentManager(_Strategy())
+    handle = manager.create(
+        name="diagnostics_agent",
+        system_prompt="Trace diagnostics.",
+        model="stub-model",
+        tools=[],
+        include_builtin_tools=False,
+        _runtime=_DiagnosticsRuntime(),
+    )
+
+    result = handle.run(task_prompt="Submit order.")
+    trace_path = result.payload["trace_path"]
+    trace_payload = json.loads(Path(trace_path).read_text(encoding="utf-8"))
+
+    assert trace_payload["tool_results"][0]["diagnostics"]["error_type"] == "ORDER_READINESS_REQUIRED"
+    assert trace_payload["tool_results"][0]["diagnostics"]["missing_requirements"] == [
+        "account_portfolio",
+        "account_positions",
+        "market_last_price(symbol='TIP')",
+    ]
+    assert trace_payload["events"][0]["diagnostics"] == {}
+    assert trace_payload["events"][1]["diagnostics"]["error_type"] == "ORDER_READINESS_REQUIRED"
+    assert trace_payload["events"][2]["diagnostics"] == {}

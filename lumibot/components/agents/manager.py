@@ -677,6 +677,43 @@ def _tool_surface_entry_for_trace(tool: BoundTool) -> dict[str, Any]:
     }
 
 
+def _error_payload_from_tool_result(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    return error if isinstance(error, dict) else None
+
+
+def _extract_order_readiness_requirements(message: str) -> list[str]:
+    marker = "call "
+    end_marker = " in this same agent run"
+    if marker not in message:
+        return []
+    tail = message.split(marker, 1)[1]
+    if end_marker in tail:
+        tail = tail.split(end_marker, 1)[0]
+    return [part.strip().rstrip(".") for part in tail.split(", ") if part.strip()]
+
+
+def _tool_result_diagnostics_for_trace(payload: Any) -> dict[str, Any]:
+    error = _error_payload_from_tool_result(payload)
+    if error is None:
+        if isinstance(payload, dict) and payload.get("ok") is True:
+            return {"ok": True}
+        return {}
+
+    message = str(error.get("message") or "")
+    diagnostics: dict[str, Any] = {
+        "ok": False,
+        "error_type": str(error.get("type") or "tool_error"),
+        "error_message": message,
+    }
+    if "ORDER_READINESS_REQUIRED" in message:
+        diagnostics["error_type"] = "ORDER_READINESS_REQUIRED"
+        diagnostics["missing_requirements"] = _extract_order_readiness_requirements(message)
+    return diagnostics
+
+
 def _strategy_day_key(strategy: Any) -> str:
     current_dt = _current_strategy_datetime(strategy)
     if hasattr(current_dt, "date"):
@@ -1675,6 +1712,7 @@ class AgentHandle:
                     "tool_name": event.tool_name,
                     "payload": event.payload,
                     "timestamp": event.timestamp,
+                    "diagnostics": _tool_result_diagnostics_for_trace(event.payload),
                 }
                 for event in result.tool_results
             ],
@@ -1685,6 +1723,9 @@ class AgentHandle:
                     "tool_name": event.tool_name,
                     "payload": event.payload,
                     "timestamp": event.timestamp,
+                    "diagnostics": (
+                        _tool_result_diagnostics_for_trace(event.payload) if event.kind == "tool_result" else {}
+                    ),
                 }
                 for event in result.events
             ],
