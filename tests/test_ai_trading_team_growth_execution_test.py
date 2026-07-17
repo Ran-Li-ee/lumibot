@@ -1,6 +1,7 @@
 import importlib
 import inspect
 import json
+import re
 import sys
 from datetime import datetime
 from types import SimpleNamespace
@@ -61,6 +62,15 @@ def assert_removed_concepts_absent(text):
     lower_text = text.lower()
     for concept in REMOVED_CONCEPTS:
         assert concept not in lower_text
+
+
+def assert_sequence_side_relationship(prompt_text, sequence, side):
+    sequence_pattern = rf"sequence[\"']?\s*[:=]?\s*[\"']?{sequence}[\"']?"
+    side_pattern = rf"(?:side|action)[\"']?\s*[:=]?\s*[\"']?{side}[\"']?"
+    pattern = rf"({sequence_pattern}.{{0,120}}{side_pattern}|{side_pattern}.{{0,120}}{sequence_pattern})"
+    assert re.search(pattern, prompt_text, re.DOTALL), (
+        f"expected sequence {sequence} to be structurally associated with {side}"
+    )
 
 
 def test_initialize_creates_three_agent_growth_decision_execution_workflow(monkeypatch):
@@ -140,7 +150,7 @@ def test_on_trading_iteration_hands_off_context_in_order():
     assert_removed_concepts_absent(json.dumps([growth_context, decision_context, execution_context]))
 
 
-def test_decision_prompt_requests_structured_exit_and_entry_plan():
+def test_decision_prompt_requests_structured_execution_plan():
     _strategy_module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
     for name in ("growth_agent", "decision_agent", "execution_agent"):
@@ -150,15 +160,80 @@ def test_decision_prompt_requests_structured_exit_and_entry_plan():
     strategy.on_trading_iteration()
 
     decision_prompt = agent_manager["decision_agent"].calls[0]["task_prompt"]
+    decision_prompt_lower = decision_prompt.lower()
     for field in (
-        "plan_type",
-        "target_symbol",
+        "decision.type",
+        "decision.from",
+        "decision.to",
+        "decision.reason_brief",
+        "execution_plan.mode",
+        "execution_plan.orders",
+        "execution_plan.execution_constraints",
+        "sequence",
+        "quantity_basis",
+        "max_affordable_after_prior_sells",
+        "cash_buffer_pct",
+    ):
+        assert field in decision_prompt_lower
+
+    assert_sequence_side_relationship(decision_prompt_lower, 1, "sell")
+    assert_sequence_side_relationship(decision_prompt_lower, 2, "buy")
+    for rotate_plan_fragment in (
+        "decision.from",
+        "decision.to",
+        "max_affordable_after_prior_sells",
+    ):
+        assert rotate_plan_fragment in decision_prompt_lower
+
+    for old_field in (
         "current_position_assessment",
         "exit_actions",
         "entry_actions",
         "do_not_trade_if",
     ):
-        assert field in decision_prompt
+        assert old_field not in decision_prompt
+
+
+def test_execution_prompt_treats_execution_plan_as_authoritative():
+    _strategy_module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    for name in ("growth_agent", "decision_agent", "execution_agent"):
+        agent_manager._agents[name] = RecordingAgent(name)
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+    strategy.on_trading_iteration()
+
+    execution_agent_created = [
+        created for created in agent_manager.created if created["name"] == "execution_agent"
+    ]
+    assert len(execution_agent_created) == 1
+
+    prompt_text = json.dumps(execution_agent_created[0])
+    prompt_text += json.dumps(agent_manager["execution_agent"].calls)
+    prompt_text = prompt_text.lower().replace('\\"', '"')
+
+    for required_phrase in (
+        "execution_plan.orders",
+        "decision.reason_brief",
+        "human context",
+        "do not re-rank",
+        "do not substitute",
+        "execution-level blockers",
+        "sequence number",
+        "max_affordable_after_prior_sells",
+        "cash_buffer_pct",
+    ):
+        assert required_phrase in prompt_text
+    for required_pattern in (
+        r"(execution_plan(?:\.orders)?.{0,100}(authoritative|source of truth|control|drive)|"
+        r"(authoritative|source of truth|control|drive).{0,100}execution_plan(?:\.orders)?)",
+        r"sequence.{0,80}(order|ordering|ascending|submitted order|in sequence)",
+        r"(do not|must not|never).{0,80}(substitute|replace|swap).{0,80}symbol",
+        r"(only|solely).{0,80}(execution-level|execution level).{0,80}(blocker|blockers)",
+        r"each.{0,80}sequence.{0,80}(submitted|blocked)",
+    ):
+        assert re.search(required_pattern, prompt_text, re.DOTALL)
 
 
 def test_prompts_frame_strategy_as_neutral_relative_strength_account_management(monkeypatch):
@@ -184,15 +259,8 @@ def test_prompts_frame_strategy_as_neutral_relative_strength_account_management(
         "you cannot place orders, but you must still make a clear research recommendation",
         "you cannot place orders, but you must produce an actionable trading plan",
         "if the account holds only cash or a cash-like position",
-        'plan_type="buy"',
         "do not treat no-trade as the default answer",
         "trading costs and weak evidence matter, but they should not override",
-        "do not use upstream research to override the trading_plan",
-        "otherwise execute the trading_plan",
-        'plan_type="rotate"',
-        'side="sell"',
-        'side="buy"',
-        "sell or reduce the current holding first",
     ):
         assert required_phrase in prompt_text
 

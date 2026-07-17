@@ -30,9 +30,18 @@
 
 - [ ] **Step 1: Replace old decision prompt field test**
 
-Change `test_decision_prompt_requests_structured_exit_and_entry_plan` to assert the new handoff shape:
+Change `test_decision_prompt_requests_structured_exit_and_entry_plan` to assert the new handoff shape. Add `import re` and use a helper so the rotate order check is structural enough to accept prose or JSON-like prompts such as `{"sequence": 1, "side": "sell"}`:
 
 ```python
+def assert_sequence_side_relationship(prompt_text, sequence, side):
+    sequence_pattern = rf"sequence[\"']?\s*[:=]?\s*[\"']?{sequence}[\"']?"
+    side_pattern = rf"(?:side|action)[\"']?\s*[:=]?\s*[\"']?{side}[\"']?"
+    pattern = rf"({sequence_pattern}.{{0,120}}{side_pattern}|{side_pattern}.{{0,120}}{sequence_pattern})"
+    assert re.search(pattern, prompt_text, re.DOTALL), (
+        f"expected sequence {sequence} to be structurally associated with {side}"
+    )
+
+
 def test_decision_prompt_requests_structured_execution_plan():
     _strategy_module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -59,6 +68,15 @@ def test_decision_prompt_requests_structured_execution_plan():
     ):
         assert field in decision_prompt_lower
 
+    assert_sequence_side_relationship(decision_prompt_lower, 1, "sell")
+    assert_sequence_side_relationship(decision_prompt_lower, 2, "buy")
+    for rotate_plan_fragment in (
+        "decision.from",
+        "decision.to",
+        "max_affordable_after_prior_sells",
+    ):
+        assert rotate_plan_fragment in decision_prompt_lower
+
     for old_field in (
         "current_position_assessment",
         "exit_actions",
@@ -83,26 +101,41 @@ def test_execution_prompt_treats_execution_plan_as_authoritative():
     strategy.initialize()
     strategy.on_trading_iteration()
 
-    prompt_text = json.dumps(agent_manager.created)
+    execution_agent_created = [
+        created for created in agent_manager.created if created["name"] == "execution_agent"
+    ]
+    assert len(execution_agent_created) == 1
+
+    prompt_text = json.dumps(execution_agent_created[0])
     prompt_text += json.dumps(agent_manager["execution_agent"].calls)
     prompt_text = prompt_text.lower().replace('\\"', '"')
 
     for required_phrase in (
-        "execute execution_plan.orders exactly in sequence",
-        "decision.reason_brief is for human context only",
-        "do not re-rank the universe",
-        "do not substitute another symbol",
-        "only reject or pause for execution-level blockers",
-        "report each sequence as submitted or blocked",
+        "execution_plan.orders",
+        "decision.reason_brief",
+        "human context",
+        "do not re-rank",
+        "do not substitute",
+        "execution-level blockers",
+        "sequence number",
         "max_affordable_after_prior_sells",
         "cash_buffer_pct",
     ):
         assert required_phrase in prompt_text
+    for required_pattern in (
+        r"(execution_plan(?:\.orders)?.{0,100}(authoritative|source of truth|control|drive)|"
+        r"(authoritative|source of truth|control|drive).{0,100}execution_plan(?:\.orders)?)",
+        r"sequence.{0,80}(order|ordering|ascending|submitted order|in sequence)",
+        r"(do not|must not|never).{0,80}(substitute|replace|swap).{0,80}symbol",
+        r"(only|solely).{0,80}(execution-level|execution level).{0,80}(blocker|blockers)",
+        r"each.{0,80}sequence.{0,80}(submitted|blocked)",
+    ):
+        assert re.search(required_pattern, prompt_text, re.DOTALL)
 ```
 
-- [ ] **Step 3: Update neutral prompt test required phrases**
+- [ ] **Step 3: Keep neutral prompt test focused on neutral framing**
 
-In `test_prompts_frame_strategy_as_neutral_relative_strength_account_management`, replace old execution phrases:
+In `test_prompts_frame_strategy_as_neutral_relative_strength_account_management`, keep the neutral strategy framing assertions focused on strategy intent, and remove old execution phrases:
 
 ```python
 "do not use upstream research to override the trading_plan",
@@ -113,21 +146,7 @@ In `test_prompts_frame_strategy_as_neutral_relative_strength_account_management`
 "sell or reduce the current holding first",
 ```
 
-with:
-
-```python
-"execution_plan is the authoritative section",
-"execute execution_plan.orders exactly in sequence",
-"decision.reason_brief is for human context only",
-"do not re-rank the universe",
-"do not substitute another symbol",
-"only reject or pause for execution-level blockers",
-"report each sequence as submitted or blocked",
-'decision.type',
-'execution_plan.orders',
-"max_affordable_after_prior_sells",
-"cash_buffer_pct",
-```
+Do not add structured handoff details such as `"execution_plan is the authoritative section"` or `'decision.type'` to this neutral framing test. The detailed execution handoff contract belongs in `test_execution_prompt_treats_execution_plan_as_authoritative`; do not duplicate it in the neutral framing test.
 
 - [ ] **Step 4: Run tests to confirm failure**
 
@@ -288,4 +307,3 @@ git commit -m "docs: plan structured execution handoff"
 ```
 
 If the plan was already committed before implementation, skip this step.
-
