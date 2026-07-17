@@ -38,13 +38,19 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "management plan. Use the strategy-specific style in this prompt instead of the default conservative "
                 "investor style. Do not treat no-trade as the default answer. Trading costs and weak evidence matter, "
                 "but they should not override a clear relative-strength downgrade of the current holding. You must "
-                "choose exactly one plan_type: hold, buy, rotate, reduce, close. If the "
+                "produce JSON-like text with top-level fields decision and execution_plan. Choose exactly one "
+                "decision.type from: hold, buy, rotate, reduce, close. decision must include decision.type, "
+                "decision.from, decision.to, and decision.reason_brief. execution_plan must include "
+                "execution_plan.mode, execution_plan.orders, and execution_plan.execution_constraints. Each order in "
+                "execution_plan.orders must include sequence, symbol, side, and quantity_basis. Include "
+                "max_affordable_after_prior_sells and cash_buffer_pct as constraints or order fields. If the "
                 "account holds an ETF and another ETF is more attractive than the current holding based on current "
-                'evidence, choose plan_type="rotate" unless there is a clear blocking reason. If choosing hold while '
-                "another ETF is stronger, explain the exact blocking reason. If the account holds only cash or a "
-                'cash-like position and the research identifies a strongest ETF candidate, choose plan_type="buy" '
+                'evidence, choose decision.type="rotate" unless there is a clear blocking reason. If choosing hold '
+                "while another ETF is stronger, explain the exact blocking reason. If the account holds only cash or a "
+                'cash-like position and the research identifies a strongest ETF candidate, choose decision.type="buy" '
                 "unless there is a clear blocking reason. "
-                "Be specific about exits, reductions, rotations, entries, and conditions that should block trading. "
+                'For rotate decisions, set an order with sequence: 1 and side: "sell" for the source holding, then '
+                'an order with sequence: 2 and side: "buy" for the destination holding. '
                 "You cannot place orders, but you must produce an actionable trading plan for the execution agent."
             ),
         )
@@ -53,15 +59,15 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
             model=model,
             allow_trading=True,
             system_prompt=(
-                "Execute the structured plan using native trading tools, especially orders_submit_order. Do not redo "
-                "investment analysis. Do not use upstream research to override the trading_plan. Inspect positions, "
-                "portfolio, open orders, and latest prices before submitting "
-                'any order. If the trading_plan is unclear, incomplete, unsafe, or blocked by account state, explain '
-                'the blocker. Otherwise execute the trading_plan. If plan_type="rotate", sell or reduce the current '
-                'holding first using '
-                'orders_submit_order(side="sell"), then buy the replacement using orders_submit_order(side="buy") '
-                "only after checking cash, positions, prices, and open orders. Do not skip the sell leg when the "
-                "current holding funds the replacement."
+                "Execute the structured trading_plan using native trading tools, especially orders_submit_order. "
+                "Treat execution_plan.orders as the authoritative source of truth that must control and drive "
+                "execution. decision.reason_brief is only human context, not permission to change orders. Do not redo "
+                "investment analysis, do not re-rank candidates, and do not substitute or replace any symbol. Inspect "
+                "positions, portfolio, open orders, and latest prices before submitting any order. Execute "
+                "execution_plan.orders in ascending sequence order and preserve the sequence number in each report. "
+                "Only execution-level blockers may block or pause execution. For each sequence, report whether it was "
+                "submitted or blocked. Honor max_affordable_after_prior_sells and cash_buffer_pct when sizing or "
+                "checking affordability."
             ),
         )
 
@@ -83,24 +89,30 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
         )
         decision = self.agents["decision_agent"].run(
             task_prompt=(
-                "Use growth_report and current account state to produce JSON-like text with fields: plan_type, "
-                "target_symbol, current_position_assessment, exit_actions, entry_actions, do_not_trade_if. Choose "
-                "exactly one plan_type: hold, buy, rotate, reduce, close. If another ETF is more attractive than the "
-                'current holding based on current evidence, output plan_type="rotate" unless a clear blocking reason '
-                'exists. If the account holds only cash or a cash-like position and growth_report identifies a '
-                'strongest ETF candidate, output plan_type="buy" unless a clear blocking reason exists. For rotate '
-                'plans, include exit_actions with side="sell" and entry_actions with side="buy". For buy plans, '
-                'include entry_actions with side="buy".'
+                "Use growth_report and current account state to produce JSON-like text with exactly two top-level "
+                "fields: decision and execution_plan. decision must include decision.type, decision.from, "
+                "decision.to, and decision.reason_brief. decision.type must be one of: hold, buy, rotate, reduce, "
+                "close. execution_plan must include execution_plan.mode, execution_plan.orders, and "
+                "execution_plan.execution_constraints. Each order in execution_plan.orders must include sequence, "
+                "symbol, side, and quantity_basis. Include max_affordable_after_prior_sells and cash_buffer_pct in "
+                "execution_plan.execution_constraints or on the relevant order. If another ETF is more attractive "
+                'than the current holding based on current evidence, output decision.type="rotate" unless a clear '
+                "blocking reason exists. If the account holds only cash or a cash-like position and growth_report "
+                'identifies a strongest ETF candidate, output decision.type="buy" unless a clear blocking reason '
+                'exists. For rotate decisions, include sequence: 1 with side: "sell" for decision.from and sequence: '
+                '2 with side: "buy" for decision.to, using max_affordable_after_prior_sells for the buy quantity_basis.'
             ),
             context={**context, "growth_report": growth.summary},
         )
         self.agents["execution_agent"].run(
             task_prompt=(
                 "Use trading_plan to inspect the account, open orders, positions, and latest prices, then submit only "
-                'the orders required by the plan with orders_submit_order. If plan_type="rotate", sell or reduce the '
-                "current holding first, then buy the replacement only after cash and positions update enough for the "
-                "replacement order. Do not use upstream research to override the trading_plan. If plan_type=\"hold\", "
-                "submit no orders and explain why."
+                "the orders listed in execution_plan.orders with orders_submit_order. execution_plan.orders is the "
+                "authoritative source of truth for execution; decision.reason_brief is human context only. Do not "
+                "re-rank, do not substitute symbol, and do not use upstream research to override the trading_plan. "
+                "Execute in sequence order, preserve each sequence number, and report each sequence as submitted or "
+                "blocked. Block or pause solely for execution-level blockers. Apply max_affordable_after_prior_sells "
+                "and cash_buffer_pct when checking cash and sizing orders."
             ),
             context={**context, "trading_plan": decision.summary},
         )
