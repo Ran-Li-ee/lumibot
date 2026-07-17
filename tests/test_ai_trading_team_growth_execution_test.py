@@ -192,6 +192,45 @@ def test_parse_execution_plan_accepts_uppercase_hold_intent():
     assert plan["intent"] == "hold"
 
 
+def test_parse_execution_plan_normalizes_real_maintain_cash_hold_plan():
+    strategy_module, _strategy_class = load_strategy_module()
+    raw_summary = json.dumps(
+        {
+            "decision": {
+                "type": "hold",
+                "from": "USD",
+                "to": "USD",
+                "reason_brief": "maintain cash after risk check",
+            },
+            "execution_plan": {
+                "schema_version": "1.0",
+                "intent": "maintain_cash",
+                "orders": [],
+                "constraints": {
+                    "cash_buffer_pct": 1.0,
+                    "max_affordable_after_prior_sells": 0,
+                },
+            },
+        }
+    )
+
+    plan = strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
+
+    assert plan["schema_version"] == 1
+    assert plan["intent"] == "hold"
+    assert plan["orders"] == []
+
+
+def test_parse_execution_plan_accepts_float_one_schema_version():
+    strategy_module, _strategy_class = load_strategy_module()
+
+    plan = strategy_module.parse_execution_plan_from_decision_summary(
+        '{"execution_plan":{"schema_version":1.0,"intent":"hold","orders":[]}}'
+    )
+
+    assert plan["schema_version"] == 1
+
+
 def test_parse_execution_plan_rejects_direct_root_plan_without_execution_plan_wrapper():
     strategy_module, _strategy_class = load_strategy_module()
 
@@ -307,7 +346,7 @@ def test_parse_execution_plan_rejects_missing_schema_version():
         )
 
 
-@pytest.mark.parametrize("schema_version", [True, 1.5, "1"])
+@pytest.mark.parametrize("schema_version", [True, 1.5, "1.5", "v1"])
 def test_parse_execution_plan_rejects_non_integer_schema_version(schema_version):
     strategy_module, _strategy_class = load_strategy_module()
 

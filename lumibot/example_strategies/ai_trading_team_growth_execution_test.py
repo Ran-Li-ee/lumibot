@@ -7,6 +7,11 @@ import os
 from lumibot.strategies.strategy import Strategy
 
 ALLOWED_INTENTS = {"hold", "enter_position", "rotate", "reduce_position", "close_position"}
+INTENT_ALIASES = {
+    "backtest": "enter_position",
+    "keep_cash": "hold",
+    "maintain_cash": "hold",
+}
 ALLOWED_ACTIONS = {"submit_order"}
 ALLOWED_SIDES = {"buy", "sell"}
 ALLOWED_QUANTITY_MODES = {
@@ -135,12 +140,21 @@ def parse_execution_plan_from_decision_summary(summary):
     if "schema_version" not in plan:
         raise ValueError("execution_plan schema_version is required.")
     schema_version = plan["schema_version"]
-    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != 1:
+    if isinstance(schema_version, bool):
+        raise ValueError(f"unsupported execution_plan schema_version: {schema_version}")
+    if isinstance(schema_version, (int, float)):
+        if schema_version != 1:
+            raise ValueError(f"unsupported execution_plan schema_version: {schema_version}")
+        schema_version = 1
+    elif isinstance(schema_version, str):
+        if schema_version.strip() not in {"1", "1.0"}:
+            raise ValueError(f"unsupported execution_plan schema_version: {schema_version}")
+        schema_version = 1
+    else:
         raise ValueError(f"unsupported execution_plan schema_version: {schema_version}")
 
     intent = str(plan.get("intent") or plan.get("mode") or "").strip().lower()
-    if intent == "backtest":
-        intent = "enter_position"
+    intent = INTENT_ALIASES.get(intent, intent)
     if not intent:
         raise ValueError("execution_plan intent is required.")
     if intent not in ALLOWED_INTENTS:
