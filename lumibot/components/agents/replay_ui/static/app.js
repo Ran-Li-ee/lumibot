@@ -949,6 +949,43 @@
     `;
   }
 
+  function renderToolAvailability(input) {
+    const availability = input && input.tool_availability ? input.tool_availability : {};
+    const available = Array.isArray(availability.available) ? availability.available : [];
+    const filtered = Array.isArray(availability.filtered) ? availability.filtered : [];
+    if (available.length === 0 && filtered.length === 0) {
+      return `<div class="empty-state">No tool availability details were recorded in this trace.</div>`;
+    }
+    return `
+      <div class="tool-availability-grid">
+        <div>
+          <h5>Available</h5>
+          ${renderToolAvailabilityList(available)}
+        </div>
+        <div>
+          <h5>Filtered</h5>
+          ${renderToolAvailabilityList(filtered)}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderToolAvailabilityList(items) {
+    if (!items.length) {
+      return `<div class="empty-state">None recorded.</div>`;
+    }
+    return `
+      <ul class="tool-availability-list">
+        ${items.map((item) => `
+          <li>
+            <strong>${escapeHtml(item.name || "unknown_tool")}</strong>
+            ${item.reason ? `<span>${escapeHtml(item.reason)}</span>` : ""}
+          </li>
+        `).join("")}
+      </ul>
+    `;
+  }
+
   function setDetailMode(mode) {
     const showOverview = mode === "overview";
     elements.overviewArea.hidden = !showOverview;
@@ -977,6 +1014,12 @@
         `${toolNames.length} tool${toolNames.length === 1 ? "" : "s"}`,
         renderAvailableToolSurface(agent, toolNames),
         Boolean(state.selectedToolName),
+      )}
+      ${renderCollapsibleSubsection(
+        "Tool Availability",
+        "available and filtered tools",
+        renderToolAvailability(input),
+        false,
       )}
       ${renderCollapsibleSubsection(
         "Base System Prompt",
@@ -1096,6 +1139,10 @@
     const description = definition.description || "Not recorded in this trace.";
     const signature = firstRecordedField(definition, ["signature", "parameters", "schema", "input_schema"]);
     const annotations = definition.annotations === undefined ? "Not recorded in this trace." : definition.annotations;
+    const defaults = definition.defaults === undefined ? "Not recorded in this trace." : definition.defaults;
+    const safetyRequirements = Array.isArray(definition.safety_requirements)
+      ? definition.safety_requirements
+      : "Not recorded in this trace.";
     const metadata = definition.metadata === undefined ? "Not recorded in this trace." : definition.metadata;
     const source = definition.source || "Not recorded in this trace.";
 
@@ -1116,6 +1163,10 @@
         <pre class="tool-definition-pre">${formatValue(signature)}</pre>
         <h5>Recorded Annotations</h5>
         <pre class="tool-definition-pre">${formatValue(annotations)}</pre>
+        <h5>Recorded Defaults</h5>
+        <pre class="tool-definition-pre">${formatValue(defaults)}</pre>
+        <h5>Safety Requirements</h5>
+        <pre class="tool-definition-pre">${formatValue(safetyRequirements)}</pre>
         <h5>Replay Metadata</h5>
         <pre class="tool-definition-pre">${formatValue(metadata)}</pre>
       </section>
@@ -1236,6 +1287,19 @@
       }));
   }
 
+  function renderToolDiagnostics(call) {
+    const diagnostics = call && call.diagnostics ? call.diagnostics : null;
+    if (!diagnostics || Object.keys(diagnostics).length === 0 || diagnostics.ok === true) {
+      return "";
+    }
+    return `
+      <div class="tool-diagnostics">
+        <strong>Failure Diagnostics</strong>
+        <pre>${formatValue(diagnostics)}</pre>
+      </div>
+    `;
+  }
+
   function renderToolRow(row) {
     const call = row.call || {};
     const inputPayload = {
@@ -1252,7 +1316,10 @@
           <pre>${formatValue(inputPayload)}</pre>
         </td>
         <td><pre>${formatValue(outputPayload)}</pre></td>
-        <td><pre>${formatValue(call.human_explanation)}</pre></td>
+        <td>
+          ${renderToolDiagnostics(call)}
+          <pre>${formatValue(call.human_explanation)}</pre>
+        </td>
       </tr>
     `;
   }

@@ -617,6 +617,33 @@ pre,
   white-space: nowrap;
 }
 
+.tool-availability-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.tool-availability-grid h5 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.tool-availability-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.tool-availability-list li {
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+}
+
+.tool-availability-list span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .tool-definition-panel {
   margin-top: 14px;
   padding: 12px;
@@ -645,6 +672,19 @@ pre,
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   max-width: 100%;
+}
+
+.tool-diagnostics {
+  margin-bottom: 8px;
+  padding: 8px;
+  border: 1px solid #d97706;
+  background: #fff7ed;
+  overflow-wrap: anywhere;
+}
+
+.tool-diagnostics strong {
+  display: block;
+  margin-bottom: 6px;
 }
 
 .warnings {

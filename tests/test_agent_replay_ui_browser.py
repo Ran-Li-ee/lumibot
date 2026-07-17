@@ -374,6 +374,84 @@ def test_missing_tool_definition_renders_clear_empty_state(page, replay_url):
     )
 
 
+def test_trace_completeness_details_render_in_input_and_tool_calls(page, replay_url):
+    agent = _public_agent("trader")
+    agent["input_material"]["available_tool_names"] = ["account_positions", "orders_submit_order"]
+    agent["input_material"]["available_tool_count"] = 2
+    agent["input_material"]["available_tools"] = [
+        {
+            "name": "orders_submit_order",
+            "description": "Submit an order.",
+            "signature": "(symbol: str, quantity: int = 1)",
+            "annotations": {"symbol": "str", "quantity": "int"},
+            "defaults": {"quantity": 1},
+            "source": "local",
+            "metadata": {"kind": "builtin", "mutates_trading": True},
+            "safety_requirements": [
+                "Call account_portfolio in the same agent run before submitting an order."
+            ],
+        }
+    ]
+    agent["input_material"]["tool_availability"] = {
+        "available": [{"name": "account_positions", "reason": "available"}],
+        "filtered": [
+            {
+                "name": "orders_submit_order",
+                "reason": "filtered because allow_trading is false",
+            }
+        ],
+    }
+    agent["tool_batches"] = [
+        {
+            "batch_index": 1,
+            "calls": [
+                {
+                    "tool_name": "orders_submit_order",
+                    "arguments": {"symbol": "TIP", "quantity": 1},
+                    "raw_result": {"ok": False},
+                    "error": {"type": "ValueError", "message": "Order readiness failed."},
+                    "human_explanation": "Order was blocked.",
+                    "timestamp": "2026-04-07T09:30:01-04:00",
+                    "diagnostics": {
+                        "ok": False,
+                        "error_type": "ORDER_READINESS_REQUIRED",
+                        "missing_requirements": ["account_portfolio"],
+                    },
+                }
+            ],
+        }
+    ]
+    page.route("**/api/dataset", lambda route: route.fulfill(json=_public_dataset([agent], [])))
+
+    page.goto(replay_url)
+    page.locator(".graph-node", has_text="trader").click()
+
+    input_card = page.locator("#inputArea details.collapsible-section").filter(has_text="Input Material")
+    input_card.locator("summary").first.click()
+    availability = page.locator("#inputArea details.collapsible-subsection").filter(has_text="Tool Availability")
+    availability.locator("summary").click()
+
+    expect(availability).to_contain_text("Tool Availability")
+    expect(availability).to_contain_text("account_positions")
+    expect(availability).to_contain_text("orders_submit_order")
+    expect(availability).to_contain_text("filtered because allow_trading is false")
+
+    available_tools = page.locator("#inputArea details.collapsible-subsection").filter(
+        has_text="Available Tool Names"
+    )
+    available_tools.locator("summary").click()
+    available_tools.get_by_role("button", name=re.compile("orders_submit_order")).click()
+
+    panel = page.locator("#inputArea .tool-definition-panel")
+    expect(panel).to_contain_text("Recorded Defaults")
+    expect(panel).to_contain_text('"quantity": 1')
+    expect(panel).to_contain_text("Safety Requirements")
+    expect(panel).to_contain_text("Call account_portfolio in the same agent run")
+
+    expect(page.locator("#toolArea")).to_contain_text("Failure Diagnostics")
+    expect(page.locator("#toolArea")).to_contain_text("ORDER_READINESS_REQUIRED")
+
+
 def test_clicking_tool_call_name_selects_input_tool_definition_panel(page, replay_url):
     page.goto(replay_url)
 

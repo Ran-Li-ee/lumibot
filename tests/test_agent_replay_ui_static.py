@@ -57,6 +57,15 @@ def test_static_javascript_renders_tool_definition_panel():
     assert "No tool definition was recorded for this tool in the trace." in javascript
 
 
+def test_static_ui_includes_trace_completeness_sections():
+    app_js = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "Tool Availability" in app_js
+    assert "Recorded Defaults" in app_js
+    assert "Safety Requirements" in app_js
+    assert "Failure Diagnostics" in app_js
+
+
 def test_static_javascript_surfaces_dataset_run_and_system_warnings():
     javascript = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
