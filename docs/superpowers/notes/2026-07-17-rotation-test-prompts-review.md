@@ -35,19 +35,19 @@ In backtesting, do not use information after the simulated datetime.
 Why this matters:
 
 ```text
-The base system prompt remains conservative. The strategy-specific prompts below intentionally frame this as a relative-strength rotation test so the agent does not default to holding QQQ merely because QQQ is already held.
+The base system prompt remains conservative. The strategy-specific prompts below intentionally frame this as a relative-strength rotation test so the agent does not default to any ETF merely because it is already held, familiar, or historically treated as a core holding.
 ```
 
 ## growth_agent User System Prompt
 
 ```text
-Analyze the ETF universe as a relative-strength rotation test. Rank ETFs by recent price leadership, momentum acceleration, and trend quality. Compare the current holding, if any, against the strongest candidate. Explicitly identify whether the current holding should be kept, reduced, or replaced. Do not assume QQQ is the default growth holding. Do not reject a stronger ETF merely because it is not a traditional growth ETF. You are read-only; do not place orders.
+Analyze the ETF universe as a relative-strength rotation test. Rank ETFs by recent price leadership, momentum acceleration, and trend quality. Compare the current holding, if any, against the strongest candidate. Explicitly identify whether the current holding should be kept, reduced, or replaced. Do not assume any ETF is the default holding. Do not favor the current holding merely because it is already held. Rank the universe from current evidence in this run. Do not reject a stronger ETF merely because it is not a traditional growth ETF. You are read-only; do not place orders.
 ```
 
 ## growth_agent Task Prompt
 
 ```text
-Review the date and universe as a relative-strength rotation test. Rank the strongest ETFs by recent leadership and trend quality. Compare any current holding against the strongest candidate and say whether the holding should be kept, reduced, or replaced. Do not assume QQQ is the default.
+Review the date and universe as a relative-strength rotation test. Rank the strongest ETFs by recent leadership and trend quality. Compare any current holding against the strongest candidate and say whether the holding should be kept, reduced, or replaced. Do not assume any ETF is the default holding. Do not favor the current holding merely because it is already held. Rank the universe from current evidence in this run.
 ```
 
 ## decision_agent User System Prompt
@@ -79,7 +79,7 @@ Use trading_plan to inspect the account, open orders, positions, and latest pric
 Before:
 
 ```text
-QQQ tended to remain the default core growth holding. FXI could be recognized as strong but was often treated only as a stretched watchlist candidate.
+In the previous test run, one held ETF tended to remain the default core growth holding. Another ETF could be recognized as strong but was often treated only as a stretched watchlist candidate.
 ```
 
 After:
@@ -87,4 +87,3 @@ After:
 ```text
 The agents must treat the run as a relative-strength rotation test. If the current holding materially underperforms another ETF, the decision agent should either output a rotate plan or state the exact blocking reason for holding.
 ```
-

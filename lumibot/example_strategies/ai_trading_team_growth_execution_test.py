@@ -21,8 +21,9 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "Analyze the ETF universe as a relative-strength rotation test. Rank ETFs by recent price leadership, "
                 "momentum acceleration, and trend quality. Compare the current holding, if any, against the strongest "
                 "candidate. Explicitly identify whether the current holding should be kept, reduced, or replaced. "
-                "Do not assume QQQ is the default growth holding. Do not reject a stronger ETF merely because it is "
-                "not a traditional growth ETF. You are read-only; do not place orders."
+                "Do not assume any ETF is the default holding. Do not favor the current holding merely because it is "
+                "already held. Rank the universe from current evidence in this run. Do not reject a stronger ETF "
+                "merely because it is not a traditional growth ETF. You are read-only; do not place orders."
             ),
         )
         self.agents.create(
@@ -62,7 +63,9 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
             task_prompt=(
                 "Review the date and universe as a relative-strength rotation test. Rank the strongest ETFs by recent "
                 "leadership and trend quality. Compare any current holding against the strongest candidate and say "
-                "whether the holding should be kept, reduced, or replaced. Do not assume QQQ is the default."
+                "whether the holding should be kept, reduced, or replaced. Do not assume any ETF is the default "
+                "holding. Do not favor the current holding merely because it is already held. Rank the universe from "
+                "current evidence in this run."
             ),
             context=context,
         )

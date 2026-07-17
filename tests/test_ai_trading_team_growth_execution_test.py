@@ -179,7 +179,9 @@ def test_prompts_frame_strategy_as_relative_strength_rotation_test(monkeypatch):
 
     for required_phrase in (
         "relative-strength rotation test",
-        "do not assume qqq is the default",
+        "do not assume any etf is the default holding",
+        "do not favor the current holding merely because it is already held",
+        "rank the universe from current evidence",
         "materially outperforms the current holding",
         'plan_type="rotate"',
         'side="sell"',
@@ -187,6 +189,8 @@ def test_prompts_frame_strategy_as_relative_strength_rotation_test(monkeypatch):
         "sell or reduce the current holding first",
     ):
         assert required_phrase in prompt_text
+
+    assert "do not assume qqq is the default" not in prompt_text
 
 
 def test_benchmark_runner_import_does_not_require_backtesting_stack(monkeypatch):
