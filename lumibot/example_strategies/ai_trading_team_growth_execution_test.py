@@ -24,7 +24,9 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "or replaced. "
                 "Do not assume any ETF is the default holding. Do not favor the current holding merely because it is "
                 "already held. Rank the universe from current evidence in this run. Do not reject a stronger ETF "
-                "merely because it is not a traditional growth ETF. You are read-only; do not place orders."
+                "merely because it is not a traditional growth ETF. You cannot place orders, but you must still make "
+                "a clear research recommendation, including whether cash should be deployed into the strongest ETF "
+                "candidate."
             ),
         )
         self.agents.create(
@@ -39,9 +41,11 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "choose exactly one plan_type: hold, buy, rotate, reduce, close. If the "
                 "account holds an ETF and another ETF is more attractive than the current holding based on current "
                 'evidence, choose plan_type="rotate" unless there is a clear blocking reason. If choosing hold while '
-                "another ETF is stronger, explain the exact blocking reason. "
+                "another ETF is stronger, explain the exact blocking reason. If the account holds only cash or a "
+                'cash-like position and the research identifies a strongest ETF candidate, choose plan_type="buy" '
+                "unless there is a clear blocking reason. "
                 "Be specific about exits, reductions, rotations, entries, and conditions that should block trading. "
-                "You are read-only; do not place orders."
+                "You cannot place orders, but you must produce an actionable trading plan for the execution agent."
             ),
         )
         self.agents.create(
@@ -72,7 +76,8 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "recent leadership and trend quality. Compare any current holding against the strongest candidate "
                 "and say whether the holding should be kept, reduced, or replaced. Do not assume any ETF is the "
                 "default holding. Do not favor the current holding merely because it is already held. Rank the "
-                "universe from current evidence in this run."
+                "universe from current evidence in this run. You cannot place orders, but you must still make a clear "
+                "research recommendation, including whether cash should be deployed into the strongest ETF candidate."
             ),
             context=context,
         )
@@ -82,7 +87,10 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "target_symbol, current_position_assessment, exit_actions, entry_actions, do_not_trade_if. Choose "
                 "exactly one plan_type: hold, buy, rotate, reduce, close. If another ETF is more attractive than the "
                 'current holding based on current evidence, output plan_type="rotate" unless a clear blocking reason '
-                'exists. For rotate plans, include exit_actions with side="sell" and entry_actions with side="buy".'
+                'exists. If the account holds only cash or a cash-like position and growth_report identifies a '
+                'strongest ETF candidate, output plan_type="buy" unless a clear blocking reason exists. For rotate '
+                'plans, include exit_actions with side="sell" and entry_actions with side="buy". For buy plans, '
+                'include entry_actions with side="buy".'
             ),
             context={**context, "growth_report": growth.summary},
         )

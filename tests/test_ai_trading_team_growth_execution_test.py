@@ -181,6 +181,10 @@ def test_prompts_frame_strategy_as_neutral_relative_strength_account_management(
         "do not favor the current holding merely because it is already held",
         "rank the universe from current evidence",
         "more attractive than the current holding",
+        "you cannot place orders, but you must still make a clear research recommendation",
+        "you cannot place orders, but you must produce an actionable trading plan",
+        "if the account holds only cash or a cash-like position",
+        'plan_type="buy"',
         "do not treat no-trade as the default answer",
         "trading costs and weak evidence matter, but they should not override",
         "do not use upstream research to override the trading_plan",
@@ -193,6 +197,7 @@ def test_prompts_frame_strategy_as_neutral_relative_strength_account_management(
         assert required_phrase in prompt_text
 
     assert "do not assume qqq is the default" not in prompt_text
+    assert "you are read-only" not in prompt_text
     for forbidden_phrase in (
         "rotation test",
         "execution capability test",
