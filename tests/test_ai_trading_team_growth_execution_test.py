@@ -131,12 +131,10 @@ def test_on_trading_iteration_hands_off_context_in_order():
 
     assert execution_context["date"] == "2026-04-07"
     assert execution_context["universe"] == ["SPY", "QQQ", "TLT"]
-    assert execution_context["growth_report"] == "growth_agent summary"
     assert execution_context["trading_plan"] == "decision_agent summary"
     assert set(execution_context) == {
         "date",
         "universe",
-        "growth_report",
         "trading_plan",
     }
     assert_removed_concepts_absent(json.dumps([growth_context, decision_context, execution_context]))
@@ -163,7 +161,7 @@ def test_decision_prompt_requests_structured_exit_and_entry_plan():
         assert field in decision_prompt
 
 
-def test_prompts_frame_strategy_as_relative_strength_rotation_test(monkeypatch):
+def test_prompts_frame_strategy_as_neutral_relative_strength_account_management(monkeypatch):
     _strategy_module, strategy_class = load_strategy_module()
     monkeypatch.setenv("AI_TRADING_TEAM_MODEL", "test-model")
     agent_manager = RecordingAgentManager()
@@ -178,11 +176,15 @@ def test_prompts_frame_strategy_as_relative_strength_rotation_test(monkeypatch):
     prompt_text = prompt_text.lower().replace('\\"', '"')
 
     for required_phrase in (
-        "relative-strength rotation test",
+        "relative-strength account management",
         "do not assume any etf is the default holding",
         "do not favor the current holding merely because it is already held",
         "rank the universe from current evidence",
-        "materially outperforms the current holding",
+        "more attractive than the current holding",
+        "do not treat no-trade as the default answer",
+        "trading costs and weak evidence matter, but they should not override",
+        "do not use upstream research to override the trading_plan",
+        "otherwise execute the trading_plan",
         'plan_type="rotate"',
         'side="sell"',
         'side="buy"',
@@ -191,6 +193,14 @@ def test_prompts_frame_strategy_as_relative_strength_rotation_test(monkeypatch):
         assert required_phrase in prompt_text
 
     assert "do not assume qqq is the default" not in prompt_text
+    for forbidden_phrase in (
+        "rotation test",
+        "execution capability test",
+        "exit capability",
+        "capability test",
+        "testing whether",
+    ):
+        assert forbidden_phrase not in prompt_text
 
 
 def test_benchmark_runner_import_does_not_require_backtesting_stack(monkeypatch):
