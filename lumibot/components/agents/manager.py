@@ -608,6 +608,75 @@ def _stable_tool_metadata_for_cache(tool: BoundTool) -> dict[str, Any]:
     return {key: value for key, value in stable.items() if value is not None}
 
 
+def _json_safe_annotation(value: Any) -> str:
+    if value is inspect.Signature.empty:
+        return ""
+    if isinstance(value, type):
+        return value.__name__
+    text = getattr(value, "__name__", None)
+    if isinstance(text, str) and text:
+        return text
+    return str(value)
+
+
+def _json_safe_default(value: Any) -> Any:
+    if value is inspect.Signature.empty:
+        return None
+    try:
+        normalized = _normalize_json(value)
+    except ModuleNotFoundError:
+        normalized = value
+    if isinstance(normalized, (str, int, float, bool)) or normalized is None:
+        return normalized
+    if isinstance(normalized, (list, dict)):
+        return normalized
+    return repr(value)
+
+
+def _tool_safety_requirements_for_trace(tool_name: str) -> list[str]:
+    if tool_name != "orders_submit_order":
+        return []
+    return [
+        "Call account_portfolio in the same agent run before submitting an order.",
+        "Call account_positions in the same agent run before submitting an order.",
+        "Call market_last_price for the same symbol in the same agent run before submitting an order.",
+    ]
+
+
+def _tool_surface_entry_for_trace(tool: BoundTool) -> dict[str, Any]:
+    function = tool.function
+    try:
+        signature = inspect.signature(function)
+        signature_text = str(signature)
+    except (TypeError, ValueError):
+        signature = None
+        signature_text = ""
+
+    annotations: dict[str, str] = {}
+    defaults: dict[str, Any] = {}
+    if signature is not None:
+        for name, parameter in signature.parameters.items():
+            annotation = _json_safe_annotation(parameter.annotation)
+            if annotation:
+                annotations[name] = annotation
+            if parameter.default is not inspect.Signature.empty:
+                defaults[name] = _json_safe_default(parameter.default)
+        return_annotation = _json_safe_annotation(signature.return_annotation)
+        if return_annotation:
+            annotations["return"] = return_annotation
+
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "source": tool.source,
+        "signature": signature_text,
+        "annotations": annotations,
+        "defaults": defaults,
+        "metadata": dict(tool.metadata or {}),
+        "safety_requirements": _tool_safety_requirements_for_trace(tool.name),
+    }
+
+
 def _strategy_day_key(strategy: Any) -> str:
     current_dt = _current_strategy_datetime(strategy)
     if hasattr(current_dt, "date"):
@@ -667,25 +736,39 @@ class AgentHandle:
         self.model_request_timeout_seconds = model_request_timeout_seconds
         self.run_timeout_seconds = run_timeout_seconds
         from .builtins import BuiltinTools
-        builtin_tools = self._filter_tools_for_trading_permission(BuiltinTools.all())
+
+        self._filtered_tool_inputs: list[dict[str, Any]] = []
+        builtin_tools = self._filter_tools_for_trading_permission(BuiltinTools.all(), record_filtered=True)
         if tools is None:
             self._tool_inputs = builtin_tools
         elif include_builtin_tools:
-            self._tool_inputs = builtin_tools + self._filter_tools_for_trading_permission(list(tools))
+            self._tool_inputs = builtin_tools + self._filter_tools_for_trading_permission(
+                list(tools),
+                record_filtered=True,
+            )
         else:
-            self._tool_inputs = self._filter_tools_for_trading_permission(list(tools))
+            self._tool_inputs = self._filter_tools_for_trading_permission(list(tools), record_filtered=True)
         self._mcp_servers = mcp_servers or []
         google_runtime, _RuntimeRequest, _StubAgentRuntime, _call_mcp_tool = _get_runtime_imports()
         self._runtime = runtime or google_runtime(mcp_servers=self._mcp_servers)
         self._bound_tools: list[BoundTool] | None = None
 
-    def _filter_tools_for_trading_permission(self, tools: list[Any]) -> list[Any]:
+    def _filter_tools_for_trading_permission(self, tools: list[Any], *, record_filtered: bool = False) -> list[Any]:
         if self.allow_trading:
             return list(tools)
         filtered: list[Any] = []
         for tool in tools:
-            metadata = getattr(tool, "metadata", {}) or {}
+            metadata = dict(getattr(tool, "metadata", {}) or {})
             if bool(metadata.get("mutates_trading")):
+                if record_filtered:
+                    self._filtered_tool_inputs.append(
+                        {
+                            "name": getattr(tool, "name", ""),
+                            "source": getattr(tool, "source", "local"),
+                            "metadata": metadata,
+                            "reason": "filtered because allow_trading is false",
+                        }
+                    )
                 continue
             filtered.append(tool)
         return filtered
@@ -1073,6 +1156,25 @@ class AgentHandle:
             ],
             "memory_notes": self._memory_prompt_notes(),
         }
+
+    def _trace_request_payload(self, cache_payload: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(cache_payload)
+        bound_tools = self._ensure_bound_tools()
+        available = [
+            {
+                "name": tool.name,
+                "source": tool.source,
+                "metadata": dict(tool.metadata or {}),
+                "reason": "available",
+            }
+            for tool in bound_tools
+        ]
+        payload["tool_surface"] = [_tool_surface_entry_for_trace(tool) for tool in bound_tools]
+        payload["tool_availability"] = {
+            "available": available,
+            "filtered": list(self._filtered_tool_inputs),
+        }
+        return payload
 
     @staticmethod
     def _cache_root() -> Path:
@@ -1559,7 +1661,7 @@ class AgentHandle:
         trace_payload = {
             "agent": self.name,
             "model": model_name,
-            "request": cache_payload,
+            "request": self._trace_request_payload(cache_payload),
             "tool_calls": [
                 {
                     "tool_name": event.tool_name,
