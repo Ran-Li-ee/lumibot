@@ -221,6 +221,72 @@ def test_parse_execution_plan_normalizes_real_maintain_cash_hold_plan():
     assert plan["orders"] == []
 
 
+def test_parse_execution_plan_derives_intent_from_real_buy_decision_type_when_plan_intent_is_sentence():
+    strategy_module, _strategy_class = load_strategy_module()
+    raw_summary = json.dumps(
+        {
+            "decision": {
+                "type": "buy",
+                "from": "USD",
+                "to": "QQQ",
+                "reason_brief": "QQQ is the strongest growth ETF candidate.",
+            },
+            "execution_plan": {
+                "schema_version": "1.0",
+                "intent": "deploy cash into the strongest growth ETF candidate using a full-investment stance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "symbol": "QQQ",
+                        "side": "buy",
+                        "quantity_mode": "max_affordable_after_prior_sells",
+                        "order_type": "market",
+                    }
+                ],
+                "constraints": {
+                    "allow_negative_cash": False,
+                    "if_any_order_blocked": "stop_remaining_orders",
+                },
+            },
+        }
+    )
+
+    plan = strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
+
+    assert plan["intent"] == "enter_position"
+    assert plan["orders"][0]["symbol"] == "QQQ"
+
+
+def test_parse_execution_plan_rejects_invalid_intent_without_valid_decision_type():
+    strategy_module, _strategy_class = load_strategy_module()
+    raw_summary = json.dumps(
+        {
+            "decision": {
+                "type": "invest",
+                "from": "USD",
+                "to": "QQQ",
+                "reason_brief": "Invalid decision type should not normalize intent.",
+            },
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "deploy cash into a fund",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "symbol": "QQQ",
+                        "side": "buy",
+                        "quantity_mode": "max_affordable_after_prior_sells",
+                    }
+                ],
+                "constraints": {},
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="unsupported execution_plan intent"):
+        strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
+
+
 def test_parse_execution_plan_accepts_float_one_schema_version():
     strategy_module, _strategy_class = load_strategy_module()
 
@@ -560,6 +626,8 @@ def test_decision_prompt_requests_structured_execution_plan():
 
     for prompt_phrase in (
         "required top-level execution_plan fields are schema_version, intent, and orders",
+        "execution_plan.intent must be one of: hold, enter_position, rotate, reduce_position, close_position",
+        "do not write a sentence",
         "constraints is optional and defaults apply",
         "each order must include sequence, symbol, side, and quantity_mode",
         "optional order fields include action, quantity, asset_type, cash_buffer_pct, order_type, "

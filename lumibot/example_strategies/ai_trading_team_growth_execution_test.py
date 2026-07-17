@@ -7,6 +7,13 @@ import os
 from lumibot.strategies.strategy import Strategy
 
 ALLOWED_INTENTS = {"hold", "enter_position", "rotate", "reduce_position", "close_position"}
+DECISION_TYPE_INTENTS = {
+    "hold": "hold",
+    "buy": "enter_position",
+    "rotate": "rotate",
+    "reduce": "reduce_position",
+    "close": "close_position",
+}
 INTENT_ALIASES = {
     "backtest": "enter_position",
     "keep_cash": "hold",
@@ -153,8 +160,13 @@ def parse_execution_plan_from_decision_summary(summary):
     else:
         raise ValueError(f"unsupported execution_plan schema_version: {schema_version}")
 
-    intent = str(plan.get("intent") or plan.get("mode") or "").strip().lower()
-    intent = INTENT_ALIASES.get(intent, intent)
+    raw_intent = str(plan.get("intent") or plan.get("mode") or "").strip().lower()
+    intent = INTENT_ALIASES.get(raw_intent, raw_intent)
+    if intent not in ALLOWED_INTENTS:
+        decision = payload.get("decision", {})
+        if isinstance(decision, dict):
+            decision_type = str(decision.get("type") or "").strip().lower()
+            intent = DECISION_TYPE_INTENTS.get(decision_type, intent)
     if not intent:
         raise ValueError("execution_plan intent is required.")
     if intent not in ALLOWED_INTENTS:
@@ -234,7 +246,9 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "decision.type from: hold, buy, rotate, reduce, close. decision must include decision.type, "
                 "decision.from, decision.to, and decision.reason_brief. Required top-level execution_plan fields "
                 "are schema_version, intent, and orders (execution_plan.orders); constraints is optional and "
-                "defaults apply. Each order must include sequence, symbol, side, and quantity_mode. Optional order "
+                "defaults apply. execution_plan.intent must be one of: hold, enter_position, rotate, "
+                "reduce_position, close_position; do not write a sentence. Each order must include sequence, symbol, "
+                "side, and quantity_mode. Optional order "
                 "fields include action, quantity, "
                 "asset_type, cash_buffer_pct, order_type, time_in_force, limit_price, stop_price, stop_limit_price, "
                 "trail_price, and trail_percent. Legacy aliases are optional: mode for intent and "
@@ -294,8 +308,9 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "decision.type, decision.from, decision.to, and decision.reason_brief. decision.type must be one of: "
                 "hold, buy, rotate, reduce, "
                 "close. Required top-level execution_plan fields are schema_version, intent, and orders "
-                "(execution_plan.orders); constraints is optional and defaults apply. Each order must include "
-                "sequence, symbol, side, and "
+                "(execution_plan.orders); constraints is optional and defaults apply. execution_plan.intent must be "
+                "one of: hold, enter_position, rotate, reduce_position, close_position; do not write a sentence. "
+                "Each order must include sequence, symbol, side, and "
                 "quantity_mode. Optional order fields include action, quantity, asset_type, cash_buffer_pct, "
                 "order_type, time_in_force, limit_price, stop_price, stop_limit_price, trail_price, and "
                 "trail_percent. Legacy aliases are optional: mode for intent and execution_constraints for "
