@@ -88,6 +88,7 @@ def test_agent_replay_public_dict_contains_three_detail_areas():
         trace_path="C:/trace/growth.json",
         request={
             "base_system_prompt": "Base prompt",
+            "effective_system_prompt": "Base prompt\n\nUSER SYSTEM PROMPT:\nGrowth system prompt",
             "user_system_prompt": "Growth system prompt",
             "task_prompt": "Pick the strongest ETF.",
             "context": {"date": "2026-04-07", "universe": ["SPY", "QQQ"]},
@@ -120,6 +121,10 @@ def test_agent_replay_public_dict_contains_three_detail_areas():
     public = agent.to_public_dict()
 
     assert public["input_material"]["base_system_prompt"] == "Base prompt"
+    assert (
+        public["input_material"]["effective_system_prompt"]
+        == "Base prompt\n\nUSER SYSTEM PROMPT:\nGrowth system prompt"
+    )
     assert public["input_material"]["user_system_prompt_heading"] == "USER SYSTEM PROMPT:"
     assert public["input_material"]["priority_explanation"].startswith("Treat this as")
     assert public["input_material"]["agent_system_prompt"] == "Growth system prompt"

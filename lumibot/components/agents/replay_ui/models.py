@@ -92,6 +92,7 @@ class AgentReplay:
 
         return {
             "base_system_prompt": redact_sensitive(self.request.get("base_system_prompt")),
+            "effective_system_prompt": redact_sensitive(self.request.get("effective_system_prompt")),
             "user_system_prompt_heading": "USER SYSTEM PROMPT:",
             "priority_explanation": PRIORITY_EXPLANATION,
             "agent_system_prompt": redact_sensitive(self.request.get("user_system_prompt")),
@@ -150,6 +151,7 @@ class ReplayRun:
     label: str
     strategy_name: str = "unknown-strategy"
     system_runs: list[SystemRun] = field(default_factory=list)
+    artifacts: dict[str, Any] = field(default_factory=dict)
     summary: Any = None
     warnings: list[Any] = field(default_factory=list)
 
@@ -159,6 +161,7 @@ class ReplayRun:
             "label": redact_sensitive(self.label),
             "strategy_name": redact_sensitive(self.strategy_name),
             "system_runs": [system_run.to_public_dict() for system_run in self.system_runs],
+            "artifacts": redact_sensitive(self.artifacts),
             "summary": redact_sensitive(self.summary),
             "warnings": redact_sensitive(self.warnings),
         }

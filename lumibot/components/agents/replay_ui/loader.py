@@ -93,10 +93,73 @@ def _build_replay_dataset_for_root(root: Path) -> ReplayDataset:
             label=label,
             strategy_name=strategy_name,
             system_runs=run_systems,
+            artifacts=backtest_artifacts_for_trace_root(root),
         )
         for (strategy_name, run_id, label), run_systems in _group_system_runs_by_backtest(root, system_runs).items()
     ]
     return ReplayDataset(runs=runs, source_path=str(root.resolve()), warnings=warnings)
+
+
+def backtest_artifacts_for_trace_root(trace_root: str | Path) -> dict[str, Any]:
+    """Return public metadata for backtest-level output files related to a trace root."""
+
+    artifact_root = backtest_artifact_root(trace_root)
+    token = artifact_token_for_root(artifact_root)
+    account_curve_path = find_account_curve_report(artifact_root)
+    report_path = find_performance_report(artifact_root)
+    return {
+        "account_curve": {
+            "available": account_curve_path is not None,
+            "url": f"/artifacts/{token}/account-curve" if account_curve_path is not None else None,
+            "reason": None
+            if account_curve_path is not None
+            else "No native account curve HTML report found for this backtest run.",
+        },
+        "performance_report": {
+            "available": report_path is not None,
+            "url": f"/artifacts/{token}/performance-report" if report_path is not None else None,
+            "reason": None if report_path is not None else "No tearsheet HTML report found for this backtest run.",
+        },
+    }
+
+
+def backtest_artifact_root(trace_root: str | Path) -> Path:
+    """Map an agent runtime trace root back to the containing backtest output directory."""
+
+    root = Path(trace_root)
+    if root.name == "agent_runtime" and root.parent.name == "cache":
+        return root.parent.parent
+    return root
+
+
+def artifact_token_for_root(root: str | Path) -> str:
+    """Create a stable opaque URL token for a backtest artifact directory."""
+
+    return hashlib.sha1(str(Path(root).resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def find_performance_report(artifact_root: str | Path) -> Path | None:
+    """Find the first local HTML performance report for a backtest output directory."""
+
+    root = Path(artifact_root)
+    patterns = ("*tearsheet*.html", "*tear_sheet*.html", "*performance*.html", "*report*.html")
+    for pattern in patterns:
+        for path in sorted(root.glob(pattern)):
+            if path.is_file():
+                return path
+    return None
+
+
+def find_account_curve_report(artifact_root: str | Path) -> Path | None:
+    """Find the first native Lumibot account curve HTML report for a backtest output directory."""
+
+    root = Path(artifact_root)
+    patterns = ("*account_curve*.html", "*trades*.html")
+    for pattern in patterns:
+        for path in sorted(root.glob(pattern)):
+            if path.is_file():
+                return path
+    return None
 
 
 def load_agent_trace(path: str | Path) -> AgentReplay:
@@ -257,7 +320,12 @@ def _context_dependencies(agents: list[AgentReplay]) -> list[AgentDependency]:
         for key in sorted(str(context_key) for context_key in context.keys()):
             if key.lower() in CONTEXT_METADATA_KEYS:
                 continue
-            source_agent, source_status = _dependency_source_from_context_value(context.get(key), agent, agents)
+            source_agent, source_status = _dependency_source_from_context_value(
+                key,
+                context.get(key),
+                agent,
+                agents,
+            )
             dependencies.append(
                 AgentDependency(
                     source_label=f"context:{key}",
@@ -271,6 +339,7 @@ def _context_dependencies(agents: list[AgentReplay]) -> list[AgentDependency]:
 
 
 def _dependency_source_from_context_value(
+    context_key: str,
     context_value: Any,
     target_agent: AgentReplay,
     agents: list[AgentReplay],
@@ -284,6 +353,9 @@ def _dependency_source_from_context_value(
         return matches[0].name, "resolved_summary"
     if len(matches) > 1:
         return None, "ambiguous_source"
+    fallback_source = _dependency_source_from_context_key(context_key, target_agent, agents)
+    if fallback_source:
+        return fallback_source, "resolved_context_key"
     return None, "unresolved_source"
 
 
@@ -291,6 +363,23 @@ def _context_value_matches_summary(context_value: Any, summary: Any) -> bool:
     if summary is None:
         return False
     return context_value == summary
+
+
+def _dependency_source_from_context_key(
+    context_key: str,
+    target_agent: AgentReplay,
+    agents: list[AgentReplay],
+) -> str | None:
+    if context_key != "execution_plan":
+        return None
+    source_candidates = [
+        agent
+        for agent in agents
+        if agent.name == "decision_agent" and agent.id != target_agent.id
+    ]
+    if len(source_candidates) == 1:
+        return source_candidates[0].name
+    return None
 
 
 def _first_text(*values: Any) -> str:

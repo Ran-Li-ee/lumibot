@@ -159,6 +159,16 @@ class DuckDBQueryLayer:
         self._table_meta[table_name] = info
         return info
 
+    def _available_table_schemas(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "table_name": str(table_name),
+                "columns": [str(column) for column in meta.get("columns", [])],
+            }
+            for table_name, meta in sorted(self._table_meta.items())
+            if meta.get("kind") != "source_frame"
+        ]
+
     def _ensure_source_table(
         self,
         *,
@@ -279,7 +289,9 @@ class DuckDBQueryLayer:
         cached = self._history_cache.get(cache_key)
         if cached is not None:
             self.metrics["history_cache_hits"] += 1.0
-            return dict(cached)
+            result = dict(cached)
+            result["available_tables"] = self._available_table_schemas()
+            return result
         asset, quote = resolve_asset_and_quote(
             self.strategy,
             symbol=symbol,
@@ -347,7 +359,9 @@ class DuckDBQueryLayer:
         self.metrics["history_load_ms"] += float(elapsed_ms)
         info["load_ms"] = round(elapsed_ms, 3)
         self._history_cache[cache_key] = dict(info)
-        return info
+        result = dict(info)
+        result["available_tables"] = self._available_table_schemas()
+        return result
 
     def query(self, *, sql: str, limit: int = 200) -> dict[str, Any]:
         if not sql or not _READ_ONLY_SQL_RE.match(sql):

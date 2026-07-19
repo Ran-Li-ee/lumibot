@@ -1,5 +1,5 @@
-import hashlib
 import functools
+import hashlib
 import inspect
 import json
 import os
@@ -8,20 +8,21 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from lumibot import LUMIBOT_CACHE_FOLDER
 
+from .duckdb_prompt import DUCKDB_SQL_GUIDANCE_PROMPT
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer, ToolDefinition
 from .tool_context import agent_tool_context
 from .tools import bind_callable_tool
-
 
 _TIMESTAMP_HINT_RE = re.compile(
     r"(time|date|datetime|published|updated|created|accepted|released|release|as_of|realtime)",
     re.IGNORECASE,
 )
 _DEFAULT_MEMORY_NOTE_MAX_CHARS = 2000
+BaseSystemPromptMode = Literal["default", "execution_minimal"]
 
 
 class AgentModelCallLimitExceeded(RuntimeError):
@@ -48,7 +49,8 @@ def _get_pandas():
 def _get_replay_imports():
     global _REPLAY_IMPORTS
     if _REPLAY_IMPORTS is None:
-        from .replay_cache import AgentReplayCache, _normalize_json as normalize_json
+        from .replay_cache import AgentReplayCache
+        from .replay_cache import _normalize_json as normalize_json
 
         _REPLAY_IMPORTS = (AgentReplayCache, normalize_json)
     return _REPLAY_IMPORTS
@@ -658,12 +660,16 @@ class AgentHandle:
         include_builtin_tools: bool = True,
         model_request_timeout_seconds: float | None = None,
         run_timeout_seconds: float | None = None,
+        base_system_prompt_mode: BaseSystemPromptMode = "default",
     ) -> None:
         self.manager = manager
         self.name = name
         self.system_prompt = system_prompt
         self.default_model = default_model
         self.allow_trading = bool(allow_trading)
+        if base_system_prompt_mode not in ("default", "execution_minimal"):
+            raise ValueError(f"Unsupported base_system_prompt_mode: {base_system_prompt_mode!r}")
+        self.base_system_prompt_mode = base_system_prompt_mode
         self.model_request_timeout_seconds = model_request_timeout_seconds
         self.run_timeout_seconds = run_timeout_seconds
         from .builtins import BuiltinTools
@@ -783,6 +789,8 @@ class AgentHandle:
         }
 
     def _base_system_prompt(self, runtime_context: dict[str, Any]) -> str:
+        if self.base_system_prompt_mode == "execution_minimal":
+            return self._execution_minimal_base_system_prompt(runtime_context)
         mode = runtime_context.get("mode") or "live"
         lines = [
             "You are operating as a trading agent inside LumiBot.",
@@ -876,15 +884,69 @@ class AgentHandle:
             )
         return "\n".join(lines).strip()
 
-    def _compose_system_prompt(self, runtime_context: dict[str, Any]) -> str:
-        return "\n\n".join(
-            [
-                self._base_system_prompt(runtime_context),
-                "USER SYSTEM PROMPT:",
-                "Treat this as the strategy-specific trading objective. It may override the default investor style, but not hard safety, broker, or look-ahead-bias rules.",
-                self.system_prompt.strip(),
-            ]
-        ).strip()
+    def _execution_minimal_base_system_prompt(self, runtime_context: dict[str, Any]) -> str:
+        mode = runtime_context.get("mode") or "live"
+        lines = [
+            "You are operating as an order execution agent inside LumiBot.",
+            "Use the provided runtime context and tool outputs as the ground truth for the current state of the "
+            "strategy.",
+            "Execute only the provided execution_plan.",
+            "Do not perform investment research, do not re-rank candidates, do not substitute symbols, and do not "
+            "change the plan.",
+            "Do not add, remove, replace, or reorder execution_plan.orders.",
+            "Before submitting any order, inspect current positions, available cash, portfolio value, open orders, "
+            "and the latest price for the ordered asset.",
+            "Execute execution_plan.orders in ascending sequence order.",
+            "When switching from one asset to another, submit the sell or reduce order before the replacement buy "
+            "order when that is the sequence provided.",
+            "Use whole-share quantities unless the tool and asset type explicitly support fractional quantities.",
+            "Block or pause only for execution-level blockers such as missing required order fields, insufficient "
+            "cash after required prior sells, broker/tool rejection, unavailable price data, or invalid order "
+            "parameters.",
+            "Report each order sequence as submitted or blocked.",
+            "Finish every run with a short summary sentence starting with RESULT: that explains what execution "
+            "action you took.",
+        ]
+        if mode == "backtesting":
+            lines.extend(
+                [
+                    "",
+                    "BACKTESTING SAFETY RULES - READ THIS AS A HARD REQUIREMENT:",
+                    "Treat the current simulated datetime as a hard wall. Do not use data that would not have been "
+                    "available at or before that datetime.",
+                    "If a tool has any parameter that controls a time range, date filter, or temporal bound, set it "
+                    "so that no data after the current simulated datetime can be returned.",
+                    "If a tool response seems to include future timestamps, treat that as suspicious and do not "
+                    "rely on those records.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "LIVE TRADING RULES:",
+                    "Act on the current visible account, broker, order, and market state.",
+                ]
+            )
+        return "\n".join(lines).strip()
+
+    def _compose_system_prompt(
+        self,
+        runtime_context: dict[str, Any],
+        bound_tools: list[BoundTool] | None = None,
+    ) -> str:
+        available_tools = bound_tools if bound_tools is not None else self._ensure_bound_tools()
+        prompt_parts = [
+            self._base_system_prompt(runtime_context),
+            "USER SYSTEM PROMPT:",
+            "Treat this as the strategy-specific trading objective. It may override the default investor style, "
+            "but not hard safety, broker, or look-ahead-bias rules.",
+            self.system_prompt.strip(),
+        ]
+        tool_names = {tool.name for tool in available_tools}
+        if tool_names.intersection({"market_load_history_table", "duckdb_query"}):
+            prompt_parts.append(DUCKDB_SQL_GUIDANCE_PROMPT.strip())
+        return "\n\n".join(prompt_parts).strip()
 
     def _append_memory(self, result: AgentRunResult) -> None:
         state = self._state_bucket()
@@ -1019,7 +1081,7 @@ class AgentHandle:
             ])
         elif category == "billing":
             lines.extend([
-                f"Likely cause: provider billing issue (out of credits, quota exceeded).",
+                "Likely cause: provider billing issue (out of credits, quota exceeded).",
                 f"  Check billing at: {billing_url}",
             ])
         elif category == "config":
@@ -1053,8 +1115,9 @@ class AgentHandle:
         memory_state: dict[str, Any] | None,
         effective_system_prompt: str,
         base_system_prompt: str,
+        bound_tools: list[BoundTool] | None = None,
     ) -> dict[str, Any]:
-        bound_tools = self._ensure_bound_tools()
+        available_tools = bound_tools if bound_tools is not None else self._ensure_bound_tools()
         return {
             "user_system_prompt": self.system_prompt,
             "base_system_prompt": base_system_prompt,
@@ -1071,7 +1134,7 @@ class AgentHandle:
                     "source": tool.source,
                     "metadata": _stable_tool_metadata_for_cache(tool),
                 }
-                for tool in bound_tools
+                for tool in available_tools
             ],
             "memory_notes": self._memory_prompt_notes(),
         }
@@ -1155,13 +1218,18 @@ class AgentHandle:
             first_event_latency_ms=_coerce_usage_int(timing.get("call_first_event_latency_ms")),
         )
 
-    def _replay_cached_side_effects(self, result: AgentRunResult) -> None:
-        bound_tools = {tool.name: tool for tool in self._ensure_bound_tools()}
+    def _replay_cached_side_effects(
+        self,
+        result: AgentRunResult,
+        bound_tools: list[BoundTool] | None = None,
+    ) -> None:
+        available_tools = bound_tools if bound_tools is not None else self._ensure_bound_tools()
+        tools_by_name = {tool.name: tool for tool in available_tools}
         for event in result.tool_calls:
             tool_name = event.tool_name
             if not tool_name:
                 continue
-            tool = bound_tools.get(tool_name)
+            tool = tools_by_name.get(tool_name)
             if tool is None:
                 continue
             if tool.source == "mcp":
@@ -1172,11 +1240,17 @@ class AgentHandle:
             with agent_tool_context({"agent_name": self.name, "model_call_id": result.cache_key}):
                 tool.function(**payload)
 
-    def _derive_warnings(self, result: AgentRunResult, runtime_context: dict[str, Any]) -> list[dict[str, Any]]:
+    def _derive_warnings(
+        self,
+        result: AgentRunResult,
+        runtime_context: dict[str, Any],
+        bound_tools: list[BoundTool] | None = None,
+    ) -> list[dict[str, Any]]:
         warnings: list[dict[str, Any]] = []
         current_dt = _parse_datetime_like(runtime_context.get("current_datetime"))
         mode = runtime_context.get("mode")
-        if self._ensure_bound_tools() and not result.tool_calls:
+        available_tools = bound_tools if bound_tools is not None else self._ensure_bound_tools()
+        if available_tools and not result.tool_calls:
             warnings.append(
                 {
                     "kind": "no_tool_calls",
@@ -1208,7 +1282,11 @@ class AgentHandle:
             )
         held_symbols = _held_position_symbols(runtime_context)
         ordered_held_symbols = sorted(_order_tool_symbols(result).intersection(held_symbols))
-        if ordered_held_symbols and "search_memory" not in tool_names:
+        if (
+            ordered_held_symbols
+            and "search_memory" not in tool_names
+            and self.base_system_prompt_mode != "execution_minimal"
+        ):
             message = (
                 "Agent used an order tool on currently held symbol(s) without first calling "
                 f"search_memory for the open thesis: {', '.join(ordered_held_symbols)}."
@@ -1388,8 +1466,9 @@ class AgentHandle:
         )
         runtime_context = self._runtime_context()
         memory_state = self._memory_state(runtime_context)
+        bound_tools = self._ensure_bound_tools()
         base_system_prompt = self._base_system_prompt(runtime_context)
-        effective_system_prompt = self._compose_system_prompt(runtime_context)
+        effective_system_prompt = self._compose_system_prompt(runtime_context, bound_tools)
         cache_payload = self._cache_payload(
             task_prompt=task_prompt,
             context=context,
@@ -1398,6 +1477,7 @@ class AgentHandle:
             memory_state=memory_state,
             effective_system_prompt=effective_system_prompt,
             base_system_prompt=base_system_prompt,
+            bound_tools=bound_tools,
         )
         cache_key = self.manager.replay_cache.compute_key(cache_payload)
         strategy = self.manager.strategy
@@ -1406,7 +1486,7 @@ class AgentHandle:
             cached = self.manager.replay_cache.load(cache_key)
             if cached is not None:
                 result = self._result_from_cached(cached, cache_key)
-                self._replay_cached_side_effects(result)
+                self._replay_cached_side_effects(result, bound_tools)
                 self.manager._record_agent_observability(
                     handle=self,
                     result=result,
@@ -1428,13 +1508,13 @@ class AgentHandle:
             runtime_context=runtime_context,
             memory_state=memory_state,
             memory_notes=self._memory_prompt_notes(),
-            bound_tools=self._ensure_bound_tools(),
+            bound_tools=bound_tools,
             model_call_id=cache_key,
             provider_prompt_cache_key=_provider_prompt_cache_key(
                 agent_name=self.name,
                 model=model_name,
                 effective_system_prompt=effective_system_prompt,
-                bound_tools=self._ensure_bound_tools(),
+                bound_tools=bound_tools,
             ),
             model_request_timeout_seconds=resolved_model_request_timeout_seconds,
             run_timeout_seconds=resolved_run_timeout_seconds,
@@ -1467,6 +1547,7 @@ class AgentHandle:
             raise
         except BaseException as exc:  # noqa: BLE001 - intentional broad catch
             import traceback as _tb
+
             from .runtime import _classify_agent_error
             from .schemas import AgentRunResult, AgentTraceEvent
 
@@ -1557,7 +1638,7 @@ class AgentHandle:
             ended_perf=time.perf_counter(),
         )
         result.cache_key = cache_key
-        result.warnings = self._derive_warnings(result, runtime_context)
+        result.warnings = self._derive_warnings(result, runtime_context, bound_tools)
         trace_payload = {
             "agent": self.name,
             "model": model_name,
@@ -2065,6 +2146,7 @@ class AgentManager:
         include_builtin_tools: bool = True,
         model_request_timeout_seconds: float | None = None,
         run_timeout_seconds: float | None = None,
+        base_system_prompt_mode: BaseSystemPromptMode = "default",
     ) -> AgentHandle:
         if name in self._agents:
             raise ValueError(f"Agent with name {name!r} already exists.")
@@ -2085,6 +2167,7 @@ class AgentManager:
             include_builtin_tools=include_builtin_tools,
             model_request_timeout_seconds=model_request_timeout_seconds,
             run_timeout_seconds=run_timeout_seconds,
+            base_system_prompt_mode=base_system_prompt_mode,
         )
         if cadence is not None:
             self.strategy.log_message(

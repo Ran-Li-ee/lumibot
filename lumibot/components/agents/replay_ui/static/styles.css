@@ -87,7 +87,7 @@ h3 {
 
 .workflow-controls {
   display: grid;
-  grid-template-columns: minmax(160px, 280px) minmax(160px, 280px) minmax(220px, 420px) auto auto;
+  grid-template-columns: minmax(160px, 280px) minmax(160px, 280px) minmax(220px, 420px) auto auto auto auto;
   gap: 12px;
   align-items: end;
   min-width: 0;
@@ -171,6 +171,9 @@ select:disabled {
 }
 
 .secondary-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 32px;
   padding: 6px 10px;
   border: 1px solid var(--border-strong);
@@ -181,12 +184,22 @@ select:disabled {
   font-size: 12px;
   font-weight: 650;
   cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
 }
 
 .secondary-button:hover,
 .secondary-button:focus-visible {
   border-color: var(--accent);
   outline: none;
+}
+
+.artifact-link.disabled {
+  color: var(--muted);
+  background: var(--panel-muted);
+  cursor: not-allowed;
+  opacity: 0.7;
+  pointer-events: none;
 }
 
 .workflow-graph {

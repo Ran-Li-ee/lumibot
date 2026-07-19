@@ -13,6 +13,25 @@ def _write_trace(path, payload):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _write_minimal_system_trace(root, *, strategy_name="DemoStrategy", current_datetime="2026-04-07T09:30:00-04:00"):
+    _write_trace(
+        root / "traces" / "growth_agent" / "trace.json",
+        {
+            "agent": "growth_agent",
+            "model": "openai/gpt-5-mini",
+            "request": {
+                "runtime_context": {
+                    "mode": "backtesting",
+                    "current_datetime": current_datetime,
+                    "strategy_name": strategy_name,
+                },
+            },
+            "events": [],
+            "summary": "RESULT: done.",
+        },
+    )
+
+
 def test_load_agent_trace_extracts_inputs_and_batches(tmp_path):
     trace_path = tmp_path / "agent_runtime" / "traces" / "growth_agent" / "growth.json"
     _write_trace(
@@ -85,6 +104,46 @@ def test_load_agent_trace_extracts_inputs_and_batches(tmp_path):
     assert agent.tool_batches[0].calls[0].raw_result["price"] == 110.71
     assert agent.tool_batches[1].calls[0].tool_name == "duckdb_query"
     assert "SQL" in agent.tool_batches[1].calls[0].human_explanation
+
+
+def test_build_replay_dataset_surfaces_backtest_artifact_links(tmp_path):
+    backtest_root = tmp_path / "artifacts" / "20260718_101010_000000" / "growth-execution-test"
+    runtime_root = backtest_root / "cache" / "agent_runtime"
+    _write_minimal_system_trace(runtime_root)
+    (backtest_root / "growth_execution_test_account_curve.html").write_text(
+        "<html>account curve</html>",
+        encoding="utf-8",
+    )
+    (backtest_root / "DemoStrategy_tearsheet.html").write_text("<html>tearsheet</html>", encoding="utf-8")
+
+    public = build_replay_dataset(runtime_root).to_public_dict()
+
+    artifacts = public["runs"][0]["artifacts"]
+    assert artifacts["account_curve"]["available"] is True
+    assert artifacts["account_curve"]["url"].startswith("/artifacts/")
+    assert artifacts["account_curve"]["url"].endswith("/account-curve")
+    assert artifacts["performance_report"]["available"] is True
+    assert artifacts["performance_report"]["url"].startswith("/artifacts/")
+    assert artifacts["performance_report"]["url"].endswith("/performance-report")
+
+
+def test_build_replay_dataset_marks_missing_backtest_artifacts_unavailable(tmp_path):
+    runtime_root = tmp_path / "cache" / "agent_runtime"
+    _write_minimal_system_trace(runtime_root)
+    (runtime_root.parent.parent / "stats.csv").write_text(
+        "datetime,portfolio_value,cash\n2026-04-07,100000,100000\n",
+        encoding="utf-8",
+    )
+
+    public = build_replay_dataset(runtime_root).to_public_dict()
+
+    artifacts = public["runs"][0]["artifacts"]
+    assert artifacts["account_curve"]["available"] is False
+    assert artifacts["account_curve"]["url"] is None
+    assert "account curve" in artifacts["account_curve"]["reason"].lower()
+    assert artifacts["performance_report"]["available"] is False
+    assert artifacts["performance_report"]["url"] is None
+    assert "tearsheet" in artifacts["performance_report"]["reason"].lower()
 
 
 def test_load_agent_trace_accepts_utf8_bom_trace_files(tmp_path):
@@ -221,6 +280,79 @@ def test_build_replay_dataset_groups_agents_by_system_run_and_context_dependenci
             "source_type": "context",
             "source_agent": "growth_agent",
             "source_status": "resolved_summary",
+        }
+    ]
+
+
+def test_build_replay_dataset_resolves_execution_plan_dependency(tmp_path):
+    root = tmp_path / "agent_runtime"
+    common_runtime = {
+        "mode": "backtesting",
+        "current_datetime": "2024-09-05T09:30:00-04:00",
+        "strategy_name": "GrowthExecutionTest",
+    }
+    decision_summary = json.dumps(
+        {
+            "decision": {"type": "buy", "from": "USD", "to": "VNQ"},
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "enter_position",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "symbol": "VNQ",
+                        "side": "buy",
+                        "quantity_mode": "max_affordable_after_prior_sells",
+                    }
+                ],
+            },
+        }
+    )
+    execution_plan = {
+        "schema_version": 1,
+        "intent": "enter_position",
+        "orders": [
+            {
+                "sequence": 1,
+                "symbol": "VNQ",
+                "side": "buy",
+                "quantity_mode": "max_affordable_after_prior_sells",
+            }
+        ],
+    }
+    _write_trace(
+        root / "traces" / "decision_agent" / "trace.json",
+        {
+            "agent": "decision_agent",
+            "request": {"context": {}, "runtime_context": common_runtime, "tool_surface": []},
+            "events": [],
+            "summary": decision_summary,
+        },
+    )
+    _write_trace(
+        root / "traces" / "execution_agent" / "trace.json",
+        {
+            "agent": "execution_agent",
+            "request": {
+                "context": {"execution_plan": execution_plan},
+                "runtime_context": common_runtime,
+                "tool_surface": [],
+            },
+            "events": [],
+            "summary": "Execution summary",
+        },
+    )
+
+    public = build_replay_dataset(root).to_public_dict()
+
+    dependencies = public["runs"][0]["system_runs"][0]["dependencies"]
+    assert dependencies == [
+        {
+            "source_label": "context:execution_plan",
+            "target_agent": "execution_agent",
+            "source_type": "context",
+            "source_agent": "decision_agent",
+            "source_status": "resolved_context_key",
         }
     ]
 

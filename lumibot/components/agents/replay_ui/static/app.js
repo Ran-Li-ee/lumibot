@@ -23,6 +23,8 @@
     elements.workflowMapViewport = document.getElementById("workflowMapViewport");
     elements.workflowGraph = document.getElementById("workflowGraph");
     elements.toggleWorkflowGraphButton = document.getElementById("toggleWorkflowGraphButton");
+    elements.accountCurveLink = document.getElementById("accountCurveLink");
+    elements.performanceReportLink = document.getElementById("performanceReportLink");
     elements.overviewButton = document.getElementById("overviewButton");
     elements.overviewArea = document.getElementById("overviewArea");
     elements.inputArea = document.getElementById("inputArea");
@@ -127,6 +129,7 @@
     renderStrategySelector();
     renderBacktestRunSelector(run);
     renderSystemRunSelector(run, systemRun);
+    renderArtifactLinks(run);
     renderWorkflowGraphVisibility();
     renderWorkflowGraph(systemRun);
     renderRightPanel(run, systemRun);
@@ -146,6 +149,7 @@
     elements.strategySelect.disabled = true;
     elements.backtestRunSelect.disabled = true;
     elements.systemRunSelect.disabled = true;
+    renderArtifactLinks(null);
     elements.workflowGraph.innerHTML = `<div class="empty-state">No workflow available.</div>`;
     setDetailMode("overview");
     elements.overviewArea.innerHTML = sectionShell("System Overview", `Dataset error: ${message}`);
@@ -163,6 +167,7 @@
     elements.backtestRunSelect.disabled = true;
     elements.systemRunSelect.innerHTML = "<option>No system runs</option>";
     elements.systemRunSelect.disabled = true;
+    renderArtifactLinks(null);
     elements.workflowGraph.innerHTML = `<div class="empty-state">No agents were discovered in the trace root.${warningText}</div>`;
     setDetailMode("overview");
     elements.overviewArea.innerHTML = `${sectionShell("System Overview", "No replay runs are available.")}${renderVisibleWarnings(warnings)}`;
@@ -216,6 +221,31 @@
       systemRun ? systemRun.id : "",
     );
     elements.systemRunSelect.disabled = systemRuns.length <= 1;
+  }
+
+  function renderArtifactLinks(run) {
+    const artifacts = run && run.artifacts ? run.artifacts : {};
+    setArtifactLink(elements.accountCurveLink, artifacts.account_curve, "Account Curve");
+    setArtifactLink(elements.performanceReportLink, artifacts.performance_report, "Performance Report");
+  }
+
+  function setArtifactLink(element, artifact, label) {
+    if (!element) {
+      return;
+    }
+    element.textContent = label;
+    if (artifact && artifact.available && artifact.url) {
+      element.href = artifact.url;
+      element.classList.remove("disabled");
+      element.removeAttribute("aria-disabled");
+      element.title = `Open ${label} for this backtest run`;
+      return;
+    }
+
+    element.removeAttribute("href");
+    element.classList.add("disabled");
+    element.setAttribute("aria-disabled", "true");
+    element.title = artifact && artifact.reason ? artifact.reason : `${label} is unavailable for this backtest run.`;
   }
 
   function renderWorkflowGraph(systemRun) {
@@ -927,6 +957,12 @@
         characterCountLabel(input.base_system_prompt),
         `<pre>${formatValue(input.base_system_prompt)}</pre>`,
         false,
+      )}
+      ${renderCollapsibleSubsection(
+        "Effective System Prompt",
+        characterCountLabel(input.effective_system_prompt),
+        `<pre>${formatValue(input.effective_system_prompt)}</pre>`,
+        true,
       )}
       ${renderCollapsibleSubsection(
         userSystemHeading,

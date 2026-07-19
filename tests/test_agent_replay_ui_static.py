@@ -11,6 +11,8 @@ def test_static_ui_contains_required_detail_regions():
     assert 'id="strategySelect"' in html
     assert 'id="backtestRunSelect"' in html
     assert 'id="systemRunSelect"' in html
+    assert 'id="accountCurveLink"' in html
+    assert 'id="performanceReportLink"' in html
     assert 'id="backtestLabel"' not in html
     assert 'id="workflowGraph"' in html
     assert 'id="toggleWorkflowGraphButton"' in html
@@ -29,6 +31,26 @@ def test_static_javascript_renders_agent_sections():
     assert "renderSummaryArea" in javascript
     assert "Human Explanation" in javascript
     assert "USER SYSTEM PROMPT:" in javascript
+    assert "Effective System Prompt" in javascript
+
+
+def test_static_javascript_renders_backtest_artifact_links():
+    javascript = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "accountCurveLink" in javascript
+    assert "performanceReportLink" in javascript
+    assert "renderArtifactLinks" in javascript
+    assert "setArtifactLink" in javascript
+    assert "Account Curve" in javascript
+    assert "Performance Report" in javascript
+
+
+def test_static_css_defines_disabled_artifact_links():
+    css = (STATIC_ROOT / "styles.css").read_text(encoding="utf-8")
+
+    assert ".artifact-link" in css
+    assert ".artifact-link.disabled" in css
+    assert "pointer-events: none" in css
 
 
 def test_static_javascript_mentions_required_detail_regions_and_tool_columns():

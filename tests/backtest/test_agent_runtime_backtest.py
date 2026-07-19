@@ -918,11 +918,83 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
     assert "Date" in history_tool.description
     assert "Do not assume datetime exists" in history_tool.description
     assert "close" in history_tool.description
+    assert "available_tables" in history_tool.description
+    assert "currently queryable tables" in history_tool.description
     assert "exact column names" in query_tool.description
     assert "market_load_history_table" in query_tool.description
     assert "pragma_table_info" in query_tool.description
     assert "Do not invent datetime" in query_tool.description
     assert "close" in query_tool.description
+    assert "alias every table" in query_tool.description
+    assert "sym, Date, close, and return" in query_tool.description
+    assert "q.sym" in query_tool.description
+    assert "q.Date" in query_tool.description
+    assert "q.close" in query_tool.description
+    assert (
+        "SELECT q.Date, q.close AS qqq_close, s.close AS spy_close FROM qqq_hist AS q "
+        "JOIN spy_hist AS s ON q.Date = s.Date ORDER BY q.Date"
+    ) in query_tool.description
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_table_inventory_tracks_fresh_and_cached_history_tables(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    pandas_data = _build_stock_pandas_data()
+    first_data = next(iter(pandas_data.values()))
+    second_asset = Asset("AGST2", Asset.AssetType.STOCK)
+    second_frame = first_data.df.copy()
+    second_frame["custom_signal"] = range(len(second_frame.index))
+    pandas_data[second_asset] = Data(second_asset, second_frame, timestep="minute")
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=pandas_data,
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    first = strategy.agents.duckdb.load_history_table(
+        symbol="AGST",
+        length=3,
+        timestep="minute",
+        table_name="z_history",
+    )
+    second = strategy.agents.duckdb.load_history_table(
+        symbol="AGST2",
+        length=3,
+        timestep="minute",
+        table_name="a_history",
+    )
+    cached_first = strategy.agents.duckdb.load_history_table(
+        symbol="AGST",
+        length=3,
+        timestep="minute",
+        table_name="z_history",
+    )
+
+    first_columns = first["columns"]
+    second_columns = second["columns"]
+    assert first_columns != second_columns
+    assert first["available_tables"] == [
+        {"table_name": "z_history", "columns": first_columns},
+    ]
+    assert second["available_tables"] == [
+        {"table_name": "a_history", "columns": second_columns},
+        {"table_name": "z_history", "columns": first_columns},
+    ]
+    assert cached_first["available_tables"] == [
+        {"table_name": "a_history", "columns": second_columns},
+        {"table_name": "z_history", "columns": first_columns},
+    ]
+    assert all("available_tables" not in meta for meta in strategy.agents.duckdb._table_meta.values())
 
 
 @pytest.mark.usefixtures("disable_datasource_override")

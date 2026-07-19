@@ -89,6 +89,7 @@ artifacts/
 # Local tool configs (untracked, user-specific)
 context*.json
 !context7.json
+project_notes/API.txt
 /tests/backtest/_manual_runs
 
 # Local scratch / diagnostics (never commit)

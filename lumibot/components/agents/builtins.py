@@ -5,11 +5,10 @@ from datetime import date, datetime, timedelta, timezone
 from importlib import import_module
 from typing import Any, Literal
 
-from .docs_tools import search_lumibot_docs
 from .asset_resolution import resolve_asset_and_quote
+from .docs_tools import search_lumibot_docs
 from .schemas import BoundTool, ToolDefinition
 from .tool_context import current_agent_tool_context
-
 
 AssetTypeArg = Literal["stock", "option", "future", "cont_future", "forex", "crypto", "index", "multileg", "us_equity"]
 OrderSideArg = Literal["buy", "sell", "buy_to_open", "sell_to_close", "sell_short", "buy_to_cover"]
@@ -209,6 +208,103 @@ def _require_agent_order_readiness(symbol: str) -> None:
         )
 
 
+def _agent_negative_cash_guard_enabled() -> bool:
+    value = os.environ.get("LUMIBOT_AGENT_ALLOW_NEGATIVE_CASH", "")
+    return value.strip().lower() not in {"1", "true", "yes", "on"}
+
+
+def _estimate_buy_order_cash_requirement(
+    strategy: Any,
+    *,
+    asset: Any,
+    quote: Any,
+    quantity: float,
+    asset_type: str,
+    order_type: str,
+    limit_price: float | None,
+    stop_price: float | None,
+    stop_limit_price: float | None,
+    exchange: str | None,
+) -> float | None:
+    if str(asset_type).strip().lower() not in {"stock", "us_equity"}:
+        return None
+
+    price: float | None = None
+    if order_type in {"limit", "smart_limit"} and limit_price is not None:
+        price = float(limit_price)
+    elif order_type == "stop_limit":
+        price = float(stop_limit_price if stop_limit_price is not None else limit_price)
+    elif order_type == "stop" and stop_price is not None:
+        price = float(stop_price)
+    elif order_type == "market":
+        raw_price = strategy.get_last_price(asset, quote=quote, exchange=exchange)
+        if raw_price is None:
+            raise ValueError(
+                "NEGATIVE_CASH_CHECK_UNAVAILABLE: orders_submit_order cannot verify affordability because "
+                f"market_last_price for {getattr(asset, 'symbol', asset)!r} returned None."
+            )
+        price = float(raw_price)
+
+    if price is None:
+        return None
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError(
+            "NEGATIVE_CASH_CHECK_UNAVAILABLE: orders_submit_order cannot verify affordability because "
+            f"estimated order price is invalid: {price!r}."
+        )
+    return quantity * price
+
+
+def _require_no_negative_cash_after_buy(
+    strategy: Any,
+    *,
+    asset: Any,
+    quote: Any,
+    quantity: float,
+    side: str,
+    asset_type: str,
+    order_type: str,
+    limit_price: float | None,
+    stop_price: float | None,
+    stop_limit_price: float | None,
+    exchange: str | None,
+) -> None:
+    if not _agent_negative_cash_guard_enabled():
+        return
+    if str(side).strip().lower() not in {"buy", "buy_to_open", "buy_to_cover"}:
+        return
+    if not callable(getattr(strategy, "get_cash", None)) or not callable(
+        getattr(strategy, "get_last_price", None)
+    ):
+        return
+
+    requirement = _estimate_buy_order_cash_requirement(
+        strategy,
+        asset=asset,
+        quote=quote,
+        quantity=quantity,
+        asset_type=asset_type,
+        order_type=order_type,
+        limit_price=limit_price,
+        stop_price=stop_price,
+        stop_limit_price=stop_limit_price,
+        exchange=exchange,
+    )
+    if requirement is None:
+        return
+
+    cash = float(strategy.get_cash())
+    if not math.isfinite(cash):
+        raise ValueError("NEGATIVE_CASH_CHECK_UNAVAILABLE: current cash is not finite.")
+    projected_cash = cash - requirement
+    if projected_cash < 0:
+        raise ValueError(
+            "NEGATIVE_CASH_NOT_ALLOWED: orders_submit_order rejected the buy order because estimated cost "
+            f"{requirement:.2f} would exceed available cash {cash:.2f} and leave cash {projected_cash:.2f}. "
+            "Reduce quantity, sell first, or explicitly enable negative cash outside the agent tool guard."
+        )
+
+
 def _asset_to_dict(asset: Any) -> dict[str, Any] | str:
     if asset is None:
         return "None"
@@ -387,6 +483,8 @@ def _bind_load_history(strategy: Any, manager: Any) -> BoundTool:
             "The symbol argument must be the exact tradable symbol, such as XLY or SPY, not a generated table name such as XLY_HIST. "
             "Use stock for normal equities. If asset_type is omitted, stock is assumed. Do not pass economic series ids such as DCOILWTICO, FEDFUNDS, or M2SL as market symbols; use macro/FRED tools for those instead. "
             "Use the exact column names returned in this tool result when querying the loaded DuckDB table. "
+            "The available_tables result field lists the currently queryable tables "
+            "and the exact columns for each table. "
             "History tables loaded by this tool often expose Date as the timestamp column, not datetime; "
             "Do not assume datetime exists unless it is explicitly listed in columns. "
             "Use close for the traded price when that column is listed. "
@@ -414,6 +512,10 @@ def _bind_duckdb_query(strategy: Any, manager: Any) -> BoundTool:
             "do not invent columns. "
             "History tables loaded by market_load_history_table often use Date as the timestamp column; "
             "Do not invent datetime unless the schema explicitly lists it. Use close for prices when listed. "
+            "For multi-table queries, alias every table and qualify shared or potentially shared columns such as "
+            "sym, Date, close, and return with the table alias, for example q.sym, q.Date, and q.close. "
+            "Example join: SELECT q.Date, q.close AS qqq_close, s.close AS spy_close FROM qqq_hist AS q "
+            "JOIN spy_hist AS s ON q.Date = s.Date ORDER BY q.Date. "
             "Caveat: only read-only SQL is allowed. "
             "Example: duckdb_query(sql='SELECT AVG(close) AS avg_close FROM recent_prices')."
         ),
@@ -1387,6 +1489,19 @@ def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
             right=right,
             quote_symbol=quote_symbol,
         )
+        _require_no_negative_cash_after_buy(
+            strategy,
+            asset=asset,
+            quote=quote,
+            quantity=quantity,
+            side=side,
+            asset_type=asset_type,
+            order_type=order_type,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            stop_limit_price=stop_limit_price,
+            exchange=exchange,
+        )
         created = strategy.create_order(
             asset,
             quantity,
@@ -1439,6 +1554,8 @@ def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
             "Valid side values: buy, sell, buy_to_open, sell_to_close, sell_short, buy_to_cover. "
             "Valid order_type values: market, limit, stop, stop_limit, trailing_stop, smart_limit. "
             "Valid time_in_force values: day, gtc, gtd. "
+            "For stock/us_equity buy-like orders, this tool estimates affordability and rejects orders that would "
+            "make cash negative unless LUMIBOT_AGENT_ALLOW_NEGATIVE_CASH is explicitly enabled. "
             "Caveats: limit orders require limit_price; stop and stop_limit orders require stop_price; trailing_stop requires trail_price or trail_percent; smart_limit uses LumiBot's built-in smart-limit behavior. "
             "Example: orders_submit_order(symbol='SPY', quantity=100, side='buy', asset_type='stock', order_type='market')."
         ),
