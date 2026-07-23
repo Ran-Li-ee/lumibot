@@ -8,6 +8,8 @@ from decimal import Decimal
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import ClassVar
 
+import numpy as np
+import pandas as pd
 import pytest
 from pydantic import BaseModel
 
@@ -430,6 +432,27 @@ def test_descriptor_captures_static_safe_shape_without_invoking_descriptor(tmp_p
     assert descriptor_calls == []
 
 
+@pytest.mark.parametrize(
+    ("value", "expected_shape"),
+    [
+        (np.zeros((2, 3)), [2, 3]),
+        (pd.DataFrame({"a": [1, 2], "b": [3, 4]}), [2, 2]),
+        (pd.Series([1, 2, 3]), [3]),
+    ],
+)
+def test_descriptor_captures_shape_for_trusted_array_and_pandas_types(
+    tmp_path,
+    value,
+    expected_shape,
+):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value(value)
+
+    assert descriptor["fidelity"] == "descriptor_only"
+    assert descriptor["shape"] == expected_shape
+
+
 def test_supported_model_uses_guarded_base_serializer(tmp_path):
     class OverriddenModelDump(BaseModel):
         dump_calls: ClassVar[int] = 0
@@ -701,27 +724,33 @@ def test_diagnostics_scrub_windows_and_posix_absolute_paths(tmp_path):
     message = collector.export()["diagnostics"][0]["message"]
     assert "private-windows-user" not in message
     assert "private-posix-user" not in message
-    assert message.count("[ABSOLUTE_PATH]") == 2
+    assert message == "failed at [ABSOLUTE_PATH]"
 
 
 @pytest.mark.parametrize(
-    "message",
+    ("message", "expected"),
     [
         (
             "failed at "
             r"C:\Users\Private User\trace\event.json "
-            "and /home/Private User/trace/event.json during trace write"
+            "and /home/Private User/trace/event.json during trace write",
+            "failed at [ABSOLUTE_PATH]",
         ),
         (
             "failed at "
             r'"C:\Users\Private User\trace\event.json" '
-            "and '/home/Private User/trace/event.json' during trace write"
+            "and '/home/Private User/trace/event.json' during trace write",
+            (
+                "failed at [ABSOLUTE_PATH] and [ABSOLUTE_PATH] "
+                "during trace write"
+            ),
         ),
     ],
 )
 def test_diagnostics_scrub_complete_absolute_paths_containing_spaces(
     tmp_path,
     message,
+    expected,
 ):
     collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
 
@@ -731,9 +760,31 @@ def test_diagnostics_scrub_complete_absolute_paths_containing_spaces(
     assert "Private User" not in safe_message
     assert r"trace\event.json" not in safe_message
     assert "trace/event.json" not in safe_message
-    assert safe_message.count("[ABSOLUTE_PATH]") == 2
-    assert "failed at" in safe_message
-    assert "during trace write" in safe_message
+    assert safe_message == expected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\Users\Tom and Jerry\trace\event.json",
+        r"C:\Users\Tom or Jerry\trace\event.json",
+        "/home/Tom and Jerry/trace/event.json",
+        "/home/Tom or Jerry/trace/event.json",
+    ],
+)
+def test_unquoted_conjunction_directory_is_scrubbed_through_end_of_line(
+    tmp_path,
+    path,
+):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    collector.add_diagnostic("path_failure", OSError(f"failed at {path}"))
+
+    safe_message = collector.export()["diagnostics"][0]["message"]
+    assert safe_message == "failed at [ABSOLUTE_PATH]"
+    assert "Tom" not in safe_message
+    assert "Jerry" not in safe_message
+    assert "trace" not in safe_message
 
 
 def test_sidecar_failure_adds_diagnostic_without_raising(monkeypatch, tmp_path):
@@ -794,7 +845,7 @@ def test_sidecar_failure_diagnostic_scrubs_machine_path(
     assert event["payload_meta"]["truncated"] is True
     assert "private-windows-user" not in message
     assert "private-posix-user" not in message
-    assert message.count("[ABSOLUTE_PATH]") == 2
+    assert message == "replace failed at [ABSOLUTE_PATH]"
 
 
 def test_redaction_failure_records_no_payload_and_does_not_raise(monkeypatch, tmp_path):

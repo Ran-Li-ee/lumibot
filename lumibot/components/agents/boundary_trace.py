@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import sys
 import tempfile
 import threading
 from datetime import date, datetime, timezone
@@ -33,10 +34,7 @@ _SAFE_SPAN_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 _QUOTED_ABSOLUTE_PATH_RE = re.compile(
     r"(?P<quote>[\"'])(?:(?:[A-Za-z]:[\\/]|\\\\)|/).*?(?P=quote)"
 )
-_PATH_MESSAGE_END = (
-    r"(?=(?:\s+(?:and|or|because|while|then|during|after|before)\b)"
-    r"|[,;\r\n]|$)"
-)
+_PATH_MESSAGE_END = r"(?=[,;\r\n]|$)"
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\).*?"
     + _PATH_MESSAGE_END,
@@ -51,6 +49,12 @@ _active_tool_call: contextvars.ContextVar[dict[str, Any] | None] = contextvars.C
     "lumibot_boundary_tool_call",
     default=None,
 )
+
+_TRUSTED_SHAPE_TYPE_EXPORTS = {
+    ("numpy", "ndarray"): ("numpy", "ndarray"),
+    ("pandas.core.frame", "DataFrame"): ("pandas", "DataFrame"),
+    ("pandas.core.series", "Series"): ("pandas", "Series"),
+}
 
 
 def utc_iso_timestamp() -> str:
@@ -172,9 +176,10 @@ def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, default=str).encode("utf-8")
 
 
-def _descriptor_type(value: Any) -> dict[str, Any]:
+def _hook_free_type_identity(
+    value_type: type,
+) -> tuple[str, str, str] | None:
     try:
-        value_type = type(value)
         python_type = type.__getattribute__(value_type, "__name__")
         module = type.__getattribute__(value_type, "__module__")
         qualname = type.__getattribute__(value_type, "__qualname__")
@@ -183,10 +188,19 @@ def _descriptor_type(value: Any) -> dict[str, Any]:
             for item in (python_type, module, qualname)
         ):
             raise TypeError("type identity is not string-valued")
-        qualified_type = f"{module}.{qualname}"
+        return python_type, module, qualname
     except Exception:
+        return None
+
+
+def _descriptor_type(value: Any) -> dict[str, Any]:
+    identity = _hook_free_type_identity(type(value))
+    if identity is None:
         python_type = "unknown"
         qualified_type = "unknown"
+    else:
+        python_type, module, qualname = identity
+        qualified_type = f"{module}.{qualname}"
     return {
         "fidelity": "descriptor_only",
         "python_type": python_type,
@@ -203,11 +217,47 @@ def _safe_static_shape(value: Any) -> list[int | None] | None:
         shape = inspect.getattr_static(value, "shape")
     except Exception:
         return None
-    if type(shape) is not tuple:
-        return None
-    if not all(dimension is None or type(dimension) is int for dimension in shape):
+    return _safe_shape_tuple(shape)
+
+
+def _safe_shape_tuple(shape: Any) -> list[int | None] | None:
+    if type(shape) is not tuple or not all(
+        dimension is None or type(dimension) is int
+        for dimension in shape
+    ):
         return None
     return list(shape)
+
+
+def _is_trusted_shape_type(value_type: type) -> bool:
+    identity = _hook_free_type_identity(value_type)
+    if identity is None:
+        return False
+    python_type, module, qualname = identity
+    export = _TRUSTED_SHAPE_TYPE_EXPORTS.get(
+        (module, qualname)
+    )
+    if export is None or python_type != qualname:
+        return False
+    module_name, export_name = export
+    loaded_module = sys.modules.get(module_name)
+    if loaded_module is None:
+        return False
+    return vars(loaded_module).get(export_name) is value_type
+
+
+def _safe_shape(value: Any) -> list[int | None] | None:
+    static_shape = _safe_static_shape(value)
+    if static_shape is not None:
+        return static_shape
+    if not _is_trusted_shape_type(type(value)):
+        return None
+    try:
+        return _safe_shape_tuple(
+            object.__getattribute__(value, "shape")
+        )
+    except Exception:
+        return None
 
 
 def _safe_mapping_key(value: Any) -> tuple[str, bool]:
@@ -360,7 +410,7 @@ class BoundaryTraceCollector:
         if isinstance(value, collections.abc.Iterator):
             descriptor["one_shot"] = True
             return descriptor
-        shape = _safe_static_shape(value)
+        shape = _safe_shape(value)
         if shape is not None:
             descriptor["shape"] = shape
         if isinstance(value, collections.abc.Mapping):
