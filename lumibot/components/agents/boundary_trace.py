@@ -6,6 +6,7 @@ import contextvars
 import copy
 import gzip
 import hashlib
+import inspect
 import itertools
 import json
 import math
@@ -37,17 +38,12 @@ DEFAULT_INLINE_PAYLOAD_LIMIT = 64_000
 _DESCRIPTOR_ONLY = object()
 _SAFE_PATH_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _SAFE_SPAN_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
-_QUOTED_ABSOLUTE_PATH_RE = re.compile(
-    r"(?P<quote>[\"'])(?:(?:[A-Za-z]:[\\/]|\\\\)|/).*?(?P=quote)"
-)
-_PATH_MESSAGE_END = r"(?=[\r\n]|$)"
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\).*?"
-    + _PATH_MESSAGE_END,
+    r"(?<![A-Za-z0-9_])[\"']?(?:[A-Za-z]:[\\/]|\\\\)[^\r\n]*",
     re.IGNORECASE,
 )
 _POSIX_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_:/\.])/.*?" + _PATH_MESSAGE_END,
+    r"(?<![A-Za-z0-9_:/\.])[\"']?/[^\r\n]*",
     re.IGNORECASE,
 )
 
@@ -242,8 +238,7 @@ def _redact_trace_keys(value: Any) -> Any:
 
 
 def _scrub_absolute_paths(value: str) -> str:
-    scrubbed = _QUOTED_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", value)
-    scrubbed = _WINDOWS_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", scrubbed)
+    scrubbed = _WINDOWS_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", value)
     return _POSIX_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", scrubbed)
 
 
@@ -317,17 +312,12 @@ def _type_based_preview(descriptor: dict[str, Any]) -> str:
     return f"<{descriptor['qualified_type']} instance>"
 
 
-def _safe_static_shape(value_type: type) -> list[int | None] | None:
-    for candidate in _hook_free_mro(value_type):
-        try:
-            namespace = type.__getattribute__(candidate, "__dict__")
-            shape = namespace.get("shape")
-        except Exception:
-            continue
-        safe_shape = _safe_shape_tuple(shape)
-        if safe_shape is not None:
-            return safe_shape
-    return None
+def _safe_static_shape(value: Any) -> list[int | None] | None:
+    try:
+        shape = inspect.getattr_static(value, "shape")
+    except Exception:
+        return None
+    return _safe_shape_tuple(shape)
 
 
 def _safe_shape_tuple(shape: Any) -> list[int | None] | None:
@@ -357,7 +347,7 @@ def _is_trusted_shape_type(value_type: type) -> bool:
 
 
 def _safe_shape(value: Any, value_type: type) -> list[int | None] | None:
-    static_shape = _safe_static_shape(value_type)
+    static_shape = _safe_static_shape(value)
     if static_shape is not None:
         return static_shape
     if not _is_trusted_shape_type(value_type):

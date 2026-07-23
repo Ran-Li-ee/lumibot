@@ -432,6 +432,31 @@ def test_descriptor_captures_static_safe_shape_without_invoking_descriptor(tmp_p
     assert descriptor_calls == []
 
 
+def test_descriptor_captures_instance_shape_without_invoking_property(tmp_path):
+    class InstanceShapeValue:
+        def __init__(self):
+            self.shape = (4, 5)
+
+    class PropertyShapeValue:
+        def __init__(self):
+            self.shape_accesses = 0
+
+        @property
+        def shape(self):
+            self.shape_accesses += 1
+            return (9, 9)
+
+    property_value = PropertyShapeValue()
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    instance_descriptor = collector.describe_raw_value(InstanceShapeValue())
+    property_descriptor = collector.describe_raw_value(property_value)
+
+    assert instance_descriptor["shape"] == [4, 5]
+    assert "shape" not in property_descriptor
+    assert property_value.shape_accesses == 0
+
+
 @pytest.mark.parametrize(
     ("value", "expected_shape"),
     [
@@ -768,10 +793,7 @@ def test_diagnostics_scrub_windows_and_posix_absolute_paths(tmp_path):
             "failed at "
             r'"C:\Users\Private User\trace\event.json" '
             "and '/home/Private User/trace/event.json' during trace write",
-            (
-                "failed at [ABSOLUTE_PATH] and [ABSOLUTE_PATH] "
-                "during trace write"
-            ),
+            "failed at [ABSOLUTE_PATH]",
         ),
     ],
 )
@@ -839,6 +861,28 @@ def test_unquoted_punctuation_directory_is_scrubbed_through_end_of_line(
     assert "Alpha" not in safe_message
     assert "Beta" not in safe_message
     assert "trace" not in safe_message
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\Users\O'Brien\trace\event.json",
+        "/home/O'Brien/trace/event.json",
+    ],
+)
+def test_quoted_apostrophe_path_is_scrubbed_through_end_of_line(tmp_path, path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    collector.add_diagnostic(
+        "path_failure",
+        OSError(f"failed at '{path}' during trace write"),
+    )
+
+    safe_message = collector.export()["diagnostics"][0]["message"]
+    assert safe_message == "failed at [ABSOLUTE_PATH]"
+    assert "O'Brien" not in safe_message
+    assert "trace" not in safe_message
+    assert "during trace write" not in safe_message
 
 
 def test_sidecar_failure_adds_diagnostic_without_raising(monkeypatch, tmp_path):
