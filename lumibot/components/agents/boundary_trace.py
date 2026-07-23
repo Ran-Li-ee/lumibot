@@ -504,6 +504,29 @@ class BoundaryTraceCollector:
         with self._lock:
             return dict(self._call_index.get(call_id) or {})
 
+    def note_wrapper_arguments(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        detached_arguments = copy.deepcopy(arguments)
+        with self._lock:
+            state = self._call_index.setdefault(call_id, {})
+            state["wrapper_received_arguments"] = detached_arguments
+            state["wrapper_invoked"] = True
+
+    def call_state(self, call_id: str) -> dict[str, Any]:
+        with self._lock:
+            return copy.deepcopy(self._call_index.get(call_id) or {})
+
+    def clear_wrapper_call_state(self, call_id: str) -> None:
+        with self._lock:
+            state = self._call_index.get(call_id)
+            if state is None:
+                return
+            state.pop("wrapper_received_arguments", None)
+            state.pop("wrapper_invoked", None)
+
     @contextlib.contextmanager
     def tool_call_context(self, **context: Any) -> Iterator[None]:
         token = _active_tool_call.set(dict(context))

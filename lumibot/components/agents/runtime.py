@@ -227,10 +227,12 @@ def _wrap_tool_callable(
 
         started_at = _utc_iso_timestamp()
         started_perf = time.perf_counter()
+        wrapper_received_arguments = dict(kwargs)
         effective_arguments = dict(kwargs)
         if callable_signature is not None:
             try:
                 bound = callable_signature.bind_partial(*args, **kwargs)
+                wrapper_received_arguments = dict(bound.arguments)
                 bound.apply_defaults()
                 effective_arguments = dict(bound.arguments)
             except (TypeError, ValueError):
@@ -241,6 +243,19 @@ def _wrap_tool_callable(
             "tool_batch_id": call_context.get("tool_batch_id"),
             "call_id": call_context.get("call_id"),
         }
+        call_id = trace_ids["call_id"]
+        if collector is not None and call_id is not None:
+            try:
+                collector.note_wrapper_arguments(
+                    str(call_id),
+                    wrapper_received_arguments,
+                )
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "note_wrapper_arguments_failed",
+                    exc,
+                )
         _record_tool_boundary(
             collector,
             transition="B05_WRAPPER_TO_PYTHON_TOOL",
@@ -348,6 +363,193 @@ def _wrap_tool_callable(
     if annotations is not None:
         wrapper.__annotations__ = annotations
     return wrapper
+
+
+def _build_observed_function_tool(
+    function_tool_type: type[Any],
+    tool: BoundTool,
+    *,
+    collector: BoundaryTraceCollector | None,
+    shared_tool_context: dict[str, Any],
+):
+    wrapped = _wrap_tool_callable(
+        tool,
+        shared_tool_context,
+        collector=collector,
+    )
+    if collector is None:
+        return function_tool_type(wrapped)
+
+    class ObservedFunctionTool(function_tool_type):
+        async def run_async(
+            self,
+            *,
+            args: dict[str, Any],
+            tool_context: Any,
+        ) -> Any:
+            try:
+                provider_call_id = getattr(
+                    tool_context,
+                    "function_call_id",
+                    None,
+                )
+                if provider_call_id:
+                    call_id = str(provider_call_id)
+                    call_id_source = "provider"
+                else:
+                    call_id = f"generated:function_tool:{uuid4().hex}"
+                    call_id_source = (
+                        "generated_missing_function_tool_id"
+                    )
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "function_call_id_observation_failed",
+                    exc,
+                )
+                call_id = f"generated:function_tool:{uuid4().hex}"
+                call_id_source = "generated_missing_function_tool_id"
+
+            ids: dict[str, Any] = {}
+            try:
+                ids = collector.call_ids(call_id)
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "function_tool_call_lookup_failed",
+                    exc,
+                )
+            try:
+                collector.clear_wrapper_call_state(call_id)
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "function_tool_call_state_cleanup_failed",
+                    exc,
+                )
+
+            trace_context = None
+            try:
+                trace_context = collector.tool_call_context(
+                    call_id=call_id,
+                    tool_name=tool.name,
+                    model_turn_id=ids.get("model_turn_id"),
+                    tool_batch_id=ids.get("tool_batch_id"),
+                )
+                trace_context.__enter__()
+            except Exception as exc:
+                trace_context = None
+                _add_trace_diagnostic(
+                    collector,
+                    "function_tool_context_failed",
+                    exc,
+                )
+
+            try:
+                result = await super().run_async(
+                    args=args,
+                    tool_context=tool_context,
+                )
+            except BaseException:
+                if trace_context is not None:
+                    try:
+                        trace_context.__exit__(*sys.exc_info())
+                    except Exception as exc:
+                        _add_trace_diagnostic(
+                            collector,
+                            "function_tool_context_exit_failed",
+                            exc,
+                        )
+                raise
+            else:
+                if trace_context is not None:
+                    try:
+                        trace_context.__exit__(None, None, None)
+                    except Exception as exc:
+                        _add_trace_diagnostic(
+                            collector,
+                            "function_tool_context_exit_failed",
+                            exc,
+                        )
+
+            state: dict[str, Any] = {}
+            try:
+                state = collector.call_state(call_id)
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "function_tool_call_state_failed",
+                    exc,
+                )
+
+            try:
+                wrapper_arguments = state.get(
+                    "wrapper_received_arguments"
+                )
+                wrapper_invoked = bool(state.get("wrapper_invoked"))
+                missing: list[str] = []
+                if not wrapper_invoked and isinstance(result, dict):
+                    message = str(result.get("error") or "")
+                    if "mandatory input parameters" in message:
+                        try:
+                            signature = inspect.signature(wrapped)
+                            missing = [
+                                name
+                                for name, parameter in signature.parameters.items()
+                                if parameter.default is inspect.Parameter.empty
+                                and name not in args
+                            ]
+                        except Exception as exc:
+                            _add_trace_diagnostic(
+                                collector,
+                                "function_tool_missing_arguments_failed",
+                                exc,
+                            )
+                accepted = set(wrapper_arguments or {})
+                _record_tool_boundary(
+                    collector,
+                    transition="B04_FUNCTION_TOOL_TO_WRAPPER",
+                    from_module="function_tool",
+                    to_module="lumibot_tool_wrapper",
+                    status=(
+                        "success"
+                        if wrapper_invoked
+                        else "blocked"
+                    ),
+                    model_turn_id=ids.get("model_turn_id"),
+                    tool_batch_id=ids.get("tool_batch_id"),
+                    call_id=call_id,
+                    payload={
+                        "tool_name": tool.name,
+                        "call_id_source": call_id_source,
+                        "model_arguments": dict(args),
+                        "wrapper_received_arguments": wrapper_arguments,
+                        "removed_arguments": (
+                            sorted(set(args) - accepted)
+                            if wrapper_arguments is not None
+                            else []
+                        ),
+                        "missing_mandatory_arguments": missing,
+                    },
+                )
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "function_tool_boundary_observation_failed",
+                    exc,
+                )
+            finally:
+                try:
+                    collector.clear_wrapper_call_state(call_id)
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "function_tool_call_state_cleanup_failed",
+                        exc,
+                    )
+            return result
+
+    return ObservedFunctionTool(wrapped)
 
 
 def _json_safe_value(value: Any) -> Any:
@@ -522,6 +724,14 @@ def _aggregate_usage_metadata(payloads: list[dict[str, Any]]) -> dict[str, Any] 
 
 def _normalize_event(event: Any) -> list[AgentTraceEvent]:
     normalized: list[AgentTraceEvent] = []
+    event_id = str(getattr(event, "id", None) or "") or None
+    invocation_id = (
+        str(getattr(event, "invocation_id", None) or "") or None
+    )
+    event_metadata = {
+        "event_id": event_id,
+        "invocation_id": invocation_id,
+    }
     parts = getattr(getattr(event, "content", None), "parts", None) or []
     for part in parts:
         if getattr(part, "thought", None) is True:
@@ -532,13 +742,20 @@ def _normalize_event(event: Any) -> list[AgentTraceEvent]:
                         kind="thinking",
                         text=thought_text.strip(),
                         payload={"source": "model_thought"},
+                        **event_metadata,
                     )
                 )
                 continue
 
         text = getattr(part, "text", None)
         if isinstance(text, str) and text.strip():
-            normalized.append(AgentTraceEvent(kind="text", text=text.strip()))
+            normalized.append(
+                AgentTraceEvent(
+                    kind="text",
+                    text=text.strip(),
+                    **event_metadata,
+                )
+            )
 
         function_call = getattr(part, "function_call", None)
         if function_call and getattr(function_call, "name", None):
@@ -550,25 +767,49 @@ def _normalize_event(event: Any) -> list[AgentTraceEvent]:
                     kind="tool_call",
                     tool_name=str(function_call.name),
                     payload=payload,
+                    call_id=(
+                        str(getattr(function_call, "id", None) or "")
+                        or None
+                    ),
+                    **event_metadata,
                 )
             )
 
         function_response = getattr(part, "function_response", None)
         if function_response and getattr(function_response, "name", None):
             tool_name = str(function_response.name)
+            call_id = (
+                str(getattr(function_response, "id", None) or "") or None
+            )
             for chunk in _extract_tool_text(function_response.response):
-                normalized.append(AgentTraceEvent(kind="text", text=chunk, tool_name=tool_name))
+                normalized.append(
+                    AgentTraceEvent(
+                        kind="text",
+                        text=chunk,
+                        tool_name=tool_name,
+                        call_id=call_id,
+                        **event_metadata,
+                    )
+                )
             normalized.append(
                 AgentTraceEvent(
                     kind="tool_result",
                     tool_name=tool_name,
                     payload=_extract_structured_content(function_response.response or {}),
+                    call_id=call_id,
+                    **event_metadata,
                 )
             )
 
     usage_payload = _coerce_usage_metadata(getattr(event, "usage_metadata", None))
     if usage_payload:
-        normalized.append(AgentTraceEvent(kind="usage", payload=usage_payload))
+        normalized.append(
+            AgentTraceEvent(
+                kind="usage",
+                payload=usage_payload,
+                **event_metadata,
+            )
+        )
     return normalized
 
 
@@ -1430,7 +1671,15 @@ class GoogleADKRuntime:
             "enforce_order_readiness": True,
             "tool_calls": [],
         }
-        tools = [function_tool_type(_wrap_tool_callable(tool, active_tool_context)) for tool in request.bound_tools]
+        tools = [
+            _build_observed_function_tool(
+                function_tool_type,
+                tool,
+                collector=request.boundary_collector,
+                shared_tool_context=active_tool_context,
+            )
+            for tool in request.bound_tools
+        ]
         config_kwargs = self._generate_content_config_kwargs_for_request(request, genai_types)
         model_request_timeout_seconds = self._model_request_timeout_seconds_for_request(request)
         run_timeout_seconds = self._run_timeout_seconds_for_request(request)

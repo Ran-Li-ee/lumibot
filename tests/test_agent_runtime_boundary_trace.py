@@ -1,12 +1,23 @@
+import asyncio
 import inspect
 import time
 from datetime import datetime, timezone
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
+from google.adk.tools.function_tool import FunctionTool
+from pydantic import BaseModel
 
+from lumibot.components.agents import runtime as agent_runtime
 from lumibot.components.agents.boundary_trace import BoundaryTraceCollector
-from lumibot.components.agents.runtime import RuntimeRequest, _wrap_tool_callable
+from lumibot.components.agents.runtime import (
+    GoogleADKRuntime,
+    RuntimeRequest,
+    _build_observed_function_tool,
+    _normalize_event,
+    _wrap_tool_callable,
+)
 from lumibot.components.agents.schemas import BoundTool
 
 
@@ -36,6 +47,478 @@ def make_runtime_request(collector, *, tools=None, model="openai/test"):
         agent_run_id=collector.agent_run_id,
         boundary_collector=collector,
     )
+
+
+class SymbolInput(BaseModel):
+    symbol: str
+
+
+class FakeToolContext:
+    function_call_id = "call_A"
+    tool_confirmation = None
+
+    class Actions:
+        skip_summarization = False
+
+    actions = Actions()
+
+
+def test_observed_function_tool_correlates_validated_wrapper_arguments(tmp_path):
+    received = {}
+
+    def tool(request: SymbolInput, asset_type: str = "stock"):
+        received["request"] = request
+        received["asset_type"] = asset_type
+        return {"symbol": request.symbol, "asset_type": asset_type}
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    turn_id = collector.start_model_turn()
+    batch_id = collector.register_tool_batch(turn_id, ["call_A"])
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(name="tool", description="tool", function=tool),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    result = asyncio.run(
+        observed.run_async(
+            args={"request": {"symbol": "QQQ"}, "unknown": "removed"},
+            tool_context=FakeToolContext(),
+        )
+    )
+
+    assert result == {"symbol": "QQQ", "asset_type": "stock"}
+    assert isinstance(received["request"], SymbolInput)
+    assert received["request"].symbol == "QQQ"
+    assert received["asset_type"] == "stock"
+    b04 = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")[0]
+    assert b04["call_id"] == "call_A"
+    assert b04["model_turn_id"] == turn_id
+    assert b04["tool_batch_id"] == batch_id
+    assert b04["payload"]["call_id_source"] == "provider"
+    assert b04["payload"]["model_arguments"]["unknown"] == "removed"
+    assert b04["payload"]["wrapper_received_arguments"]["request"] == {
+        "symbol": "QQQ"
+    }
+    assert b04["payload"]["removed_arguments"] == ["unknown"]
+    b05 = _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL")[0]
+    assert b05["payload"]["effective_arguments"]["asset_type"] == "stock"
+
+
+def test_missing_required_argument_records_b04_without_local_execution(tmp_path):
+    executed = []
+
+    def tool(symbol: str):
+        executed.append(symbol)
+        return {"symbol": symbol}
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    turn_id = collector.start_model_turn()
+    collector.register_tool_batch(turn_id, ["call_A"])
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(name="tool", description="tool", function=tool),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    result = asyncio.run(
+        observed.run_async(args={}, tool_context=FakeToolContext())
+    )
+
+    assert executed == []
+    assert "mandatory input parameters" in result["error"]
+    b04 = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")[0]
+    assert b04["status"] == "blocked"
+    assert b04["payload"]["missing_mandatory_arguments"] == ["symbol"]
+    assert _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL") == []
+
+
+def test_collector_call_state_is_detached_from_mutable_arguments(tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    arguments = {"request": {"symbol": "QQQ"}}
+
+    collector.note_wrapper_arguments("call_A", arguments)
+    arguments["request"]["symbol"] = "SPY"
+    first_state = collector.call_state("call_A")
+    first_state["wrapper_received_arguments"]["request"]["symbol"] = "IWM"
+
+    assert collector.call_state("call_A") == {
+        "wrapper_invoked": True,
+        "wrapper_received_arguments": {"request": {"symbol": "QQQ"}},
+    }
+
+
+def test_observed_function_tool_without_collector_is_ordinary_function_tool():
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(
+            name="echo",
+            description="echo",
+            function=lambda value="default": value,
+        ),
+        collector=None,
+        shared_tool_context={},
+    )
+
+    assert type(observed) is FunctionTool
+    assert (
+        asyncio.run(
+            observed.run_async(
+                args={"value": "received"},
+                tool_context=FakeToolContext(),
+            )
+        )
+        == "received"
+    )
+
+
+def test_observed_function_tool_generates_missing_call_id(tmp_path):
+    class MissingIdToolContext(FakeToolContext):
+        function_call_id = None
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(
+            name="echo",
+            description="echo",
+            function=lambda value: value,
+        ),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    assert (
+        asyncio.run(
+            observed.run_async(
+                args={"value": "received"},
+                tool_context=MissingIdToolContext(),
+            )
+        )
+        == "received"
+    )
+
+    b04 = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")[0]
+    assert b04["call_id"].startswith("generated:function_tool:")
+    assert (
+        b04["payload"]["call_id_source"]
+        == "generated_missing_function_tool_id"
+    )
+
+
+def test_unreadable_provider_call_id_falls_back_without_blocking_tool(tmp_path):
+    class UnreadableCallId:
+        def __bool__(self):
+            return True
+
+        def __str__(self):
+            raise RuntimeError("call ID unavailable")
+
+    class UnreadableIdToolContext(FakeToolContext):
+        function_call_id = UnreadableCallId()
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(
+            name="echo",
+            description="echo",
+            function=lambda value: value,
+        ),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    result = asyncio.run(
+        observed.run_async(
+            args={"value": "received"},
+            tool_context=UnreadableIdToolContext(),
+        )
+    )
+
+    assert result == "received"
+    b04 = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")[0]
+    assert b04["call_id"].startswith("generated:function_tool:")
+    assert (
+        b04["payload"]["call_id_source"]
+        == "generated_missing_function_tool_id"
+    )
+
+
+def test_repeated_provider_call_id_does_not_reuse_wrapper_state(tmp_path):
+    executed = []
+
+    def tool(symbol: str):
+        executed.append(symbol)
+        return {"symbol": symbol}
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(name="tool", description="tool", function=tool),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    first = asyncio.run(
+        observed.run_async(
+            args={"symbol": "QQQ"},
+            tool_context=FakeToolContext(),
+        )
+    )
+    second = asyncio.run(
+        observed.run_async(args={}, tool_context=FakeToolContext())
+    )
+
+    assert first == {"symbol": "QQQ"}
+    assert "mandatory input parameters" in second["error"]
+    assert executed == ["QQQ"]
+    b04_events = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")
+    assert [event["status"] for event in b04_events] == ["success", "blocked"]
+    assert b04_events[1]["payload"]["wrapper_received_arguments"] is None
+    assert b04_events[1]["payload"]["missing_mandatory_arguments"] == ["symbol"]
+
+
+def test_function_tool_observation_failures_preserve_success_result(
+    monkeypatch, tmp_path
+):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(
+            name="echo",
+            description="echo",
+            function=lambda value: {"value": value},
+        ),
+        collector=collector,
+        shared_tool_context={},
+    )
+    monkeypatch.setattr(
+        collector,
+        "call_state",
+        lambda _call_id: (_ for _ in ()).throw(RuntimeError("state failed")),
+    )
+    monkeypatch.setattr(
+        collector,
+        "record",
+        lambda **_event: (_ for _ in ()).throw(RuntimeError("record failed")),
+    )
+
+    result = asyncio.run(
+        observed.run_async(
+            args={"value": "received"},
+            tool_context=FakeToolContext(),
+        )
+    )
+
+    assert result == {"value": "received"}
+
+
+def test_b04_payload_observation_failure_preserves_success_result(
+    monkeypatch, tmp_path
+):
+    class BrokenState:
+        def get(self, _key, _default=None):
+            raise RuntimeError("state payload failed")
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(
+            name="echo",
+            description="echo",
+            function=lambda value: {"value": value},
+        ),
+        collector=collector,
+        shared_tool_context={},
+    )
+    monkeypatch.setattr(
+        collector,
+        "call_state",
+        lambda _call_id: BrokenState(),
+    )
+
+    result = asyncio.run(
+        observed.run_async(
+            args={"value": "received"},
+            tool_context=FakeToolContext(),
+        )
+    )
+
+    assert result == {"value": "received"}
+
+
+def test_function_tool_observation_failures_preserve_validation_result(
+    monkeypatch, tmp_path
+):
+    executed = []
+
+    def tool(symbol: str):
+        executed.append(symbol)
+        return {"symbol": symbol}
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(name="tool", description="tool", function=tool),
+        collector=collector,
+        shared_tool_context={},
+    )
+    monkeypatch.setattr(
+        collector,
+        "call_ids",
+        lambda _call_id: (_ for _ in ()).throw(RuntimeError("lookup failed")),
+    )
+
+    result = asyncio.run(
+        observed.run_async(args={}, tool_context=FakeToolContext())
+    )
+
+    assert executed == []
+    assert "mandatory input parameters" in result["error"]
+
+
+def test_normalize_event_preserves_raw_and_function_call_ids():
+    event = SimpleNamespace(
+        id="event-1",
+        invocation_id="invocation-1",
+        content=SimpleNamespace(
+            parts=[
+                SimpleNamespace(thought=True, text="reasoning"),
+                SimpleNamespace(thought=False, text="answer"),
+                SimpleNamespace(
+                    thought=False,
+                    text=None,
+                    function_call=SimpleNamespace(
+                        id="call-1",
+                        name="lookup",
+                        args={"symbol": "QQQ"},
+                    ),
+                ),
+                SimpleNamespace(
+                    thought=False,
+                    text=None,
+                    function_response=SimpleNamespace(
+                        id="call-2",
+                        name="lookup",
+                        response={
+                            "content": [{"text": "tool output"}],
+                            "value": 42,
+                        },
+                    ),
+                ),
+            ]
+        ),
+        usage_metadata={"total_token_count": 3},
+    )
+
+    normalized = _normalize_event(event)
+
+    assert normalized
+    assert {item.event_id for item in normalized} == {"event-1"}
+    assert {item.invocation_id for item in normalized} == {"invocation-1"}
+    tool_call = next(item for item in normalized if item.kind == "tool_call")
+    assert tool_call.call_id == "call-1"
+    response_events = [
+        item
+        for item in normalized
+        if item.tool_name == "lookup" and item.kind in {"text", "tool_result"}
+    ]
+    assert response_events
+    assert {item.call_id for item in response_events} == {"call-2"}
+
+
+def test_run_async_builds_every_bound_tool_with_request_collector(
+    monkeypatch, tmp_path
+):
+    built = []
+    agent_tools = []
+
+    def build(function_tool_type, tool, *, collector, shared_tool_context):
+        built.append(
+            (
+                function_tool_type,
+                tool,
+                collector,
+                shared_tool_context,
+            )
+        )
+        return f"built:{tool.name}"
+
+    class FakeTypes:
+        class GenerateContentConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class Part:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class Content:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            agent_tools.extend(kwargs["tools"])
+
+    class FakeSessionService:
+        async def create_session(self, **_kwargs):
+            return None
+
+    class FakeRunner:
+        def __init__(self, *, agent, app_name):
+            self.agent = agent
+            self.app_name = app_name
+            self.session_service = FakeSessionService()
+
+        async def run_async(self, **_kwargs):
+            if False:
+                yield None
+
+    class FakeRunConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    tools = [
+        BoundTool(name="one", description="one", function=lambda: 1),
+        BoundTool(name="two", description="two", function=lambda: 2),
+    ]
+    request = make_runtime_request(collector, tools=tools, model="gemini-test")
+    runtime = GoogleADKRuntime()
+    monkeypatch.setattr(agent_runtime, "_build_observed_function_tool", build)
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_adk",
+        lambda: (FakeAgent, FakeRunner, FakeTypes, FunctionTool),
+    )
+    monkeypatch.setattr(
+        agent_runtime.importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(RunConfig=FakeRunConfig)
+            if name == "google.adk.agents.run_config"
+            else pytest.fail(f"unexpected import: {name}")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_maybe_build_gemini_thinking_planner",
+        lambda *_args: None,
+    )
+
+    result = asyncio.run(runtime._run_async(request))
+
+    assert result.events == []
+    assert agent_tools == ["built:one", "built:two"]
+    assert [entry[1] for entry in built] == tools
+    assert all(entry[0] is FunctionTool for entry in built)
+    assert all(entry[2] is collector for entry in built)
+    assert built[0][3] is built[1][3]
+    assert built[0][3]["agent_name"] == "agent"
 
 
 def test_wrapper_records_raw_and_serialized_results_separately(tmp_path):
