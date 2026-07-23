@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import collections.abc
 import contextlib
 import contextvars
+import copy
 import hashlib
 import itertools
 import json
+import math
 import threading
-import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from .trace_redaction import redact_sensitive
 
@@ -30,6 +34,47 @@ def utc_iso_timestamp() -> str:
 def current_tool_call_context() -> dict[str, Any] | None:
     value = _active_tool_call.get()
     return dict(value) if isinstance(value, dict) else None
+
+
+def _normalize_trace_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (Decimal, UUID)):
+        return str(value)
+    if isinstance(value, Enum):
+        return _normalize_trace_value(value.value)
+    if isinstance(value, collections.abc.Mapping):
+        return {str(key): _normalize_trace_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_trace_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized = [_normalize_trace_value(item) for item in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True))
+    if isinstance(value, collections.abc.Iterator):
+        return repr(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _normalize_trace_value(model_dump(mode="json"))
+    return repr(value)
+
+
+def _redact_trace_value(value: Any) -> Any:
+    return _redact_trace_keys(redact_sensitive(value))
+
+
+def _redact_trace_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            redact_sensitive(str(key)): _redact_trace_keys(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_trace_keys(item) for item in value]
+    return value
 
 
 class BoundaryTraceCollector:
@@ -92,6 +137,7 @@ class BoundaryTraceCollector:
         to_module: str,
         payload: Any,
         status: str = "success",
+        adk_invocation_id: str | None = None,
         model_turn_id: str | None = None,
         tool_batch_id: str | None = None,
         call_id: str | None = None,
@@ -112,6 +158,7 @@ class BoundaryTraceCollector:
                     "to_module": to_module,
                     "status": status,
                     "agent_run_id": self.agent_run_id,
+                    "adk_invocation_id": adk_invocation_id,
                     "model_turn_id": model_turn_id,
                     "tool_batch_id": tool_batch_id,
                     "call_id": call_id,
@@ -122,38 +169,45 @@ class BoundaryTraceCollector:
                     "duration_ms": duration_ms,
                     "payload": safe_payload,
                     "payload_meta": payload_meta,
-                    "error": redact_sensitive(error),
+                    "error": _redact_trace_value(_normalize_trace_value(error)),
                 }
-                self._events.append(event)
-                return event
+                self._events.append(copy.deepcopy(event))
+                return copy.deepcopy(event)
         except Exception as exc:
             self.add_diagnostic("record_failed", exc)
             return {}
 
     def snapshot(self, payload: Any) -> tuple[Any, dict[str, Any]]:
-        redacted = redact_sensitive(payload)
-        encoded = json.dumps(redacted, sort_keys=True, default=str).encode("utf-8")
+        normalized = _normalize_trace_value(payload)
+        redacted = _redact_trace_value(normalized)
+        encoded = json.dumps(redacted, sort_keys=True).encode("utf-8")
         return redacted, {
             "fidelity": "normalized_copy",
             "representation": "json",
             "byte_count": len(encoded),
             "sha256": hashlib.sha256(encoded).hexdigest(),
-            "redacted": redacted != payload,
+            "redacted": redacted != normalized,
             "pruned": False,
             "truncated": False,
             "sidecar_path": None,
         }
 
     def add_diagnostic(self, kind: str, exc: BaseException | str) -> None:
-        message = str(exc)
-        with self._lock:
-            self._diagnostics.append(
-                {
-                    "kind": kind,
-                    "message": redact_sensitive(message),
-                    "timestamp": utc_iso_timestamp(),
-                }
-            )
+        try:
+            safe_message = redact_sensitive(str(exc))
+        except Exception:
+            safe_message = "[diagnostic message unavailable: redaction failed]"
+        try:
+            with self._lock:
+                self._diagnostics.append(
+                    {
+                        "kind": kind,
+                        "message": safe_message,
+                        "timestamp": utc_iso_timestamp(),
+                    }
+                )
+        except Exception:
+            return
 
     def export(self) -> dict[str, Any]:
         with self._lock:
@@ -162,6 +216,6 @@ class BoundaryTraceCollector:
                 "agent_run_id": self.agent_run_id,
                 "capture_scope": "semantic_boundaries",
                 "provider_wire_capture": False,
-                "events": list(self._events),
-                "diagnostics": list(self._diagnostics),
+                "events": copy.deepcopy(self._events),
+                "diagnostics": copy.deepcopy(self._diagnostics),
             }
