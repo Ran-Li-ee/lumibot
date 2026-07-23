@@ -210,6 +210,10 @@ def test_snapshot_normalizes_arbitrary_payloads_before_redaction(tmp_path):
         "symbols": ["QQQ", "SPY"],
         "7": {
             "fidelity": "descriptor_only",
+            "preview": (
+                f"<{CredentialBearingValue.__module__}."
+                f"{CredentialBearingValue.__qualname__} instance>"
+            ),
             "python_type": "CredentialBearingValue",
             "qualified_type": (
                 f"{CredentialBearingValue.__module__}."
@@ -357,7 +361,9 @@ def test_descriptor_only_value_does_not_invoke_mutating_repr(tmp_path):
     assert descriptor["python_type"] == "MutatingReprValue"
     assert descriptor["qualified_type"].endswith(".MutatingReprValue")
     assert descriptor["fidelity"] == "descriptor_only"
-    assert descriptor["preview"] == "[preview unavailable]"
+    assert "MutatingReprValue instance" in descriptor["preview"]
+    assert "0x" not in descriptor["preview"]
+    assert "descriptor-only-secret" not in descriptor["preview"]
 
 
 def test_descriptor_only_value_does_not_access_throwing_shape(tmp_path):
@@ -377,7 +383,7 @@ def test_descriptor_only_value_does_not_access_throwing_shape(tmp_path):
 
     assert value.shape_accesses == 0
     assert descriptor["fidelity"] == "descriptor_only"
-    assert descriptor["preview"] == "[preview unavailable]"
+    assert "ThrowingShapeValue instance" in descriptor["preview"]
 
 
 def test_descriptor_only_value_does_not_access_unknown_model_dump(tmp_path):
@@ -397,7 +403,31 @@ def test_descriptor_only_value_does_not_access_unknown_model_dump(tmp_path):
 
     assert value.model_dump_accesses == 0
     assert descriptor["fidelity"] == "descriptor_only"
-    assert descriptor["preview"] == "[preview unavailable]"
+    assert "ThrowingModelDumpValue instance" in descriptor["preview"]
+
+
+def test_descriptor_captures_static_safe_shape_without_invoking_descriptor(tmp_path):
+    descriptor_calls = []
+
+    class ThrowingShapeDescriptor:
+        def __get__(self, instance, owner):
+            descriptor_calls.append((instance, owner))
+            raise RuntimeError("shape descriptor must not run")
+
+    class StaticShapeValue:
+        shape = (2, 3, None)
+
+    class DescriptorShapeValue:
+        shape = ThrowingShapeDescriptor()
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    static_descriptor = collector.describe_raw_value(StaticShapeValue())
+    throwing_descriptor = collector.describe_raw_value(DescriptorShapeValue())
+
+    assert static_descriptor["shape"] == [2, 3, None]
+    assert "shape" not in throwing_descriptor
+    assert descriptor_calls == []
 
 
 def test_supported_model_uses_guarded_base_serializer(tmp_path):
@@ -417,6 +447,29 @@ def test_supported_model_uses_guarded_base_serializer(tmp_path):
     assert OverriddenModelDump.dump_calls == 0
     assert descriptor["fidelity"] == "semantic_copy"
     assert descriptor["semantic_value"] == {"value": 7}
+
+
+def test_descriptor_type_identity_bypasses_adversarial_metaclass(tmp_path):
+    intercepted_attributes = []
+
+    class AdversarialMeta(type):
+        def __getattribute__(cls, name):
+            if name in {"__name__", "__module__", "__qualname__"}:
+                intercepted_attributes.append(name)
+            return super().__getattribute__(name)
+
+    class AdversarialValue(metaclass=AdversarialMeta):
+        pass
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value(AdversarialValue())
+
+    assert intercepted_attributes == []
+    assert descriptor["python_type"] == "AdversarialValue"
+    assert descriptor["qualified_type"].endswith(".AdversarialValue")
+    assert "AdversarialValue instance" in descriptor["preview"]
+    assert "0x" not in descriptor["preview"]
 
 
 def test_descriptor_preview_redacts_complete_safe_preview_before_truncating(tmp_path):
@@ -537,6 +590,10 @@ def test_record_uses_nested_descriptor_without_opaque_repr(tmp_path):
     assert event["payload"] == {
         "opaque": {
             "fidelity": "descriptor_only",
+            "preview": (
+                f"<{OpaqueValue.__module__}."
+                f"{OpaqueValue.__qualname__} instance>"
+            ),
             "python_type": "OpaqueValue",
             "qualified_type": (
                 f"{OpaqueValue.__module__}.{OpaqueValue.__qualname__}"
@@ -562,6 +619,7 @@ def test_record_uses_safe_nested_descriptor_for_plain_object(tmp_path):
     assert event["payload"] == {
         "opaque": {
             "fidelity": "descriptor_only",
+            "preview": "<builtins.object instance>",
             "python_type": "object",
             "qualified_type": "builtins.object",
         },
@@ -644,6 +702,38 @@ def test_diagnostics_scrub_windows_and_posix_absolute_paths(tmp_path):
     assert "private-windows-user" not in message
     assert "private-posix-user" not in message
     assert message.count("[ABSOLUTE_PATH]") == 2
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "failed at "
+            r"C:\Users\Private User\trace\event.json "
+            "and /home/Private User/trace/event.json during trace write"
+        ),
+        (
+            "failed at "
+            r'"C:\Users\Private User\trace\event.json" '
+            "and '/home/Private User/trace/event.json' during trace write"
+        ),
+    ],
+)
+def test_diagnostics_scrub_complete_absolute_paths_containing_spaces(
+    tmp_path,
+    message,
+):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    collector.add_diagnostic("path_failure", OSError(message))
+
+    safe_message = collector.export()["diagnostics"][0]["message"]
+    assert "Private User" not in safe_message
+    assert r"trace\event.json" not in safe_message
+    assert "trace/event.json" not in safe_message
+    assert safe_message.count("[ABSOLUTE_PATH]") == 2
+    assert "failed at" in safe_message
+    assert "during trace write" in safe_message
 
 
 def test_sidecar_failure_adds_diagnostic_without_raising(monkeypatch, tmp_path):

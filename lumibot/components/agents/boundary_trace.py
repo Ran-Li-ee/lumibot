@@ -6,6 +6,7 @@ import contextvars
 import copy
 import gzip
 import hashlib
+import inspect
 import itertools
 import json
 import math
@@ -29,13 +30,22 @@ DEFAULT_INLINE_PAYLOAD_LIMIT = 64_000
 _DESCRIPTOR_ONLY = object()
 _SAFE_PATH_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _SAFE_SPAN_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+_QUOTED_ABSOLUTE_PATH_RE = re.compile(
+    r"(?P<quote>[\"'])(?:(?:[A-Za-z]:[\\/]|\\\\)|/).*?(?P=quote)"
+)
+_PATH_MESSAGE_END = (
+    r"(?=(?:\s+(?:and|or|because|while|then|during|after|before)\b)"
+    r"|[,;\r\n]|$)"
+)
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>|,;]+"
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\).*?"
+    + _PATH_MESSAGE_END,
+    re.IGNORECASE,
 )
 _POSIX_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_:/\.])/[^\s\"'<>|,;]+"
+    r"(?<![A-Za-z0-9_:/\.])/.*?" + _PATH_MESSAGE_END,
+    re.IGNORECASE,
 )
-_PREVIEW_UNAVAILABLE = "[preview unavailable]"
 
 _active_tool_call: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "lumibot_boundary_tool_call",
@@ -123,7 +133,8 @@ def _redact_trace_keys(value: Any) -> Any:
 
 
 def _scrub_absolute_paths(value: str) -> str:
-    scrubbed = _WINDOWS_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", value)
+    scrubbed = _QUOTED_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", value)
+    scrubbed = _WINDOWS_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", scrubbed)
     return _POSIX_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", scrubbed)
 
 
@@ -164,8 +175,15 @@ def _canonical_json_bytes(value: Any) -> bytes:
 def _descriptor_type(value: Any) -> dict[str, Any]:
     try:
         value_type = type(value)
-        python_type = value_type.__name__
-        qualified_type = f"{value_type.__module__}.{value_type.__qualname__}"
+        python_type = type.__getattribute__(value_type, "__name__")
+        module = type.__getattribute__(value_type, "__module__")
+        qualname = type.__getattribute__(value_type, "__qualname__")
+        if not all(
+            type(item) is str
+            for item in (python_type, module, qualname)
+        ):
+            raise TypeError("type identity is not string-valued")
+        qualified_type = f"{module}.{qualname}"
     except Exception:
         python_type = "unknown"
         qualified_type = "unknown"
@@ -174,6 +192,22 @@ def _descriptor_type(value: Any) -> dict[str, Any]:
         "python_type": python_type,
         "qualified_type": qualified_type,
     }
+
+
+def _type_based_preview(descriptor: dict[str, Any]) -> str:
+    return f"<{descriptor['qualified_type']} instance>"
+
+
+def _safe_static_shape(value: Any) -> list[int | None] | None:
+    try:
+        shape = inspect.getattr_static(value, "shape")
+    except Exception:
+        return None
+    if type(shape) is not tuple:
+        return None
+    if not all(dimension is None or type(dimension) is int for dimension in shape):
+        return None
+    return list(shape)
 
 
 def _safe_mapping_key(value: Any) -> tuple[str, bool]:
@@ -326,6 +360,9 @@ class BoundaryTraceCollector:
         if isinstance(value, collections.abc.Iterator):
             descriptor["one_shot"] = True
             return descriptor
+        shape = _safe_static_shape(value)
+        if shape is not None:
+            descriptor["shape"] = shape
         if isinstance(value, collections.abc.Mapping):
             try:
                 descriptor["keys"] = [
@@ -348,12 +385,12 @@ class BoundaryTraceCollector:
         if include_safe_preview and type(value) in {bytes, bytearray}:
             descriptor["preview"] = repr(value)
         elif include_safe_preview:
-            descriptor["preview"] = _PREVIEW_UNAVAILABLE
+            descriptor["preview"] = _type_based_preview(descriptor)
         return descriptor
 
     def describe_raw_value(self, value: Any) -> dict[str, Any]:
         fallback = _descriptor_type(value)
-        fallback["preview"] = _PREVIEW_UNAVAILABLE
+        fallback["preview"] = _type_based_preview(fallback)
         try:
             identity = {
                 "python_type": fallback["python_type"],
@@ -502,7 +539,13 @@ class BoundaryTraceCollector:
             except Exception:
                 pass
         if nested:
-            return _descriptor_type(value), True
+            return (
+                self._descriptor_only_value(
+                    value,
+                    include_safe_preview=True,
+                ),
+                True,
+            )
         return (
             self._descriptor_only_value(
                 value,
