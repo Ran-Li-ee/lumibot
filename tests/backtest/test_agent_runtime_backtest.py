@@ -275,6 +275,7 @@ class NoBoundaryResultRuntime:
 
 class UsageTelemetryRuntime:
     call_count = 0
+    last_result = None
 
     def run(self, request):
         type(self).call_count += 1
@@ -295,12 +296,14 @@ class UsageTelemetryRuntime:
             _event("usage", payload=usage),
             _event("text", text="RESULT: Held cash after validating telemetry."),
         ]
-        return AgentRunResult(
+        result = AgentRunResult(
             summary="RESULT: Held cash after validating telemetry.",
             model=request.model,
             events=events,
             usage=usage,
         )
+        type(self).last_result = result
+        return result
 
 
 class FutureTimestampRuntime:
@@ -1194,6 +1197,7 @@ def test_agent_runtime_injects_base_prompt_runtime_context_and_default_summary_l
 def test_agent_detail_parquet_has_single_token_summary_row_and_full_events(monkeypatch, tmp_path):
     monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
     UsageTelemetryRuntime.call_count = 0
+    UsageTelemetryRuntime.last_result = None
     _, strategy = UsageTelemetryStrategy.run_backtest(
         datasource_class=PandasDataBacktesting,
         backtesting_start=datetime(2025, 1, 6),
@@ -1237,6 +1241,19 @@ def test_agent_detail_parquet_has_single_token_summary_row_and_full_events(monke
     assert pd.to_numeric(summaries["call_latency_ms"]).ge(0).all()
     assert "I should inspect the account first." in " ".join(df["thinking_text"].fillna("").astype(str).tolist())
     assert "portfolio_value" in " ".join(df["event_payload_json"].fillna("").astype(str).tolist())
+    original_result = UsageTelemetryRuntime.last_result
+    assert original_result is not None
+    original_trace_path = Path(original_result.payload["trace_path"])
+    assert original_trace_path.is_absolute()
+    assert original_trace_path.is_file()
+    persisted_trace_paths = set(df["trace_path"].dropna().astype(str))
+    assert persisted_trace_paths
+    for persisted_trace_path in persisted_trace_paths:
+        assert PureWindowsPath(persisted_trace_path).drive == ""
+        assert not PureWindowsPath(persisted_trace_path).is_absolute()
+        assert not PurePosixPath(persisted_trace_path).is_absolute()
+        assert "\\" not in persisted_trace_path
+        assert (tmp_path / "cache" / "agent_runtime" / persisted_trace_path).is_file()
 
     non_summary = df[df["event_kind"] != "call_summary"]
     assert non_summary["call_input_tokens"].sum() == 0

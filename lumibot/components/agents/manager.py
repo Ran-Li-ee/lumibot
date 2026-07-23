@@ -1986,7 +1986,9 @@ class AgentManager:
         detail_path.parent.mkdir(parents=True, exist_ok=True)
         trace_path = ""
         if isinstance(result.payload, dict):
-            trace_path = str(result.payload.get("trace_path") or "")
+            trace_path = handle._portable_runtime_trace_path(
+                result.payload.get("trace_path")
+            )
         warning_messages = " | ".join(_sanitize_csv_text(message) for message in result.warning_messages if message)
         normalized_events = result.events or [AgentTraceEvent(kind="text", text=result.summary or "")]
         thinking_texts = _thinking_texts(result)
