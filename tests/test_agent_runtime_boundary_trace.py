@@ -1825,6 +1825,127 @@ def test_b08_record_failure_preserves_state_for_retry(
     assert "call_fingerprint" not in compacted
 
 
+def test_merged_duplicate_b08_failure_reserves_instance_until_event_end(
+    monkeypatch,
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    registered = collector.register_tool_calls(
+        turn_id,
+        [
+            {
+                "trace_call_id": "duplicate-provider-id",
+                "provider_call_id": "duplicate-provider-id",
+                "provider_runtime_call_id": "duplicate-provider-id",
+                "call_id_source": "provider",
+                "tool_name": "echo",
+                "call_fingerprint": f"fingerprint-{value}",
+            }
+            for value in ("A", "B")
+        ],
+    )
+    first_instance_id, second_instance_id = [
+        call["call_instance_id"] for call in registered["calls"]
+    ]
+    for call, value in zip(registered["calls"], ("A", "B")):
+        collector.note_function_tool_response(
+            call["call_instance_id"],
+            unpruned_response={"value": value, "large": value * 5_000},
+            model_facing_response={
+                "value": value,
+                "large": value * 5_000,
+            },
+            pruned=False,
+        )
+
+    def response_event(event_id, values):
+        event = SimpleNamespace(
+            id=event_id,
+            invocation_id="invocation-1",
+            content=types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_function_response(
+                        name="echo",
+                        response={"value": value},
+                    )
+                    for value in values
+                ],
+            ),
+            usage_metadata=None,
+        )
+        for part in event.content.parts:
+            part.function_response.id = "duplicate-provider-id"
+        return event
+
+    original_record = collector.record
+    failed_once = False
+
+    def fail_first_b08(**boundary):
+        nonlocal failed_once
+        if (
+            not failed_once
+            and boundary["transition"] == "B08_FUNCTION_TOOL_TO_ADK"
+        ):
+            failed_once = True
+            raise RuntimeError("first merged B08 failed")
+        return original_record(**boundary)
+
+    monkeypatch.setattr(collector, "record", fail_first_b08)
+
+    normalized = _normalize_event(
+        response_event("merged-event", ("A", "B")),
+        collector=collector,
+    )
+
+    assert [
+        item.payload["value"]
+        for item in normalized
+        if item.kind == "tool_result"
+    ] == ["A", "B"]
+    first_pass_b08 = _events(
+        collector,
+        "B08_FUNCTION_TOOL_TO_ADK",
+    )
+    assert len(first_pass_b08) == 1
+    assert first_pass_b08[0]["call_instance_id"] == second_instance_id
+    assert first_pass_b08[0]["payload"]["function_response"] == {
+        "value": "B"
+    }
+    first_state = collector.call_state(first_instance_id)
+    assert first_state["function_tool_response"]["value"] == "A"
+    assert len(first_state["function_tool_response"]["large"]) == 5_000
+    assert first_state["call_fingerprint"] == "fingerprint-A"
+    assert "function_response_claimed" not in first_state
+    second_state = collector.call_state(second_instance_id)
+    assert second_state["call_state_compacted"] is True
+    assert "function_tool_response" not in second_state
+
+    retried = _normalize_event(
+        response_event("retry-event", ("A",)),
+        collector=collector,
+    )
+
+    assert [
+        item.payload["value"]
+        for item in retried
+        if item.kind == "tool_result"
+    ] == ["A"]
+    b08_events = _events(collector, "B08_FUNCTION_TOOL_TO_ADK")
+    assert len(b08_events) == 2
+    assert b08_events[1]["call_instance_id"] == first_instance_id
+    assert b08_events[1]["payload"]["function_response"] == {
+        "value": "A"
+    }
+    assert collector.call_state(first_instance_id)[
+        "call_state_compacted"
+    ] is True
+
+
 def test_b08_compacts_large_multi_call_state_after_sidecar_record(tmp_path):
     collector = BoundaryTraceCollector(
         agent_run_id="run-1",

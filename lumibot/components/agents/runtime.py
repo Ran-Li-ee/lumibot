@@ -1515,10 +1515,11 @@ def _aggregate_usage_metadata(payloads: list[dict[str, Any]]) -> dict[str, Any] 
     return aggregate
 
 
-def _normalize_event(
+def _normalize_event_impl(
     event: Any,
     *,
     collector: BoundaryTraceCollector | None = None,
+    failed_b08_claims: list[str],
 ) -> list[AgentTraceEvent]:
     normalized: list[AgentTraceEvent] = []
     event_id = str(getattr(event, "id", None) or "") or None
@@ -1766,16 +1767,21 @@ def _normalize_event(
                     b08_recorded = bool(recorded_event)
                 finally:
                     if call_instance_id:
-                        try:
-                            collector.finalize_call_instance(
-                                call_instance_id,
-                                b08_recorded=b08_recorded,
-                            )
-                        except Exception as exc:
-                            _add_trace_diagnostic(
-                                collector,
-                                "function_response_finalize_failed",
-                                exc,
+                        if b08_recorded:
+                            try:
+                                collector.finalize_call_instance(
+                                    call_instance_id,
+                                    b08_recorded=True,
+                                )
+                            except Exception as exc:
+                                _add_trace_diagnostic(
+                                    collector,
+                                    "function_response_finalize_failed",
+                                    exc,
+                                )
+                        else:
+                            failed_b08_claims.append(
+                                str(call_instance_id)
                             )
             for chunk in _extract_tool_text(response):
                 normalized.append(
@@ -1807,6 +1813,34 @@ def _normalize_event(
             )
         )
     return normalized
+
+
+def _normalize_event(
+    event: Any,
+    *,
+    collector: BoundaryTraceCollector | None = None,
+) -> list[AgentTraceEvent]:
+    failed_b08_claims: list[str] = []
+    try:
+        return _normalize_event_impl(
+            event,
+            collector=collector,
+            failed_b08_claims=failed_b08_claims,
+        )
+    finally:
+        if collector is not None:
+            for call_instance_id in failed_b08_claims:
+                try:
+                    collector.finalize_call_instance(
+                        call_instance_id,
+                        b08_recorded=False,
+                    )
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "function_response_claim_release_failed",
+                        exc,
+                    )
 
 
 @dataclass
