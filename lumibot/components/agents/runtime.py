@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import contextlib
 import asyncio
+import contextlib
 import hashlib
 import importlib
-import logging
-import json
 import inspect
+import json
+import logging
 import math
 import os
 import re
@@ -20,9 +20,9 @@ from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
 
+from .boundary_trace import BoundaryTraceCollector
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer
 from .tool_context import agent_tool_context
-
 
 _GOOGLE_SDK_NOISE_FILTERS_CONFIGURED = False
 ClientSession = None
@@ -34,7 +34,8 @@ streamablehttp_client = None
 def _ensure_mcp_client_imports():
     global ClientSession, StdioServerParameters, stdio_client, streamablehttp_client
     if ClientSession is None or StdioServerParameters is None:
-        from mcp import ClientSession as _ClientSession, StdioServerParameters as _StdioServerParameters
+        from mcp import ClientSession as _ClientSession
+        from mcp import StdioServerParameters as _StdioServerParameters
 
         ClientSession = _ClientSession
         StdioServerParameters = _StdioServerParameters
@@ -373,6 +374,8 @@ class RuntimeRequest:
     provider_prompt_cache_key: str | None = None
     model_request_timeout_seconds: float | None = None
     run_timeout_seconds: float | None = None
+    agent_run_id: str | None = None
+    boundary_collector: BoundaryTraceCollector | None = None
 
 
 _LITELLM_CONFIGURED = False

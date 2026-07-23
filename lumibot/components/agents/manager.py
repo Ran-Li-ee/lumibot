@@ -9,9 +9,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from lumibot import LUMIBOT_CACHE_FOLDER
 
+from .boundary_trace import BoundaryTraceCollector
 from .duckdb_prompt import DUCKDB_SQL_GUIDANCE_PROMPT
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer, ToolDefinition
 from .tool_context import agent_tool_context
@@ -1154,8 +1156,25 @@ class AgentHandle:
         return trace_dir
 
     def _write_trace(self, result: AgentRunResult, trace_payload: dict[str, Any]) -> Path:
-        trace_path = self._trace_dir() / f"{result.cache_key or 'live'}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.json"
-        trace_path.write_text(json.dumps(_normalize_json(trace_payload), indent=2, sort_keys=True), encoding="utf-8")
+        trace_path = self._trace_dir() / (
+            f"{result.cache_key or 'live'}-"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.json"
+        )
+        normalized = json.dumps(
+            _normalize_json(trace_payload),
+            indent=2,
+            sort_keys=True,
+        )
+        temp_path = trace_path.with_suffix(f".{uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(normalized, encoding="utf-8")
+            os.replace(temp_path, trace_path)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
         return trace_path
 
     def _append_run_artifact_summary(self, result: AgentRunResult, runtime_context: dict[str, Any]) -> None:
@@ -1197,11 +1216,31 @@ class AgentHandle:
                 tool_name=event.get("tool_name"),
                 payload=event.get("payload"),
                 timestamp=event.get("timestamp"),
+                call_id=event.get("call_id"),
+                event_id=event.get("event_id"),
+                invocation_id=event.get("invocation_id"),
             )
             for event in cached.get("events", [])
             if isinstance(event, dict)
         ]
         timing = cached.get("timing") if isinstance(cached.get("timing"), dict) else {}
+        boundary_trace_ref = cached.get("boundary_trace_ref")
+        if isinstance(boundary_trace_ref, dict):
+            boundary_trace = {
+                **boundary_trace_ref,
+                "schema_version": 1,
+                "execution_source": "replay_cache",
+                "events": [],
+                "diagnostics": [],
+            }
+        else:
+            boundary_trace = {
+                "schema_version": 1,
+                "status": "unavailable_legacy_cache",
+                "execution_source": "replay_cache",
+                "events": [],
+                "diagnostics": [],
+            }
         return AgentRunResult(
             summary=cached.get("summary"),
             model=cached.get("model") or self.default_model,
@@ -1216,6 +1255,7 @@ class AgentHandle:
             ended_at=timing.get("call_ended_at"),
             latency_ms=_coerce_usage_int(timing.get("call_latency_ms")),
             first_event_latency_ms=_coerce_usage_int(timing.get("call_first_event_latency_ms")),
+            boundary_trace=boundary_trace,
         )
 
     def _replay_cached_side_effects(
@@ -1498,6 +1538,11 @@ class AgentHandle:
                 self._log_run_summary(result, runtime_context)
                 return result
 
+        agent_run_id = uuid4().hex
+        boundary_collector = BoundaryTraceCollector(
+            agent_run_id=agent_run_id,
+            artifact_root=self._runtime_artifact_dir(),
+        )
         _GoogleADKRuntime, runtime_request_class, _StubAgentRuntime, _call_mcp_tool = _get_runtime_imports()
         request = runtime_request_class(
             agent_name=self.name,
@@ -1518,6 +1563,8 @@ class AgentHandle:
             ),
             model_request_timeout_seconds=resolved_model_request_timeout_seconds,
             run_timeout_seconds=resolved_run_timeout_seconds,
+            agent_run_id=agent_run_id,
+            boundary_collector=boundary_collector,
         )
         self.manager._reserve_model_call(agent_name=self.name, model=model_name)
         # Strategy-level safety net with live-vs-backtest branching.
@@ -1666,9 +1713,13 @@ class AgentHandle:
                     "tool_name": event.tool_name,
                     "payload": event.payload,
                     "timestamp": event.timestamp,
+                    "call_id": event.call_id,
+                    "event_id": event.event_id,
+                    "invocation_id": event.invocation_id,
                 }
                 for event in result.events
             ],
+            "boundary_trace": result.boundary_trace,
             "warnings": result.warnings,
             "summary": result.summary,
             "usage": result.usage,
@@ -1681,6 +1732,7 @@ class AgentHandle:
             "warnings": result.warnings,
         }
         if should_replay:
+            portable_trace_path = trace_path.relative_to(self._runtime_artifact_dir()).as_posix()
             self.manager.replay_cache.save(
                 cache_key,
                 {
@@ -1691,6 +1743,11 @@ class AgentHandle:
                     "usage": result.usage,
                     "payload": result.payload,
                     "timing": _runtime_timing_payload(result),
+                    "boundary_trace_ref": {
+                        "status": "available_original_trace",
+                        "trace_path": portable_trace_path,
+                        "agent_run_id": (result.boundary_trace or {}).get("agent_run_id"),
+                    },
                 },
             )
         self.manager._record_agent_observability(

@@ -1,5 +1,6 @@
-import logging
+import gzip
 import json
+import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -16,7 +17,16 @@ def _utc_iso_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _event(kind: str, *, text: str | None = None, tool_name: str | None = None, payload: dict | None = None):
+def _event(
+    kind: str,
+    *,
+    text: str | None = None,
+    tool_name: str | None = None,
+    payload: dict | None = None,
+    call_id: str | None = None,
+    event_id: str | None = None,
+    invocation_id: str | None = None,
+):
     from lumibot.components.agents import AgentTraceEvent
 
     return AgentTraceEvent(
@@ -25,6 +35,9 @@ def _event(kind: str, *, text: str | None = None, tool_name: str | None = None, 
         tool_name=tool_name,
         payload=payload,
         timestamp=_utc_iso_timestamp(),
+        call_id=call_id,
+        event_id=event_id,
+        invocation_id=invocation_id,
     )
 
 
@@ -219,6 +232,35 @@ class PromptCaptureRuntime:
             summary=summary,
             model=request.model,
             events=[_event("text", text=summary)],
+        )
+
+
+class BoundaryResultRuntime:
+    def __init__(self):
+        self.call_count = 0
+
+    def run(self, request):
+        self.call_count += 1
+        collector = request.boundary_collector
+        collector.record(
+            transition="B09_ADK_TO_LITELLM",
+            from_module="google_adk",
+            to_module="litellm",
+            payload={"contents": [{"role": "user", "text": "test"}]},
+        )
+        return AgentRunResult(
+            summary="RESULT: done",
+            model=request.model,
+            events=[
+                _event(
+                    "text",
+                    text="RESULT: done",
+                    call_id="call-1",
+                    event_id="event-1",
+                    invocation_id="invocation-1",
+                )
+            ],
+            boundary_trace=collector.export(),
         )
 
 
@@ -625,6 +667,144 @@ def _build_minute_stress_pandas_data():
     )
     asset = Asset("AGMS", Asset.AssetType.STOCK)
     return {asset: Data(asset, df, timestep="minute")}
+
+
+class BoundaryTraceTestVars(dict):
+    def set(self, key, value):
+        self[key] = value
+
+
+class BoundaryTraceTestStrategy:
+    name = "BoundaryTraceStrategy"
+    market = "24/7"
+
+    def __init__(self, *, is_backtesting):
+        from lumibot.components.agents.manager import AgentManager
+
+        self.is_backtesting = is_backtesting
+        self.vars = BoundaryTraceTestVars()
+        self.parameters = {}
+        self.agents = AgentManager(self)
+
+    def get_datetime(self):
+        return None
+
+    def log_message(self, *args, **kwargs):
+        return None
+
+
+def _build_boundary_trace_handle(monkeypatch, tmp_path, *, is_backtesting):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path))
+    strategy = BoundaryTraceTestStrategy(is_backtesting=is_backtesting)
+    runtime = BoundaryResultRuntime()
+    handle = strategy.agents.create(
+        name="trace_agent",
+        system_prompt="test",
+        include_builtin_tools=False,
+        _runtime=runtime,
+    )
+    monkeypatch.setattr(strategy.agents, "_record_agent_observability", lambda **kwargs: None)
+    monkeypatch.setattr(handle, "_append_memory", lambda result: None)
+    monkeypatch.setattr(handle, "_append_run_artifact_summary", lambda result, context: None)
+    monkeypatch.setattr(handle, "_log_run_summary", lambda result, context: None)
+    return handle, runtime
+
+
+def test_agent_run_result_accepts_boundary_trace():
+    boundary_trace = {"schema_version": 1, "agent_run_id": "test-run"}
+
+    result = AgentRunResult(
+        summary="RESULT: done",
+        model="test-model",
+        events=[],
+        boundary_trace=boundary_trace,
+    )
+
+    assert result.boundary_trace == boundary_trace
+
+
+def test_agent_trace_persists_boundary_trace_without_changing_legacy_events(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+
+    handle.run(task_prompt="test")
+
+    trace_path = next((tmp_path / "agent_runtime" / "traces" / "trace_agent").glob("*.json"))
+    payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert payload["events"][0]["kind"] == "text"
+    assert payload["events"][0]["call_id"] == "call-1"
+    assert payload["events"][0]["event_id"] == "event-1"
+    assert payload["events"][0]["invocation_id"] == "invocation-1"
+    assert payload["boundary_trace"]["schema_version"] == 1
+    assert payload["boundary_trace"]["agent_run_id"]
+    assert list(trace_path.parent.glob("*.tmp")) == []
+
+
+def test_agent_replay_cache_uses_portable_boundary_trace_reference(monkeypatch, tmp_path):
+    from lumibot.components.agents import manager as manager_module
+
+    collector_calls = []
+    collector_class = manager_module.BoundaryTraceCollector
+
+    def tracking_collector(**kwargs):
+        collector_calls.append(kwargs)
+        return collector_class(**kwargs)
+
+    monkeypatch.setattr(manager_module, "BoundaryTraceCollector", tracking_collector)
+    handle, runtime = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=True)
+
+    live_result = handle.run(task_prompt="test")
+    cached_result = handle.run(task_prompt="test")
+
+    cache_path = next((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz"))
+    with gzip.open(cache_path, "rt", encoding="utf-8") as cache_file:
+        cached_payload = json.load(cache_file)
+    reference = cached_payload["boundary_trace_ref"]
+    assert "boundary_trace" not in cached_payload
+    assert reference == {
+        "status": "available_original_trace",
+        "trace_path": reference["trace_path"],
+        "agent_run_id": live_result.boundary_trace["agent_run_id"],
+    }
+    assert not Path(reference["trace_path"]).is_absolute()
+    assert reference["trace_path"].startswith("traces/trace_agent/")
+    assert (tmp_path / "agent_runtime" / reference["trace_path"]).is_file()
+    assert cached_payload["events"][0]["call_id"] == "call-1"
+    assert cached_payload["events"][0]["event_id"] == "event-1"
+    assert cached_payload["events"][0]["invocation_id"] == "invocation-1"
+    assert runtime.call_count == 1
+    assert len(collector_calls) == 1
+    assert cached_result.boundary_trace == {
+        **reference,
+        "schema_version": 1,
+        "execution_source": "replay_cache",
+        "events": [],
+        "diagnostics": [],
+    }
+    assert cached_result.events[0].call_id == "call-1"
+    assert cached_result.events[0].event_id == "event-1"
+    assert cached_result.events[0].invocation_id == "invocation-1"
+
+
+def test_legacy_agent_replay_cache_marks_boundary_trace_unavailable(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=True)
+
+    result = handle._result_from_cached(
+        {
+            "summary": "Cached.",
+            "model": "test-model",
+            "events": [],
+            "warnings": [],
+        },
+        "legacy-key",
+    )
+
+    assert result.boundary_trace == {
+        "schema_version": 1,
+        "status": "unavailable_legacy_cache",
+        "execution_source": "replay_cache",
+        "events": [],
+        "diagnostics": [],
+    }
 
 
 @pytest.mark.usefixtures("disable_datasource_override")
