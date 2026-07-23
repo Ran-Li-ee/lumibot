@@ -16,9 +16,11 @@ import threading
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Iterator
 from uuid import UUID, uuid4
+
+from pydantic import BaseModel
 
 from .trace_redaction import redact_sensitive
 
@@ -27,6 +29,13 @@ DEFAULT_INLINE_PAYLOAD_LIMIT = 64_000
 _DESCRIPTOR_ONLY = object()
 _SAFE_PATH_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _SAFE_SPAN_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>|,;]+"
+)
+_POSIX_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_:/\.])/[^\s\"'<>|,;]+"
+)
+_PREVIEW_UNAVAILABLE = "[preview unavailable]"
 
 _active_tool_call: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "lumibot_boundary_tool_call",
@@ -52,6 +61,8 @@ def _semantic_trace_value(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, (Decimal, UUID)):
         return str(value)
+    if isinstance(value, PurePath):
+        return _portable_path_value(value)
     if isinstance(value, Enum):
         return _semantic_trace_value(value.value)
     if isinstance(value, collections.abc.Iterator):
@@ -62,7 +73,10 @@ def _semantic_trace_value(value: Any) -> Any:
             normalized_item = _semantic_trace_value(item)
             if normalized_item is _DESCRIPTOR_ONLY:
                 return _DESCRIPTOR_ONLY
-            normalized_mapping[str(key)] = normalized_item
+            normalized_key, key_is_descriptor = _safe_mapping_key(key)
+            if key_is_descriptor:
+                return _DESCRIPTOR_ONLY
+            normalized_mapping[normalized_key] = normalized_item
         return normalized_mapping
     if isinstance(value, (list, tuple)):
         normalized_sequence = []
@@ -83,17 +97,18 @@ def _semantic_trace_value(value: Any) -> Any:
             normalized_set,
             key=lambda item: json.dumps(item, sort_keys=True),
         )
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
+    if isinstance(value, BaseModel):
         try:
-            return _semantic_trace_value(model_dump(mode="json"))
+            return _semantic_trace_value(
+                BaseModel.model_dump(value, mode="json")
+            )
         except Exception:
             return _DESCRIPTOR_ONLY
     return _DESCRIPTOR_ONLY
 
 
 def _redact_trace_value(value: Any) -> Any:
-    return _redact_trace_keys(redact_sensitive(value))
+    return _scrub_trace_paths(_redact_trace_keys(redact_sensitive(value)))
 
 
 def _redact_trace_keys(value: Any) -> Any:
@@ -107,16 +122,76 @@ def _redact_trace_keys(value: Any) -> Any:
     return value
 
 
+def _scrub_absolute_paths(value: str) -> str:
+    scrubbed = _WINDOWS_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", value)
+    return _POSIX_ABSOLUTE_PATH_RE.sub("[ABSOLUTE_PATH]", scrubbed)
+
+
+def _scrub_trace_paths(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            _scrub_absolute_paths(str(key)): _scrub_trace_paths(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_scrub_trace_paths(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_trace_paths(item) for item in value)
+    if isinstance(value, str):
+        return _scrub_absolute_paths(value)
+    return value
+
+
+def _bound_descriptor_previews(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                item[:500]
+                if key == "preview" and isinstance(item, str)
+                else _bound_descriptor_previews(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_bound_descriptor_previews(item) for item in value]
+    return value
+
+
 def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, default=str).encode("utf-8")
 
 
 def _descriptor_type(value: Any) -> dict[str, Any]:
-    value_type = type(value)
+    try:
+        value_type = type(value)
+        python_type = value_type.__name__
+        qualified_type = f"{value_type.__module__}.{value_type.__qualname__}"
+    except Exception:
+        python_type = "unknown"
+        qualified_type = "unknown"
     return {
         "fidelity": "descriptor_only",
-        "python_type": value_type.__name__,
-        "qualified_type": f"{value_type.__module__}.{value_type.__qualname__}",
+        "python_type": python_type,
+        "qualified_type": qualified_type,
+    }
+
+
+def _safe_mapping_key(value: Any) -> tuple[str, bool]:
+    if type(value) in {str, int, float, bool, type(None), Decimal, UUID}:
+        return str(value), False
+    descriptor = _descriptor_type(value)
+    return f"<{descriptor['python_type']}>", True
+
+
+def _portable_path_value(value: PurePath) -> dict[str, Any]:
+    if value.is_absolute():
+        return {
+            "kind": "absolute_path",
+            "name": value.name or None,
+        }
+    return {
+        "kind": "relative_path",
+        "value": value.as_posix(),
     }
 
 
@@ -228,44 +303,79 @@ class BoundaryTraceCollector:
                     "payload_meta": payload_meta,
                     "error": safe_error,
                 }
-                stored_event = copy.deepcopy(event)
-                returned_event = copy.deepcopy(event)
-                self._events.append(stored_event)
-                return returned_event
+                return self._store_event(event)
         except Exception as exc:
             if sidecar_path is not None:
                 self._remove_sidecar(sidecar_path)
             self.add_diagnostic("record_failed", exc)
             return {}
 
-    def describe_raw_value(self, value: Any) -> dict[str, Any]:
-        value_type = type(value)
-        descriptor: dict[str, Any] = {
-            "python_type": value_type.__name__,
-            "qualified_type": f"{value_type.__module__}.{value_type.__qualname__}",
-        }
-        semantic_value = _semantic_trace_value(value)
-        if semantic_value is not _DESCRIPTOR_ONLY:
-            descriptor["fidelity"] = "semantic_copy"
-            descriptor["semantic_value"] = semantic_value
-            return descriptor
+    def _store_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        stored_event = copy.deepcopy(event)
+        returned_event = copy.deepcopy(event)
+        self._events.append(stored_event)
+        return returned_event
 
-        descriptor["fidelity"] = "descriptor_only"
+    def _descriptor_only_value(
+        self,
+        value: Any,
+        *,
+        include_safe_preview: bool,
+    ) -> dict[str, Any]:
+        descriptor = _descriptor_type(value)
         if isinstance(value, collections.abc.Iterator):
             descriptor["one_shot"] = True
             return descriptor
-        elif isinstance(value, collections.abc.Mapping):
-            descriptor["keys"] = [str(key) for key in list(value.keys())[:100]]
-            descriptor["length"] = len(value)
+        if isinstance(value, collections.abc.Mapping):
+            try:
+                descriptor["keys"] = [
+                    _safe_mapping_key(key)[0]
+                    for key in itertools.islice(value.keys(), 100)
+                ]
+            except Exception:
+                pass
+            try:
+                descriptor["length"] = len(value)
+            except Exception:
+                pass
             return descriptor
-        elif isinstance(value, (list, tuple, set, frozenset)):
-            descriptor["length"] = len(value)
+        if isinstance(value, (list, tuple, set, frozenset)):
+            try:
+                descriptor["length"] = len(value)
+            except Exception:
+                pass
             return descriptor
-        shape = getattr(value, "shape", None)
-        if isinstance(shape, tuple):
-            descriptor["shape"] = list(shape)
-        descriptor["preview"] = redact_sensitive(repr(value))[:500]
+        if include_safe_preview and type(value) in {bytes, bytearray}:
+            descriptor["preview"] = repr(value)
+        elif include_safe_preview:
+            descriptor["preview"] = _PREVIEW_UNAVAILABLE
         return descriptor
+
+    def describe_raw_value(self, value: Any) -> dict[str, Any]:
+        fallback = _descriptor_type(value)
+        fallback["preview"] = _PREVIEW_UNAVAILABLE
+        try:
+            identity = {
+                "python_type": fallback["python_type"],
+                "qualified_type": fallback["qualified_type"],
+            }
+            semantic_value = _semantic_trace_value(value)
+            if semantic_value is not _DESCRIPTOR_ONLY:
+                descriptor = {
+                    **identity,
+                    "fidelity": "semantic_copy",
+                    "semantic_value": semantic_value,
+                }
+            else:
+                descriptor = self._descriptor_only_value(
+                    value,
+                    include_safe_preview=True,
+                )
+            return _bound_descriptor_previews(
+                _redact_trace_value(descriptor)
+            )
+        except Exception:
+            return fallback
 
     def _resolve_sidecar_target(self, relative: Path) -> Path:
         if self.artifact_root is None:
@@ -283,7 +393,7 @@ class BoundaryTraceCollector:
             raise OSError("sidecar path escapes artifact root") from exc
         return target
 
-    def _write_sidecar(self, *, span_id: str, payload: Any) -> str:
+    def _write_sidecar(self, *, span_id: str, encoded: bytes) -> str:
         if _SAFE_SPAN_ID_RE.fullmatch(span_id) is None:
             raise OSError("span id is not a safe path component")
         relative = (
@@ -301,7 +411,7 @@ class BoundaryTraceCollector:
         try:
             with os.fdopen(fd, "wb") as raw:
                 with gzip.GzipFile(fileobj=raw, mode="wb") as compressed:
-                    compressed.write(_canonical_json_bytes(payload))
+                    compressed.write(encoded)
             os.replace(temp_name, target)
         except Exception:
             with contextlib.suppress(OSError):
@@ -314,7 +424,10 @@ class BoundaryTraceCollector:
             target = self._resolve_sidecar_target(Path(relative_path))
             target.unlink(missing_ok=True)
         except OSError:
-            return
+            self.add_diagnostic(
+                "sidecar_cleanup_failed",
+                "orphan sidecar cleanup failed",
+            )
 
     def _snapshot_trace_value(
         self,
@@ -330,6 +443,8 @@ class BoundaryTraceCollector:
             return value.isoformat(), False
         if isinstance(value, (Decimal, UUID)):
             return str(value), False
+        if isinstance(value, PurePath):
+            return _portable_path_value(value), False
         if isinstance(value, Enum):
             return self._snapshot_trace_value(value.value, nested=nested)
         if isinstance(value, collections.abc.Iterator):
@@ -344,8 +459,13 @@ class BoundaryTraceCollector:
                     item,
                     nested=True,
                 )
-                normalized_mapping[str(key)] = normalized_item
-                descriptor_only = descriptor_only or item_is_descriptor
+                normalized_key, key_is_descriptor = _safe_mapping_key(key)
+                normalized_mapping[normalized_key] = normalized_item
+                descriptor_only = (
+                    descriptor_only
+                    or item_is_descriptor
+                    or key_is_descriptor
+                )
             return normalized_mapping, descriptor_only
         if isinstance(value, (list, tuple)):
             normalized_sequence = []
@@ -373,18 +493,23 @@ class BoundaryTraceCollector:
                 descriptor_only,
             )
 
-        model_dump = getattr(value, "model_dump", None)
-        if callable(model_dump):
+        if isinstance(value, BaseModel):
             try:
                 return self._snapshot_trace_value(
-                    model_dump(mode="json"),
+                    BaseModel.model_dump(value, mode="json"),
                     nested=nested,
                 )
             except Exception:
                 pass
         if nested:
             return _descriptor_type(value), True
-        return self.describe_raw_value(value), True
+        return (
+            self._descriptor_only_value(
+                value,
+                include_safe_preview=True,
+            ),
+            True,
+        )
 
     def snapshot(
         self,
@@ -396,7 +521,9 @@ class BoundaryTraceCollector:
             payload,
             nested=False,
         )
-        redacted = _redact_trace_value(normalized)
+        sanitized = _redact_trace_value(normalized)
+        was_redacted = sanitized != normalized
+        redacted = _bound_descriptor_previews(sanitized)
         encoded = _canonical_json_bytes(redacted)
         meta = {
             "fidelity": (
@@ -405,7 +532,7 @@ class BoundaryTraceCollector:
             "representation": "json",
             "byte_count": len(encoded),
             "sha256": hashlib.sha256(encoded).hexdigest(),
-            "redacted": redacted != normalized,
+            "redacted": was_redacted,
             "pruned": False,
             "truncated": False,
             "sidecar_path": None,
@@ -417,7 +544,7 @@ class BoundaryTraceCollector:
         try:
             meta["sidecar_path"] = self._write_sidecar(
                 span_id=span_id,
-                payload=redacted,
+                encoded=encoded,
             )
             meta["compression"] = "gzip"
             return preview, meta
@@ -428,7 +555,9 @@ class BoundaryTraceCollector:
 
     def add_diagnostic(self, kind: str, exc: BaseException | str) -> None:
         try:
-            safe_message = redact_sensitive(str(exc))
+            safe_message = _scrub_absolute_paths(
+                redact_sensitive(str(exc))
+            )
         except Exception:
             safe_message = "[diagnostic message unavailable: redaction failed]"
         try:
