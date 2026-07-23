@@ -634,8 +634,22 @@ def test_public_observed_generator_close_closes_provider_stream(
 
 def test_public_observed_generator_preserves_provider_close_failure(
     tmp_path,
+    monkeypatch,
 ):
     expected = RuntimeError("provider stream close failed")
+    created_loggers = []
+    request_clients = []
+
+    class CapturingLogger(LiteLLMBoundaryLogger):
+        def __init__(self, collector):
+            super().__init__(collector)
+            created_loggers.append(self)
+
+    monkeypatch.setattr(
+        agent_runtime,
+        "LiteLLMBoundaryLogger",
+        CapturingLogger,
+    )
 
     class ProviderStream:
         def __init__(self):
@@ -680,6 +694,7 @@ def test_public_observed_generator_preserves_provider_close_failure(
                 stream=stream,
                 **self._additional_args,
             )
+            request_clients.append(self.llm_client)
             async for response in response_stream:
                 yield response
 
@@ -714,6 +729,112 @@ def test_public_observed_generator_preserves_provider_close_failure(
     assert b01[0]["error"]["message"] == (
         "provider stream close failed"
     )
+    assert request_clients[0].active_stream_count() == 0
+    assert created_loggers[0].pending_attempt_count() == 0
+
+
+def test_model_error_precedes_provider_stream_close_error(
+    tmp_path,
+    monkeypatch,
+):
+    primary_error = ValueError("primary model processing failed")
+    close_error = RuntimeError(
+        "provider close failed api_key=cleanup-secret"
+    )
+    created_loggers = []
+    request_clients = []
+
+    class CapturingLogger(LiteLLMBoundaryLogger):
+        def __init__(self, collector):
+            super().__init__(collector)
+            created_loggers.append(self)
+
+    monkeypatch.setattr(
+        agent_runtime,
+        "LiteLLMBoundaryLogger",
+        CapturingLogger,
+    )
+
+    class ProviderStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return {"id": "stream-chunk", "choices": []}
+
+        async def aclose(self):
+            raise close_error
+
+    class StreamClient:
+        async def acompletion(self, **_kwargs):
+            return ProviderStream()
+
+    class ProcessingFailingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=stream,
+                **self._additional_args,
+            )
+            request_clients.append(self.llm_client)
+            yield await response_stream.__anext__()
+            raise primary_error
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-primary-stream-error",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        ProcessingFailingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+
+    with pytest.raises(ValueError) as raised:
+        _run(
+            _collect_async(
+                observed_type().generate_content_async(
+                    "request",
+                    stream=True,
+                )
+            )
+        )
+
+    assert raised.value is primary_error
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert events[1]["status"] == "error"
+    assert events[1]["error"] == {
+        "type": "ValueError",
+        "message": "primary model processing failed",
+    }
+    exported = collector.export()
+    assert exported["diagnostics"][-1]["kind"] == (
+        "litellm_stream_cleanup_failed"
+    )
+    assert "cleanup-secret" not in str(exported)
+    assert request_clients[0].active_stream_count() == 0
+    assert created_loggers[0].pending_attempt_count() == 0
 
 
 def test_observed_proxy_records_mid_stream_failure_and_preserves_identity(
