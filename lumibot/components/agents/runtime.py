@@ -2504,6 +2504,130 @@ def _build_observed_litellm_type(
     )
     dynamic_input_supported = supports_dynamic_input_callback()
 
+    class RequestLocalLiteLLMStream:
+        def __init__(
+            self,
+            delegate: Any,
+            *,
+            token: Any,
+            capture_kwargs: dict[str, Any],
+        ) -> None:
+            self._delegate = delegate
+            self._token = token
+            self._capture_kwargs = capture_kwargs
+            self._iterator = None
+            self._last_chunk = None
+
+        def __aiter__(self):
+            return self
+
+        def _complete_success(self) -> None:
+            boundary_logger.complete_success(
+                self._token,
+                (
+                    self._last_chunk
+                    if self._last_chunk is not None
+                    else self._delegate
+                ),
+                kwargs=self._capture_kwargs,
+                cache_source=self._delegate,
+            )
+
+        def _complete_error(self, error: BaseException) -> None:
+            boundary_logger.complete_error(
+                self._token,
+                error,
+                kwargs=self._capture_kwargs,
+                cache_source=self._delegate,
+            )
+
+        async def __anext__(self):
+            try:
+                if self._iterator is None:
+                    self._iterator = self._delegate.__aiter__()
+                chunk = await self._iterator.__anext__()
+            except StopAsyncIteration:
+                self._complete_success()
+                raise
+            except BaseException as exc:
+                self._complete_error(exc)
+                raise
+            self._last_chunk = chunk
+            return chunk
+
+        async def aclose(self) -> None:
+            try:
+                close = (
+                    getattr(self._iterator, "aclose", None)
+                    if self._iterator is not None
+                    else None
+                )
+                if close is None:
+                    close = getattr(self._delegate, "aclose", None)
+                if close is not None:
+                    await close()
+            except BaseException as exc:
+                self._complete_error(exc)
+                raise
+            self._complete_error(
+                asyncio.CancelledError(
+                    "LiteLLM response stream closed before exhaustion"
+                )
+            )
+
+        async def __aenter__(self):
+            try:
+                enter = getattr(self._delegate, "__aenter__", None)
+                if enter is not None:
+                    await enter()
+            except BaseException as exc:
+                self._complete_error(exc)
+                raise
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: Any,
+            exc: BaseException | None,
+            traceback: Any,
+        ) -> Any:
+            try:
+                exit_context = getattr(
+                    self._delegate,
+                    "__aexit__",
+                    None,
+                )
+                result = (
+                    await exit_context(exc_type, exc, traceback)
+                    if exit_context is not None
+                    else None
+                )
+            except BaseException as exit_error:
+                self._complete_error(exit_error)
+                raise
+            self._complete_error(
+                (
+                    exc
+                    if exc is not None
+                    else asyncio.CancelledError(
+                        "LiteLLM response stream context exited "
+                        "before exhaustion"
+                    )
+                )
+            )
+            return result
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._delegate, name)
+
+    def _is_async_stream(value: Any) -> bool:
+        try:
+            value_type = type(value)
+            type.__getattribute__(value_type, "__aiter__")
+        except BaseException:
+            return False
+        return True
+
     class RequestLocalLiteLLMClient:
         def __init__(self, delegate: Any) -> None:
             self._delegate = delegate
@@ -2540,6 +2664,15 @@ def _build_observed_litellm_type(
                     kwargs=capture_kwargs,
                 )
                 raise
+            if (
+                kwargs.get("stream") is True
+                and _is_async_stream(response)
+            ):
+                return RequestLocalLiteLLMStream(
+                    response,
+                    token=token,
+                    capture_kwargs=capture_kwargs,
+                )
             boundary_logger.complete_success(
                 token,
                 response,

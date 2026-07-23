@@ -437,7 +437,7 @@ def test_litellm_attempt_state_is_explicit_and_bounded(tmp_path):
     assert collector.export()["events"] == events_before_late_callback
 
 
-def test_observed_proxy_records_stream_boundary_before_returning_stream(
+def test_observed_proxy_defers_stream_boundary_until_normal_exhaustion(
     tmp_path,
 ):
     events_before_consumption = []
@@ -511,12 +511,573 @@ def test_observed_proxy_records_stream_boundary_before_returning_stream(
     )
 
     assert responses == [{"id": "stream-chunk", "choices": []}]
+    assert events_before_consumption == []
     assert [
-        event["transition"] for event in events_before_consumption
+        event["transition"]
+        for event in collector.export()["events"]
     ] == [
         "B10_LITELLM_TO_PROVIDER",
         "B01_PROVIDER_TO_LITELLM",
     ]
+
+
+def test_observed_proxy_records_mid_stream_failure_and_preserves_identity(
+    tmp_path,
+):
+    expected = RuntimeError("stream failed")
+
+    class FailingStream:
+        def __init__(self):
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._yielded:
+                self._yielded = True
+                return {"id": "first-chunk", "choices": []}
+            raise expected
+
+    class StreamClient:
+        async def acompletion(self, **_kwargs):
+            return FailingStream()
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is True
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=True,
+                **self._additional_args,
+            )
+            async for response in response_stream:
+                yield response
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stream-failure",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        _run(
+            _collect_async(
+                observed_type().generate_content_async(
+                    "request",
+                    stream=True,
+                )
+            )
+        )
+
+    assert raised.value is expected
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert events[0]["status"] == "error"
+    assert events[1]["status"] == "error"
+    assert events[1]["error"]["message"] == "stream failed"
+
+
+def test_observed_proxy_records_stream_cancellation_and_cleans_pending(
+    tmp_path,
+    monkeypatch,
+):
+    created_loggers = []
+
+    class CapturingLogger(LiteLLMBoundaryLogger):
+        def __init__(self, collector):
+            super().__init__(collector)
+            created_loggers.append(self)
+
+    monkeypatch.setattr(
+        agent_runtime,
+        "LiteLLMBoundaryLogger",
+        CapturingLogger,
+    )
+
+    class BlockingStream:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.never = asyncio.Event()
+            self.cancelled_error = None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.entered.set()
+            try:
+                await self.never.wait()
+            except asyncio.CancelledError as exc:
+                self.cancelled_error = exc
+                raise
+            raise StopAsyncIteration
+
+    class StreamClient:
+        def __init__(self):
+            self.stream = BlockingStream()
+
+        async def acompletion(self, **_kwargs):
+            return self.stream
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=stream,
+                **self._additional_args,
+            )
+            async for response in response_stream:
+                yield response
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stream-cancel",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type()
+
+    async def invoke():
+        task = asyncio.create_task(
+            _collect_async(
+                model.generate_content_async(
+                    "request",
+                    stream=True,
+                )
+            )
+        )
+        await model.llm_client.stream.entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        return raised.value
+
+    raised_error = _run(invoke())
+
+    assert raised_error is model.llm_client.stream.cancelled_error
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert events[1]["status"] == "error"
+    assert events[1]["error"]["type"] == "CancelledError"
+    assert created_loggers[0].pending_attempt_count() == 0
+
+
+def test_observed_proxy_aclose_delegates_and_records_cancellation(
+    tmp_path,
+    monkeypatch,
+):
+    created_loggers = []
+
+    class CapturingLogger(LiteLLMBoundaryLogger):
+        def __init__(self, collector):
+            super().__init__(collector)
+            created_loggers.append(self)
+
+    monkeypatch.setattr(
+        agent_runtime,
+        "LiteLLMBoundaryLogger",
+        CapturingLogger,
+    )
+
+    class ClosableStream:
+        marker = "delegated"
+
+        def __init__(self):
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return {"id": "unused", "choices": []}
+
+        async def aclose(self):
+            self.closed = True
+
+    class StreamClient:
+        def __init__(self):
+            self.stream = ClosableStream()
+
+        async def acompletion(self, **_kwargs):
+            return self.stream
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=stream,
+                **self._additional_args,
+            )
+            assert response_stream.marker == "delegated"
+            await response_stream.aclose()
+            if False:
+                yield None
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stream-close",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type()
+
+    assert _run(
+        _collect_async(
+            model.generate_content_async(
+                "request",
+                stream=True,
+            )
+        )
+    ) == []
+    assert model.llm_client.stream.closed is True
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert events[1]["status"] == "error"
+    assert events[1]["error"]["type"] == "CancelledError"
+    assert created_loggers[0].pending_attempt_count() == 0
+
+
+def test_observed_stream_proxy_delegates_async_context_without_duplicates(
+    tmp_path,
+):
+    class ContextStream:
+        marker = "context-marker"
+
+        def __init__(self):
+            self.entered = False
+            self.exited = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def __aenter__(self):
+            self.entered = True
+            return self
+
+        async def __aexit__(self, *_args):
+            self.exited = True
+            return False
+
+    class StreamClient:
+        def __init__(self):
+            self.stream = ContextStream()
+
+        async def acompletion(self, **_kwargs):
+            return self.stream
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=stream,
+                **self._additional_args,
+            )
+            async with response_stream as entered:
+                assert entered is response_stream
+                assert entered.marker == "context-marker"
+                async for response in entered:
+                    yield response
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stream-context",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type()
+
+    assert _run(
+        _collect_async(
+            model.generate_content_async(
+                "request",
+                stream=True,
+            )
+        )
+    ) == []
+    assert model.llm_client.stream.entered is True
+    assert model.llm_client.stream.exited is True
+    assert len(_events(collector, "B10_LITELLM_TO_PROVIDER")) == 1
+    assert len(_events(collector, "B01_PROVIDER_TO_LITELLM")) == 1
+    assert _events(
+        collector,
+        "B01_PROVIDER_TO_LITELLM",
+    )[0]["status"] == "success"
+
+
+def test_observed_cache_hit_stream_emits_no_provider_events(
+    tmp_path,
+    monkeypatch,
+):
+    created_loggers = []
+
+    class CapturingLogger(LiteLLMBoundaryLogger):
+        def __init__(self, collector):
+            super().__init__(collector)
+            created_loggers.append(self)
+
+    monkeypatch.setattr(
+        agent_runtime,
+        "LiteLLMBoundaryLogger",
+        CapturingLogger,
+    )
+
+    class CachedStream:
+        def __init__(self):
+            self._hidden_params = {"cache_hit": True}
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    class StreamClient:
+        async def acompletion(self, **_kwargs):
+            return CachedStream()
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=stream,
+                **self._additional_args,
+            )
+            async for response in response_stream:
+                yield response
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stream-cache",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+
+    assert _run(
+        _collect_async(
+            observed_type().generate_content_async(
+                "request",
+                stream=True,
+            )
+        )
+    ) == []
+    exported = collector.export()
+    assert exported["events"] == []
+    assert exported["diagnostics"][-1]["kind"] == (
+        "litellm_adapter_cache_hit"
+    )
+    assert created_loggers[0].pending_attempt_count() == 0
+
+
+def test_stream_native_callback_is_ignored_until_exhaustion(tmp_path):
+    events_after_native_callback = []
+
+    class CallbackStream:
+        def __init__(self, callback_task):
+            self._callback_task = callback_task
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._yielded:
+                self._yielded = True
+                await self._callback_task
+                events_after_native_callback.extend(
+                    collector.export()["events"]
+                )
+                return {"id": "stream-chunk", "choices": []}
+            raise StopAsyncIteration
+
+    class StreamClient:
+        async def acompletion(
+            self,
+            model,
+            messages,
+            tools,
+            **kwargs,
+        ):
+            response = {"id": "native-stream-response"}
+            logger = kwargs["success_callback"][-1]
+            callback_task = asyncio.create_task(
+                logger.async_log_success_event(
+                    {
+                        **kwargs,
+                        "model": model,
+                        "messages": messages,
+                        "tools": tools,
+                    },
+                    response,
+                    None,
+                    None,
+                )
+            )
+            return CallbackStream(callback_task)
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=stream,
+                **self._additional_args,
+            )
+            async for response in response_stream:
+                yield response
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stream-native-callback",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+
+    responses = _run(
+        _collect_async(
+            observed_type().generate_content_async(
+                "request",
+                stream=True,
+            )
+        )
+    )
+
+    assert responses == [{"id": "stream-chunk", "choices": []}]
+    assert events_after_native_callback == []
+    assert len(_events(collector, "B10_LITELLM_TO_PROVIDER")) == 1
+    assert len(_events(collector, "B01_PROVIDER_TO_LITELLM")) == 1
 
 
 def test_observed_proxy_suppresses_response_marked_cache_hit(tmp_path):
@@ -757,12 +1318,30 @@ def test_native_callback_cannot_claim_proxy_owned_attempt(tmp_path):
     ]
 
 
-def test_google_adk_runtime_export_precedes_delayed_native_success_callback(
+def test_google_adk_runtime_exports_stream_events_before_delayed_callback(
     tmp_path,
     monkeypatch,
 ):
     timers = []
     agent_kwargs = {}
+
+    class RuntimeStream:
+        def __init__(self):
+            self._remaining = [
+                {
+                    "id": "response-runtime",
+                    "model": "provider-model",
+                    "choices": [],
+                }
+            ]
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._remaining:
+                raise StopAsyncIteration
+            return self._remaining.pop()
 
     class DelayedThreadCallbackClient:
         async def acompletion(
@@ -795,7 +1374,7 @@ def test_google_adk_runtime_export_precedes_delayed_native_success_callback(
             )
             timer.start()
             timers.append(timer)
-            return response
+            return RuntimeStream()
 
     class RuntimeLiteLlm:
         def __init__(self):
@@ -813,13 +1392,16 @@ def test_google_adk_runtime_export_precedes_delayed_native_success_callback(
             _llm_request,
             stream=False,
         ):
-            assert stream is False
-            yield await self.llm_client.acompletion(
+            assert stream is True
+            response_stream = await self.llm_client.acompletion(
                 model="provider-model",
                 messages=[{"role": "user", "content": "hello"}],
                 tools=[],
+                stream=True,
                 **self._additional_args,
             )
+            async for response in response_stream:
+                yield response
 
     class FakeTypes:
         class GenerateContentConfig:
@@ -863,7 +1445,7 @@ def test_google_adk_runtime_export_precedes_delayed_native_success_callback(
                 response
                 async for response in agent_kwargs[
                     "model"
-                ].generate_content_async(llm_request)
+                ].generate_content_async(llm_request, stream=True)
             ]
             assert responses
             yield SimpleNamespace(
@@ -1738,6 +2320,53 @@ def test_observed_litellm_real_async_failure_records_once_without_globals(
         "pre_api_to_terminal_not_per_attempt"
     )
     assert events[0]["duration_ms"] >= 0
+
+
+def test_observed_litellm_real_mock_stream_records_after_exhaustion(
+    tmp_path,
+):
+    from google.adk.models.llm_request import LlmRequest
+    from google.genai import types
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-real-stream",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    model = agent_runtime._resolve_model_for_adk(
+        "openai/test",
+        model_entry_observer=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model._additional_args["mock_response"] = "stream hello"
+    request = LlmRequest(
+        model="openai/test",
+        contents=[
+            types.Content(
+                role="user",
+                parts=[types.Part(text="hello")],
+            )
+        ],
+        config=types.GenerateContentConfig(),
+    )
+    global_state = _litellm_global_state()
+
+    responses = _run(
+        _collect_async(
+            model.generate_content_async(request, stream=True)
+        )
+    )
+
+    assert responses
+    assert _litellm_global_state() == global_state
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert events[0]["status"] == "success"
+    assert events[1]["status"] == "success"
 
 
 def test_observed_pre_provider_failure_reraises_same_exception_without_events(

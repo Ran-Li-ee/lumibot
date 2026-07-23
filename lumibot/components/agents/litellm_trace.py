@@ -866,6 +866,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
         outcome: str,
         kwargs: Any,
         response_obj: Any,
+        cache_source: Any,
         start_time: Any,
         end_time: Any,
     ) -> bool:
@@ -876,6 +877,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
             pending.cache_hit
             or _cache_hit(kwargs)
             or _response_cache_hit(response_obj)
+            or _response_cache_hit(cache_source)
         ):
             self._try_diagnostic(
                 "litellm_adapter_cache_hit",
@@ -969,6 +971,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
         response_obj: Any,
         *,
         kwargs: Any = None,
+        cache_source: Any = None,
         start_time: Any = None,
         end_time: Any = None,
     ) -> bool:
@@ -978,6 +981,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 outcome="success",
                 kwargs=kwargs if type(kwargs) is dict else {},
                 response_obj=response_obj,
+                cache_source=cache_source,
                 start_time=start_time,
                 end_time=end_time,
             )
@@ -994,6 +998,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
         error: BaseException,
         *,
         kwargs: Any = None,
+        cache_source: Any = None,
         start_time: Any = None,
         end_time: Any = None,
     ) -> bool:
@@ -1009,6 +1014,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 outcome="failure",
                 kwargs=callback_kwargs,
                 response_obj=error,
+                cache_source=cache_source,
                 start_time=start_time,
                 end_time=end_time,
             )
