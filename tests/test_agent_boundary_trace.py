@@ -2,6 +2,7 @@ import gzip
 import hashlib
 import json
 import os
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -87,6 +88,7 @@ def test_boundary_collector_allocates_stable_turn_batch_and_event_ids(tmp_path):
     assert first["sequence"] == 1
     assert second["sequence"] == 2
     assert first["span_id"] != second["span_id"]
+    assert first["payload_meta"]["compression"] is None
     assert exported["agent_run_id"] == "run-1"
     assert exported["events"] == [first, second]
 
@@ -205,9 +207,17 @@ def test_snapshot_normalizes_arbitrary_payloads_before_redaction(tmp_path):
 
     assert event["payload"] == {
         "symbols": ["QQQ", "SPY"],
-        "7": "api_key=[REDACTED]",
+        "7": {
+            "fidelity": "descriptor_only",
+            "python_type": "CredentialBearingValue",
+            "qualified_type": (
+                f"{CredentialBearingValue.__module__}."
+                f"{CredentialBearingValue.__qualname__}"
+            ),
+        },
         "authorization": "[REDACTED]",
     }
+    assert event["payload_meta"]["fidelity"] == "descriptor_only"
     assert json.loads(json.dumps(event["payload"], sort_keys=True)) == event["payload"]
     assert "custom-object-secret" not in str(collector.export())
     assert "mixed-mapping-secret" not in str(collector.export())
@@ -232,13 +242,16 @@ def test_large_payload_is_redacted_then_written_to_relative_sidecar(tmp_path):
 
     relative = event["payload_meta"]["sidecar_path"]
     assert relative and not Path(relative).is_absolute()
-    assert relative == f"boundary_payloads/run-1/{event['span_id']}.json.gz"
+    relative_path = Path(relative)
+    assert relative_path.parts[0] == "boundary_payloads"
+    assert relative_path.name == f"{event['span_id']}.json.gz"
     with gzip.open(tmp_path / relative, "rb") as handle:
         persisted_bytes = handle.read()
     persisted = json.loads(persisted_bytes)
     assert "test-only-secret-value" not in str(persisted)
     assert persisted["rows"] == ["x" * 100]
     assert event["payload_meta"]["truncated"] is False
+    assert event["payload_meta"]["compression"] == "gzip"
     canonical_bytes = json.dumps(
         persisted,
         sort_keys=True,
@@ -268,6 +281,35 @@ def test_raw_generator_uses_descriptor_without_consuming_it(tmp_path):
     assert descriptor["python_type"] == "generator"
     assert descriptor["qualified_type"] == "builtins.generator"
     assert descriptor["one_shot"] is True
+
+
+def test_raw_iterator_descriptor_never_calls_consuming_repr(tmp_path):
+    class ConsumingReprIterator(Iterator):
+        def __init__(self):
+            self.position = 0
+
+        def __next__(self):
+            self.position += 1
+            return self.position
+
+        def __repr__(self):
+            return f"next={next(self)}"
+
+    iterator = ConsumingReprIterator()
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value(iterator)
+
+    assert iterator.position == 0
+    assert descriptor == {
+        "python_type": "ConsumingReprIterator",
+        "qualified_type": (
+            f"{ConsumingReprIterator.__module__}."
+            f"{ConsumingReprIterator.__qualname__}"
+        ),
+        "fidelity": "descriptor_only",
+        "one_shot": True,
+    }
 
 
 def test_raw_semantic_values_preserve_supported_types(tmp_path):
@@ -315,6 +357,22 @@ def test_descriptor_only_value_reports_safe_bounded_metadata(tmp_path):
     assert "descriptor-only-secret" not in descriptor["preview"]
 
 
+def test_descriptor_preview_redacts_complete_repr_before_truncating(tmp_path):
+    secret = "quoted-secret-" + ("s" * 600)
+
+    class LongQuotedSecret:
+        def __repr__(self):
+            return f"{{'api_key': '{secret}'}}"
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value(LongQuotedSecret())
+
+    assert descriptor["preview"] == "{'api_key': '[REDACTED]'}"
+    assert secret[:100] not in descriptor["preview"]
+    assert len(descriptor["preview"]) <= 500
+
+
 def test_descriptor_only_container_reports_keys_and_length(tmp_path):
     collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
 
@@ -323,6 +381,65 @@ def test_descriptor_only_container_reports_keys_and_length(tmp_path):
     assert descriptor["fidelity"] == "descriptor_only"
     assert descriptor["keys"] == ["opaque"]
     assert descriptor["length"] == 1
+    assert "preview" not in descriptor
+
+
+def test_record_uses_nested_descriptor_without_opaque_repr(tmp_path):
+    repr_calls = []
+
+    class OpaqueValue:
+        def __repr__(self):
+            repr_calls.append(True)
+            return "user-repr-secret at 0xDEADBEEF"
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    event = collector.record(
+        transition="B03_ADK_TO_FUNCTION_TOOL",
+        from_module="google_adk",
+        to_module="function_tool",
+        payload={
+            "opaque": OpaqueValue(),
+            "supported": {"symbols": ["QQQ", "SPY"]},
+        },
+    )
+
+    assert repr_calls == []
+    assert event["payload"] == {
+        "opaque": {
+            "fidelity": "descriptor_only",
+            "python_type": "OpaqueValue",
+            "qualified_type": (
+                f"{OpaqueValue.__module__}.{OpaqueValue.__qualname__}"
+            ),
+        },
+        "supported": {"symbols": ["QQQ", "SPY"]},
+    }
+    assert event["payload_meta"]["fidelity"] == "descriptor_only"
+    assert "0xDEADBEEF" not in str(event)
+    assert "user-repr-secret" not in str(event)
+
+
+def test_record_uses_safe_nested_descriptor_for_plain_object(tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    event = collector.record(
+        transition="B03_ADK_TO_FUNCTION_TOOL",
+        from_module="google_adk",
+        to_module="function_tool",
+        payload={"opaque": object(), "supported": [1, 2]},
+    )
+
+    assert event["payload"] == {
+        "opaque": {
+            "fidelity": "descriptor_only",
+            "python_type": "object",
+            "qualified_type": "builtins.object",
+        },
+        "supported": [1, 2],
+    }
+    assert event["payload_meta"]["fidelity"] == "descriptor_only"
+    assert "0x" not in str(event["payload"])
 
 
 def test_sidecar_failure_adds_diagnostic_without_raising(monkeypatch, tmp_path):
@@ -347,6 +464,7 @@ def test_sidecar_failure_adds_diagnostic_without_raising(monkeypatch, tmp_path):
     assert event["payload"] == {"preview": '{"value": "large"}'}
     assert event["payload_meta"]["sidecar_path"] is None
     assert event["payload_meta"]["truncated"] is True
+    assert event["payload_meta"]["compression"] is None
     assert collector.export()["diagnostics"][0]["kind"] == "sidecar_write_failed"
 
 
@@ -376,6 +494,92 @@ def test_redaction_failure_records_no_payload_and_does_not_raise(monkeypatch, tm
     assert "must-not-persist" not in str(exported)
 
 
+def test_later_redaction_failure_leaves_no_orphan_sidecar(monkeypatch, tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+        inline_payload_limit=1,
+    )
+    calls = 0
+
+    def fail_after_first_redaction(value):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise ValueError("redaction unavailable")
+        return value
+
+    monkeypatch.setattr(
+        "lumibot.components.agents.boundary_trace.redact_sensitive",
+        fail_after_first_redaction,
+    )
+
+    event = collector.record(
+        transition="B07_WRAPPER_TO_FUNCTION_TOOL",
+        from_module="lumibot_tool_wrapper",
+        to_module="function_tool",
+        payload="x" * 100,
+        error={"message": "later redaction"},
+    )
+
+    assert event == {}
+    assert collector.export()["events"] == []
+    assert collector.export()["diagnostics"][0]["kind"] == "record_failed"
+    assert list(tmp_path.rglob("*.json.gz")) == []
+
+
+@pytest.mark.parametrize(
+    "agent_run_id",
+    [
+        "../escape",
+        r"..\escape",
+        r"C:\outside\run",
+    ],
+)
+def test_sidecar_path_sanitizes_agent_run_id_and_stays_in_root(
+    monkeypatch,
+    tmp_path,
+    agent_run_id,
+):
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    boundary_root = (artifact_root / "boundary_payloads").resolve()
+    real_mkdir = Path.mkdir
+
+    def guarded_mkdir(path, *args, **kwargs):
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(boundary_root)
+        except ValueError as exc:
+            raise AssertionError(f"attempted outside write: {resolved}") from exc
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", guarded_mkdir)
+    collector = BoundaryTraceCollector(
+        agent_run_id=agent_run_id,
+        artifact_root=artifact_root,
+        inline_payload_limit=1,
+    )
+
+    event = collector.record(
+        transition="B07_WRAPPER_TO_FUNCTION_TOOL",
+        from_module="lumibot_tool_wrapper",
+        to_module="function_tool",
+        payload={"value": "large"},
+    )
+
+    relative = Path(event["payload_meta"]["sidecar_path"])
+    target = (artifact_root / relative).resolve()
+    assert not relative.is_absolute()
+    assert len(relative.parts) == 3
+    assert relative.parts[0] == "boundary_payloads"
+    assert ".." not in relative.parts
+    assert "\\" not in relative.parts[1]
+    assert ":" not in relative.parts[1]
+    assert target.is_relative_to(boundary_root)
+    assert target.is_file()
+
+
 def test_write_sidecar_uses_atomic_replace(monkeypatch, tmp_path):
     collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
     replaced = {}
@@ -402,7 +606,9 @@ def test_write_sidecar_uses_atomic_replace(monkeypatch, tmp_path):
         payload={"value": "persisted"},
     )
 
-    assert relative == "boundary_payloads/run-1/span-1.json.gz"
+    relative_path = Path(relative)
+    assert relative_path.parts[0] == "boundary_payloads"
+    assert relative_path.name == "span-1.json.gz"
     assert replaced["target"] == tmp_path / relative
     assert not replaced["source"].exists()
     assert replaced["target"].is_file()
@@ -422,8 +628,8 @@ def test_write_sidecar_cleans_temporary_file_on_failure(monkeypatch, tmp_path):
     with pytest.raises(OSError, match="replace failed"):
         collector._write_sidecar(span_id="span-1", payload={"value": "persisted"})
 
-    target_parent = tmp_path / "boundary_payloads" / "run-1"
-    assert list(target_parent.iterdir()) == []
+    assert list(tmp_path.rglob("*.tmp")) == []
+    assert list(tmp_path.rglob("*.json.gz")) == []
 
 
 def test_write_sidecar_requires_artifact_root():

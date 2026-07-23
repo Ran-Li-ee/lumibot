@@ -10,6 +10,7 @@ import itertools
 import json
 import math
 import os
+import re
 import tempfile
 import threading
 from datetime import date, datetime, timezone
@@ -24,6 +25,8 @@ from .trace_redaction import redact_sensitive
 BOUNDARY_SCHEMA_VERSION = 1
 DEFAULT_INLINE_PAYLOAD_LIMIT = 64_000
 _DESCRIPTOR_ONLY = object()
+_SAFE_PATH_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
+_SAFE_SPAN_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 _active_tool_call: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "lumibot_boundary_tool_call",
@@ -38,32 +41,6 @@ def utc_iso_timestamp() -> str:
 def current_tool_call_context() -> dict[str, Any] | None:
     value = _active_tool_call.get()
     return dict(value) if isinstance(value, dict) else None
-
-
-def _normalize_trace_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, str, int)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, (Decimal, UUID)):
-        return str(value)
-    if isinstance(value, Enum):
-        return _normalize_trace_value(value.value)
-    if isinstance(value, collections.abc.Mapping):
-        return {str(key): _normalize_trace_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_normalize_trace_value(item) for item in value]
-    if isinstance(value, (set, frozenset)):
-        normalized = [_normalize_trace_value(item) for item in value]
-        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True))
-    if isinstance(value, collections.abc.Iterator):
-        return repr(value)
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        return _normalize_trace_value(model_dump(mode="json"))
-    return repr(value)
 
 
 def _semantic_trace_value(value: Any) -> Any:
@@ -132,6 +109,24 @@ def _redact_trace_keys(value: Any) -> Any:
 
 def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+
+
+def _descriptor_type(value: Any) -> dict[str, Any]:
+    value_type = type(value)
+    return {
+        "fidelity": "descriptor_only",
+        "python_type": value_type.__name__,
+        "qualified_type": f"{value_type.__module__}.{value_type.__qualname__}",
+    }
+
+
+def _safe_agent_run_segment(agent_run_id: str) -> str:
+    raw_value = str(agent_run_id)
+    sanitized = _SAFE_PATH_SEGMENT_RE.sub("-", raw_value).strip("-_")[:48]
+    digest = hashlib.sha256(
+        raw_value.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:16]
+    return f"{sanitized or 'run'}-{digest}"
 
 
 class BoundaryTraceCollector:
@@ -204,9 +199,13 @@ class BoundaryTraceCollector:
         duration_ms: float | None = None,
         error: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        sidecar_path: str | None = None
         try:
+            normalized_error, _ = self._snapshot_trace_value(error, nested=False)
+            safe_error = _redact_trace_value(normalized_error)
             span_id = uuid4().hex
             safe_payload, payload_meta = self.snapshot(payload, span_id=span_id)
+            sidecar_path = payload_meta.get("sidecar_path")
             with self._lock:
                 event = {
                     "schema_version": BOUNDARY_SCHEMA_VERSION,
@@ -227,11 +226,15 @@ class BoundaryTraceCollector:
                     "duration_ms": duration_ms,
                     "payload": safe_payload,
                     "payload_meta": payload_meta,
-                    "error": _redact_trace_value(_normalize_trace_value(error)),
+                    "error": safe_error,
                 }
-                self._events.append(copy.deepcopy(event))
-                return copy.deepcopy(event)
+                stored_event = copy.deepcopy(event)
+                returned_event = copy.deepcopy(event)
+                self._events.append(stored_event)
+                return returned_event
         except Exception as exc:
+            if sidecar_path is not None:
+                self._remove_sidecar(sidecar_path)
             self.add_diagnostic("record_failed", exc)
             return {}
 
@@ -250,26 +253,45 @@ class BoundaryTraceCollector:
         descriptor["fidelity"] = "descriptor_only"
         if isinstance(value, collections.abc.Iterator):
             descriptor["one_shot"] = True
+            return descriptor
         elif isinstance(value, collections.abc.Mapping):
             descriptor["keys"] = [str(key) for key in list(value.keys())[:100]]
             descriptor["length"] = len(value)
+            return descriptor
         elif isinstance(value, (list, tuple, set, frozenset)):
             descriptor["length"] = len(value)
+            return descriptor
         shape = getattr(value, "shape", None)
         if isinstance(shape, tuple):
             descriptor["shape"] = list(shape)
-        descriptor["preview"] = redact_sensitive(repr(value)[:500])[:500]
+        descriptor["preview"] = redact_sensitive(repr(value))[:500]
         return descriptor
 
-    def _write_sidecar(self, *, span_id: str, payload: Any) -> str:
+    def _resolve_sidecar_target(self, relative: Path) -> Path:
         if self.artifact_root is None:
             raise OSError("artifact root is unavailable")
+        if relative.is_absolute() or ".." in relative.parts:
+            raise OSError("sidecar path must be relative and contained")
+
+        artifact_root = self.artifact_root.resolve()
+        boundary_root = (artifact_root / "boundary_payloads").resolve()
+        target = (artifact_root / relative).resolve()
+        try:
+            boundary_root.relative_to(artifact_root)
+            target.relative_to(boundary_root)
+        except ValueError as exc:
+            raise OSError("sidecar path escapes artifact root") from exc
+        return target
+
+    def _write_sidecar(self, *, span_id: str, payload: Any) -> str:
+        if _SAFE_SPAN_ID_RE.fullmatch(span_id) is None:
+            raise OSError("span id is not a safe path component")
         relative = (
             Path("boundary_payloads")
-            / self.agent_run_id
+            / _safe_agent_run_segment(self.agent_run_id)
             / f"{span_id}.json.gz"
         )
-        target = self.artifact_root / relative
+        target = self._resolve_sidecar_target(relative)
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{span_id}-",
@@ -287,31 +309,99 @@ class BoundaryTraceCollector:
             raise
         return relative.as_posix()
 
+    def _remove_sidecar(self, relative_path: str) -> None:
+        try:
+            target = self._resolve_sidecar_target(Path(relative_path))
+            target.unlink(missing_ok=True)
+        except OSError:
+            return
+
+    def _snapshot_trace_value(
+        self,
+        value: Any,
+        *,
+        nested: bool,
+    ) -> tuple[Any, bool]:
+        if value is None or isinstance(value, (bool, str, int)):
+            return value, False
+        if isinstance(value, float):
+            return (value if math.isfinite(value) else None), False
+        if isinstance(value, (datetime, date)):
+            return value.isoformat(), False
+        if isinstance(value, (Decimal, UUID)):
+            return str(value), False
+        if isinstance(value, Enum):
+            return self._snapshot_trace_value(value.value, nested=nested)
+        if isinstance(value, collections.abc.Iterator):
+            descriptor = _descriptor_type(value)
+            descriptor["one_shot"] = True
+            return descriptor, True
+        if isinstance(value, collections.abc.Mapping):
+            normalized_mapping = {}
+            descriptor_only = False
+            for key, item in value.items():
+                normalized_item, item_is_descriptor = self._snapshot_trace_value(
+                    item,
+                    nested=True,
+                )
+                normalized_mapping[str(key)] = normalized_item
+                descriptor_only = descriptor_only or item_is_descriptor
+            return normalized_mapping, descriptor_only
+        if isinstance(value, (list, tuple)):
+            normalized_sequence = []
+            descriptor_only = False
+            for item in value:
+                normalized_item, item_is_descriptor = self._snapshot_trace_value(
+                    item,
+                    nested=True,
+                )
+                normalized_sequence.append(normalized_item)
+                descriptor_only = descriptor_only or item_is_descriptor
+            return normalized_sequence, descriptor_only
+        if isinstance(value, (set, frozenset)):
+            normalized_set = []
+            descriptor_only = False
+            for item in value:
+                normalized_item, item_is_descriptor = self._snapshot_trace_value(
+                    item,
+                    nested=True,
+                )
+                normalized_set.append(normalized_item)
+                descriptor_only = descriptor_only or item_is_descriptor
+            return (
+                sorted(normalized_set, key=_canonical_json_bytes),
+                descriptor_only,
+            )
+
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            try:
+                return self._snapshot_trace_value(
+                    model_dump(mode="json"),
+                    nested=nested,
+                )
+            except Exception:
+                pass
+        if nested:
+            return _descriptor_type(value), True
+        return self.describe_raw_value(value), True
+
     def snapshot(
         self,
         payload: Any,
         *,
         span_id: str,
     ) -> tuple[Any, dict[str, Any]]:
-        normalized = _semantic_trace_value(payload)
-        if normalized is _DESCRIPTOR_ONLY:
-            if isinstance(
-                payload,
-                (
-                    collections.abc.Mapping,
-                    list,
-                    tuple,
-                    set,
-                    frozenset,
-                ),
-            ):
-                normalized = _normalize_trace_value(payload)
-            else:
-                normalized = self.describe_raw_value(payload)
+        normalized, descriptor_only = self._snapshot_trace_value(
+            payload,
+            nested=False,
+        )
         redacted = _redact_trace_value(normalized)
         encoded = _canonical_json_bytes(redacted)
         meta = {
-            "fidelity": "normalized_copy",
+            "fidelity": (
+                "descriptor_only" if descriptor_only else "normalized_copy"
+            ),
             "representation": "json",
             "byte_count": len(encoded),
             "sha256": hashlib.sha256(encoded).hexdigest(),
@@ -319,6 +409,7 @@ class BoundaryTraceCollector:
             "pruned": False,
             "truncated": False,
             "sidecar_path": None,
+            "compression": None,
         }
         if len(encoded) <= self.inline_payload_limit:
             return redacted, meta
@@ -328,6 +419,7 @@ class BoundaryTraceCollector:
                 span_id=span_id,
                 payload=redacted,
             )
+            meta["compression"] = "gzip"
             return preview, meta
         except Exception as exc:
             self.add_diagnostic("sidecar_write_failed", exc)
