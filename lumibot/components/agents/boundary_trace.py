@@ -65,6 +65,7 @@ _STANDARD_PATH_TYPES = (
     WindowsPath,
 )
 _SAFE_NUMERIC_USAGE_FIELDS = {
+    "budget_tokens",
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
     "cached_content_token_count",
@@ -74,6 +75,9 @@ _SAFE_NUMERIC_USAGE_FIELDS = {
     "candidates_token_count",
     "completion_tokens",
     "input_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "max_tokens",
     "output_tokens",
     "prompt_cache_hit_tokens",
     "prompt_cache_miss_tokens",

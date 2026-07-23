@@ -2528,14 +2528,11 @@ def _build_observed_litellm_type(
                             callbacks = list(existing)
                         else:
                             callbacks = [existing]
-                        if callback_key == "success_callback":
-                            callbacks.append(
-                                boundary_logger.async_log_success_event
-                            )
-                        elif callback_key == "failure_callback":
-                            callbacks.append(
-                                boundary_logger.log_failure_event
-                            )
+                        if callback_key in (
+                            "success_callback",
+                            "failure_callback",
+                        ):
+                            callbacks.append(boundary_logger)
                         if callbacks or callback_key in invocation_args:
                             invocation_args[callback_key] = callbacks
                     metadata_value = invocation_args.get("metadata")

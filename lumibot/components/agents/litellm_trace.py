@@ -16,12 +16,42 @@ _ALLOWED_REQUEST_FIELDS = (
     "model",
     "messages",
     "tools",
+    "functions",
+    "function_call",
     "response_format",
     "temperature",
     "max_completion_tokens",
+    "max_output_tokens",
+    "max_tokens",
     "top_p",
+    "top_k",
     "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "stream_options",
+    "seed",
+    "n",
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+    "tool_choice",
+    "parallel_tool_calls",
+    "reasoning_effort",
+    "thinking",
+    "verbosity",
+    "service_tier",
+    "modalities",
+    "prediction",
+    "audio",
+    "web_search_options",
+    "store",
     "timeout",
+    "request_timeout",
+    "max_retries",
+    "drop_params",
+    "allowed_openai_params",
+    "additional_drop_params",
+    "context_management",
     "prompt_cache_key",
     "prompt_cache_retention",
     "metadata",
@@ -39,6 +69,9 @@ _ROUTING_FIELDS = (
     "call_type",
     "model_group",
     "deployment_id",
+    "api_version",
+    "base_model",
+    "region_name",
 )
 _RESPONSE_FIELDS = (
     "id",
@@ -420,13 +453,41 @@ def _failure_error(kwargs: Any, response_obj: Any) -> Any:
     return response_obj
 
 
+def _cache_hit(kwargs: Any) -> bool:
+    nested = _nested_litellm_params(kwargs)
+    metadata_values = (
+        _field(kwargs, "metadata"),
+        _field(nested, "metadata"),
+    )
+    candidates = (
+        _field(kwargs, "cache_hit"),
+        _field(nested, "cache_hit"),
+        *(
+            _field(metadata, "cache_hit")
+            for metadata in metadata_values
+        ),
+        *(
+            _field(_field(metadata, "cache"), "hit")
+            for metadata in metadata_values
+        ),
+    )
+    return any(value is True for value in candidates)
+
+
 class LiteLLMBoundaryLogger(CustomLogger):
     """Request-local LiteLLM callback that records provider adapter boundaries."""
 
     def __init__(self, collector: BoundaryTraceCollector) -> None:
         super().__init__()
+        # LiteLLM 1.83 checks an instance-level __call__ attribute to route
+        # async callbacks. Special-method lookup ignores this instance
+        # attribute, so the logger remains non-callable and cannot enter
+        # LiteLLM's global function-callback compatibility path.
+        self.__call__ = self.async_log_success_event
         self.collector = collector
-        self._seen_callbacks: set[tuple[str, str, int | None]] = set()
+        self._seen_callbacks: set[
+            tuple[str, str | None, str, str, int | None]
+        ] = set()
         self._seen_lock = threading.Lock()
 
     def _try_diagnostic(self, kind: str, detail: str) -> None:
@@ -470,8 +531,11 @@ class LiteLLMBoundaryLogger(CustomLogger):
         outcome: str,
         kwargs: Any,
         response_obj: Any,
+        model_turn_id: str | None,
     ) -> bool:
         key = (
+            self.collector.agent_run_id,
+            model_turn_id,
             outcome,
             self._callback_identity(kwargs, response_obj),
             _retry_count(kwargs),
@@ -500,9 +564,23 @@ class LiteLLMBoundaryLogger(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
-        if not self._claim_callback(outcome, kwargs, response_obj):
-            return
         turn_id = self._turn_id(kwargs)
+        if not self._claim_callback(
+            outcome,
+            kwargs,
+            response_obj,
+            turn_id,
+        ):
+            return
+        if _cache_hit(kwargs):
+            self._try_diagnostic(
+                "litellm_adapter_cache_hit",
+                (
+                    "LiteLLM callback exposed cache_hit=True; "
+                    "provider exchange omitted"
+                ),
+            )
+            return
         timing, timing_visibility = _callback_timing(
             start_time,
             end_time,
