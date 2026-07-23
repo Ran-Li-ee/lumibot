@@ -1,4 +1,5 @@
 import inspect
+import time
 from datetime import datetime, timezone
 from functools import partial
 
@@ -15,6 +16,10 @@ def _events(collector, transition):
         for event in collector.export()["events"]
         if event["transition"] == transition
     ]
+
+
+def _event_timestamp(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def make_runtime_request(collector, *, tools=None, model="openai/test"):
@@ -126,6 +131,82 @@ def test_wrapper_records_original_exception_and_returns_existing_error_payload(t
     b07 = _events(collector, "B07_WRAPPER_TO_FUNCTION_TOOL")[0]
     assert b07["call_id"] == "call_A"
     assert b07["payload"]["serialized_result"] == result
+
+
+def test_b06_success_timing_excludes_trace_overhead(monkeypatch, tmp_path):
+    tool_times = {}
+
+    def fast_tool():
+        tool_times["started_at"] = datetime.now(timezone.utc)
+        result = {"price": 100.0}
+        tool_times["ended_at"] = datetime.now(timezone.utc)
+        return result
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    original_record = collector.record
+    original_describe = collector.describe_raw_value
+
+    def delayed_record(**event):
+        time.sleep(0.08)
+        return original_record(**event)
+
+    def delayed_describe(value):
+        time.sleep(0.08)
+        return original_describe(value)
+
+    monkeypatch.setattr(collector, "record", delayed_record)
+    monkeypatch.setattr(collector, "describe_raw_value", delayed_describe)
+    wrapped = _wrap_tool_callable(
+        BoundTool(name="fast", description="fast", function=fast_tool),
+        collector=collector,
+    )
+
+    elapsed_started = time.perf_counter()
+    assert wrapped() == {"price": 100.0}
+    elapsed_ms = (time.perf_counter() - elapsed_started) * 1000
+
+    b06 = _events(collector, "B06_PYTHON_TOOL_TO_WRAPPER")[0]
+    assert elapsed_ms >= 280
+    assert b06["duration_ms"] < 50
+    assert abs(
+        (_event_timestamp(b06["started_at"]) - tool_times["started_at"]).total_seconds()
+    ) < 0.05
+    assert abs(
+        (_event_timestamp(b06["ended_at"]) - tool_times["ended_at"]).total_seconds()
+    ) < 0.05
+
+
+def test_b06_error_timing_excludes_exception_formatting(tmp_path):
+    tool_times = {}
+
+    class SlowMessageError(Exception):
+        def __str__(self):
+            time.sleep(0.1)
+            return "slow message"
+
+    def broken_tool():
+        tool_times["started_at"] = datetime.now(timezone.utc)
+        time.sleep(0.025)
+        tool_times["ended_at"] = datetime.now(timezone.utc)
+        raise SlowMessageError()
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    wrapped = _wrap_tool_callable(
+        BoundTool(name="broken", description="broken", function=broken_tool),
+        collector=collector,
+    )
+
+    result = wrapped()
+
+    assert result["error"] == {"type": "SlowMessageError", "message": "slow message"}
+    b06 = _events(collector, "B06_PYTHON_TOOL_TO_WRAPPER")[0]
+    assert 15 <= b06["duration_ms"] < 70
+    assert abs(
+        (_event_timestamp(b06["started_at"]) - tool_times["started_at"]).total_seconds()
+    ) < 0.05
+    assert abs(
+        (_event_timestamp(b06["ended_at"]) - tool_times["ended_at"]).total_seconds()
+    ) < 0.05
 
 
 def test_recorder_failure_does_not_change_successful_tool_result(monkeypatch, tmp_path):

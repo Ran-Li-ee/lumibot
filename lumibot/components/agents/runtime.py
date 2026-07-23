@@ -259,10 +259,26 @@ def _wrap_tool_callable(
             **trace_ids,
         )
 
+        tool_started_at: str | None = None
+        tool_ended_at: str | None = None
+        tool_duration_ms = 0.0
         try:
             with agent_tool_context(tool_context):
-                raw_result = original(*args, **kwargs)
+                tool_started_at = _utc_iso_timestamp()
+                tool_started_perf = time.perf_counter()
+                try:
+                    raw_result = original(*args, **kwargs)
+                finally:
+                    tool_ended_perf = time.perf_counter()
+                    tool_ended_at = _utc_iso_timestamp()
+                    tool_duration_ms = max(
+                        (tool_ended_perf - tool_started_perf) * 1000,
+                        0.0,
+                    )
         except Exception as exc:
+            if tool_started_at is None:
+                tool_started_at = _utc_iso_timestamp()
+                tool_ended_at = tool_started_at
             error = _safe_exception_details(exc)
             _record_tool_boundary(
                 collector,
@@ -270,8 +286,9 @@ def _wrap_tool_callable(
                 from_module="python_tool",
                 to_module="lumibot_tool_wrapper",
                 status="error",
-                started_at=started_at,
-                duration_ms=max((time.perf_counter() - started_perf) * 1000, 0.0),
+                started_at=tool_started_at,
+                ended_at=tool_ended_at,
+                duration_ms=tool_duration_ms,
                 payload={"tool_name": tool.name},
                 error=error,
                 **trace_ids,
@@ -290,8 +307,9 @@ def _wrap_tool_callable(
                         from_module="python_tool",
                         to_module="lumibot_tool_wrapper",
                         status="success",
-                        started_at=started_at,
-                        duration_ms=max((time.perf_counter() - started_perf) * 1000, 0.0),
+                        started_at=tool_started_at,
+                        ended_at=tool_ended_at,
+                        duration_ms=tool_duration_ms,
                         payload={"raw_result": raw_description},
                         **trace_ids,
                     )
