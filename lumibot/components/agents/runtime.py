@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel
 
 from .boundary_trace import BoundaryTraceCollector
+from .litellm_trace import LiteLLMBoundaryLogger
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer
 from .tool_context import agent_tool_context
 
@@ -2489,8 +2490,15 @@ def _build_observed_litellm_type(
     *,
     on_model_entry: Callable[[Any], None],
     prepare_model_entry: Callable[[Any], None] | None = None,
+    boundary_collector: BoundaryTraceCollector | None = None,
 ) -> type[Any]:
     """Build a request-local LiteLLM adapter with extensible entry hooks."""
+
+    boundary_logger = (
+        LiteLLMBoundaryLogger(boundary_collector)
+        if boundary_collector is not None
+        else None
+    )
 
     class ObservedLiteLlm(base_type):
         async def generate_content_async(
@@ -2504,7 +2512,56 @@ def _build_observed_litellm_type(
                 on_model_entry(llm_request)
             except Exception:
                 pass
-            async for response in super().generate_content_async(
+            invocation_model = self
+            if boundary_logger is not None:
+                try:
+                    invocation_args = dict(self._additional_args)
+                    for callback_key in (
+                        "callbacks",
+                        "success_callback",
+                        "failure_callback",
+                    ):
+                        existing = invocation_args.get(callback_key)
+                        if existing is None:
+                            callbacks = []
+                        elif type(existing) in (list, tuple):
+                            callbacks = list(existing)
+                        else:
+                            callbacks = [existing]
+                        if callback_key == "success_callback":
+                            callbacks.append(
+                                boundary_logger.async_log_success_event
+                            )
+                        elif callback_key == "failure_callback":
+                            callbacks.append(
+                                boundary_logger.log_failure_event
+                            )
+                        if callbacks or callback_key in invocation_args:
+                            invocation_args[callback_key] = callbacks
+                    metadata_value = invocation_args.get("metadata")
+                    metadata = (
+                        dict(metadata_value)
+                        if type(metadata_value) is dict
+                        else {}
+                    )
+                    metadata["lumibot_agent_run_id"] = (
+                        boundary_collector.agent_run_id
+                    )
+                    metadata["lumibot_model_turn_id"] = (
+                        boundary_collector.active_model_turn()
+                    )
+                    invocation_args["metadata"] = metadata
+                    invocation_model = self.model_copy(deep=False)
+                    invocation_model._additional_args = invocation_args
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        boundary_collector,
+                        "litellm_callback_composition_failed",
+                        exc,
+                    )
+                    invocation_model = self
+            async for response in base_type.generate_content_async(
+                invocation_model,
                 llm_request,
                 stream=stream,
             ):
@@ -2521,6 +2578,7 @@ def _resolve_model_for_adk(
     prompt_cache_key: str | None = None,
     model_request_timeout_seconds: float | None = None,
     model_entry_observer: Callable[[Any], None] | None = None,
+    boundary_collector: BoundaryTraceCollector | None = None,
 ) -> Any:
     # Native Gemini IDs take ADK's fast path as plain strings. Any other
     # provider prefix (e.g. "openai/...", "xai/...", "anthropic/...") is
@@ -2573,15 +2631,19 @@ def _resolve_model_for_adk(
             kwargs["headers"] = {"x-grok-conv-id": prompt_cache_key}
     is_cerebras_model = lower.startswith("cerebras/")
     model_type = CerebrasLiteLlm if is_cerebras_model else LiteLlm
-    if model_entry_observer is not None:
+    if (
+        model_entry_observer is not None
+        or boundary_collector is not None
+    ):
         model_type = _build_observed_litellm_type(
             LiteLlm,
-            on_model_entry=model_entry_observer,
+            on_model_entry=model_entry_observer or (lambda _request: None),
             prepare_model_entry=(
                 _strip_thought_parts_from_litellm_request
                 if is_cerebras_model
                 else None
             ),
+            boundary_collector=boundary_collector,
         )
     return model_type(model=model, **kwargs)
 
@@ -3944,6 +4006,11 @@ class GoogleADKRuntime:
                         request.boundary_collector is not None
                         and uses_litellm_boundaries
                     )
+                    else None
+                ),
+                boundary_collector=(
+                    request.boundary_collector
+                    if uses_litellm_boundaries
                     else None
                 ),
             ),
