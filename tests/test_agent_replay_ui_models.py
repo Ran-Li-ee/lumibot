@@ -8,6 +8,11 @@ from lumibot.components.agents.replay_ui.models import (
     ToolCallReplay,
 )
 from lumibot.components.agents.replay_ui.redaction import redact_sensitive
+from lumibot.components.agents.trace_redaction import redact_sensitive as shared_redact_sensitive
+
+
+def test_replay_ui_redact_sensitive_reexports_shared_function():
+    assert redact_sensitive is shared_redact_sensitive
 
 
 def test_redact_sensitive_masks_secret_shaped_keys_and_values():
