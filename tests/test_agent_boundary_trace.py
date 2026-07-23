@@ -1,4 +1,13 @@
+import gzip
+import hashlib
 import json
+import os
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+from pydantic import BaseModel
 
 from lumibot.components.agents.boundary_trace import (
     BOUNDARY_SCHEMA_VERSION,
@@ -10,6 +19,11 @@ from lumibot.components.agents.trace_redaction import redact_sensitive
 class CredentialBearingValue:
     def __repr__(self):
         return "api_key=custom-object-secret"
+
+
+class ExampleTraceModel(BaseModel):
+    symbol: str
+    score: Decimal
 
 
 def test_redact_sensitive_masks_credentials_and_preserves_safe_values():
@@ -197,3 +211,243 @@ def test_snapshot_normalizes_arbitrary_payloads_before_redaction(tmp_path):
     assert json.loads(json.dumps(event["payload"], sort_keys=True)) == event["payload"]
     assert "custom-object-secret" not in str(collector.export())
     assert "mixed-mapping-secret" not in str(collector.export())
+
+
+def test_large_payload_is_redacted_then_written_to_relative_sidecar(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+        inline_payload_limit=32,
+    )
+
+    event = collector.record(
+        transition="B07_WRAPPER_TO_FUNCTION_TOOL",
+        from_module="lumibot_tool_wrapper",
+        to_module="function_tool",
+        payload={
+            "OPENAI_API_KEY": "test-only-secret-value",
+            "rows": ["x" * 100],
+        },
+    )
+
+    relative = event["payload_meta"]["sidecar_path"]
+    assert relative and not Path(relative).is_absolute()
+    assert relative == f"boundary_payloads/run-1/{event['span_id']}.json.gz"
+    with gzip.open(tmp_path / relative, "rb") as handle:
+        persisted_bytes = handle.read()
+    persisted = json.loads(persisted_bytes)
+    assert "test-only-secret-value" not in str(persisted)
+    assert persisted["rows"] == ["x" * 100]
+    assert event["payload_meta"]["truncated"] is False
+    canonical_bytes = json.dumps(
+        persisted,
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    assert persisted_bytes == canonical_bytes
+    assert event["payload_meta"]["byte_count"] == len(canonical_bytes)
+    assert event["payload_meta"]["sha256"] == hashlib.sha256(
+        canonical_bytes
+    ).hexdigest()
+
+
+def test_raw_generator_uses_descriptor_without_consuming_it(tmp_path):
+    consumed = []
+
+    def values():
+        consumed.append("started")
+        yield 1
+
+    generator = values()
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value(generator)
+
+    assert consumed == []
+    assert descriptor["fidelity"] == "descriptor_only"
+    assert descriptor["python_type"] == "generator"
+    assert descriptor["qualified_type"] == "builtins.generator"
+    assert descriptor["one_shot"] is True
+
+
+def test_raw_semantic_values_preserve_supported_types(tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    values = {
+        "scalar": 7,
+        "mapping": {"symbol": "QQQ"},
+        "sequence": ["QQQ", "SPY"],
+        "datetime": datetime(2024, 9, 5, tzinfo=timezone.utc),
+        "decimal": Decimal("1.25"),
+        "model": ExampleTraceModel(symbol="QQQ", score=Decimal("9.5")),
+    }
+
+    descriptor = collector.describe_raw_value(values)
+
+    assert descriptor["python_type"] == "dict"
+    assert descriptor["qualified_type"] == "builtins.dict"
+    assert descriptor["fidelity"] == "semantic_copy"
+    assert descriptor["semantic_value"] == {
+        "scalar": 7,
+        "mapping": {"symbol": "QQQ"},
+        "sequence": ["QQQ", "SPY"],
+        "datetime": "2024-09-05T00:00:00+00:00",
+        "decimal": "1.25",
+        "model": {"symbol": "QQQ", "score": "9.5"},
+    }
+
+
+def test_descriptor_only_value_reports_safe_bounded_metadata(tmp_path):
+    class ShapedOpaqueValue:
+        shape = (2, 3)
+
+        def __repr__(self):
+            return "api_key=descriptor-only-secret " + ("x" * 600)
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value(ShapedOpaqueValue())
+
+    assert descriptor["python_type"] == "ShapedOpaqueValue"
+    assert descriptor["qualified_type"].endswith(".ShapedOpaqueValue")
+    assert descriptor["fidelity"] == "descriptor_only"
+    assert descriptor["shape"] == [2, 3]
+    assert len(descriptor["preview"]) <= 500
+    assert "descriptor-only-secret" not in descriptor["preview"]
+
+
+def test_descriptor_only_container_reports_keys_and_length(tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value({"opaque": object()})
+
+    assert descriptor["fidelity"] == "descriptor_only"
+    assert descriptor["keys"] == ["opaque"]
+    assert descriptor["length"] == 1
+
+
+def test_sidecar_failure_adds_diagnostic_without_raising(monkeypatch, tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+        inline_payload_limit=1,
+    )
+    monkeypatch.setattr(
+        collector,
+        "_write_sidecar",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    event = collector.record(
+        transition="B07_WRAPPER_TO_FUNCTION_TOOL",
+        from_module="lumibot_tool_wrapper",
+        to_module="function_tool",
+        payload={"value": "large"},
+    )
+
+    assert event["payload"] == {"preview": '{"value": "large"}'}
+    assert event["payload_meta"]["sidecar_path"] is None
+    assert event["payload_meta"]["truncated"] is True
+    assert collector.export()["diagnostics"][0]["kind"] == "sidecar_write_failed"
+
+
+def test_redaction_failure_records_no_payload_and_does_not_raise(monkeypatch, tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    def fail_redaction(_value):
+        raise ValueError("redaction unavailable")
+
+    monkeypatch.setattr(
+        "lumibot.components.agents.boundary_trace.redact_sensitive",
+        fail_redaction,
+    )
+
+    event = collector.record(
+        transition="B07_WRAPPER_TO_FUNCTION_TOOL",
+        from_module="lumibot_tool_wrapper",
+        to_module="function_tool",
+        payload={"authorization": "must-not-persist"},
+    )
+
+    exported = collector.export()
+    assert event == {}
+    assert exported["events"] == []
+    assert len(exported["diagnostics"]) == 1
+    assert exported["diagnostics"][0]["kind"] == "record_failed"
+    assert "must-not-persist" not in str(exported)
+
+
+def test_write_sidecar_uses_atomic_replace(monkeypatch, tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    replaced = {}
+    real_replace = os.replace
+
+    def capture_replace(source, target):
+        source_path = Path(source)
+        target_path = Path(target)
+        assert source_path.parent == target_path.parent
+        assert source_path != target_path
+        with gzip.open(source_path, "rt", encoding="utf-8") as handle:
+            assert json.load(handle) == {"value": "persisted"}
+        replaced["source"] = source_path
+        replaced["target"] = target_path
+        real_replace(source, target)
+
+    monkeypatch.setattr(
+        "lumibot.components.agents.boundary_trace.os.replace",
+        capture_replace,
+    )
+
+    relative = collector._write_sidecar(
+        span_id="span-1",
+        payload={"value": "persisted"},
+    )
+
+    assert relative == "boundary_payloads/run-1/span-1.json.gz"
+    assert replaced["target"] == tmp_path / relative
+    assert not replaced["source"].exists()
+    assert replaced["target"].is_file()
+
+
+def test_write_sidecar_cleans_temporary_file_on_failure(monkeypatch, tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    def fail_replace(_source, _target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(
+        "lumibot.components.agents.boundary_trace.os.replace",
+        fail_replace,
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        collector._write_sidecar(span_id="span-1", payload={"value": "persisted"})
+
+    target_parent = tmp_path / "boundary_payloads" / "run-1"
+    assert list(target_parent.iterdir()) == []
+
+
+def test_write_sidecar_requires_artifact_root():
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=None)
+
+    with pytest.raises(OSError, match="artifact root is unavailable"):
+        collector._write_sidecar(span_id="span-1", payload={"value": "persisted"})
+
+
+def test_record_allocates_span_before_snapshot(monkeypatch, tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    snapshot_span_ids = []
+
+    def capture_snapshot(payload, *, span_id):
+        snapshot_span_ids.append(span_id)
+        return payload, {"truncated": False}
+
+    monkeypatch.setattr(collector, "snapshot", capture_snapshot)
+
+    event = collector.record(
+        transition="B07_WRAPPER_TO_FUNCTION_TOOL",
+        from_module="lumibot_tool_wrapper",
+        to_module="function_tool",
+        payload={"value": "safe"},
+    )
+
+    assert snapshot_span_ids == [event["span_id"]]
