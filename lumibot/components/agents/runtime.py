@@ -2509,37 +2509,53 @@ def _build_observed_litellm_type(
             self,
             delegate: Any,
             *,
+            owner: Any,
             token: Any,
             capture_kwargs: dict[str, Any],
         ) -> None:
             self._delegate = delegate
+            self._owner = owner
             self._token = token
             self._capture_kwargs = capture_kwargs
             self._iterator = None
             self._last_chunk = None
+            self._owner.register_stream(self)
 
         def __aiter__(self):
             return self
 
         def _complete_success(self) -> None:
-            boundary_logger.complete_success(
-                self._token,
-                (
-                    self._last_chunk
-                    if self._last_chunk is not None
-                    else self._delegate
-                ),
-                kwargs=self._capture_kwargs,
-                cache_source=self._delegate,
-            )
+            try:
+                boundary_logger.complete_success(
+                    self._token,
+                    (
+                        self._last_chunk
+                        if self._last_chunk is not None
+                        else self._delegate
+                    ),
+                    kwargs=self._capture_kwargs,
+                    cache_source=self._delegate,
+                )
+            finally:
+                self._unregister()
 
         def _complete_error(self, error: BaseException) -> None:
-            boundary_logger.complete_error(
-                self._token,
-                error,
-                kwargs=self._capture_kwargs,
-                cache_source=self._delegate,
-            )
+            try:
+                boundary_logger.complete_error(
+                    self._token,
+                    error,
+                    kwargs=self._capture_kwargs,
+                    cache_source=self._delegate,
+                )
+            finally:
+                self._unregister()
+
+        def _unregister(self) -> None:
+            owner = self._owner
+            if owner is None:
+                return
+            self._owner = None
+            owner.unregister_stream(self)
 
         async def __anext__(self):
             try:
@@ -2631,6 +2647,34 @@ def _build_observed_litellm_type(
     class RequestLocalLiteLLMClient:
         def __init__(self, delegate: Any) -> None:
             self._delegate = delegate
+            self._active_streams: set[
+                RequestLocalLiteLLMStream
+            ] = set()
+
+        def register_stream(
+            self,
+            stream: RequestLocalLiteLLMStream,
+        ) -> None:
+            self._active_streams.add(stream)
+
+        def unregister_stream(
+            self,
+            stream: RequestLocalLiteLLMStream,
+        ) -> None:
+            self._active_streams.discard(stream)
+
+        def active_stream_count(self) -> int:
+            return len(self._active_streams)
+
+        async def close_active_streams(self) -> None:
+            errors: list[BaseException] = []
+            for stream in tuple(self._active_streams):
+                try:
+                    await stream.aclose()
+                except BaseException as exc:
+                    errors.append(exc)
+            if errors:
+                raise errors[0]
 
         async def acompletion(
             self,
@@ -2670,6 +2714,7 @@ def _build_observed_litellm_type(
             ):
                 return RequestLocalLiteLLMStream(
                     response,
+                    owner=self,
                     token=token,
                     capture_kwargs=capture_kwargs,
                 )
@@ -2694,6 +2739,9 @@ def _build_observed_litellm_type(
                 pass
             invocation_model = self
             invocation_args: dict[str, Any] | None = None
+            request_local_client: RequestLocalLiteLLMClient | None = (
+                None
+            )
             invocation_turn_id = (
                 boundary_collector.active_model_turn()
                 if boundary_collector is not None
@@ -2746,8 +2794,13 @@ def _build_observed_litellm_type(
                         None,
                     )
                     if invocation_client is not None:
+                        request_local_client = (
+                            RequestLocalLiteLLMClient(
+                                invocation_client
+                            )
+                        )
                         invocation_model.llm_client = (
-                            RequestLocalLiteLLMClient(invocation_client)
+                            request_local_client
                         )
                 except Exception as exc:
                     _add_trace_diagnostic(
@@ -2756,6 +2809,7 @@ def _build_observed_litellm_type(
                         exc,
                     )
                     invocation_model = self
+            terminal_error: BaseException | None = None
             try:
                 async for response in base_type.generate_content_async(
                     invocation_model,
@@ -2764,12 +2818,21 @@ def _build_observed_litellm_type(
                 ):
                     yield response
             except BaseException as exc:
-                if boundary_logger is not None:
-                    boundary_logger.complete_pending_error(
-                        exc,
-                        model_turn_id=invocation_turn_id,
-                    )
+                terminal_error = exc
                 raise
+            finally:
+                try:
+                    if request_local_client is not None:
+                        await request_local_client.close_active_streams()
+                finally:
+                    if (
+                        boundary_logger is not None
+                        and terminal_error is not None
+                    ):
+                        boundary_logger.complete_pending_error(
+                            terminal_error,
+                            model_turn_id=invocation_turn_id,
+                        )
 
     ObservedLiteLlm.__name__ = f"Observed{base_type.__name__}"
     ObservedLiteLlm.__qualname__ = ObservedLiteLlm.__name__

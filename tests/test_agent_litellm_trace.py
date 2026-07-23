@@ -441,6 +441,7 @@ def test_observed_proxy_defers_stream_boundary_until_normal_exhaustion(
     tmp_path,
 ):
     events_before_consumption = []
+    request_clients = []
 
     class OneChunkStream:
         def __init__(self):
@@ -484,6 +485,7 @@ def test_observed_proxy_defers_stream_boundary_until_normal_exhaustion(
                 stream=True,
                 **self._additional_args,
             )
+            request_clients.append(self.llm_client)
             events_before_consumption.extend(
                 collector.export()["events"]
             )
@@ -519,12 +521,206 @@ def test_observed_proxy_defers_stream_boundary_until_normal_exhaustion(
         "B10_LITELLM_TO_PROVIDER",
         "B01_PROVIDER_TO_LITELLM",
     ]
+    assert request_clients[0].active_stream_count() == 0
+
+
+def test_public_observed_generator_close_closes_provider_stream(
+    tmp_path,
+    monkeypatch,
+):
+    created_loggers = []
+    request_clients = []
+
+    class CapturingLogger(LiteLLMBoundaryLogger):
+        def __init__(self, collector):
+            super().__init__(collector)
+            created_loggers.append(self)
+
+    monkeypatch.setattr(
+        agent_runtime,
+        "LiteLLMBoundaryLogger",
+        CapturingLogger,
+    )
+
+    class ProviderStream:
+        def __init__(self):
+            self.closed = False
+            self._index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self._index += 1
+            return {
+                "id": f"stream-chunk-{self._index}",
+                "choices": [],
+            }
+
+        async def aclose(self):
+            self.closed = True
+
+    class StreamClient:
+        def __init__(self):
+            self.stream = ProviderStream()
+
+        async def acompletion(self, **_kwargs):
+            return self.stream
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=stream,
+                **self._additional_args,
+            )
+            request_clients.append(self.llm_client)
+            async for response in response_stream:
+                yield response
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-public-stream-close",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type()
+
+    async def invoke():
+        public_generator = model.generate_content_async(
+            "request",
+            stream=True,
+        )
+        first = await public_generator.__anext__()
+        assert request_clients[0].active_stream_count() == 1
+        await public_generator.aclose()
+        return first
+
+    first = _run(invoke())
+
+    assert first["id"] == "stream-chunk-1"
+    assert model.llm_client.stream.closed is True
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert events[0]["status"] == "error"
+    assert events[1]["status"] == "error"
+    assert events[1]["error"]["type"] == "CancelledError"
+    assert request_clients[0].active_stream_count() == 0
+    assert created_loggers[0].pending_attempt_count() == 0
+
+
+def test_public_observed_generator_preserves_provider_close_failure(
+    tmp_path,
+):
+    expected = RuntimeError("provider stream close failed")
+
+    class ProviderStream:
+        def __init__(self):
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return {"id": "stream-chunk", "choices": []}
+
+        async def aclose(self):
+            raise expected
+
+    class StreamClient:
+        async def acompletion(self, **_kwargs):
+            return ProviderStream()
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=stream,
+                **self._additional_args,
+            )
+            async for response in response_stream:
+                yield response
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-public-stream-close-error",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type()
+
+    async def invoke():
+        public_generator = model.generate_content_async(
+            "request",
+            stream=True,
+        )
+        await public_generator.__anext__()
+        with pytest.raises(RuntimeError) as raised:
+            await public_generator.aclose()
+        return raised.value
+
+    raised_error = _run(invoke())
+
+    assert raised_error is expected
+    b01 = _events(collector, "B01_PROVIDER_TO_LITELLM")
+    assert len(b01) == 1
+    assert b01[0]["status"] == "error"
+    assert b01[0]["error"]["message"] == (
+        "provider stream close failed"
+    )
 
 
 def test_observed_proxy_records_mid_stream_failure_and_preserves_identity(
     tmp_path,
 ):
     expected = RuntimeError("stream failed")
+    request_clients = []
 
     class FailingStream:
         def __init__(self):
@@ -567,6 +763,7 @@ def test_observed_proxy_records_mid_stream_failure_and_preserves_identity(
                 stream=True,
                 **self._additional_args,
             )
+            request_clients.append(self.llm_client)
             async for response in response_stream:
                 yield response
 
@@ -600,6 +797,7 @@ def test_observed_proxy_records_mid_stream_failure_and_preserves_identity(
     assert events[0]["status"] == "error"
     assert events[1]["status"] == "error"
     assert events[1]["error"]["message"] == "stream failed"
+    assert request_clients[0].active_stream_count() == 0
 
 
 def test_observed_proxy_records_stream_cancellation_and_cleans_pending(
@@ -607,6 +805,7 @@ def test_observed_proxy_records_stream_cancellation_and_cleans_pending(
     monkeypatch,
 ):
     created_loggers = []
+    request_clients = []
 
     class CapturingLogger(LiteLLMBoundaryLogger):
         def __init__(self, collector):
@@ -667,6 +866,7 @@ def test_observed_proxy_records_stream_cancellation_and_cleans_pending(
                 stream=stream,
                 **self._additional_args,
             )
+            request_clients.append(self.llm_client)
             async for response in response_stream:
                 yield response
 
@@ -708,6 +908,7 @@ def test_observed_proxy_records_stream_cancellation_and_cleans_pending(
     assert events[1]["status"] == "error"
     assert events[1]["error"]["type"] == "CancelledError"
     assert created_loggers[0].pending_attempt_count() == 0
+    assert request_clients[0].active_stream_count() == 0
 
 
 def test_observed_proxy_aclose_delegates_and_records_cancellation(
@@ -715,6 +916,7 @@ def test_observed_proxy_aclose_delegates_and_records_cancellation(
     monkeypatch,
 ):
     created_loggers = []
+    request_clients = []
 
     class CapturingLogger(LiteLLMBoundaryLogger):
         def __init__(self, collector):
@@ -772,6 +974,7 @@ def test_observed_proxy_aclose_delegates_and_records_cancellation(
                 stream=stream,
                 **self._additional_args,
             )
+            request_clients.append(self.llm_client)
             assert response_stream.marker == "delegated"
             await response_stream.aclose()
             if False:
@@ -806,6 +1009,7 @@ def test_observed_proxy_aclose_delegates_and_records_cancellation(
     assert events[1]["status"] == "error"
     assert events[1]["error"]["type"] == "CancelledError"
     assert created_loggers[0].pending_attempt_count() == 0
+    assert request_clients[0].active_stream_count() == 0
 
 
 def test_observed_stream_proxy_delegates_async_context_without_duplicates(
