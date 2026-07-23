@@ -2124,6 +2124,7 @@ def _build_observed_litellm_type(
     base_type: type[Any],
     *,
     on_model_entry: Callable[[Any], None],
+    prepare_model_entry: Callable[[Any], None] | None = None,
 ) -> type[Any]:
     """Build a request-local LiteLLM adapter with extensible entry hooks."""
 
@@ -2133,6 +2134,8 @@ def _build_observed_litellm_type(
             llm_request: Any,
             stream: bool = False,
         ):
+            if prepare_model_entry is not None:
+                prepare_model_entry(llm_request)
             try:
                 on_model_entry(llm_request)
             except Exception:
@@ -2204,15 +2207,17 @@ def _resolve_model_for_adk(
         elif lower.startswith("xai/"):
             # xAI recommends x-grok-conv-id for Chat Completions cache routing.
             kwargs["headers"] = {"x-grok-conv-id": prompt_cache_key}
-    model_type = (
-        CerebrasLiteLlm
-        if lower.startswith("cerebras/")
-        else LiteLlm
-    )
+    is_cerebras_model = lower.startswith("cerebras/")
+    model_type = CerebrasLiteLlm if is_cerebras_model else LiteLlm
     if model_entry_observer is not None:
         model_type = _build_observed_litellm_type(
-            model_type,
+            LiteLlm,
             on_model_entry=model_entry_observer,
+            prepare_model_entry=(
+                _strip_thought_parts_from_litellm_request
+                if is_cerebras_model
+                else None
+            ),
         )
     return model_type(model=model, **kwargs)
 

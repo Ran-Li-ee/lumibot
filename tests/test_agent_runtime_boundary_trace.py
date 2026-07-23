@@ -1036,6 +1036,95 @@ def test_observed_litellm_captures_final_live_adk_request_labels(tmp_path):
     )
 
 
+def test_cerebras_b09_matches_sanitized_underlying_litellm_entry(
+    tmp_path,
+    monkeypatch,
+):
+    from google.adk.models import lite_llm as adk_lite_llm
+    from google.adk.models.llm_request import LlmRequest
+
+    underlying_requests = []
+    prepare_calls = []
+    original_litellm_type = adk_lite_llm.LiteLlm
+    original_sanitizer = (
+        agent_runtime._strip_thought_parts_from_litellm_request
+    )
+
+    class ProbeLiteLlm(original_litellm_type):
+        async def generate_content_async(
+            self,
+            llm_request,
+            stream=False,
+        ):
+            underlying_requests.append(
+                llm_request.model_dump(mode="json", exclude_none=True)
+            )
+            if False:
+                yield
+
+    def track_sanitizer(llm_request):
+        prepare_calls.append(llm_request)
+        original_sanitizer(llm_request)
+
+    monkeypatch.setattr(adk_lite_llm, "LiteLlm", ProbeLiteLlm)
+    monkeypatch.setattr(
+        agent_runtime,
+        "_strip_thought_parts_from_litellm_request",
+        track_sanitizer,
+    )
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    request = make_runtime_request(
+        collector,
+        model="cerebras/gpt-oss-120b",
+    )
+    runtime = GoogleADKRuntime()
+    model = agent_runtime._resolve_model_for_adk(
+        request.model,
+        model_entry_observer=runtime._model_entry_boundary_observer(
+            request
+        ),
+    )
+    llm_request = LlmRequest(
+        model=request.model,
+        contents=[
+            types.Content(
+                role="model",
+                parts=[
+                    types.Part(text="private reasoning", thought=True),
+                    types.Part(text="visible answer"),
+                ],
+            )
+        ],
+        config=types.GenerateContentConfig(
+            labels={"adk_agent_name": "agent"}
+        ),
+    )
+    runtime._before_model_boundary_callback(request)(
+        llm_request=llm_request
+    )
+
+    async def run_probe():
+        return [
+            response
+            async for response in model.generate_content_async(llm_request)
+        ]
+
+    assert asyncio.run(run_probe()) == []
+    assert type(model).__mro__[1] is ProbeLiteLlm
+    assert prepare_calls == [llm_request]
+    assert len(underlying_requests) == 1
+    b09 = _events(collector, "B09_ADK_TO_LITELLM")[0]
+    assert b09["payload"]["llm_request"] == underlying_requests[0]
+    assert b09["payload"]["llm_request"]["config"]["labels"] == {
+        "adk_agent_name": "agent"
+    }
+    assert "private reasoning" not in str(underlying_requests[0])
+    assert "visible answer" in str(underlying_requests[0])
+
+
 def test_model_entry_records_previous_and_current_turn_ids(tmp_path):
     collector = BoundaryTraceCollector(
         agent_run_id="run-1",
