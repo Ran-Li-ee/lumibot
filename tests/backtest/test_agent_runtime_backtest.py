@@ -2,7 +2,7 @@ import gzip
 import json
 import logging
 from datetime import date, datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pandas as pd
 import pytest
@@ -757,17 +757,27 @@ def test_agent_replay_cache_uses_portable_boundary_trace_reference(monkeypatch, 
 
     cache_path = next((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz"))
     with gzip.open(cache_path, "rt", encoding="utf-8") as cache_file:
-        cached_payload = json.load(cache_file)
+        cache_text = cache_file.read()
+    cached_payload = json.loads(cache_text)
+    assert tmp_path.as_posix() not in cache_text.replace("\\", "/")
     reference = cached_payload["boundary_trace_ref"]
+    payload_trace_path = cached_payload["payload"]["trace_path"]
     assert "boundary_trace" not in cached_payload
     assert reference == {
         "status": "available_original_trace",
         "trace_path": reference["trace_path"],
         "agent_run_id": live_result.boundary_trace["agent_run_id"],
     }
-    assert not Path(reference["trace_path"]).is_absolute()
+    assert payload_trace_path == reference["trace_path"]
+    for portable_path in (payload_trace_path, reference["trace_path"]):
+        assert PureWindowsPath(portable_path).drive == ""
+        assert not PureWindowsPath(portable_path).is_absolute()
+        assert not PurePosixPath(portable_path).is_absolute()
+        assert "\\" not in portable_path
+        assert (tmp_path / "agent_runtime" / portable_path).is_file()
     assert reference["trace_path"].startswith("traces/trace_agent/")
-    assert (tmp_path / "agent_runtime" / reference["trace_path"]).is_file()
+    assert live_result.payload["trace_path"] == payload_trace_path
+    assert cached_result.payload["trace_path"] == payload_trace_path
     assert cached_payload["events"][0]["call_id"] == "call-1"
     assert cached_payload["events"][0]["event_id"] == "event-1"
     assert cached_payload["events"][0]["invocation_id"] == "invocation-1"
@@ -794,10 +804,14 @@ def test_legacy_agent_replay_cache_marks_boundary_trace_unavailable(monkeypatch,
             "model": "test-model",
             "events": [],
             "warnings": [],
+            "payload": {
+                "trace_path": "C:/cache/agent_runtime/traces/trace_agent/legacy.json",
+            },
         },
         "legacy-key",
     )
 
+    assert result.payload["trace_path"] == "traces/trace_agent/legacy.json"
     assert result.boundary_trace == {
         "schema_version": 1,
         "status": "unavailable_legacy_cache",

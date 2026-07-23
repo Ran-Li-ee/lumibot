@@ -7,7 +7,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -1145,6 +1145,28 @@ class AgentHandle:
     def _cache_root() -> Path:
         return Path(os.environ.get("LUMIBOT_CACHE_FOLDER") or LUMIBOT_CACHE_FOLDER)
 
+    @staticmethod
+    def _portable_runtime_trace_path(value: Any) -> str:
+        raw_path = str(value or "").strip()
+        if not raw_path:
+            return ""
+
+        posix_path = PurePosixPath(raw_path.replace("\\", "/"))
+        parts = posix_path.parts
+        if "agent_runtime" in parts:
+            portable_parts = parts[parts.index("agent_runtime") + 1 :]
+            if portable_parts and ".." not in portable_parts:
+                return PurePosixPath(*portable_parts).as_posix()
+            return ""
+        if (
+            posix_path.is_absolute()
+            or PureWindowsPath(raw_path).drive
+            or PureWindowsPath(raw_path).is_absolute()
+            or ".." in parts
+        ):
+            return ""
+        return posix_path.as_posix()
+
     def _runtime_artifact_dir(self) -> Path:
         runtime_dir = self._cache_root() / "agent_runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1181,14 +1203,12 @@ class AgentHandle:
         summary_path = self._runtime_artifact_dir() / "agent_run_summaries.jsonl"
         trace_path = ""
         if isinstance(result.payload, dict):
-            trace_path = str(result.payload.get("trace_path") or "")
-        cache_root = self._cache_root()
+            trace_path = self._portable_runtime_trace_path(result.payload.get("trace_path"))
         trace_relative_path = trace_path
         if trace_path:
-            try:
-                trace_relative_path = Path(trace_path).resolve().relative_to(cache_root.resolve()).as_posix()
-            except Exception:
-                trace_relative_path = trace_path
+            trace_path_value = Path(trace_path)
+            if not trace_path_value.parts or trace_path_value.parts[0] != "agent_runtime":
+                trace_relative_path = (Path("agent_runtime") / trace_path_value).as_posix()
         record = {
             "timestamp": self._event_timestamp(),
             "agent_name": self.name,
@@ -1241,6 +1261,18 @@ class AgentHandle:
                 "events": [],
                 "diagnostics": [],
             }
+        payload = cached.get("payload")
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            reference_trace_path = (
+                boundary_trace_ref.get("trace_path")
+                if isinstance(boundary_trace_ref, dict)
+                else None
+            )
+            portable_trace_path = self._portable_runtime_trace_path(
+                reference_trace_path or payload.get("trace_path")
+            )
+            payload["trace_path"] = portable_trace_path or None
         return AgentRunResult(
             summary=cached.get("summary"),
             model=cached.get("model") or self.default_model,
@@ -1248,7 +1280,7 @@ class AgentHandle:
             cache_hit=True,
             cache_key=cache_key,
             usage=cached.get("usage"),
-            payload=cached.get("payload"),
+            payload=payload,
             warnings=list(cached.get("warnings") or []),
             started_at=timing.get("call_started_at"),
             first_event_at=timing.get("call_first_event_at"),
@@ -1727,12 +1759,12 @@ class AgentHandle:
             "duckdb_metrics": self.manager.duckdb.get_metrics(),
         }
         trace_path = self._write_trace(result, trace_payload)
+        portable_trace_path = trace_path.relative_to(self._runtime_artifact_dir()).as_posix()
         result.payload = {
-            "trace_path": trace_path.as_posix(),
+            "trace_path": portable_trace_path,
             "warnings": result.warnings,
         }
         if should_replay:
-            portable_trace_path = trace_path.relative_to(self._runtime_artifact_dir()).as_posix()
             self.manager.replay_cache.save(
                 cache_key,
                 {
