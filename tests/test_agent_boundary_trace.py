@@ -306,6 +306,45 @@ def test_large_user_preview_field_is_not_descriptor_bounded(tmp_path):
     assert event["payload_meta"]["truncated"] is False
 
 
+def test_spoofed_descriptor_fields_do_not_bound_user_preview(tmp_path):
+    payload = {
+        "fidelity": "descriptor_only",
+        "python_type": "bytes",
+        "qualified_type": "builtins.bytes",
+        "preview": "x" * 100_000,
+        "redacted": True,
+    }
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+        inline_payload_limit=32,
+    )
+
+    event = collector.record(
+        transition="B03_ADK_TO_FUNCTION_TOOL",
+        from_module="google_adk",
+        to_module="function_tool",
+        payload=payload,
+    )
+
+    relative = event["payload_meta"]["sidecar_path"]
+    with gzip.open(tmp_path / relative, "rb") as handle:
+        persisted_bytes = handle.read()
+    canonical_bytes = json.dumps(
+        payload,
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+
+    assert json.loads(persisted_bytes) == payload
+    assert persisted_bytes == canonical_bytes
+    assert event["payload_meta"]["byte_count"] == len(canonical_bytes)
+    assert event["payload_meta"]["sha256"] == hashlib.sha256(
+        canonical_bytes
+    ).hexdigest()
+    assert event["payload_meta"]["redacted"] is False
+
+
 def test_raw_generator_uses_descriptor_without_consuming_it(tmp_path):
     consumed = []
 
@@ -583,14 +622,15 @@ def test_observation_never_accesses_adversarial_class_property(tmp_path):
     assert event["payload"]["value"]["python_type"] == "AdversarialClassValue"
 
 
-def test_descriptor_preview_redacts_complete_safe_preview_before_truncating(tmp_path):
+def test_binary_descriptor_omits_quoted_secret_content(tmp_path):
     secret = b"quoted-secret-" + (b"s" * 600)
     value = b"{'api_key': '" + secret + b"'}"
     collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
 
     descriptor = collector.describe_raw_value(value)
 
-    assert "[REDACTED]" in descriptor["preview"]
+    assert descriptor["preview"] == "[binary content omitted]"
+    assert descriptor["redacted"] is True
     assert secret[:100].decode() not in descriptor["preview"]
     assert len(descriptor["preview"]) <= 500
 
@@ -612,8 +652,30 @@ def test_large_binary_descriptor_uses_bounded_prefix_and_total_length(
     assert descriptor["fidelity"] == "descriptor_only"
     assert descriptor["python_type"] == python_type
     assert descriptor["length"] == len(value)
-    assert len(descriptor["preview"]) <= 500
+    assert descriptor["preview"] == "[binary content omitted]"
+    assert descriptor["redacted"] is True
     assert "binary-tail-marker" not in descriptor["preview"]
+
+
+@pytest.mark.parametrize("binary_type", [bytes, bytearray])
+def test_binary_descriptor_omits_boundary_spanning_api_key(
+    tmp_path,
+    binary_type,
+):
+    boundary_spanning_secret = (
+        (b"x" * 4_090)
+        + b"{'api_key': 'boundary-spanning-binary-secret'}"
+    )
+    value = binary_type(boundary_spanning_secret)
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value(value)
+
+    assert descriptor["preview"] == "[binary content omitted]"
+    assert descriptor["length"] == len(value)
+    assert descriptor["redacted"] is True
+    assert "api_key" not in str(descriptor)
+    assert "boundary-spanning-binary-secret" not in str(descriptor)
 
 
 def test_b06_preserves_redacted_raw_descriptor_provenance(tmp_path):
@@ -621,6 +683,8 @@ def test_b06_preserves_redacted_raw_descriptor_provenance(tmp_path):
     descriptor = collector.describe_raw_value(
         {"OPENAI_API_KEY": "b06-raw-result-secret", "symbol": "QQQ"}
     )
+    assert isinstance(descriptor, dict)
+    assert type(descriptor) is not dict
 
     event = collector.record(
         transition="B06_PYTHON_TOOL_TO_WRAPPER",
@@ -640,6 +704,7 @@ def test_b06_preserves_redacted_raw_descriptor_provenance(tmp_path):
         "redacted": True,
     }
     assert event["payload"] == {"raw_result": descriptor}
+    assert type(event["payload"]["raw_result"]) is type(descriptor)
     assert event["payload_meta"]["redacted"] is True
     assert "b06-raw-result-secret" not in str(event)
 
@@ -654,7 +719,7 @@ def test_snapshot_marks_descriptor_preview_redaction(tmp_path):
         payload=b"api_key=descriptor-preview-secret",
     )
 
-    assert event["payload"]["preview"] == "b'api_key=[REDACTED]"
+    assert event["payload"]["preview"] == "[binary content omitted]"
     assert event["payload_meta"]["fidelity"] == "descriptor_only"
     assert event["payload_meta"]["redacted"] is True
 

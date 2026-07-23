@@ -35,7 +35,6 @@ from .trace_redaction import redact_sensitive
 
 BOUNDARY_SCHEMA_VERSION = 1
 DEFAULT_INLINE_PAYLOAD_LIMIT = 64_000
-_BINARY_PREVIEW_BYTE_LIMIT = 4_096
 _DESCRIPTOR_ONLY = object()
 _SAFE_PATH_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _SAFE_SPAN_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
@@ -64,6 +63,10 @@ _STANDARD_PATH_TYPES = (
     PureWindowsPath,
     WindowsPath,
 )
+
+
+class _TraceDescriptor(dict):
+    pass
 
 
 def utc_iso_timestamp() -> str:
@@ -169,7 +172,11 @@ def _semantic_trace_value(value: Any) -> Any:
     if _type_is_subclass(actual_type, collections.abc.Iterator):
         return _DESCRIPTOR_ONLY
     if _is_mapping_type(actual_type):
-        normalized_mapping = {}
+        normalized_mapping = (
+            _TraceDescriptor()
+            if actual_type is _TraceDescriptor
+            else {}
+        )
         try:
             for key, item in _mapping_items(value, actual_type):
                 normalized_item = _semantic_trace_value(item)
@@ -224,16 +231,56 @@ def _semantic_trace_value(value: Any) -> Any:
 
 
 def _redact_trace_value(value: Any) -> Any:
-    return _scrub_trace_paths(_redact_trace_keys(redact_sensitive(value)))
+    redacted = redact_sensitive(value)
+    with_descriptors = _restore_trace_descriptors(value, redacted)
+    return _scrub_trace_paths(_redact_trace_keys(with_descriptors))
+
+
+def _restore_trace_descriptors(source: Any, transformed: Any) -> Any:
+    source_type = type(source)
+    if (
+        source_type in (dict, _TraceDescriptor)
+        and type(transformed) is dict
+    ):
+        restored = _TraceDescriptor() if source_type is _TraceDescriptor else {}
+        for key, item in transformed.items():
+            if dict.__contains__(source, key):
+                item = _restore_trace_descriptors(
+                    dict.__getitem__(source, key),
+                    item,
+                )
+            restored[key] = item
+        return restored
+    if source_type is list and type(transformed) is list:
+        return [
+            _restore_trace_descriptors(source_item, transformed_item)
+            for source_item, transformed_item in zip(
+                source,
+                transformed,
+                strict=True,
+            )
+        ]
+    if source_type is tuple and type(transformed) is tuple:
+        return tuple(
+            _restore_trace_descriptors(source_item, transformed_item)
+            for source_item, transformed_item in zip(
+                source,
+                transformed,
+                strict=True,
+            )
+        )
+    return transformed
 
 
 def _redact_trace_keys(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
+    value_type = type(value)
+    if value_type in (dict, _TraceDescriptor):
+        redacted = {
             redact_sensitive(str(key)): _redact_trace_keys(item)
             for key, item in value.items()
         }
-    if isinstance(value, list):
+        return _TraceDescriptor(redacted) if value_type is _TraceDescriptor else redacted
+    if type(value) is list:
         return [_redact_trace_keys(item) for item in value]
     return value
 
@@ -244,36 +291,31 @@ def _scrub_absolute_paths(value: str) -> str:
 
 
 def _scrub_trace_paths(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
+    value_type = type(value)
+    if value_type in (dict, _TraceDescriptor):
+        scrubbed = {
             _scrub_absolute_paths(str(key)): _scrub_trace_paths(item)
             for key, item in value.items()
         }
-    if isinstance(value, list):
+        return _TraceDescriptor(scrubbed) if value_type is _TraceDescriptor else scrubbed
+    if type(value) is list:
         return [_scrub_trace_paths(item) for item in value]
-    if isinstance(value, tuple):
+    if type(value) is tuple:
         return tuple(_scrub_trace_paths(item) for item in value)
-    if isinstance(value, str):
+    if type(value) is str:
         return _scrub_absolute_paths(value)
     return value
 
 
 def _is_trace_descriptor(value: Any) -> bool:
-    if type(value) is not dict:
-        return False
-    fidelity = dict.get(value, "fidelity")
-    return (
-        type(fidelity) is str
-        and fidelity in ("semantic_copy", "descriptor_only")
-        and type(dict.get(value, "python_type")) is str
-        and type(dict.get(value, "qualified_type")) is str
-    )
+    return type(value) is _TraceDescriptor
 
 
 def _bound_descriptor_previews(value: Any) -> Any:
-    if type(value) is dict:
+    value_type = type(value)
+    if value_type in (dict, _TraceDescriptor):
         is_descriptor = _is_trace_descriptor(value)
-        return {
+        bounded = {
             key: (
                 item[:500]
                 if is_descriptor
@@ -283,13 +325,14 @@ def _bound_descriptor_previews(value: Any) -> Any:
             )
             for key, item in value.items()
         }
+        return _TraceDescriptor(bounded) if is_descriptor else bounded
     if type(value) is list:
         return [_bound_descriptor_previews(item) for item in value]
     return value
 
 
 def _contains_redacted_descriptor(value: Any) -> bool:
-    if type(value) is dict:
+    if type(value) in (dict, _TraceDescriptor):
         if _is_trace_descriptor(value) and value.get("redacted") is True:
             return True
         return any(_contains_redacted_descriptor(item) for item in value.values())
@@ -327,11 +370,13 @@ def _descriptor_type(value: Any) -> dict[str, Any]:
     else:
         python_type, module, qualname = identity
         qualified_type = f"{module}.{qualname}"
-    return {
-        "fidelity": "descriptor_only",
-        "python_type": python_type,
-        "qualified_type": qualified_type,
-    }
+    return _TraceDescriptor(
+        {
+            "fidelity": "descriptor_only",
+            "python_type": python_type,
+            "qualified_type": qualified_type,
+        }
+    )
 
 
 def _type_based_preview(descriptor: dict[str, Any]) -> str:
@@ -574,17 +619,8 @@ class BoundaryTraceCollector:
             (bytes, bytearray),
         ):
             descriptor["length"] = len(value)
-            if actual_type is bytes:
-                preview_value = bytes.__getitem__(
-                    value,
-                    slice(0, _BINARY_PREVIEW_BYTE_LIMIT),
-                )
-            else:
-                preview_value = bytearray.__getitem__(
-                    value,
-                    slice(0, _BINARY_PREVIEW_BYTE_LIMIT),
-                )
-            descriptor["preview"] = repr(preview_value)
+            descriptor["preview"] = "[binary content omitted]"
+            descriptor["redacted"] = True
         elif include_safe_preview:
             descriptor["preview"] = _type_based_preview(descriptor)
         return descriptor
@@ -599,11 +635,13 @@ class BoundaryTraceCollector:
             }
             semantic_value = _semantic_trace_value(value)
             if semantic_value is not _DESCRIPTOR_ONLY:
-                descriptor = {
-                    **identity,
-                    "fidelity": "semantic_copy",
-                    "semantic_value": semantic_value,
-                }
+                descriptor = _TraceDescriptor(
+                    {
+                        **identity,
+                        "fidelity": "semantic_copy",
+                        "semantic_value": semantic_value,
+                    }
+                )
             else:
                 descriptor = self._descriptor_only_value(
                     value,
@@ -715,7 +753,11 @@ class BoundaryTraceCollector:
             descriptor["one_shot"] = True
             return descriptor, True
         if _is_mapping_type(actual_type):
-            normalized_mapping = {}
+            normalized_mapping = (
+                _TraceDescriptor()
+                if actual_type is _TraceDescriptor
+                else {}
+            )
             descriptor_only = False
             try:
                 for key, item in _mapping_items(value, actual_type):
