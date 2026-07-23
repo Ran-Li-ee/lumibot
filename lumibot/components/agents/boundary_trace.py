@@ -35,6 +35,7 @@ from .trace_redaction import redact_sensitive
 
 BOUNDARY_SCHEMA_VERSION = 1
 DEFAULT_INLINE_PAYLOAD_LIMIT = 64_000
+_BINARY_PREVIEW_BYTE_LIMIT = 4_096
 _DESCRIPTOR_ONLY = object()
 _SAFE_PATH_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _SAFE_SPAN_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
@@ -257,19 +258,44 @@ def _scrub_trace_paths(value: Any) -> Any:
     return value
 
 
+def _is_trace_descriptor(value: Any) -> bool:
+    if type(value) is not dict:
+        return False
+    fidelity = dict.get(value, "fidelity")
+    return (
+        type(fidelity) is str
+        and fidelity in ("semantic_copy", "descriptor_only")
+        and type(dict.get(value, "python_type")) is str
+        and type(dict.get(value, "qualified_type")) is str
+    )
+
+
 def _bound_descriptor_previews(value: Any) -> Any:
-    if isinstance(value, dict):
+    if type(value) is dict:
+        is_descriptor = _is_trace_descriptor(value)
         return {
             key: (
                 item[:500]
-                if key == "preview" and isinstance(item, str)
+                if is_descriptor
+                and key == "preview"
+                and type(item) is str
                 else _bound_descriptor_previews(item)
             )
             for key, item in value.items()
         }
-    if isinstance(value, list):
+    if type(value) is list:
         return [_bound_descriptor_previews(item) for item in value]
     return value
+
+
+def _contains_redacted_descriptor(value: Any) -> bool:
+    if type(value) is dict:
+        if _is_trace_descriptor(value) and value.get("redacted") is True:
+            return True
+        return any(_contains_redacted_descriptor(item) for item in value.values())
+    if type(value) is list:
+        return any(_contains_redacted_descriptor(item) for item in value)
+    return False
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -547,7 +573,18 @@ class BoundaryTraceCollector:
             actual_type,
             (bytes, bytearray),
         ):
-            descriptor["preview"] = repr(value)
+            descriptor["length"] = len(value)
+            if actual_type is bytes:
+                preview_value = bytes.__getitem__(
+                    value,
+                    slice(0, _BINARY_PREVIEW_BYTE_LIMIT),
+                )
+            else:
+                preview_value = bytearray.__getitem__(
+                    value,
+                    slice(0, _BINARY_PREVIEW_BYTE_LIMIT),
+                )
+            descriptor["preview"] = repr(preview_value)
         elif include_safe_preview:
             descriptor["preview"] = _type_based_preview(descriptor)
         return descriptor
@@ -572,9 +609,10 @@ class BoundaryTraceCollector:
                     value,
                     include_safe_preview=True,
                 )
-            return _bound_descriptor_previews(
-                _redact_trace_value(descriptor)
-            )
+            sanitized = _redact_trace_value(descriptor)
+            if sanitized != descriptor:
+                sanitized["redacted"] = True
+            return _bound_descriptor_previews(sanitized)
         except Exception:
             return fallback
 
@@ -776,8 +814,9 @@ class BoundaryTraceCollector:
             payload,
             nested=False,
         )
+        has_redacted_descriptor = _contains_redacted_descriptor(normalized)
         sanitized = _redact_trace_value(normalized)
-        was_redacted = sanitized != normalized
+        was_redacted = sanitized != normalized or has_redacted_descriptor
         redacted = _bound_descriptor_previews(sanitized)
         encoded = _canonical_json_bytes(redacted)
         meta = {

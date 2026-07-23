@@ -271,6 +271,41 @@ def test_large_payload_is_redacted_then_written_to_relative_sidecar(tmp_path):
     ).hexdigest()
 
 
+def test_large_user_preview_field_is_not_descriptor_bounded(tmp_path):
+    payload = {"preview": "x" * 100_000}
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+        inline_payload_limit=32,
+    )
+
+    event = collector.record(
+        transition="B03_ADK_TO_FUNCTION_TOOL",
+        from_module="google_adk",
+        to_module="function_tool",
+        payload=payload,
+    )
+
+    relative = event["payload_meta"]["sidecar_path"]
+    with gzip.open(tmp_path / relative, "rb") as handle:
+        persisted_bytes = handle.read()
+    persisted = json.loads(persisted_bytes)
+    canonical_bytes = json.dumps(
+        payload,
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+
+    assert persisted == payload
+    assert persisted_bytes == canonical_bytes
+    assert event["payload_meta"]["byte_count"] == len(canonical_bytes)
+    assert event["payload_meta"]["sha256"] == hashlib.sha256(
+        canonical_bytes
+    ).hexdigest()
+    assert event["payload_meta"]["compression"] == "gzip"
+    assert event["payload_meta"]["truncated"] is False
+
+
 def test_raw_generator_uses_descriptor_without_consuming_it(tmp_path):
     consumed = []
 
@@ -558,6 +593,55 @@ def test_descriptor_preview_redacts_complete_safe_preview_before_truncating(tmp_
     assert "[REDACTED]" in descriptor["preview"]
     assert secret[:100].decode() not in descriptor["preview"]
     assert len(descriptor["preview"]) <= 500
+
+
+@pytest.mark.parametrize(
+    ("binary_type", "python_type"),
+    [(bytes, "bytes"), (bytearray, "bytearray")],
+)
+def test_large_binary_descriptor_uses_bounded_prefix_and_total_length(
+    tmp_path,
+    binary_type,
+    python_type,
+):
+    value = binary_type((b"x" * 1_000_000) + b"binary-tail-marker")
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value(value)
+
+    assert descriptor["fidelity"] == "descriptor_only"
+    assert descriptor["python_type"] == python_type
+    assert descriptor["length"] == len(value)
+    assert len(descriptor["preview"]) <= 500
+    assert "binary-tail-marker" not in descriptor["preview"]
+
+
+def test_b06_preserves_redacted_raw_descriptor_provenance(tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    descriptor = collector.describe_raw_value(
+        {"OPENAI_API_KEY": "b06-raw-result-secret", "symbol": "QQQ"}
+    )
+
+    event = collector.record(
+        transition="B06_PYTHON_TOOL_TO_WRAPPER",
+        from_module="python_tool",
+        to_module="lumibot_tool_wrapper",
+        payload={"raw_result": descriptor},
+    )
+
+    assert descriptor == {
+        "python_type": "dict",
+        "qualified_type": "builtins.dict",
+        "fidelity": "semantic_copy",
+        "semantic_value": {
+            "OPENAI_API_KEY": "[REDACTED]",
+            "symbol": "QQQ",
+        },
+        "redacted": True,
+    }
+    assert event["payload"] == {"raw_result": descriptor}
+    assert event["payload_meta"]["redacted"] is True
+    assert "b06-raw-result-secret" not in str(event)
 
 
 def test_snapshot_marks_descriptor_preview_redaction(tmp_path):
