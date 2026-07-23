@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import importlib
 import inspect
@@ -18,7 +19,13 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from importlib.metadata import version
-from types import SimpleNamespace
+from types import (
+    BuiltinFunctionType,
+    BuiltinMethodType,
+    FunctionType,
+    MethodType,
+    SimpleNamespace,
+)
 from typing import Any, Callable
 from uuid import UUID, uuid4
 
@@ -182,6 +189,40 @@ def _fallback_callable_signature(original: Any) -> inspect.Signature | None:
         return signature
     except Exception:
         return None
+
+
+def _is_async_callable(original: Any) -> bool:
+    safe_coroutine_types = {
+        FunctionType,
+        MethodType,
+        BuiltinFunctionType,
+        BuiltinMethodType,
+    }
+    seen: set[int] = set()
+
+    def classify(value: Any) -> bool:
+        value_id = id(value)
+        if value_id in seen:
+            return False
+        seen.add(value_id)
+
+        value_type = type(value)
+        if value_type in safe_coroutine_types:
+            return inspect.iscoroutinefunction(value)
+        if value_type in {staticmethod, classmethod}:
+            return classify(object.__getattribute__(value, "__func__"))
+        if value_type is functools.partialmethod:
+            return classify(object.__getattribute__(value, "func"))
+        if value_type is functools.partial:
+            return classify(object.__getattribute__(value, "func"))
+
+        raw_call = inspect.getattr_static(value_type, "__call__")
+        return classify(raw_call)
+
+    try:
+        return classify(original)
+    except Exception:
+        return False
 
 
 def _add_trace_diagnostic(
@@ -501,22 +542,7 @@ def _wrap_tool_callable(
             tool_duration_ms=tool_duration_ms,
         )
 
-    try:
-        call_method = inspect.getattr_static(
-            original,
-            "__call__",
-            None,
-        )
-    except Exception:
-        call_method = None
-    wrapper = (
-        async_wrapper
-        if (
-            inspect.iscoroutinefunction(original)
-            or inspect.iscoroutinefunction(call_method)
-        )
-        else sync_wrapper
-    )
+    wrapper = async_wrapper if _is_async_callable(original) else sync_wrapper
     wrapper.__name__ = _tool_function_name(tool.name)
     wrapper.__qualname__ = wrapper.__name__
     wrapper.__doc__ = tool.description

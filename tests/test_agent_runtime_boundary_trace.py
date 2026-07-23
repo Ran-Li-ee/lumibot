@@ -7,7 +7,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from functools import partial
+from functools import partial, partialmethod
 from threading import Event
 from types import SimpleNamespace
 
@@ -62,7 +62,11 @@ def make_runtime_request(collector, *, tools=None, model="openai/test"):
         memory_state={},
         memory_notes=[],
         bound_tools=list(tools or []),
-        agent_run_id=collector.agent_run_id,
+        agent_run_id=(
+            collector.agent_run_id
+            if collector is not None
+            else "run-without-boundary-collector"
+        ),
         boundary_collector=collector,
     )
 
@@ -4199,6 +4203,221 @@ def test_async_tool_error_records_await_timing_and_restores_context(
         b07["ended_at"]
     )
     assert b07["payload"]["serialized_result"] == result
+
+
+def _make_wrapped_async_callable(callable_kind, raises):
+    async def execute():
+        await asyncio.sleep(0.005)
+        if raises:
+            raise ValueError(f"{callable_kind} async failed")
+        return {"status": f"{callable_kind} complete"}
+
+    if callable_kind == "staticmethod":
+
+        class DescriptorAsyncTool:
+            @staticmethod
+            async def __call__():
+                return await execute()
+
+    elif callable_kind == "classmethod":
+
+        class DescriptorAsyncTool:
+            @classmethod
+            async def __call__(cls):
+                return await execute()
+
+    elif callable_kind == "partialmethod":
+
+        class DescriptorAsyncTool:
+            async def invoke(self, marker):
+                assert marker == "partialmethod"
+                return await execute()
+
+            __call__ = partialmethod(invoke, "partialmethod")
+
+    elif callable_kind == "partial":
+        return partial(partial(execute))
+    else:
+        raise AssertionError(f"unknown callable kind: {callable_kind}")
+
+    return DescriptorAsyncTool()
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+@pytest.mark.filterwarnings(
+    "error::pytest.PytestUnraisableExceptionWarning"
+)
+@pytest.mark.parametrize(
+    "callable_kind",
+    ["staticmethod", "classmethod", "partialmethod", "partial"],
+)
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("with_collector", [False, True])
+@pytest.mark.parametrize("runtime_path", ["wrapper", "stub"])
+def test_wrapped_async_callable_is_awaited_without_instance_probes(
+    tmp_path,
+    callable_kind,
+    raises,
+    with_collector,
+    runtime_path,
+):
+    original = _make_wrapped_async_callable(callable_kind, raises)
+    collector = (
+        BoundaryTraceCollector(
+            agent_run_id=(
+                f"run-{runtime_path}-{callable_kind}-{raises}"
+            ),
+            artifact_root=tmp_path,
+        )
+        if with_collector
+        else None
+    )
+    tool = BoundTool(
+        name=f"{callable_kind}_tool",
+        description=f"{callable_kind} async tool",
+        function=original,
+    )
+
+    if runtime_path == "wrapper":
+        wrapped = _wrap_tool_callable(
+            tool,
+            {"marker": "descriptor"},
+            collector=collector,
+        )
+        assert inspect.iscoroutinefunction(wrapped)
+        outcome = asyncio.run(wrapped())
+        trace = collector.export() if collector is not None else None
+    else:
+        result = StubAgentRuntime().run(
+            make_runtime_request(collector, tools=[tool])
+        )
+        outcome = next(
+            event.payload
+            for event in result.events
+            if event.kind == "tool_result"
+        )
+        trace = result.boundary_trace
+
+    gc.collect()
+
+    assert not inspect.isawaitable(outcome)
+    if raises:
+        assert outcome["tool_error"] is True
+        assert outcome["error"] == {
+            "type": "ValueError",
+            "message": f"{callable_kind} async failed",
+        }
+    else:
+        assert outcome == {
+            "status": f"{callable_kind} complete"
+        }
+    if collector is None:
+        assert trace is None
+    else:
+        assert trace == collector.export()
+        assert [
+            event["transition"]
+            for event in trace["events"]
+        ] == [
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+        ]
+        b06 = _trace_events(
+            trace,
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+        )[0]
+        b07 = _trace_events(
+            trace,
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+        )[0]
+        assert b06["status"] == ("error" if raises else "success")
+        assert b06["duration_ms"] > 0
+        assert _event_timestamp(b06["started_at"]) < _event_timestamp(
+            b06["ended_at"]
+        )
+        assert _event_timestamp(b06["ended_at"]) <= _event_timestamp(
+            b07["ended_at"]
+        )
+        assert b07["payload"]["serialized_result"] == outcome
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+@pytest.mark.filterwarnings(
+    "error::pytest.PytestUnraisableExceptionWarning"
+)
+@pytest.mark.parametrize("with_collector", [False, True])
+@pytest.mark.parametrize("runtime_path", ["wrapper", "stub"])
+def test_guarded_sync_callable_wraps_without_unsafe_instance_probes(
+    tmp_path,
+    with_collector,
+    runtime_path,
+):
+    probes = []
+
+    class GuardedSyncTool:
+        def __getattribute__(self, name):
+            if name == "__signature__":
+                probes.append(name)
+                raise RuntimeError("signature unavailable")
+            if name in {
+                "__call__",
+                "__code__",
+                "__name__",
+                "_is_coroutine_marker",
+            }:
+                raise AssertionError(f"unsafe instance probe: {name}")
+            return object.__getattribute__(self, name)
+
+        def __call__(self):
+            return {"status": "sync complete"}
+
+    collector = (
+        BoundaryTraceCollector(
+            agent_run_id=f"run-guarded-{runtime_path}",
+            artifact_root=tmp_path,
+        )
+        if with_collector
+        else None
+    )
+    tool = BoundTool(
+        name="guarded_sync",
+        description="guarded sync tool",
+        function=GuardedSyncTool(),
+    )
+
+    if runtime_path == "wrapper":
+        wrapped = _wrap_tool_callable(
+            tool,
+            {},
+            collector=collector,
+        )
+        assert not inspect.iscoroutinefunction(wrapped)
+        outcome = wrapped()
+        trace = collector.export() if collector is not None else None
+    else:
+        result = StubAgentRuntime().run(
+            make_runtime_request(collector, tools=[tool])
+        )
+        outcome = next(
+            event.payload
+            for event in result.events
+            if event.kind == "tool_result"
+        )
+        trace = result.boundary_trace
+
+    gc.collect()
+
+    assert outcome == {"status": "sync complete"}
+    assert probes == ["__signature__"]
+    if collector is None:
+        assert trace is None
+    else:
+        assert trace == collector.export()
+        assert _trace_events(
+            trace,
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+        )[0]["status"] == "success"
 
 
 @pytest.mark.parametrize("callable_kind", ["function", "object"])
