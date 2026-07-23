@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from google.adk.tools.function_tool import FunctionTool
+from google.adk.tools.tool_context import ToolContext
 from pydantic import BaseModel
 
 from lumibot.components.agents import runtime as agent_runtime
@@ -135,6 +136,33 @@ def test_missing_required_argument_records_b04_without_local_execution(tmp_path)
     assert _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL") == []
 
 
+def test_missing_required_arguments_exclude_adk_injected_tool_context(tmp_path):
+    executed = []
+
+    def tool(symbol: str, tool_context: ToolContext):
+        executed.append((symbol, tool_context))
+        return {"symbol": symbol}
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(name="tool", description="tool", function=tool),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    result = asyncio.run(
+        observed.run_async(args={}, tool_context=FakeToolContext())
+    )
+
+    assert executed == []
+    assert "mandatory input parameters" in result["error"]
+    b04 = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")[0]
+    assert b04["status"] == "blocked"
+    assert b04["payload"]["missing_mandatory_arguments"] == ["symbol"]
+    assert _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL") == []
+
+
 def test_collector_call_state_is_detached_from_mutable_arguments(tmp_path):
     collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
     arguments = {"request": {"symbol": "QQQ"}}
@@ -148,6 +176,81 @@ def test_collector_call_state_is_detached_from_mutable_arguments(tmp_path):
         "wrapper_invoked": True,
         "wrapper_received_arguments": {"request": {"symbol": "QQQ"}},
     }
+
+
+def test_uncopyable_wrapper_arguments_preserve_successful_boundary_state(tmp_path):
+    class UncopyableArgument:
+        def __deepcopy__(self, _memo):
+            raise RuntimeError("argument copy unavailable")
+
+        def __str__(self):
+            return "[uncopyable argument]"
+
+        def __repr__(self):
+            raise AssertionError("raw repr must not be called")
+
+    received = []
+
+    def tool(value):
+        received.append(value)
+        return {"ok": True}
+
+    value = UncopyableArgument()
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(name="tool", description="tool", function=tool),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    result = asyncio.run(
+        observed.run_async(
+            args={"value": value},
+            tool_context=FakeToolContext(),
+        )
+    )
+
+    assert result == {"ok": True}
+    assert received == [value]
+    assert _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL")[0]["status"] == "success"
+    b04 = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")[0]
+    assert b04["status"] == "success"
+    safe_value = b04["payload"]["wrapper_received_arguments"]["value"]
+    assert safe_value["python_type"] == "UncopyableArgument"
+    assert safe_value["preview"].endswith("UncopyableArgument instance>")
+    assert "0x" not in safe_value["preview"]
+    assert any(
+        diagnostic["kind"] == "wrapper_arguments_snapshot_failed"
+        for diagnostic in collector.export()["diagnostics"]
+    )
+
+
+def test_call_state_uses_safe_fallback_when_detachment_fails(tmp_path):
+    class UncopyableArgument:
+        def __deepcopy__(self, _memo):
+            raise RuntimeError("state copy unavailable")
+
+        def __repr__(self):
+            raise AssertionError("raw repr must not be called")
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    collector._call_index["call_A"] = {
+        "wrapper_invoked": True,
+        "wrapper_received_arguments": {"value": UncopyableArgument()},
+    }
+
+    state = collector.call_state("call_A")
+
+    assert state["wrapper_invoked"] is True
+    safe_value = state["wrapper_received_arguments"]["value"]
+    assert safe_value["python_type"] == "UncopyableArgument"
+    assert safe_value["preview"].endswith("UncopyableArgument instance>")
+    assert "0x" not in safe_value["preview"]
+    assert any(
+        diagnostic["kind"] == "call_state_snapshot_failed"
+        for diagnostic in collector.export()["diagnostics"]
+    )
 
 
 def test_observed_function_tool_without_collector_is_ordinary_function_tool():

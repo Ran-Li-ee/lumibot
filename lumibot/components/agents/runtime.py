@@ -492,11 +492,37 @@ def _build_observed_function_tool(
                     message = str(result.get("error") or "")
                     if "mandatory input parameters" in message:
                         try:
-                            signature = inspect.signature(wrapped)
+                            get_mandatory_args = getattr(
+                                self,
+                                "_get_mandatory_args",
+                                None,
+                            )
+                            if callable(get_mandatory_args):
+                                mandatory_arguments = (
+                                    get_mandatory_args()
+                                )
+                            else:
+                                signature = inspect.signature(wrapped)
+                                mandatory_arguments = [
+                                    name
+                                    for name, parameter in signature.parameters.items()
+                                    if parameter.default
+                                    is inspect.Parameter.empty
+                                    and parameter.kind
+                                    not in (
+                                        inspect.Parameter.VAR_POSITIONAL,
+                                        inspect.Parameter.VAR_KEYWORD,
+                                    )
+                                ]
+                            context_parameter = getattr(
+                                self,
+                                "_context_param_name",
+                                "tool_context",
+                            )
                             missing = [
                                 name
-                                for name, parameter in signature.parameters.items()
-                                if parameter.default is inspect.Parameter.empty
+                                for name in mandatory_arguments
+                                if name != context_parameter
                                 and name not in args
                             ]
                         except Exception as exc:

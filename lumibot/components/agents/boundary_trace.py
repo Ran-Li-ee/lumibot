@@ -509,15 +509,52 @@ class BoundaryTraceCollector:
         call_id: str,
         arguments: dict[str, Any],
     ) -> None:
-        detached_arguments = copy.deepcopy(arguments)
         with self._lock:
             state = self._call_index.setdefault(call_id, {})
-            state["wrapper_received_arguments"] = detached_arguments
             state["wrapper_invoked"] = True
+            state["wrapper_received_arguments"] = None
+
+        try:
+            detached_arguments = copy.deepcopy(arguments)
+        except Exception as exc:
+            self.add_diagnostic("wrapper_arguments_snapshot_failed", exc)
+            detached_arguments = arguments
+
+        try:
+            safe_arguments, _ = self._snapshot_trace_value(
+                detached_arguments,
+                nested=False,
+            )
+            if type(safe_arguments) is not dict:
+                safe_arguments = {}
+        except Exception as exc:
+            self.add_diagnostic(
+                "wrapper_arguments_normalization_failed",
+                exc,
+            )
+            safe_arguments = {}
+
+        with self._lock:
+            state = self._call_index.setdefault(call_id, {})
+            state["wrapper_invoked"] = True
+            state["wrapper_received_arguments"] = safe_arguments
 
     def call_state(self, call_id: str) -> dict[str, Any]:
         with self._lock:
-            return copy.deepcopy(self._call_index.get(call_id) or {})
+            state = dict(self._call_index.get(call_id) or {})
+        try:
+            return copy.deepcopy(state)
+        except Exception as exc:
+            self.add_diagnostic("call_state_snapshot_failed", exc)
+        try:
+            safe_state, _ = self._snapshot_trace_value(
+                state,
+                nested=False,
+            )
+            return safe_state if type(safe_state) is dict else {}
+        except Exception as exc:
+            self.add_diagnostic("call_state_normalization_failed", exc)
+            return {"wrapper_invoked": state.get("wrapper_invoked") is True}
 
     def clear_wrapper_call_state(self, call_id: str) -> None:
         with self._lock:
