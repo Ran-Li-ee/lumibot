@@ -63,6 +63,27 @@ _STANDARD_PATH_TYPES = (
     PureWindowsPath,
     WindowsPath,
 )
+_SAFE_NUMERIC_USAGE_FIELDS = {
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "cached_content_token_count",
+    "cached_input_tokens",
+    "cached_prompt_tokens",
+    "cached_tokens",
+    "candidates_token_count",
+    "completion_tokens",
+    "input_tokens",
+    "output_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+    "prompt_token_count",
+    "prompt_tokens",
+    "reasoning_tokens",
+    "thoughts_token_count",
+    "tool_use_prompt_token_count",
+    "total_token_count",
+    "total_tokens",
+}
 
 
 class _TraceDescriptor(dict):
@@ -232,8 +253,41 @@ def _semantic_trace_value(value: Any) -> Any:
 
 def _redact_trace_value(value: Any) -> Any:
     redacted = redact_sensitive(value)
+    redacted = _restore_safe_numeric_usage_fields(value, redacted)
     with_descriptors = _restore_trace_descriptors(value, redacted)
     return _scrub_trace_paths(_redact_trace_keys(with_descriptors))
+
+
+def _restore_safe_numeric_usage_fields(source: Any, transformed: Any) -> Any:
+    if type(source) in (dict, _TraceDescriptor) and type(transformed) is dict:
+        restored = dict(transformed)
+        for key, item in dict.items(source):
+            transformed_item = restored.get(key)
+            if (
+                key in _SAFE_NUMERIC_USAGE_FIELDS
+                and type(item) in (int, float)
+            ):
+                restored[key] = item
+            elif key in restored:
+                restored[key] = _restore_safe_numeric_usage_fields(
+                    item,
+                    transformed_item,
+                )
+        return (
+            _TraceDescriptor(restored)
+            if type(source) is _TraceDescriptor
+            else restored
+        )
+    if type(source) is list and type(transformed) is list:
+        return [
+            _restore_safe_numeric_usage_fields(source_item, transformed_item)
+            for source_item, transformed_item in zip(
+                source,
+                transformed,
+                strict=True,
+            )
+        ]
+    return transformed
 
 
 def _restore_trace_descriptors(source: Any, transformed: Any) -> Any:
@@ -481,6 +535,7 @@ class BoundaryTraceCollector:
         self._batch_number_by_turn: dict[str, int] = {}
         self._call_index: dict[str, dict[str, Any]] = {}
         self._observation_index: dict[str, dict[str, Any]] = {}
+        self._active_model_turn_id: str | None = None
         self._lock = threading.Lock()
 
     def start_model_turn(self) -> str:
@@ -488,22 +543,86 @@ class BoundaryTraceCollector:
             self._turn_number += 1
             return f"{self.agent_run_id}:turn:{self._turn_number:04d}"
 
+    def set_active_model_turn(self, model_turn_id: str) -> None:
+        with self._lock:
+            self._active_model_turn_id = model_turn_id
+
+    def active_model_turn(self) -> str | None:
+        with self._lock:
+            return self._active_model_turn_id
+
     def register_tool_batch(self, model_turn_id: str, call_ids: list[str]) -> str:
         with self._lock:
             number = self._batch_number_by_turn.get(model_turn_id, 0) + 1
             self._batch_number_by_turn[model_turn_id] = number
             batch_id = f"{model_turn_id}:batch:{number:04d}"
             for index, call_id in enumerate(call_ids, start=1):
-                self._call_index[call_id] = {
-                    "model_turn_id": model_turn_id,
-                    "tool_batch_id": batch_id,
-                    "call_sequence": index,
-                }
+                state = self._call_index.setdefault(call_id, {})
+                state.update(
+                    {
+                        "model_turn_id": model_turn_id,
+                        "tool_batch_id": batch_id,
+                        "call_sequence": index,
+                    }
+                )
             return batch_id
+
+    def batch_call_ids(self, tool_batch_id: str | None) -> list[str]:
+        if not tool_batch_id:
+            return []
+        with self._lock:
+            calls = [
+                (state.get("call_sequence"), call_id)
+                for call_id, state in self._call_index.items()
+                if state.get("tool_batch_id") == tool_batch_id
+            ]
+        return [
+            call_id
+            for _, call_id in sorted(
+                calls,
+                key=lambda item: (
+                    item[0] if isinstance(item[0], int) else sys.maxsize,
+                    item[1],
+                ),
+            )
+        ]
 
     def call_ids(self, call_id: str) -> dict[str, Any]:
         with self._lock:
             return dict(self._call_index.get(call_id) or {})
+
+    def note_call_id_source(self, call_id: str, source: str) -> None:
+        with self._lock:
+            state = self._call_index.setdefault(call_id, {})
+            state["call_id_source"] = source
+
+    def note_function_tool_response(
+        self,
+        call_id: str,
+        *,
+        unpruned_response: Any,
+        model_facing_response: Any,
+        pruned: bool,
+    ) -> None:
+        safe_unpruned = self._safe_observation_value(
+            unpruned_response,
+            snapshot_diagnostic="function_tool_response_snapshot_failed",
+            normalization_diagnostic=(
+                "function_tool_response_normalization_failed"
+            ),
+        )
+        safe_model_facing = self._safe_observation_value(
+            model_facing_response,
+            snapshot_diagnostic="model_facing_response_snapshot_failed",
+            normalization_diagnostic=(
+                "model_facing_response_normalization_failed"
+            ),
+        )
+        with self._lock:
+            state = self._call_index.setdefault(call_id, {})
+            state["function_tool_response"] = safe_unpruned
+            state["model_facing_response"] = safe_model_facing
+            state["tool_response_pruned"] = bool(pruned)
 
     def _safe_observation_value(
         self,
