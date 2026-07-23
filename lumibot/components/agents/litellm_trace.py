@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import math
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+import litellm
 from litellm.integrations.custom_logger import CustomLogger
 
 from .boundary_trace import BoundaryTraceCollector
@@ -100,6 +103,26 @@ _FUNCTION_FIELDS = (
     "name",
     "arguments",
 )
+
+
+@dataclass(frozen=True)
+class _PendingProviderRequest:
+    model_turn_id: str | None
+    request: dict[str, Any]
+    routing: dict[str, Any]
+    retry_count: int | None
+    cache_hit: bool
+    started_at: datetime
+    visibility: str
+
+
+def supports_dynamic_input_callback() -> bool:
+    """Return whether this LiteLLM exposes a request-local input callback."""
+    try:
+        parameters = inspect.signature(litellm.acompletion).parameters
+    except (TypeError, ValueError):
+        return False
+    return "input_callback" in parameters
 
 
 def _type_name(value: Any) -> str:
@@ -393,8 +416,10 @@ def _provider_attempt_payload(
     *,
     accepted_response: bool,
     timing_visibility: str,
+    retry_count: int | None = None,
 ) -> dict[str, Any]:
-    retry_count = _retry_count(kwargs)
+    if retry_count is None:
+        retry_count = _retry_count(kwargs)
     return {
         "provider_attempt": (
             retry_count + 1
@@ -488,6 +513,13 @@ class LiteLLMBoundaryLogger(CustomLogger):
         self._seen_callbacks: set[
             tuple[str, str | None, str, str, int | None]
         ] = set()
+        self._fallback_outcomes: set[
+            tuple[str, str | None, str]
+        ] = set()
+        self._pending_requests: dict[
+            tuple[str, str | None, int | None],
+            _PendingProviderRequest,
+        ] = {}
         self._seen_lock = threading.Lock()
 
     def _try_diagnostic(self, kind: str, detail: str) -> None:
@@ -532,7 +564,14 @@ class LiteLLMBoundaryLogger(CustomLogger):
         kwargs: Any,
         response_obj: Any,
         model_turn_id: str | None,
+        *,
+        fallback: bool = False,
     ) -> bool:
+        fallback_key = (
+            self.collector.agent_run_id,
+            model_turn_id,
+            outcome,
+        )
         key = (
             self.collector.agent_run_id,
             model_turn_id,
@@ -541,10 +580,134 @@ class LiteLLMBoundaryLogger(CustomLogger):
             _retry_count(kwargs),
         )
         with self._seen_lock:
+            if fallback:
+                if fallback_key in self._fallback_outcomes or any(
+                    seen[:3] == fallback_key
+                    for seen in self._seen_callbacks
+                ):
+                    return False
+                self._fallback_outcomes.add(fallback_key)
+            elif fallback_key in self._fallback_outcomes:
+                return False
             if key in self._seen_callbacks:
                 return False
             self._seen_callbacks.add(key)
         return True
+
+    def _pending_key(
+        self,
+        model_turn_id: str | None,
+        retry_count: int | None,
+    ) -> tuple[str, str | None, int | None]:
+        return (
+            self.collector.agent_run_id,
+            model_turn_id,
+            retry_count,
+        )
+
+    def _capture_pre_api(
+        self,
+        model: Any,
+        messages: Any,
+        kwargs: Any,
+        *,
+        visibility: str,
+    ) -> None:
+        captured_kwargs = (
+            dict.copy(kwargs)
+            if type(kwargs) is dict
+            else {}
+        )
+        if _field(captured_kwargs, "model") is _MISSING:
+            captured_kwargs["model"] = model
+        if _field(captured_kwargs, "messages") is _MISSING:
+            captured_kwargs["messages"] = messages
+        turn_id = self._turn_id(captured_kwargs)
+        retry_count = _retry_count(captured_kwargs)
+        started_at = _field(captured_kwargs, "api_call_start_time")
+        if type(started_at) is not datetime:
+            started_at = datetime.now()
+        pending = _PendingProviderRequest(
+            model_turn_id=turn_id,
+            request=_safe_provider_request(captured_kwargs),
+            routing=_safe_routing(captured_kwargs),
+            retry_count=retry_count,
+            cache_hit=_cache_hit(captured_kwargs),
+            started_at=started_at,
+            visibility=visibility,
+        )
+        key = self._pending_key(turn_id, retry_count)
+        with self._seen_lock:
+            if retry_count is not None:
+                self._pending_requests.pop(
+                    self._pending_key(turn_id, None),
+                    None,
+                )
+            self._pending_requests[key] = pending
+
+    def capture_acompletion_request(
+        self,
+        model: Any,
+        messages: Any,
+        kwargs: Any,
+    ) -> None:
+        """Retain a safe projection of request-local acompletion arguments."""
+        try:
+            self._capture_pre_api(
+                model,
+                messages,
+                kwargs,
+                visibility="litellm_acompletion_args_pre_adapter",
+            )
+        except BaseException:
+            self._try_diagnostic(
+                "litellm_boundary_pre_api_callback_failed",
+                "LiteLLM pre-API request capture failed",
+            )
+
+    def log_pre_api_call(
+        self,
+        model: Any,
+        messages: Any,
+        kwargs: Any,
+    ) -> None:
+        try:
+            self._capture_pre_api(
+                model,
+                messages,
+                kwargs,
+                visibility="litellm_pre_api_callback",
+            )
+        except BaseException:
+            self._try_diagnostic(
+                "litellm_boundary_pre_api_callback_failed",
+                "LiteLLM pre-API request capture failed",
+            )
+
+    async def async_log_pre_api_call(
+        self,
+        model: Any,
+        messages: Any,
+        kwargs: Any,
+    ) -> None:
+        self.log_pre_api_call(model, messages, kwargs)
+
+    def _take_pending_request(
+        self,
+        model_turn_id: str | None,
+        retry_count: int | None,
+    ) -> _PendingProviderRequest | None:
+        with self._seen_lock:
+            pending = self._pending_requests.pop(
+                self._pending_key(model_turn_id, retry_count),
+                None,
+            )
+            if pending is None and retry_count is not None:
+                pending = self._pending_requests.pop(
+                    self._pending_key(model_turn_id, None),
+                    None,
+                )
+            return pending
 
     def _try_record(self, **event: Any) -> None:
         try:
@@ -563,6 +726,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
         response_obj: Any,
         start_time: Any,
         end_time: Any,
+        fallback: bool = False,
     ) -> None:
         turn_id = self._turn_id(kwargs)
         if not self._claim_callback(
@@ -570,9 +734,14 @@ class LiteLLMBoundaryLogger(CustomLogger):
             kwargs,
             response_obj,
             turn_id,
+            fallback=fallback,
         ):
             return
-        if _cache_hit(kwargs):
+        retry_count = _retry_count(kwargs)
+        pending = self._take_pending_request(turn_id, retry_count)
+        if _cache_hit(kwargs) or (
+            pending is not None and pending.cache_hit
+        ):
             self._try_diagnostic(
                 "litellm_adapter_cache_hit",
                 (
@@ -581,17 +750,37 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 ),
             )
             return
+        timing_start = (
+            pending.started_at
+            if pending is not None
+            else start_time
+        )
+        if pending is not None and type(end_time) is not datetime:
+            end_time = datetime.now()
         timing, timing_visibility = _callback_timing(
-            start_time,
+            timing_start,
             end_time,
         )
+        if pending is not None and timing:
+            timing_visibility = "pre_api_to_terminal_not_per_attempt"
         accepted_response = outcome == "success"
+        effective_retry_count = (
+            retry_count
+            if retry_count is not None
+            else pending.retry_count if pending is not None else None
+        )
         attempt = _provider_attempt_payload(
             kwargs,
             accepted_response=accepted_response,
             timing_visibility=timing_visibility,
+            retry_count=effective_retry_count,
         )
         routing = _safe_routing(kwargs)
+        if pending is not None:
+            routing = {**pending.routing, **routing}
+        request = _safe_provider_request(kwargs)
+        if pending is not None:
+            request = {**pending.request, **request}
         status = "success" if accepted_response else "error"
         self._try_record(
             transition="B10_LITELLM_TO_PROVIDER",
@@ -605,7 +794,12 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 "boundary_distinction": (
                     "litellm_provider_adapter_request_not_adk_model_entry"
                 ),
-                "request": _safe_provider_request(kwargs),
+                "provider_request_visibility": (
+                    pending.visibility
+                    if pending is not None
+                    else "terminal_callback_kwargs"
+                ),
+                "request": request,
                 "provider_routing": routing,
                 **attempt,
             },
@@ -632,6 +826,45 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 _failure_error(kwargs, response_obj)
             )
         self._try_record(**response_event)
+
+    def record_async_failure_fallback(
+        self,
+        error: BaseException,
+        *,
+        kwargs: Any = None,
+        model_turn_id: str | None = None,
+    ) -> None:
+        """Record a missing async failure callback without changing the error."""
+        try:
+            callback_kwargs = (
+                dict.copy(kwargs)
+                if type(kwargs) is dict
+                else {}
+            )
+            metadata = _field(callback_kwargs, "metadata")
+            metadata = (
+                dict.copy(metadata)
+                if type(metadata) is dict
+                else {}
+            )
+            if model_turn_id is not None:
+                metadata["lumibot_model_turn_id"] = model_turn_id
+            if metadata:
+                callback_kwargs["metadata"] = metadata
+            callback_kwargs["exception"] = error
+            self._record_callback(
+                outcome="failure",
+                kwargs=callback_kwargs,
+                response_obj=error,
+                start_time=None,
+                end_time=datetime.now(),
+                fallback=True,
+            )
+        except BaseException:
+            self._try_diagnostic(
+                "litellm_boundary_failure_fallback_failed",
+                "LiteLLM async failure fallback tracing failed",
+            )
 
     async def async_log_success_event(
         self,

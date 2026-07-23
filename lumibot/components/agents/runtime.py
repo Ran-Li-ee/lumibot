@@ -25,7 +25,10 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel
 
 from .boundary_trace import BoundaryTraceCollector
-from .litellm_trace import LiteLLMBoundaryLogger
+from .litellm_trace import (
+    LiteLLMBoundaryLogger,
+    supports_dynamic_input_callback,
+)
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer
 from .tool_context import agent_tool_context
 
@@ -2499,6 +2502,36 @@ def _build_observed_litellm_type(
         if boundary_collector is not None
         else None
     )
+    dynamic_input_supported = supports_dynamic_input_callback()
+
+    class RequestLocalLiteLLMClient:
+        def __init__(self, delegate: Any) -> None:
+            self._delegate = delegate
+
+        async def acompletion(
+            self,
+            model: Any,
+            messages: Any,
+            tools: Any,
+            **kwargs: Any,
+        ) -> Any:
+            capture_kwargs = {
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                **kwargs,
+            }
+            boundary_logger.capture_acompletion_request(
+                model,
+                messages,
+                capture_kwargs,
+            )
+            return await self._delegate.acompletion(
+                model=model,
+                messages=messages,
+                tools=tools,
+                **kwargs,
+            )
 
     class ObservedLiteLlm(base_type):
         async def generate_content_async(
@@ -2513,14 +2546,23 @@ def _build_observed_litellm_type(
             except Exception:
                 pass
             invocation_model = self
+            invocation_args: dict[str, Any] | None = None
+            invocation_turn_id = (
+                boundary_collector.active_model_turn()
+                if boundary_collector is not None
+                else None
+            )
             if boundary_logger is not None:
                 try:
                     invocation_args = dict(self._additional_args)
-                    for callback_key in (
+                    callback_keys = [
                         "callbacks",
                         "success_callback",
                         "failure_callback",
-                    ):
+                    ]
+                    if dynamic_input_supported:
+                        callback_keys.append("input_callback")
+                    for callback_key in callback_keys:
                         existing = invocation_args.get(callback_key)
                         if existing is None:
                             callbacks = []
@@ -2529,6 +2571,7 @@ def _build_observed_litellm_type(
                         else:
                             callbacks = [existing]
                         if callback_key in (
+                            "input_callback",
                             "success_callback",
                             "failure_callback",
                         ):
@@ -2545,11 +2588,20 @@ def _build_observed_litellm_type(
                         boundary_collector.agent_run_id
                     )
                     metadata["lumibot_model_turn_id"] = (
-                        boundary_collector.active_model_turn()
+                        invocation_turn_id
                     )
                     invocation_args["metadata"] = metadata
                     invocation_model = self.model_copy(deep=False)
                     invocation_model._additional_args = invocation_args
+                    invocation_client = getattr(
+                        invocation_model,
+                        "llm_client",
+                        None,
+                    )
+                    if invocation_client is not None:
+                        invocation_model.llm_client = (
+                            RequestLocalLiteLLMClient(invocation_client)
+                        )
                 except Exception as exc:
                     _add_trace_diagnostic(
                         boundary_collector,
@@ -2557,12 +2609,21 @@ def _build_observed_litellm_type(
                         exc,
                     )
                     invocation_model = self
-            async for response in base_type.generate_content_async(
-                invocation_model,
-                llm_request,
-                stream=stream,
-            ):
-                yield response
+            try:
+                async for response in base_type.generate_content_async(
+                    invocation_model,
+                    llm_request,
+                    stream=stream,
+                ):
+                    yield response
+            except Exception as exc:
+                if boundary_logger is not None:
+                    boundary_logger.record_async_failure_fallback(
+                        exc,
+                        kwargs=invocation_args,
+                        model_turn_id=invocation_turn_id,
+                    )
+                raise
 
     ObservedLiteLlm.__name__ = f"Observed{base_type.__name__}"
     ObservedLiteLlm.__qualname__ = ObservedLiteLlm.__name__

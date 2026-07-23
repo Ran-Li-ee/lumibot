@@ -34,6 +34,9 @@ def _litellm_global_state():
         "input_callback": tuple(litellm.input_callback),
         "success_callback": tuple(litellm.success_callback),
         "failure_callback": tuple(litellm.failure_callback),
+        "async_input_callback": tuple(
+            litellm._async_input_callback
+        ),
         "async_success_callback": tuple(
             litellm._async_success_callback
         ),
@@ -284,6 +287,57 @@ def test_litellm_exposed_retry_count_records_attempt_and_acceptance(tmp_path):
     assert b01["payload"]["provider_timing_visibility"] == "unavailable"
 
 
+def test_litellm_pre_api_request_is_flushed_before_success_response(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    logger = LiteLLMBoundaryLogger(collector)
+    pre_kwargs = {
+        "model": "provider-model",
+        "messages": [{"role": "user", "content": "adapter request"}],
+        "temperature": 0.3,
+        "litellm_call_id": "call-pre-api",
+        "metadata": {"lumibot_model_turn_id": turn_id},
+    }
+
+    logger.log_pre_api_call(
+        "provider-model",
+        pre_kwargs["messages"],
+        pre_kwargs,
+    )
+    assert collector.export()["events"] == []
+
+    _run(
+        logger.async_log_success_event(
+            {
+                "model": "provider-model",
+                "litellm_call_id": "call-pre-api",
+                "metadata": {"lumibot_model_turn_id": turn_id},
+            },
+            {"id": "response-pre-api", "choices": []},
+            None,
+            None,
+        )
+    )
+
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert events[0]["payload"]["request"] == {
+        "model": "provider-model",
+        "messages": [
+            {"role": "user", "content": "adapter request"}
+        ],
+        "temperature": 0.3,
+        "metadata": {"lumibot_model_turn_id": turn_id},
+    }
+
+
 def test_litellm_failure_records_redacted_provider_error(tmp_path):
     collector = BoundaryTraceCollector(
         agent_run_id="run-1",
@@ -317,6 +371,45 @@ def test_litellm_failure_records_redacted_provider_error(tmp_path):
     }
     assert b01["payload"]["provider_attempt"] == 1
     assert b01["payload"]["accepted_response"] is False
+
+
+def test_litellm_failure_fallback_deduplicates_late_native_callback(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    logger = LiteLLMBoundaryLogger(collector)
+    kwargs = {
+        "model": "provider-model",
+        "messages": [],
+        "metadata": {"lumibot_model_turn_id": turn_id},
+        "retry_count": 0,
+    }
+    error = RuntimeError("provider unavailable")
+
+    logger.log_pre_api_call(
+        "provider-model",
+        kwargs["messages"],
+        kwargs,
+    )
+    logger.record_async_failure_fallback(
+        error,
+        kwargs=kwargs,
+        model_turn_id=turn_id,
+    )
+    _run(
+        logger.async_log_failure_event(
+            kwargs,
+            error,
+            None,
+            None,
+        )
+    )
+
+    assert len(_events(collector, "B10_LITELLM_TO_PROVIDER")) == 1
+    assert len(_events(collector, "B01_PROVIDER_TO_LITELLM")) == 1
 
 
 def test_litellm_turn_correlation_uses_nested_metadata_then_active_turn(tmp_path):
@@ -471,6 +564,11 @@ def test_litellm_cache_hit_does_not_emit_false_provider_exchange(
         **cache_kwargs,
     }
 
+    logger.log_pre_api_call(
+        "provider-model",
+        kwargs["messages"],
+        kwargs,
+    )
     _run(
         logger.async_log_success_event(
             kwargs,
@@ -556,6 +654,13 @@ def test_litellm_logger_is_fail_open_when_collector_and_diagnostic_fail():
                 None,
                 None,
             )
+        )
+        is None
+    )
+    assert (
+        logger.record_async_failure_fallback(
+            RuntimeError("provider unavailable"),
+            kwargs={"model": "provider-model", "messages": []},
         )
         is None
     )
@@ -764,6 +869,140 @@ def test_litellm_mock_failure_preserves_error_and_records_actual_exception(
     assert "mock internal server error" in b01[0]["error"]["message"]
 
 
+def test_observed_litellm_real_async_failure_records_once_without_globals(
+    tmp_path,
+    monkeypatch,
+):
+    import litellm
+    from google.adk.models.llm_request import LlmRequest
+    from google.genai import types
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-async-failure",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    model = agent_runtime._resolve_model_for_adk(
+        "openai/test",
+        model_entry_observer=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model._additional_args.update(
+        {
+            "mock_response": "litellm.InternalServerError",
+            "num_retries": 0,
+        }
+    )
+    request = LlmRequest(
+        model="openai/test",
+        contents=[
+            types.Content(
+                role="user",
+                parts=[types.Part(text="hello")],
+            )
+        ],
+        config=types.GenerateContentConfig(),
+    )
+    fallback_errors = []
+    original_fallback = (
+        LiteLLMBoundaryLogger.record_async_failure_fallback
+    )
+
+    def observe_fallback(self, error, **kwargs):
+        fallback_errors.append(error)
+        return original_fallback(self, error, **kwargs)
+
+    monkeypatch.setattr(
+        LiteLLMBoundaryLogger,
+        "record_async_failure_fallback",
+        observe_fallback,
+    )
+    global_state = _litellm_global_state()
+
+    async def invoke():
+        return [
+            response
+            async for response in model.generate_content_async(request)
+        ]
+
+    with pytest.raises(litellm.InternalServerError) as raised:
+        _run(invoke())
+
+    assert type(raised.value) is litellm.InternalServerError
+    assert fallback_errors == [raised.value]
+    assert fallback_errors[0] is raised.value
+    assert _litellm_global_state() == global_state
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert events[0]["status"] == "error"
+    assert events[1]["status"] == "error"
+    assert events[1]["error"]["type"] == "InternalServerError"
+    assert events[0]["payload"]["provider_request_visibility"] == (
+        "litellm_acompletion_args_pre_adapter"
+    )
+    assert events[0]["payload"]["provider_retry_visibility"] == (
+        "unavailable"
+    )
+    assert events[0]["payload"]["provider_timing_visibility"] == (
+        "pre_api_to_terminal_not_per_attempt"
+    )
+    assert events[0]["duration_ms"] >= 0
+
+
+def test_observed_litellm_failure_fallback_reraises_same_exception(tmp_path):
+    expected = RuntimeError("same exception")
+
+    class FailingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is False
+            raise expected
+            yield
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-identity",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        FailingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type(model="provider-model")
+
+    async def invoke():
+        return [
+            response
+            async for response in model.generate_content_async("request")
+        ]
+
+    with pytest.raises(RuntimeError) as raised:
+        _run(invoke())
+
+    assert raised.value is expected
+    assert len(_events(collector, "B10_LITELLM_TO_PROVIDER")) == 1
+    b01 = _events(collector, "B01_PROVIDER_TO_LITELLM")
+    assert len(b01) == 1
+    assert b01[0]["error"]["message"] == "same exception"
+
+
 def test_litellm_mock_stream_records_one_provider_pair(tmp_path):
     import litellm
 
@@ -805,6 +1044,7 @@ def test_litellm_mock_stream_records_one_provider_pair(tmp_path):
 
 def test_observed_litellm_uses_fresh_callbacks_for_repeated_invocations(
     tmp_path,
+    monkeypatch,
 ):
     snapshots = []
     prepared = []
@@ -814,6 +1054,9 @@ def test_observed_litellm_uses_fresh_callbacks_for_repeated_invocations(
         return None
 
     def user_failure(*_args):
+        return None
+
+    def user_input(*_args):
         return None
 
     def user_callback(*_args):
@@ -841,6 +1084,7 @@ def test_observed_litellm_uses_fresh_callbacks_for_repeated_invocations(
                     for key, value in self._additional_args.items()
                     if key in {
                         "callbacks",
+                        "input_callback",
                         "success_callback",
                         "failure_callback",
                         "metadata",
@@ -849,6 +1093,7 @@ def test_observed_litellm_uses_fresh_callbacks_for_repeated_invocations(
             )
             for key in (
                 "callbacks",
+                "input_callback",
                 "success_callback",
                 "failure_callback",
             ):
@@ -859,6 +1104,11 @@ def test_observed_litellm_uses_fresh_callbacks_for_repeated_invocations(
         agent_run_id="run-1",
         artifact_root=tmp_path,
     )
+    monkeypatch.setattr(
+        agent_runtime,
+        "supports_dynamic_input_callback",
+        lambda: True,
+    )
     observed_type = agent_runtime._build_observed_litellm_type(
         ProbeLiteLlm,
         on_model_entry=observed.append,
@@ -867,10 +1117,12 @@ def test_observed_litellm_uses_fresh_callbacks_for_repeated_invocations(
     )
     original_metadata = {"user_metadata": "preserved"}
     original_callbacks = [user_callback]
+    original_input = [user_input]
     original_success = [user_success]
     original_failure = [user_failure]
     model = observed_type(
         callbacks=original_callbacks,
+        input_callback=original_input,
         success_callback=original_success,
         failure_callback=original_failure,
         metadata=original_metadata,
@@ -897,6 +1149,7 @@ def test_observed_litellm_uses_fresh_callbacks_for_repeated_invocations(
     assert observed == ["request-0", "request-1"]
     assert model._additional_args == {
         "callbacks": original_callbacks,
+        "input_callback": original_input,
         "success_callback": original_success,
         "failure_callback": original_failure,
         "metadata": original_metadata,
@@ -904,13 +1157,17 @@ def test_observed_litellm_uses_fresh_callbacks_for_repeated_invocations(
     assert len(snapshots) == 2
     for snapshot in snapshots:
         assert snapshot["callbacks"] == [user_callback]
+        assert snapshot["input_callback"][0] is user_input
         assert snapshot["success_callback"][0] is user_success
         assert snapshot["failure_callback"][0] is user_failure
+        assert len(snapshot["input_callback"]) == 2
         assert len(snapshot["success_callback"]) == 2
         assert len(snapshot["failure_callback"]) == 2
+        input_logger = snapshot["input_callback"][1]
         success_logger = snapshot["success_callback"][1]
         failure_logger = snapshot["failure_callback"][1]
         assert isinstance(success_logger, LiteLLMBoundaryLogger)
+        assert input_logger is success_logger
         assert failure_logger is success_logger
         assert success_logger.collector is collector
         assert snapshot["metadata"]["user_metadata"] == "preserved"
