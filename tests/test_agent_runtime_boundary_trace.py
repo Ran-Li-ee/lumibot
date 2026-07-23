@@ -28,6 +28,7 @@ from lumibot.components.agents.boundary_trace import BoundaryTraceCollector
 from lumibot.components.agents.runtime import (
     GoogleADKRuntime,
     RuntimeRequest,
+    StubAgentRuntime,
     _build_observed_function_tool,
     _normalize_event,
     _wrap_tool_callable,
@@ -4198,6 +4199,194 @@ def test_async_tool_error_records_await_timing_and_restores_context(
         b07["ended_at"]
     )
     assert b07["payload"]["serialized_result"] == result
+
+
+@pytest.mark.parametrize("callable_kind", ["function", "object"])
+@pytest.mark.parametrize("raises", [False, True])
+def test_stub_runtime_awaits_async_tools_and_exports_trace(
+    tmp_path,
+    recwarn,
+    callable_kind,
+    raises,
+):
+    async def execute():
+        await asyncio.sleep(0)
+        if raises:
+            raise ValueError("async stub failed")
+        return {"status": "async complete"}
+
+    if callable_kind == "function":
+
+        async def tool():
+            return await execute()
+
+    else:
+
+        class AsyncTool:
+            async def __call__(self):
+                return await execute()
+
+        tool = AsyncTool()
+
+    collector = BoundaryTraceCollector(
+        agent_run_id=f"run-stub-{callable_kind}-{raises}",
+        artifact_root=tmp_path,
+    )
+    request = make_runtime_request(
+        collector,
+        tools=[
+            BoundTool(
+                name="async_stub",
+                description="async stub",
+                function=tool,
+            )
+        ],
+    )
+
+    result = StubAgentRuntime().run(request)
+    gc.collect()
+
+    tool_result = next(
+        event.payload
+        for event in result.events
+        if event.kind == "tool_result"
+    )
+    if raises:
+        assert tool_result["tool_error"] is True
+        assert tool_result["error"] == {
+            "type": "ValueError",
+            "message": "async stub failed",
+        }
+    else:
+        assert tool_result == {"status": "async complete"}
+    assert result.boundary_trace == collector.export()
+    assert [
+        event["transition"]
+        for event in result.boundary_trace["events"]
+    ] == [
+        "B05_WRAPPER_TO_PYTHON_TOOL",
+        "B06_PYTHON_TOOL_TO_WRAPPER",
+        "B07_WRAPPER_TO_FUNCTION_TOOL",
+    ]
+    assert _trace_events(
+        result.boundary_trace,
+        "B06_PYTHON_TOOL_TO_WRAPPER",
+    )[0]["status"] == ("error" if raises else "success")
+    assert not [
+        warning
+        for warning in recwarn
+        if "was never awaited" in str(warning.message)
+    ]
+
+
+def test_stub_runtime_sync_tool_does_not_enter_asyncio(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    def sync_tool():
+        calls.append("sync")
+        return {"status": "sync complete"}
+
+    monkeypatch.setattr(
+        agent_runtime.asyncio,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "sync stub tool entered asyncio.run"
+        ),
+    )
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stub-sync",
+        artifact_root=tmp_path,
+    )
+    result = StubAgentRuntime().run(
+        make_runtime_request(
+            collector,
+            tools=[
+                BoundTool(
+                    name="sync_stub",
+                    description="sync stub",
+                    function=sync_tool,
+                )
+            ],
+        )
+    )
+
+    assert calls == ["sync"]
+    assert next(
+        event.payload
+        for event in result.events
+        if event.kind == "tool_result"
+    ) == {"status": "sync complete"}
+    assert result.boundary_trace == collector.export()
+
+
+def test_stub_runtime_closes_async_wrapper_when_sync_runner_fails(
+    tmp_path,
+    recwarn,
+):
+    async def async_tool():
+        await asyncio.sleep(0)
+        return {"status": "unreachable"}
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stub-runner-failure",
+        artifact_root=tmp_path,
+    )
+    request = make_runtime_request(
+        collector,
+        tools=[
+            BoundTool(
+                name="async_stub",
+                description="async stub",
+                function=async_tool,
+            )
+        ],
+    )
+
+    async def invoke_from_running_loop():
+        with pytest.raises(
+            RuntimeError,
+            match=r"asyncio\.run\(\) cannot be called",
+        ):
+            StubAgentRuntime().run(request)
+
+    asyncio.run(invoke_from_running_loop())
+    gc.collect()
+
+    assert not [
+        warning
+        for warning in recwarn
+        if "was never awaited" in str(warning.message)
+    ]
+
+
+def test_stub_runtime_scripted_events_remain_authoritative_with_trace(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stub-scripted",
+        artifact_root=tmp_path,
+    )
+    runtime = StubAgentRuntime(
+        scripted_events=[
+            {
+                "kind": "text",
+                "text": "scripted summary",
+                "timestamp": "2026-07-24T00:00:00Z",
+            }
+        ]
+    )
+
+    result = runtime.run(make_runtime_request(collector))
+
+    assert result.summary == "scripted summary"
+    assert len(result.events) == 1
+    assert result.events[0].text == "scripted summary"
+    assert result.events[0].timestamp == "2026-07-24T00:00:00Z"
+    assert result.boundary_trace == collector.export()
+    assert result.boundary_trace["events"] == []
 
 
 def test_full_boundary_loop_preserves_turns_batches_and_reversed_parallel_completion(

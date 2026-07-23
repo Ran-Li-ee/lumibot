@@ -4695,6 +4695,21 @@ class StubAgentRuntime:
     def __init__(self, scripted_events: list[dict[str, Any]] | None = None) -> None:
         self.scripted_events = scripted_events or []
 
+    @staticmethod
+    def _resolve_tool_result(tool_result: Any) -> Any:
+        if not inspect.isawaitable(tool_result):
+            return tool_result
+        try:
+            return asyncio.run(tool_result)
+        except BaseException:
+            close = getattr(tool_result, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            raise
+
     def run(self, request: RuntimeRequest) -> AgentRunResult:
         if self.scripted_events:
             events = [
@@ -4708,7 +4723,17 @@ class StubAgentRuntime:
                 for event in self.scripted_events
             ]
             summary = next((event.text for event in reversed(events) if event.kind == "text" and event.text), None)
-            return AgentRunResult(summary=summary, model=request.model, events=events)
+            boundary_trace = (
+                request.boundary_collector.export()
+                if request.boundary_collector is not None
+                else None
+            )
+            return AgentRunResult(
+                summary=summary,
+                model=request.model,
+                events=events,
+                boundary_trace=boundary_trace,
+            )
 
         events: list[AgentTraceEvent] = []
         if request.context is not None:
@@ -4728,7 +4753,12 @@ class StubAgentRuntime:
                 "tool_calls": [],
             }
             if callable(first_tool.function):
-                tool_result = _wrap_tool_callable(first_tool, tool_context)()
+                wrapped_tool = _wrap_tool_callable(
+                    first_tool,
+                    tool_context,
+                    collector=request.boundary_collector,
+                )
+                tool_result = self._resolve_tool_result(wrapped_tool())
             else:
                 tool_result = None
             events.append(
@@ -4756,7 +4786,17 @@ class StubAgentRuntime:
                 timestamp=_utc_iso_timestamp(),
             )
         )
-        return AgentRunResult(summary=summary, model=request.model, events=events)
+        boundary_trace = (
+            request.boundary_collector.export()
+            if request.boundary_collector is not None
+            else None
+        )
+        return AgentRunResult(
+            summary=summary,
+            model=request.model,
+            events=events,
+            boundary_trace=boundary_trace,
+        )
 
 
 def list_mcp_tools(server: MCPServer) -> list[dict[str, Any]]:
