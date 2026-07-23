@@ -2571,11 +2571,7 @@ def _build_observed_litellm_type(
             self._last_chunk = chunk
             return chunk
 
-        async def _aclose(
-            self,
-            *,
-            primary_error: BaseException | None = None,
-        ) -> None:
+        async def _aclose(self) -> None:
             try:
                 close = (
                     getattr(self._iterator, "aclose", None)
@@ -2587,11 +2583,7 @@ def _build_observed_litellm_type(
                 if close is not None:
                     await close()
             except BaseException as exc:
-                self._complete_error(
-                    primary_error
-                    if primary_error is not None
-                    else exc
-                )
+                self._complete_error(exc)
                 raise
             self._complete_error(
                 asyncio.CancelledError(
@@ -2677,17 +2669,11 @@ def _build_observed_litellm_type(
         def active_stream_count(self) -> int:
             return len(self._active_streams)
 
-        async def close_active_streams(
-            self,
-            *,
-            primary_error: BaseException | None = None,
-        ) -> None:
+        async def close_active_streams(self) -> None:
             errors: list[BaseException] = []
             for stream in tuple(self._active_streams):
                 try:
-                    await stream._aclose(
-                        primary_error=primary_error,
-                    )
+                    await stream._aclose()
                 except BaseException as exc:
                     errors.append(exc)
             if errors:
@@ -2842,9 +2828,7 @@ def _build_observed_litellm_type(
                 try:
                     if request_local_client is not None:
                         try:
-                            await request_local_client.close_active_streams(
-                                primary_error=terminal_error,
-                            )
+                            await request_local_client.close_active_streams()
                         except BaseException as cleanup_error:
                             if terminal_error is None:
                                 raise

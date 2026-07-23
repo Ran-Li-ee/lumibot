@@ -742,12 +742,23 @@ def test_model_error_precedes_provider_stream_close_error(
         "provider close failed api_key=cleanup-secret"
     )
     created_loggers = []
+    completed_errors = []
     request_clients = []
 
     class CapturingLogger(LiteLLMBoundaryLogger):
         def __init__(self, collector):
             super().__init__(collector)
             created_loggers.append(self)
+
+        def complete_error(self, token, error, **kwargs):
+            completed = super().complete_error(
+                token,
+                error,
+                **kwargs,
+            )
+            if completed:
+                completed_errors.append(error)
+            return completed
 
     monkeypatch.setattr(
         agent_runtime,
@@ -818,6 +829,8 @@ def test_model_error_precedes_provider_stream_close_error(
         )
 
     assert raised.value is primary_error
+    assert completed_errors == [close_error]
+    assert completed_errors[0] is close_error
     events = collector.export()["events"]
     assert [event["transition"] for event in events] == [
         "B10_LITELLM_TO_PROVIDER",
@@ -825,8 +838,8 @@ def test_model_error_precedes_provider_stream_close_error(
     ]
     assert events[1]["status"] == "error"
     assert events[1]["error"] == {
-        "type": "ValueError",
-        "message": "primary model processing failed",
+        "type": "RuntimeError",
+        "message": "provider close failed api_key=[REDACTED]",
     }
     exported = collector.export()
     assert exported["diagnostics"][-1]["kind"] == (
