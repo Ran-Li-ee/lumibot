@@ -2521,17 +2521,31 @@ def _build_observed_litellm_type(
                 "tools": tools,
                 **kwargs,
             }
-            boundary_logger.capture_acompletion_request(
+            token = boundary_logger.begin_attempt(
                 model,
                 messages,
                 capture_kwargs,
             )
-            return await self._delegate.acompletion(
-                model=model,
-                messages=messages,
-                tools=tools,
-                **kwargs,
+            try:
+                response = await self._delegate.acompletion(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    **kwargs,
+                )
+            except BaseException as exc:
+                boundary_logger.complete_error(
+                    token,
+                    exc,
+                    kwargs=capture_kwargs,
+                )
+                raise
+            boundary_logger.complete_success(
+                token,
+                response,
+                kwargs=capture_kwargs,
             )
+            return response
 
     class ObservedLiteLlm(base_type):
         async def generate_content_async(
@@ -2616,11 +2630,10 @@ def _build_observed_litellm_type(
                     stream=stream,
                 ):
                     yield response
-            except Exception as exc:
+            except BaseException as exc:
                 if boundary_logger is not None:
-                    boundary_logger.record_async_failure_fallback(
+                    boundary_logger.complete_pending_error(
                         exc,
-                        kwargs=invocation_args,
                         model_turn_id=invocation_turn_id,
                     )
                 raise

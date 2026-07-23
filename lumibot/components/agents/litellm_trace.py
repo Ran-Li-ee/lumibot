@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import math
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -106,14 +107,23 @@ _FUNCTION_FIELDS = (
 
 
 @dataclass(frozen=True)
-class _PendingProviderRequest:
+class LiteLLMAttemptToken:
+    agent_run_id: str
     model_turn_id: str | None
+    attempt_index: int
+    retry_count: int | None
+
+
+@dataclass
+class _PendingProviderRequest:
+    token: LiteLLMAttemptToken
     request: dict[str, Any]
     routing: dict[str, Any]
-    retry_count: int | None
     cache_hit: bool
     started_at: datetime
     visibility: str
+    pre_api_seen: bool = False
+    proxy_owned: bool = False
 
 
 def supports_dynamic_input_callback() -> bool:
@@ -499,10 +509,37 @@ def _cache_hit(kwargs: Any) -> bool:
     return any(value is True for value in candidates)
 
 
+def _response_cache_hit(response_obj: Any) -> bool:
+    hidden_params = _field(response_obj, "_hidden_params")
+    if hidden_params is _MISSING:
+        try:
+            private = object.__getattribute__(
+                response_obj,
+                "__pydantic_private__",
+            )
+        except BaseException:
+            private = None
+        hidden_params = _field(private, "_hidden_params")
+    return any(
+        value is True
+        for value in (
+            _field(response_obj, "cache_hit"),
+            _field(hidden_params, "cache_hit"),
+            _field(_field(hidden_params, "cache"), "hit"),
+        )
+    )
+
+
 class LiteLLMBoundaryLogger(CustomLogger):
     """Request-local LiteLLM callback that records provider adapter boundaries."""
 
-    def __init__(self, collector: BoundaryTraceCollector) -> None:
+    def __init__(
+        self,
+        collector: BoundaryTraceCollector,
+        *,
+        max_pending_attempts: int = 128,
+        max_completed_attempts: int = 512,
+    ) -> None:
         super().__init__()
         # LiteLLM 1.83 checks an instance-level __call__ attribute to route
         # async callbacks. Special-method lookup ignores this instance
@@ -510,17 +547,21 @@ class LiteLLMBoundaryLogger(CustomLogger):
         # LiteLLM's global function-callback compatibility path.
         self.__call__ = self.async_log_success_event
         self.collector = collector
-        self._seen_callbacks: set[
-            tuple[str, str | None, str, str, int | None]
-        ] = set()
-        self._fallback_outcomes: set[
-            tuple[str, str | None, str]
-        ] = set()
-        self._pending_requests: dict[
-            tuple[str, str | None, int | None],
+        self._max_pending_attempts = max(int(max_pending_attempts), 1)
+        self._max_completed_attempts = max(
+            int(max_completed_attempts),
+            1,
+        )
+        self._attempt_sequence = 0
+        self._pending_requests: OrderedDict[
+            LiteLLMAttemptToken,
             _PendingProviderRequest,
-        ] = {}
-        self._seen_lock = threading.Lock()
+        ] = OrderedDict()
+        self._completed_attempts: OrderedDict[
+            LiteLLMAttemptToken,
+            tuple[str, Any],
+        ] = OrderedDict()
+        self._state_lock = threading.Lock()
 
     def _try_diagnostic(self, kind: str, detail: str) -> None:
         try:
@@ -540,79 +581,16 @@ class LiteLLMBoundaryLogger(CustomLogger):
             return str(safe_turn_id)
         return self.collector.active_model_turn()
 
-    def _callback_identity(
-        self,
-        kwargs: Any,
-        response_obj: Any,
-    ) -> str:
-        routing = _safe_routing(kwargs)
-        call_id = routing.get("litellm_call_id")
-        if call_id is not None:
-            return f"call:{call_id}"
-        response_id = _field(response_obj, "id")
-        safe_response_id = _safe_scalar(response_id)
-        if (
-            safe_response_id is not _MISSING
-            and safe_response_id is not None
-        ):
-            return f"response:{safe_response_id}"
-        return f"object:{id(response_obj)}"
-
-    def _claim_callback(
-        self,
-        outcome: str,
-        kwargs: Any,
-        response_obj: Any,
-        model_turn_id: str | None,
-        *,
-        fallback: bool = False,
-    ) -> bool:
-        fallback_key = (
-            self.collector.agent_run_id,
-            model_turn_id,
-            outcome,
-        )
-        key = (
-            self.collector.agent_run_id,
-            model_turn_id,
-            outcome,
-            self._callback_identity(kwargs, response_obj),
-            _retry_count(kwargs),
-        )
-        with self._seen_lock:
-            if fallback:
-                if fallback_key in self._fallback_outcomes or any(
-                    seen[:3] == fallback_key
-                    for seen in self._seen_callbacks
-                ):
-                    return False
-                self._fallback_outcomes.add(fallback_key)
-            elif fallback_key in self._fallback_outcomes:
-                return False
-            if key in self._seen_callbacks:
-                return False
-            self._seen_callbacks.add(key)
-        return True
-
-    def _pending_key(
-        self,
-        model_turn_id: str | None,
-        retry_count: int | None,
-    ) -> tuple[str, str | None, int | None]:
-        return (
-            self.collector.agent_run_id,
-            model_turn_id,
-            retry_count,
-        )
-
-    def _capture_pre_api(
+    def _new_attempt(
         self,
         model: Any,
         messages: Any,
         kwargs: Any,
         *,
         visibility: str,
-    ) -> None:
+        pre_api_seen: bool,
+        proxy_owned: bool,
+    ) -> LiteLLMAttemptToken:
         captured_kwargs = (
             dict.copy(kwargs)
             if type(kwargs) is dict
@@ -627,43 +605,127 @@ class LiteLLMBoundaryLogger(CustomLogger):
         started_at = _field(captured_kwargs, "api_call_start_time")
         if type(started_at) is not datetime:
             started_at = datetime.now()
-        pending = _PendingProviderRequest(
-            model_turn_id=turn_id,
-            request=_safe_provider_request(captured_kwargs),
-            routing=_safe_routing(captured_kwargs),
-            retry_count=retry_count,
-            cache_hit=_cache_hit(captured_kwargs),
-            started_at=started_at,
-            visibility=visibility,
-        )
-        key = self._pending_key(turn_id, retry_count)
-        with self._seen_lock:
-            if retry_count is not None:
-                self._pending_requests.pop(
-                    self._pending_key(turn_id, None),
-                    None,
-                )
-            self._pending_requests[key] = pending
+        with self._state_lock:
+            self._attempt_sequence += 1
+            token = LiteLLMAttemptToken(
+                agent_run_id=self.collector.agent_run_id,
+                model_turn_id=turn_id,
+                attempt_index=self._attempt_sequence,
+                retry_count=retry_count,
+            )
+            self._pending_requests[token] = _PendingProviderRequest(
+                token=token,
+                request=_safe_provider_request(captured_kwargs),
+                routing=_safe_routing(captured_kwargs),
+                cache_hit=_cache_hit(captured_kwargs),
+                started_at=started_at,
+                visibility=visibility,
+                pre_api_seen=pre_api_seen,
+                proxy_owned=proxy_owned,
+            )
+            while (
+                len(self._pending_requests)
+                > self._max_pending_attempts
+            ):
+                self._pending_requests.popitem(last=False)
+        return token
+
+    def begin_attempt(
+        self,
+        model: Any,
+        messages: Any,
+        kwargs: Any,
+    ) -> LiteLLMAttemptToken | None:
+        """Prove that the request-local provider adapter was entered."""
+        try:
+            return self._new_attempt(
+                model,
+                messages,
+                kwargs,
+                visibility="litellm_acompletion_args_pre_adapter",
+                pre_api_seen=False,
+                proxy_owned=True,
+            )
+        except BaseException:
+            self._try_diagnostic(
+                "litellm_boundary_pre_api_callback_failed",
+                "LiteLLM provider request capture failed",
+            )
+            return None
 
     def capture_acompletion_request(
         self,
         model: Any,
         messages: Any,
         kwargs: Any,
-    ) -> None:
+    ) -> LiteLLMAttemptToken | None:
         """Retain a safe projection of request-local acompletion arguments."""
-        try:
-            self._capture_pre_api(
-                model,
-                messages,
-                kwargs,
-                visibility="litellm_acompletion_args_pre_adapter",
+        return self.begin_attempt(model, messages, kwargs)
+
+    def _refine_or_begin_pre_api(
+        self,
+        model: Any,
+        messages: Any,
+        kwargs: Any,
+    ) -> LiteLLMAttemptToken:
+        captured_kwargs = (
+            dict.copy(kwargs)
+            if type(kwargs) is dict
+            else {}
+        )
+        if _field(captured_kwargs, "model") is _MISSING:
+            captured_kwargs["model"] = model
+        if _field(captured_kwargs, "messages") is _MISSING:
+            captured_kwargs["messages"] = messages
+        turn_id = self._turn_id(captured_kwargs)
+        retry_count = _retry_count(captured_kwargs)
+        with self._state_lock:
+            for token, pending in reversed(
+                self._pending_requests.items()
+            ):
+                if (
+                    token.model_turn_id == turn_id
+                    and token.retry_count == retry_count
+                    and not pending.pre_api_seen
+                ):
+                    pending.request = {
+                        **pending.request,
+                        **_safe_provider_request(captured_kwargs),
+                    }
+                    pending.routing = {
+                        **pending.routing,
+                        **_safe_routing(captured_kwargs),
+                    }
+                    pending.cache_hit = (
+                        pending.cache_hit
+                        or _cache_hit(captured_kwargs)
+                    )
+                    pending.visibility = "litellm_pre_api_callback"
+                    pending.pre_api_seen = True
+                    return token
+            call_id = _safe_routing(captured_kwargs).get(
+                "litellm_call_id"
             )
-        except BaseException:
-            self._try_diagnostic(
-                "litellm_boundary_pre_api_callback_failed",
-                "LiteLLM pre-API request capture failed",
-            )
+            for token, (_outcome, completed_call_id) in reversed(
+                self._completed_attempts.items()
+            ):
+                if (
+                    token.model_turn_id == turn_id
+                    and token.retry_count == retry_count
+                    and (
+                        call_id is None
+                        or completed_call_id == call_id
+                    )
+                ):
+                    return token
+        return self._new_attempt(
+            model,
+            messages,
+            captured_kwargs,
+            visibility="litellm_pre_api_callback",
+            pre_api_seen=True,
+            proxy_owned=False,
+        )
 
     def log_pre_api_call(
         self,
@@ -672,12 +734,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
         kwargs: Any,
     ) -> None:
         try:
-            self._capture_pre_api(
-                model,
-                messages,
-                kwargs,
-                visibility="litellm_pre_api_callback",
-            )
+            self._refine_or_begin_pre_api(model, messages, kwargs)
         except BaseException:
             self._try_diagnostic(
                 "litellm_boundary_pre_api_callback_failed",
@@ -692,22 +749,106 @@ class LiteLLMBoundaryLogger(CustomLogger):
     ) -> None:
         self.log_pre_api_call(model, messages, kwargs)
 
-    def _take_pending_request(
+    def pending_attempt_count(self) -> int:
+        with self._state_lock:
+            return len(self._pending_requests)
+
+    def completed_attempt_count(self) -> int:
+        with self._state_lock:
+            return len(self._completed_attempts)
+
+    def has_completed_attempt(
         self,
-        model_turn_id: str | None,
-        retry_count: int | None,
-    ) -> _PendingProviderRequest | None:
-        with self._seen_lock:
-            pending = self._pending_requests.pop(
-                self._pending_key(model_turn_id, retry_count),
-                None,
+        token: LiteLLMAttemptToken | None,
+    ) -> bool:
+        if token is None:
+            return False
+        with self._state_lock:
+            return token in self._completed_attempts
+
+    def has_pending_attempt(
+        self,
+        token: LiteLLMAttemptToken | None = None,
+        *,
+        model_turn_id: str | None = None,
+    ) -> bool:
+        with self._state_lock:
+            if token is not None:
+                return token in self._pending_requests
+            return any(
+                pending_token.model_turn_id == model_turn_id
+                for pending_token in self._pending_requests
             )
-            if pending is None and retry_count is not None:
-                pending = self._pending_requests.pop(
-                    self._pending_key(model_turn_id, None),
-                    None,
+
+    def drain_pending_attempts(
+        self,
+        *,
+        model_turn_id: str | None = None,
+    ) -> tuple[LiteLLMAttemptToken, ...]:
+        with self._state_lock:
+            tokens = tuple(
+                token
+                for token in self._pending_requests
+                if (
+                    model_turn_id is None
+                    or token.model_turn_id == model_turn_id
                 )
+            )
+            for token in tokens:
+                self._pending_requests.pop(token, None)
+            return tokens
+
+    def _claim_attempt(
+        self,
+        token: LiteLLMAttemptToken | None,
+        outcome: str,
+    ) -> _PendingProviderRequest | None:
+        if token is None:
+            return None
+        with self._state_lock:
+            pending = self._pending_requests.pop(token, None)
+            if pending is None:
+                return None
+            self._completed_attempts[token] = (
+                outcome,
+                pending.routing.get("litellm_call_id"),
+            )
+            while (
+                len(self._completed_attempts)
+                > self._max_completed_attempts
+            ):
+                self._completed_attempts.popitem(last=False)
             return pending
+
+    def _callback_token(
+        self,
+        kwargs: Any,
+    ) -> LiteLLMAttemptToken | None:
+        turn_id = self._turn_id(kwargs)
+        retry_count = _retry_count(kwargs)
+        callback_routing = _safe_routing(kwargs)
+        callback_call_id = callback_routing.get("litellm_call_id")
+        with self._state_lock:
+            candidates = [
+                (token, pending)
+                for token, pending in self._pending_requests.items()
+                if (
+                    token.model_turn_id == turn_id
+                    and not pending.proxy_owned
+                    and (
+                        retry_count is None
+                        or token.retry_count in (None, retry_count)
+                    )
+                )
+            ]
+            if callback_call_id is not None:
+                for token, pending in reversed(candidates):
+                    if (
+                        pending.routing.get("litellm_call_id")
+                        == callback_call_id
+                    ):
+                        return token
+            return candidates[-1][0] if candidates else None
 
     def _try_record(self, **event: Any) -> None:
         try:
@@ -718,29 +859,23 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 "LiteLLM boundary collector failed",
             )
 
-    def _record_callback(
+    def _record_attempt(
         self,
         *,
+        token: LiteLLMAttemptToken | None,
         outcome: str,
         kwargs: Any,
         response_obj: Any,
         start_time: Any,
         end_time: Any,
-        fallback: bool = False,
-    ) -> None:
-        turn_id = self._turn_id(kwargs)
-        if not self._claim_callback(
-            outcome,
-            kwargs,
-            response_obj,
-            turn_id,
-            fallback=fallback,
-        ):
-            return
-        retry_count = _retry_count(kwargs)
-        pending = self._take_pending_request(turn_id, retry_count)
-        if _cache_hit(kwargs) or (
-            pending is not None and pending.cache_hit
+    ) -> bool:
+        pending = self._claim_attempt(token, outcome)
+        if pending is None:
+            return False
+        if (
+            pending.cache_hit
+            or _cache_hit(kwargs)
+            or _response_cache_hit(response_obj)
         ):
             self._try_diagnostic(
                 "litellm_adapter_cache_hit",
@@ -749,44 +884,46 @@ class LiteLLMBoundaryLogger(CustomLogger):
                     "provider exchange omitted"
                 ),
             )
-            return
+            return True
         timing_start = (
             pending.started_at
-            if pending is not None
+            if type(pending.started_at) is datetime
             else start_time
         )
-        if pending is not None and type(end_time) is not datetime:
+        if type(end_time) is not datetime:
             end_time = datetime.now()
         timing, timing_visibility = _callback_timing(
             timing_start,
             end_time,
         )
-        if pending is not None and timing:
+        if timing:
             timing_visibility = "pre_api_to_terminal_not_per_attempt"
         accepted_response = outcome == "success"
-        effective_retry_count = (
-            retry_count
-            if retry_count is not None
-            else pending.retry_count if pending is not None else None
-        )
         attempt = _provider_attempt_payload(
             kwargs,
             accepted_response=accepted_response,
             timing_visibility=timing_visibility,
-            retry_count=effective_retry_count,
+            retry_count=pending.token.retry_count,
         )
-        routing = _safe_routing(kwargs)
-        if pending is not None:
-            routing = {**pending.routing, **routing}
-        request = _safe_provider_request(kwargs)
-        if pending is not None:
-            request = {**pending.request, **request}
+        routing = {**pending.routing, **_safe_routing(kwargs)}
+        request = {
+            **pending.request,
+            **_safe_provider_request(kwargs),
+        }
+        response_model = _safe_scalar(_field(response_obj, "model"))
+        if (
+            accepted_response
+            and response_model is not _MISSING
+            and response_model is not None
+        ):
+            request["model"] = response_model
+            routing["model"] = response_model
         status = "success" if accepted_response else "error"
         self._try_record(
             transition="B10_LITELLM_TO_PROVIDER",
             from_module="litellm",
             to_module="provider",
-            model_turn_id=turn_id,
+            model_turn_id=pending.token.model_turn_id,
             status=status,
             **timing,
             payload={
@@ -796,8 +933,6 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 ),
                 "provider_request_visibility": (
                     pending.visibility
-                    if pending is not None
-                    else "terminal_callback_kwargs"
                 ),
                 "request": request,
                 "provider_routing": routing,
@@ -808,7 +943,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
             "transition": "B01_PROVIDER_TO_LITELLM",
             "from_module": "provider",
             "to_module": "litellm",
-            "model_turn_id": turn_id,
+            "model_turn_id": pending.token.model_turn_id,
             "status": status,
             **timing,
             "payload": {
@@ -826,6 +961,89 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 _failure_error(kwargs, response_obj)
             )
         self._try_record(**response_event)
+        return True
+
+    def complete_success(
+        self,
+        token: LiteLLMAttemptToken | None,
+        response_obj: Any,
+        *,
+        kwargs: Any = None,
+        start_time: Any = None,
+        end_time: Any = None,
+    ) -> bool:
+        try:
+            return self._record_attempt(
+                token=token,
+                outcome="success",
+                kwargs=kwargs if type(kwargs) is dict else {},
+                response_obj=response_obj,
+                start_time=start_time,
+                end_time=end_time,
+            )
+        except BaseException:
+            self._try_diagnostic(
+                "litellm_boundary_success_callback_failed",
+                "LiteLLM success tracing failed",
+            )
+            return False
+
+    def complete_error(
+        self,
+        token: LiteLLMAttemptToken | None,
+        error: BaseException,
+        *,
+        kwargs: Any = None,
+        start_time: Any = None,
+        end_time: Any = None,
+    ) -> bool:
+        try:
+            callback_kwargs = (
+                dict.copy(kwargs)
+                if type(kwargs) is dict
+                else {}
+            )
+            callback_kwargs["exception"] = error
+            return self._record_attempt(
+                token=token,
+                outcome="failure",
+                kwargs=callback_kwargs,
+                response_obj=error,
+                start_time=start_time,
+                end_time=end_time,
+            )
+        except BaseException:
+            self._try_diagnostic(
+                "litellm_boundary_failure_callback_failed",
+                "LiteLLM failure tracing failed",
+            )
+            return False
+
+    def complete_pending_error(
+        self,
+        error: BaseException,
+        *,
+        model_turn_id: str | None,
+    ) -> bool:
+        try:
+            with self._state_lock:
+                token = next(
+                    (
+                        candidate
+                        for candidate in reversed(
+                            self._pending_requests
+                        )
+                        if candidate.model_turn_id == model_turn_id
+                    ),
+                    None,
+                )
+            return self.complete_error(token, error)
+        except BaseException:
+            self._try_diagnostic(
+                "litellm_boundary_failure_fallback_failed",
+                "LiteLLM pending failure tracing failed",
+            )
+            return False
 
     def record_async_failure_fallback(
         self,
@@ -834,37 +1052,12 @@ class LiteLLMBoundaryLogger(CustomLogger):
         kwargs: Any = None,
         model_turn_id: str | None = None,
     ) -> None:
-        """Record a missing async failure callback without changing the error."""
-        try:
-            callback_kwargs = (
-                dict.copy(kwargs)
-                if type(kwargs) is dict
-                else {}
-            )
-            metadata = _field(callback_kwargs, "metadata")
-            metadata = (
-                dict.copy(metadata)
-                if type(metadata) is dict
-                else {}
-            )
-            if model_turn_id is not None:
-                metadata["lumibot_model_turn_id"] = model_turn_id
-            if metadata:
-                callback_kwargs["metadata"] = metadata
-            callback_kwargs["exception"] = error
-            self._record_callback(
-                outcome="failure",
-                kwargs=callback_kwargs,
-                response_obj=error,
-                start_time=None,
-                end_time=datetime.now(),
-                fallback=True,
-            )
-        except BaseException:
-            self._try_diagnostic(
-                "litellm_boundary_failure_fallback_failed",
-                "LiteLLM async failure fallback tracing failed",
-            )
+        """Complete only a proven provider attempt; callback kwargs cannot prove one."""
+        del kwargs
+        self.complete_pending_error(
+            error,
+            model_turn_id=model_turn_id,
+        )
 
     async def async_log_success_event(
         self,
@@ -874,10 +1067,10 @@ class LiteLLMBoundaryLogger(CustomLogger):
         end_time: Any,
     ) -> None:
         try:
-            self._record_callback(
-                outcome="success",
+            self.complete_success(
+                self._callback_token(kwargs),
+                response_obj,
                 kwargs=kwargs,
-                response_obj=response_obj,
                 start_time=start_time,
                 end_time=end_time,
             )
@@ -895,10 +1088,10 @@ class LiteLLMBoundaryLogger(CustomLogger):
         end_time: Any,
     ) -> None:
         try:
-            self._record_callback(
-                outcome="success",
+            self.complete_success(
+                self._callback_token(kwargs),
+                response_obj,
                 kwargs=kwargs,
-                response_obj=response_obj,
                 start_time=start_time,
                 end_time=end_time,
             )
@@ -916,10 +1109,11 @@ class LiteLLMBoundaryLogger(CustomLogger):
         end_time: Any,
     ) -> None:
         try:
-            self._record_callback(
-                outcome="failure",
+            error = _failure_error(kwargs, response_obj)
+            self.complete_error(
+                self._callback_token(kwargs),
+                error,
                 kwargs=kwargs,
-                response_obj=response_obj,
                 start_time=start_time,
                 end_time=end_time,
             )
@@ -937,10 +1131,11 @@ class LiteLLMBoundaryLogger(CustomLogger):
         end_time: Any,
     ) -> None:
         try:
-            self._record_callback(
-                outcome="failure",
+            error = _failure_error(kwargs, response_obj)
+            self.complete_error(
+                self._callback_token(kwargs),
+                error,
                 kwargs=kwargs,
-                response_obj=response_obj,
                 start_time=start_time,
                 end_time=end_time,
             )

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -23,6 +24,26 @@ def _events(collector, transition):
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+async def _collect_async(iterator):
+    return [item async for item in iterator]
+
+
+def _begin(logger, kwargs):
+    return logger.begin_attempt(
+        kwargs.get("model"),
+        kwargs.get("messages"),
+        kwargs,
+    )
+
+
+def _begin_callback(logger, kwargs):
+    logger.log_pre_api_call(
+        kwargs.get("model"),
+        kwargs.get("messages"),
+        kwargs,
+    )
 
 
 def _litellm_global_state():
@@ -85,6 +106,12 @@ def test_litellm_success_records_provider_adapter_pair_without_secrets(tmp_path)
         "headers": {"Authorization": f"Bearer {secret}"},
         "custom_llm_provider": "openai",
         "litellm_call_id": "litellm-call-1",
+        "api_call_start_time": datetime(
+            2026,
+            7,
+            24,
+            tzinfo=timezone.utc,
+        ),
         "metadata": {
             "lumibot_model_turn_id": turn_id,
             "lumibot_agent_run_id": "run-1",
@@ -105,6 +132,7 @@ def test_litellm_success_records_provider_adapter_pair_without_secrets(tmp_path)
         ],
         "usage": {"prompt_tokens": 3, "completion_tokens": 1},
     }
+    _begin_callback(logger, kwargs)
 
     _run(
         logger.async_log_success_event(
@@ -143,7 +171,7 @@ def test_litellm_success_records_provider_adapter_pair_without_secrets(tmp_path)
     assert b10["payload"]["provider_attempt"] is None
     assert b10["payload"]["provider_retry_visibility"] == "unavailable"
     assert b10["payload"]["provider_timing_visibility"] == (
-        "callback_window_not_per_attempt"
+        "pre_api_to_terminal_not_per_attempt"
     )
     assert b10["duration_ms"] == 1000.0
     assert b01["payload"]["response"]["id"] == "response-1"
@@ -233,6 +261,7 @@ def test_litellm_provider_request_allowlist_is_complete_and_deny_by_default(
             },
         },
     }
+    _begin_callback(logger, kwargs)
 
     _run(
         logger.async_log_success_event(
@@ -270,6 +299,7 @@ def test_litellm_exposed_retry_count_records_attempt_and_acceptance(tmp_path):
             "metadata": {"lumibot_model_turn_id": turn_id},
         },
     }
+    _begin_callback(logger, kwargs)
 
     _run(
         logger.async_log_success_event(
@@ -284,7 +314,9 @@ def test_litellm_exposed_retry_count_records_attempt_and_acceptance(tmp_path):
     assert b01["payload"]["provider_attempt"] == 3
     assert b01["payload"]["provider_retry_visibility"] == "exposed"
     assert b01["payload"]["accepted_response"] is True
-    assert b01["payload"]["provider_timing_visibility"] == "unavailable"
+    assert b01["payload"]["provider_timing_visibility"] == (
+        "pre_api_to_terminal_not_per_attempt"
+    )
 
 
 def test_litellm_pre_api_request_is_flushed_before_success_response(tmp_path):
@@ -338,6 +370,734 @@ def test_litellm_pre_api_request_is_flushed_before_success_response(tmp_path):
     }
 
 
+def test_litellm_attempt_state_is_explicit_and_bounded(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-bounded",
+        artifact_root=tmp_path,
+    )
+    logger = LiteLLMBoundaryLogger(
+        collector,
+        max_pending_attempts=2,
+        max_completed_attempts=2,
+    )
+    tokens = []
+    for index in range(3):
+        turn_id = collector.start_model_turn()
+        tokens.append(
+            logger.begin_attempt(
+                "provider-model",
+                [{"role": "user", "content": str(index)}],
+                {
+                    "model": "provider-model",
+                    "messages": [],
+                    "metadata": {
+                        "lumibot_model_turn_id": turn_id,
+                    },
+                },
+            )
+        )
+
+    assert logger.pending_attempt_count() == 2
+    assert not logger.has_pending_attempt(tokens[0])
+    assert logger.has_pending_attempt(tokens[1])
+    assert logger.has_pending_attempt(tokens[2])
+    assert logger.drain_pending_attempts() == tuple(tokens[1:])
+    assert logger.pending_attempt_count() == 0
+
+    for index in range(3):
+        turn_id = collector.start_model_turn()
+        token = logger.begin_attempt(
+            "provider-model",
+            [],
+            {
+                "model": "provider-model",
+                "messages": [],
+                "metadata": {"lumibot_model_turn_id": turn_id},
+            },
+        )
+        assert logger.complete_success(
+            token,
+            {"id": f"response-{index}", "choices": []},
+        )
+
+    assert logger.pending_attempt_count() == 0
+    assert logger.completed_attempt_count() == 2
+    assert logger.has_completed_attempt(token)
+    events_before_late_callback = collector.export()["events"]
+    logger.log_pre_api_call(
+        "provider-model",
+        [],
+        {
+            "model": "provider-model",
+            "messages": [],
+            "metadata": {"lumibot_model_turn_id": turn_id},
+        },
+    )
+    assert logger.pending_attempt_count() == 0
+    assert collector.export()["events"] == events_before_late_callback
+
+
+def test_observed_proxy_records_stream_boundary_before_returning_stream(
+    tmp_path,
+):
+    events_before_consumption = []
+
+    class OneChunkStream:
+        def __init__(self):
+            self._remaining = [
+                {"id": "stream-chunk", "choices": []}
+            ]
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._remaining:
+                raise StopAsyncIteration
+            return self._remaining.pop()
+
+    class StreamClient:
+        async def acompletion(self, **_kwargs):
+            return OneChunkStream()
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is True
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=True,
+                **self._additional_args,
+            )
+            events_before_consumption.extend(
+                collector.export()["events"]
+            )
+            async for response in response_stream:
+                yield response
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stream-proxy",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+
+    responses = _run(
+        _collect_async(
+            observed_type().generate_content_async(
+                "request",
+                stream=True,
+            )
+        )
+    )
+
+    assert responses == [{"id": "stream-chunk", "choices": []}]
+    assert [
+        event["transition"] for event in events_before_consumption
+    ] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+
+
+def test_observed_proxy_suppresses_response_marked_cache_hit(tmp_path):
+    class CacheClient:
+        async def acompletion(self, **_kwargs):
+            return SimpleNamespace(
+                id="cached-response",
+                choices=[],
+                _hidden_params={"cache_hit": True},
+            )
+
+    class CachedLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = CacheClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is False
+            yield await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                **self._additional_args,
+            )
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-cached-proxy",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        CachedLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+
+    responses = _run(
+        _collect_async(
+            observed_type().generate_content_async("request")
+        )
+    )
+
+    assert responses[0].id == "cached-response"
+    exported = collector.export()
+    assert exported["events"] == []
+    assert exported["diagnostics"][-1]["kind"] == (
+        "litellm_adapter_cache_hit"
+    )
+
+
+def test_observed_proxy_persists_success_before_delayed_native_callback(
+    tmp_path,
+):
+    release_callback = asyncio.Event()
+
+    class DelayedCallbackClient:
+        def __init__(self):
+            self.callback_task = None
+
+        async def acompletion(
+            self,
+            model,
+            messages,
+            tools,
+            **kwargs,
+        ):
+            response = {
+                "id": "response-delayed",
+                "model": model,
+                "choices": [],
+            }
+            logger = kwargs["success_callback"][-1]
+
+            async def notify_later():
+                await release_callback.wait()
+                await logger.async_log_success_event(
+                    {
+                        **kwargs,
+                        "model": model,
+                        "messages": messages,
+                        "tools": tools,
+                    },
+                    response,
+                    None,
+                    None,
+                )
+
+            self.callback_task = asyncio.create_task(notify_later())
+            return response
+
+    class ProxyLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = DelayedCallbackClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is False
+            yield await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[{"role": "user", "content": "hello"}],
+                tools=[],
+                **self._additional_args,
+            )
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-delayed",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        ProxyLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type()
+
+    async def invoke():
+        responses = [
+            response
+            async for response in model.generate_content_async("request")
+        ]
+        events_before_callback = collector.export()["events"]
+        release_callback.set()
+        await model.llm_client.callback_task
+        return responses, events_before_callback
+
+    responses, events_before_callback = _run(invoke())
+
+    assert responses[0]["id"] == "response-delayed"
+    assert [event["transition"] for event in events_before_callback] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert collector.export()["events"] == events_before_callback
+
+
+def test_native_callback_cannot_claim_proxy_owned_attempt(tmp_path):
+    pending_after_native_callback = []
+
+    class EagerCallbackClient:
+        async def acompletion(
+            self,
+            model,
+            messages,
+            tools,
+            **kwargs,
+        ):
+            response = {
+                "id": "response-eager",
+                "model": model,
+                "choices": [],
+            }
+            logger = kwargs["success_callback"][-1]
+            logger.log_success_event(
+                {
+                    **kwargs,
+                    "model": model,
+                    "messages": messages,
+                    "tools": tools,
+                },
+                response,
+                None,
+                None,
+            )
+            pending_after_native_callback.append(
+                logger.pending_attempt_count()
+            )
+            return response
+
+    class EagerLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = EagerCallbackClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is False
+            yield await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                **self._additional_args,
+            )
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-eager-native",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        EagerLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+
+    _run(
+        _collect_async(
+            observed_type().generate_content_async("request")
+        )
+    )
+
+    assert pending_after_native_callback == [1]
+    assert [
+        event["transition"]
+        for event in collector.export()["events"]
+    ] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+
+
+def test_google_adk_runtime_export_precedes_delayed_native_success_callback(
+    tmp_path,
+    monkeypatch,
+):
+    timers = []
+    agent_kwargs = {}
+
+    class DelayedThreadCallbackClient:
+        async def acompletion(
+            self,
+            model,
+            messages,
+            tools,
+            **kwargs,
+        ):
+            response = {
+                "id": "response-runtime",
+                "model": model,
+                "choices": [],
+            }
+            logger = kwargs["success_callback"][-1]
+            timer = threading.Timer(
+                0.25,
+                logger.log_success_event,
+                args=(
+                    {
+                        **kwargs,
+                        "model": model,
+                        "messages": messages,
+                        "tools": tools,
+                    },
+                    response,
+                    None,
+                    None,
+                ),
+            )
+            timer.start()
+            timers.append(timer)
+            return response
+
+    class RuntimeLiteLlm:
+        def __init__(self):
+            self._additional_args = {}
+            self.llm_client = DelayedThreadCallbackClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is False
+            yield await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[{"role": "user", "content": "hello"}],
+                tools=[],
+                **self._additional_args,
+            )
+
+    class FakeTypes:
+        class GenerateContentConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class Part:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class Content:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            agent_kwargs.update(kwargs)
+
+    class FakeSessionService:
+        async def create_session(self, **_kwargs):
+            return None
+
+    class FakeRunner:
+        def __init__(self, *, agent, app_name):
+            self.agent = agent
+            self.app_name = app_name
+            self.session_service = FakeSessionService()
+
+        async def run_async(self, **_kwargs):
+            llm_request = SimpleNamespace(
+                contents=[],
+                config=SimpleNamespace(labels={}),
+                model="openai/test",
+            )
+            callbacks = agent_kwargs["before_model_callback"]
+            if type(callbacks) is not list:
+                callbacks = [callbacks]
+            for callback in callbacks:
+                callback(llm_request=llm_request)
+            responses = [
+                response
+                async for response in agent_kwargs[
+                    "model"
+                ].generate_content_async(llm_request)
+            ]
+            assert responses
+            yield SimpleNamespace(
+                id="event-runtime",
+                invocation_id="invocation-runtime",
+                content=None,
+                usage_metadata=None,
+            )
+
+    class FakeRunConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-runtime-export",
+        artifact_root=tmp_path,
+    )
+    request = RuntimeRequest(
+        agent_name="agent",
+        model="openai/test",
+        system_prompt="system",
+        task_prompt="task",
+        context={},
+        runtime_context={"mode": "backtesting"},
+        memory_state={},
+        memory_notes=[],
+        bound_tools=[],
+        agent_run_id=collector.agent_run_id,
+        boundary_collector=collector,
+        run_timeout_seconds=None,
+    )
+    runtime = GoogleADKRuntime()
+
+    def resolve_model(
+        _model,
+        *,
+        model_entry_observer,
+        boundary_collector,
+        **_kwargs,
+    ):
+        observed_type = agent_runtime._build_observed_litellm_type(
+            RuntimeLiteLlm,
+            on_model_entry=model_entry_observer,
+            boundary_collector=boundary_collector,
+        )
+        return observed_type()
+
+    monkeypatch.setattr(
+        agent_runtime,
+        "_resolve_model_for_adk",
+        resolve_model,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_adk",
+        lambda: (FakeAgent, FakeRunner, FakeTypes, object),
+    )
+    original_import_module = agent_runtime.importlib.import_module
+    monkeypatch.setattr(
+        agent_runtime.importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(RunConfig=FakeRunConfig)
+            if name == "google.adk.agents.run_config"
+            else original_import_module(name)
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_maybe_build_gemini_thinking_planner",
+        lambda *_args: None,
+    )
+
+    result = runtime.run(request)
+    exported_provider_events = [
+        event
+        for event in result.boundary_trace["events"]
+        if event["transition"]
+        in {"B10_LITELLM_TO_PROVIDER", "B01_PROVIDER_TO_LITELLM"}
+    ]
+    assert [event["transition"] for event in exported_provider_events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+
+    for timer in timers:
+        timer.join(timeout=2)
+        assert not timer.is_alive()
+    assert len(_events(collector, "B10_LITELLM_TO_PROVIDER")) == 1
+    assert len(_events(collector, "B01_PROVIDER_TO_LITELLM")) == 1
+
+
+def test_observed_conversion_error_before_proxy_emits_no_provider_events(
+    tmp_path,
+):
+    expected = ValueError("request conversion failed")
+
+    class ConversionFailingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is False
+            raise expected
+            yield
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-conversion",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        ConversionFailingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type(model="provider-model")
+
+    async def invoke():
+        return [
+            response
+            async for response in model.generate_content_async("request")
+        ]
+
+    with pytest.raises(ValueError) as raised:
+        _run(invoke())
+
+    assert raised.value is expected
+    assert collector.export()["events"] == []
+
+
+@pytest.mark.parametrize("termination", ["cancel", "timeout"])
+def test_observed_proxy_persists_base_exception_after_adapter_entry(
+    tmp_path,
+    monkeypatch,
+    termination,
+):
+    created_loggers = []
+
+    class CapturingLogger(LiteLLMBoundaryLogger):
+        def __init__(self, collector):
+            super().__init__(collector)
+            created_loggers.append(self)
+
+    monkeypatch.setattr(
+        agent_runtime,
+        "LiteLLMBoundaryLogger",
+        CapturingLogger,
+    )
+
+    class BlockingClient:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.never = asyncio.Event()
+
+        async def acompletion(self, **_kwargs):
+            self.entered.set()
+            await self.never.wait()
+
+    class BlockingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = BlockingClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is False
+            yield await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                **self._additional_args,
+            )
+
+    collector = BoundaryTraceCollector(
+        agent_run_id=f"run-{termination}",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    observed_type = agent_runtime._build_observed_litellm_type(
+        BlockingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type()
+
+    async def consume():
+        return [
+            response
+            async for response in model.generate_content_async("request")
+        ]
+
+    async def invoke():
+        task = asyncio.create_task(consume())
+        await model.llm_client.entered.wait()
+        if termination == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(task, timeout=0.01)
+
+    _run(invoke())
+
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert events[1]["status"] == "error"
+    assert events[1]["error"]["type"] == "CancelledError"
+    assert created_loggers[0].pending_attempt_count() == 0
+
+
 def test_litellm_failure_records_redacted_provider_error(tmp_path):
     collector = BoundaryTraceCollector(
         agent_run_id="run-1",
@@ -346,15 +1106,17 @@ def test_litellm_failure_records_redacted_provider_error(tmp_path):
     turn_id = collector.start_model_turn()
     collector.set_active_model_turn(turn_id)
     logger = LiteLLMBoundaryLogger(collector)
+    kwargs = {
+        "model": "provider-model",
+        "messages": [],
+        "metadata": {"lumibot_model_turn_id": turn_id},
+        "retry_count": 0,
+    }
+    _begin_callback(logger, kwargs)
 
     _run(
         logger.async_log_failure_event(
-            {
-                "model": "provider-model",
-                "messages": [],
-                "metadata": {"lumibot_model_turn_id": turn_id},
-                "retry_count": 0,
-            },
+            kwargs,
             RuntimeError("provider unavailable api_key=failure-secret"),
             None,
             None,
@@ -421,26 +1183,30 @@ def test_litellm_turn_correlation_uses_nested_metadata_then_active_turn(tmp_path
     active_turn = collector.start_model_turn()
     collector.set_active_model_turn(active_turn)
     logger = LiteLLMBoundaryLogger(collector)
+    nested_kwargs = {
+        "model": "first",
+        "messages": [],
+        "litellm_params": {
+            "metadata": {
+                "lumibot_model_turn_id": nested_turn,
+            }
+        },
+    }
+    active_kwargs = {"model": "second", "messages": []}
+    _begin_callback(logger, nested_kwargs)
 
     _run(
         logger.async_log_success_event(
-            {
-                "model": "first",
-                "messages": [],
-                "litellm_params": {
-                    "metadata": {
-                        "lumibot_model_turn_id": nested_turn,
-                    }
-                },
-            },
+            nested_kwargs,
             {"id": "response-nested", "choices": []},
             None,
             None,
         )
     )
+    _begin_callback(logger, active_kwargs)
     _run(
         logger.async_log_success_event(
-            {"model": "second", "messages": []},
+            active_kwargs,
             {"id": "response-active", "choices": []},
             None,
             None,
@@ -468,6 +1234,7 @@ def test_litellm_repeated_stream_success_callback_is_deduplicated(tmp_path):
         "litellm_call_id": "stream-call-1",
         "metadata": {"lumibot_model_turn_id": turn_id},
     }
+    _begin_callback(logger, kwargs)
 
     for chunk_id in ("chunk-1", "chunk-2", "chunk-3"):
         _run(
@@ -505,6 +1272,7 @@ def test_litellm_reused_call_and_response_ids_are_scoped_to_model_turn(
                 "lumibot_model_turn_id": turn_id,
             },
         }
+        _begin_callback(logger, kwargs)
         for _duplicate in range(2):
             _run(
                 logger.async_log_success_event(
@@ -604,13 +1372,15 @@ def test_litellm_logger_avoids_arbitrary_object_hooks(tmp_path):
         artifact_root=tmp_path,
     )
     logger = LiteLLMBoundaryLogger(collector)
+    kwargs = {
+        "model": "provider-model",
+        "messages": [{"role": "user", "content": Explosive()}],
+    }
+    _begin_callback(logger, kwargs)
 
     _run(
         logger.async_log_success_event(
-            {
-                "model": "provider-model",
-                "messages": [{"role": "user", "content": Explosive()}],
-            },
+            kwargs,
             Explosive(),
             None,
             None,
@@ -679,31 +1449,35 @@ def test_litellm_loggers_keep_concurrent_collectors_isolated(tmp_path):
     second_turn = second.start_model_turn()
     first_logger = LiteLLMBoundaryLogger(first)
     second_logger = LiteLLMBoundaryLogger(second)
+    first_kwargs = {
+        "model": "first-model",
+        "messages": [{"role": "user", "content": "first"}],
+        "litellm_call_id": "first-call",
+        "metadata": {
+            "lumibot_model_turn_id": first_turn,
+        },
+    }
+    second_kwargs = {
+        "model": "second-model",
+        "messages": [{"role": "user", "content": "second"}],
+        "litellm_call_id": "second-call",
+        "metadata": {
+            "lumibot_model_turn_id": second_turn,
+        },
+    }
+    _begin_callback(first_logger, first_kwargs)
+    _begin_callback(second_logger, second_kwargs)
 
     async def invoke_both():
         await asyncio.gather(
             first_logger.async_log_success_event(
-                {
-                    "model": "first-model",
-                    "messages": [{"role": "user", "content": "first"}],
-                    "litellm_call_id": "first-call",
-                    "metadata": {
-                        "lumibot_model_turn_id": first_turn,
-                    },
-                },
+                first_kwargs,
                 {"id": "first-response", "choices": []},
                 None,
                 None,
             ),
             second_logger.async_log_success_event(
-                {
-                    "model": "second-model",
-                    "messages": [{"role": "user", "content": "second"}],
-                    "litellm_call_id": "second-call",
-                    "metadata": {
-                        "lumibot_model_turn_id": second_turn,
-                    },
-                },
+                second_kwargs,
                 {"id": "second-response", "choices": []},
                 None,
                 None,
@@ -738,18 +1512,19 @@ def test_litellm_acompletion_uses_dynamic_logger_without_global_registration(
     assert not callable(logger)
 
     async def invoke():
+        call_kwargs = {
+            "model": "openai/test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "mock_response": "hello",
+            "metadata": {"lumibot_model_turn_id": turn_id},
+        }
+        token = _begin(logger, call_kwargs)
         response = await litellm.acompletion(
-            model="openai/test",
-            messages=[{"role": "user", "content": "hello"}],
-            mock_response="hello",
-            metadata={"lumibot_model_turn_id": turn_id},
+            **call_kwargs,
             success_callback=[logger],
             failure_callback=[logger],
         )
-        for _ in range(100):
-            if _events(collector, "B01_PROVIDER_TO_LITELLM"):
-                break
-            await asyncio.sleep(0.01)
+        logger.complete_success(token, response, kwargs=call_kwargs)
         return response
 
     response = _run(invoke())
@@ -789,18 +1564,21 @@ def test_litellm_concurrent_request_loggers_do_not_touch_global_state(
         turn_id,
         response_text,
     ):
+        call_kwargs = {
+            "model": "openai/test",
+            "messages": [
+                {"role": "user", "content": response_text}
+            ],
+            "mock_response": response_text,
+            "metadata": {"lumibot_model_turn_id": turn_id},
+        }
+        token = _begin(logger, call_kwargs)
         response = await litellm.acompletion(
-            model="openai/test",
-            messages=[{"role": "user", "content": response_text}],
-            mock_response=response_text,
-            metadata={"lumibot_model_turn_id": turn_id},
+            **call_kwargs,
             success_callback=[logger],
             failure_callback=[logger],
         )
-        for _ in range(100):
-            if _events(collector, "B01_PROVIDER_TO_LITELLM"):
-                break
-            await asyncio.sleep(0.01)
+        logger.complete_success(token, response, kwargs=call_kwargs)
         return response
 
     async def invoke_both():
@@ -845,16 +1623,20 @@ def test_litellm_mock_failure_preserves_error_and_records_actual_exception(
     collector.set_active_model_turn(turn_id)
     logger = LiteLLMBoundaryLogger(collector)
     global_state = _litellm_global_state()
+    call_kwargs = {
+        "model": "openai/test",
+        "messages": [{"role": "user", "content": "hello"}],
+        "mock_response": "litellm.InternalServerError",
+        "metadata": {"lumibot_model_turn_id": turn_id},
+        "num_retries": 0,
+    }
+    _begin_callback(logger, call_kwargs)
 
     with pytest.raises(litellm.InternalServerError) as raised:
         litellm.completion(
-            model="openai/test",
-            messages=[{"role": "user", "content": "hello"}],
-            mock_response="litellm.InternalServerError",
-            metadata={"lumibot_model_turn_id": turn_id},
+            **call_kwargs,
             success_callback=[logger],
             failure_callback=[logger],
-            num_retries=0,
         )
     error = raised.value
 
@@ -904,19 +1686,24 @@ def test_observed_litellm_real_async_failure_records_once_without_globals(
         ],
         config=types.GenerateContentConfig(),
     )
-    fallback_errors = []
-    original_fallback = (
-        LiteLLMBoundaryLogger.record_async_failure_fallback
-    )
+    completed_errors = []
+    original_complete_error = LiteLLMBoundaryLogger.complete_error
 
-    def observe_fallback(self, error, **kwargs):
-        fallback_errors.append(error)
-        return original_fallback(self, error, **kwargs)
+    def observe_complete_error(self, token, error, **kwargs):
+        completed = original_complete_error(
+            self,
+            token,
+            error,
+            **kwargs,
+        )
+        if completed:
+            completed_errors.append(error)
+        return completed
 
     monkeypatch.setattr(
         LiteLLMBoundaryLogger,
-        "record_async_failure_fallback",
-        observe_fallback,
+        "complete_error",
+        observe_complete_error,
     )
     global_state = _litellm_global_state()
 
@@ -930,8 +1717,8 @@ def test_observed_litellm_real_async_failure_records_once_without_globals(
         _run(invoke())
 
     assert type(raised.value) is litellm.InternalServerError
-    assert fallback_errors == [raised.value]
-    assert fallback_errors[0] is raised.value
+    assert completed_errors == [raised.value]
+    assert completed_errors[0] is raised.value
     assert _litellm_global_state() == global_state
     events = collector.export()["events"]
     assert [event["transition"] for event in events] == [
@@ -953,7 +1740,9 @@ def test_observed_litellm_real_async_failure_records_once_without_globals(
     assert events[0]["duration_ms"] >= 0
 
 
-def test_observed_litellm_failure_fallback_reraises_same_exception(tmp_path):
+def test_observed_pre_provider_failure_reraises_same_exception_without_events(
+    tmp_path,
+):
     expected = RuntimeError("same exception")
 
     class FailingLiteLlm:
@@ -997,10 +1786,7 @@ def test_observed_litellm_failure_fallback_reraises_same_exception(tmp_path):
         _run(invoke())
 
     assert raised.value is expected
-    assert len(_events(collector, "B10_LITELLM_TO_PROVIDER")) == 1
-    b01 = _events(collector, "B01_PROVIDER_TO_LITELLM")
-    assert len(b01) == 1
-    assert b01[0]["error"]["message"] == "same exception"
+    assert collector.export()["events"] == []
 
 
 def test_litellm_mock_stream_records_one_provider_pair(tmp_path):
@@ -1016,20 +1802,25 @@ def test_litellm_mock_stream_records_one_provider_pair(tmp_path):
     global_state = _litellm_global_state()
 
     async def invoke():
+        call_kwargs = {
+            "model": "openai/test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "mock_response": "stream hello",
+            "metadata": {"lumibot_model_turn_id": turn_id},
+            "stream": True,
+        }
+        token = _begin(logger, call_kwargs)
         stream = await litellm.acompletion(
-            model="openai/test",
-            messages=[{"role": "user", "content": "hello"}],
-            mock_response="stream hello",
-            metadata={"lumibot_model_turn_id": turn_id},
+            **call_kwargs,
             success_callback=[logger],
             failure_callback=[logger],
-            stream=True,
         )
         chunks = [chunk async for chunk in stream]
-        for _ in range(100):
-            if _events(collector, "B01_PROVIDER_TO_LITELLM"):
-                break
-            await asyncio.sleep(0.01)
+        logger.complete_success(
+            token,
+            chunks[-1],
+            kwargs=call_kwargs,
+        )
         return chunks
 
     chunks = _run(invoke())
