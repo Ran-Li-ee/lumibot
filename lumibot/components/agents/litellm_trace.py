@@ -10,12 +10,16 @@ from typing import Any
 
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
+from pydantic import BaseModel
 
 from .boundary_trace import BoundaryTraceCollector
 
 _MISSING = object()
 _MAX_CAPTURE_ITEMS = 200
 _MAX_CAPTURE_DEPTH = 8
+_PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__[
+    "__pydantic_extra__"
+]
 _ALLOWED_REQUEST_FIELDS = (
     "model",
     "messages",
@@ -114,6 +118,13 @@ class LiteLLMAttemptToken:
     retry_count: int | None
 
 
+@dataclass(frozen=True)
+class LiteLLMStreamAggregate:
+    complete: bool
+    fidelity: str
+    chunks: tuple[Any, ...]
+
+
 @dataclass
 class _PendingProviderRequest:
     token: LiteLLMAttemptToken
@@ -160,10 +171,33 @@ def _object_storage(value: Any) -> dict[str, Any] | None:
 
 def _field(value: Any, key: str) -> Any:
     storage = _object_storage(value)
-    if storage is None:
+    if storage is not None:
+        try:
+            item = dict.get(storage, key, _MISSING)
+        except BaseException:
+            return _MISSING
+        if item is not _MISSING:
+            return item
+    try:
+        value_mro = type.__getattribute__(
+            type(value),
+            "__mro__",
+        )
+    except BaseException:
+        return _MISSING
+    if BaseModel not in value_mro:
         return _MISSING
     try:
-        return dict.get(storage, key, _MISSING)
+        extra = _PYDANTIC_EXTRA_DESCRIPTOR.__get__(
+            value,
+            type(value),
+        )
+    except BaseException:
+        return _MISSING
+    if type(extra) is not dict:
+        return _MISSING
+    try:
+        return dict.get(extra, key, _MISSING)
     except BaseException:
         return _MISSING
 
@@ -396,6 +430,22 @@ def _safe_choices(value: Any) -> list[dict[str, Any]]:
 
 
 def _safe_provider_response(response_obj: Any) -> dict[str, Any]:
+    if type(response_obj) is LiteLLMStreamAggregate:
+        return {
+            "object": "lumibot.stream_aggregate",
+            "stream_aggregate": {
+                "complete": response_obj.complete,
+                "fidelity": _safe_scalar(
+                    response_obj.fidelity
+                ),
+                "chunks": [
+                    _safe_provider_response(chunk)
+                    for chunk in tuple.__iter__(
+                        response_obj.chunks
+                    )
+                ],
+            },
+        }
     response: dict[str, Any] = {}
     for key in _RESPONSE_FIELDS:
         value = _field(response_obj, key)
@@ -869,6 +919,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
         cache_source: Any,
         start_time: Any,
         end_time: Any,
+        partial_response_obj: Any = None,
     ) -> bool:
         pending = self._claim_attempt(token, outcome)
         if pending is None:
@@ -962,6 +1013,13 @@ class LiteLLMBoundaryLogger(CustomLogger):
             response_event["error"] = _safe_error(
                 _failure_error(kwargs, response_obj)
             )
+            if partial_response_obj is not None:
+                response_event["payload"]["partial_stream"] = {
+                    "complete": False,
+                    "response": _safe_provider_response(
+                        partial_response_obj
+                    ),
+                }
         self._try_record(**response_event)
         return True
 
@@ -1001,6 +1059,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
         cache_source: Any = None,
         start_time: Any = None,
         end_time: Any = None,
+        partial_response_obj: Any = None,
     ) -> bool:
         try:
             callback_kwargs = (
@@ -1017,6 +1076,7 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 cache_source=cache_source,
                 start_time=start_time,
                 end_time=end_time,
+                partial_response_obj=partial_response_obj,
             )
         except BaseException:
             self._try_diagnostic(

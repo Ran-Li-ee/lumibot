@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from .boundary_trace import BoundaryTraceCollector
 from .litellm_trace import (
     LiteLLMBoundaryLogger,
+    LiteLLMStreamAggregate,
     supports_dynamic_input_callback,
 )
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer
@@ -2518,37 +2519,92 @@ def _build_observed_litellm_type(
             self._token = token
             self._capture_kwargs = capture_kwargs
             self._iterator = None
-            self._last_chunk = None
+            self._chunks: list[Any] = []
+            self._terminal = False
             self._owner.register_stream(self)
 
         def __aiter__(self):
             return self
 
-        def _complete_success(self) -> None:
+        def _aggregate_response(
+            self,
+            *,
+            complete: bool,
+        ) -> Any:
+            chunks = list(self._chunks)
             try:
+                import litellm
+
+                response = litellm.stream_chunk_builder(
+                    chunks=chunks
+                )
+            except BaseException as exc:
+                _add_trace_diagnostic(
+                    boundary_collector,
+                    "litellm_stream_aggregate_failed",
+                    exc,
+                )
+                return LiteLLMStreamAggregate(
+                    complete=complete,
+                    fidelity="stream_chunk_builder_raises",
+                    chunks=tuple(chunks),
+                )
+            if response is not None:
+                return response
+            _add_trace_diagnostic(
+                boundary_collector,
+                "litellm_stream_aggregate_failed",
+                "LiteLLM stream_chunk_builder returned None",
+            )
+            return LiteLLMStreamAggregate(
+                complete=complete,
+                fidelity="stream_chunk_builder_none",
+                chunks=tuple(chunks),
+            )
+
+        def _release(self) -> None:
+            self._chunks.clear()
+            self._unregister()
+
+        def buffered_chunk_count(self) -> int:
+            return len(self._chunks)
+
+        def _complete_success(self) -> None:
+            if self._terminal:
+                return
+            self._terminal = True
+            try:
+                response = self._aggregate_response(
+                    complete=True
+                )
                 boundary_logger.complete_success(
                     self._token,
-                    (
-                        self._last_chunk
-                        if self._last_chunk is not None
-                        else self._delegate
-                    ),
+                    response,
                     kwargs=self._capture_kwargs,
                     cache_source=self._delegate,
                 )
             finally:
-                self._unregister()
+                self._release()
 
         def _complete_error(self, error: BaseException) -> None:
+            if self._terminal:
+                return
+            self._terminal = True
             try:
+                partial_response = (
+                    self._aggregate_response(complete=False)
+                    if self._chunks
+                    else None
+                )
                 boundary_logger.complete_error(
                     self._token,
                     error,
                     kwargs=self._capture_kwargs,
                     cache_source=self._delegate,
+                    partial_response_obj=partial_response,
                 )
             finally:
-                self._unregister()
+                self._release()
 
         def _unregister(self) -> None:
             owner = self._owner
@@ -2558,6 +2614,8 @@ def _build_observed_litellm_type(
             owner.unregister_stream(self)
 
         async def __anext__(self):
+            if self._terminal:
+                raise StopAsyncIteration
             try:
                 if self._iterator is None:
                     self._iterator = self._delegate.__aiter__()
@@ -2568,10 +2626,19 @@ def _build_observed_litellm_type(
             except BaseException as exc:
                 self._complete_error(exc)
                 raise
-            self._last_chunk = chunk
+            try:
+                self._chunks.append(chunk)
+            except BaseException as exc:
+                _add_trace_diagnostic(
+                    boundary_collector,
+                    "litellm_stream_chunk_capture_failed",
+                    exc,
+                )
             return chunk
 
         async def _aclose(self) -> None:
+            if self._terminal:
+                return
             try:
                 close = (
                     getattr(self._iterator, "aclose", None)
@@ -2625,13 +2692,11 @@ def _build_observed_litellm_type(
                 self._complete_error(exit_error)
                 raise
             self._complete_error(
-                (
-                    exc
-                    if exc is not None
-                    else asyncio.CancelledError(
-                        "LiteLLM response stream context exited "
-                        "before exhaustion"
-                    )
+                exc
+                if exc is not None
+                else asyncio.CancelledError(
+                    "LiteLLM response stream context exited "
+                    "before exhaustion"
                 )
             )
             return result

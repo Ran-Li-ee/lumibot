@@ -30,6 +30,65 @@ async def _collect_async(iterator):
     return [item async for item in iterator]
 
 
+def _observed_stream_model(
+    collector,
+    provider_stream,
+    *,
+    wrapped_streams=None,
+    request_clients=None,
+):
+    wrapped_streams = (
+        wrapped_streams
+        if wrapped_streams is not None
+        else []
+    )
+    request_clients = (
+        request_clients
+        if request_clients is not None
+        else []
+    )
+
+    class StreamClient:
+        async def acompletion(self, **_kwargs):
+            return provider_stream
+
+    class StreamingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+            self.llm_client = StreamClient()
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            clone = object.__new__(type(self))
+            clone.__dict__ = dict(self.__dict__)
+            return clone
+
+        async def generate_content_async(
+            self,
+            _llm_request,
+            stream=False,
+        ):
+            assert stream is True
+            response_stream = await self.llm_client.acompletion(
+                model="provider-model",
+                messages=[],
+                tools=[],
+                stream=True,
+                **self._additional_args,
+            )
+            wrapped_streams.append(response_stream)
+            request_clients.append(self.llm_client)
+            async for response in response_stream:
+                yield response
+
+    observed_type = agent_runtime._build_observed_litellm_type(
+        StreamingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    return observed_type()
+
+
 def _begin(logger, kwargs):
     return logger.begin_attempt(
         kwargs.get("model"),
@@ -524,6 +583,198 @@ def test_observed_proxy_defers_stream_boundary_until_normal_exhaustion(
     assert request_clients[0].active_stream_count() == 0
 
 
+def test_observed_stream_aggregates_split_tool_call_arguments_and_releases_chunks(
+    tmp_path,
+):
+    import litellm
+
+    chunks = [
+        litellm.ModelResponse(
+            id="chatcmpl-tools",
+            model="provider-model",
+            stream=True,
+            choices=[
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": '{"sym',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        ),
+        litellm.ModelResponse(
+            id="chatcmpl-tools",
+            model="provider-model",
+            stream=True,
+            choices=[
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "arguments": 'bol":"SPY"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        ),
+    ]
+
+    class ToolCallStream:
+        def __init__(self):
+            self._chunks = list(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._chunks:
+                raise StopAsyncIteration
+            return self._chunks.pop(0)
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-stream-tools",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    wrapped_streams = []
+    model = _observed_stream_model(
+        collector,
+        ToolCallStream(),
+        wrapped_streams=wrapped_streams,
+    )
+
+    responses = _run(
+        _collect_async(
+            model.generate_content_async("request", stream=True)
+        )
+    )
+
+    assert responses == chunks
+    response = _events(
+        collector,
+        "B01_PROVIDER_TO_LITELLM",
+    )[0]["payload"]["response"]
+    assert response["id"] == "chatcmpl-tools"
+    assert response["choices"][0]["finish_reason"] == "tool_calls"
+    tool_call = response["choices"][0]["message"]["tool_calls"][0]
+    assert tool_call["id"] == "call-1"
+    assert tool_call["function"] == {
+        "name": "lookup",
+        "arguments": '{"symbol":"SPY"}',
+    }
+    assert wrapped_streams[0].buffered_chunk_count() == 0
+
+
+@pytest.mark.parametrize("builder_result", ["raises", "none"])
+def test_observed_stream_builder_failure_captures_all_normalized_chunks(
+    tmp_path,
+    monkeypatch,
+    builder_result,
+):
+    import litellm
+
+    chunks = [
+        {
+            "id": "chunk-1",
+            "model": "provider-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "one"},
+                }
+            ],
+        },
+        {
+            "id": "chunk-2",
+            "model": "provider-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": " two"},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+    ]
+
+    def broken_builder(*, chunks):
+        assert len(chunks) == 2
+        if builder_result == "raises":
+            raise RuntimeError("builder failed api_key=secret")
+        return None
+
+    monkeypatch.setattr(litellm, "stream_chunk_builder", broken_builder)
+
+    class ChunkStream:
+        def __init__(self):
+            self._chunks = list(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._chunks:
+                raise StopAsyncIteration
+            return self._chunks.pop(0)
+
+    collector = BoundaryTraceCollector(
+        agent_run_id=f"run-stream-fallback-{builder_result}",
+        artifact_root=tmp_path,
+    )
+    collector.set_active_model_turn(collector.start_model_turn())
+    wrapped_streams = []
+    model = _observed_stream_model(
+        collector,
+        ChunkStream(),
+        wrapped_streams=wrapped_streams,
+    )
+
+    responses = _run(
+        _collect_async(
+            model.generate_content_async("request", stream=True)
+        )
+    )
+
+    assert responses == chunks
+    response = _events(
+        collector,
+        "B01_PROVIDER_TO_LITELLM",
+    )[0]["payload"]["response"]
+    assert response["object"] == "lumibot.stream_aggregate"
+    assert response["stream_aggregate"]["complete"] is True
+    assert response["stream_aggregate"]["fidelity"] == (
+        f"stream_chunk_builder_{builder_result}"
+    )
+    assert [
+        chunk["id"]
+        for chunk in response["stream_aggregate"]["chunks"]
+    ] == ["chunk-1", "chunk-2"]
+    exported = collector.export()
+    assert exported["diagnostics"][-1]["kind"] == (
+        "litellm_stream_aggregate_failed"
+    )
+    assert "secret" not in str(exported)
+    assert wrapped_streams[0].buffered_chunk_count() == 0
+
+
 def test_public_observed_generator_close_closes_provider_stream(
     tmp_path,
     monkeypatch,
@@ -853,8 +1104,26 @@ def test_model_error_precedes_provider_stream_close_error(
 def test_observed_proxy_records_mid_stream_failure_and_preserves_identity(
     tmp_path,
 ):
+    import litellm
+
     expected = RuntimeError("stream failed")
     request_clients = []
+    wrapped_streams = []
+    partial_chunk = litellm.ModelResponse(
+        id="chatcmpl-partial",
+        model="provider-model",
+        stream=True,
+        choices=[
+            {
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": "partial",
+                },
+                "finish_reason": None,
+            }
+        ],
+    )
 
     class FailingStream:
         def __init__(self):
@@ -866,7 +1135,7 @@ def test_observed_proxy_records_mid_stream_failure_and_preserves_identity(
         async def __anext__(self):
             if not self._yielded:
                 self._yielded = True
-                return {"id": "first-chunk", "choices": []}
+                return partial_chunk
             raise expected
 
     class StreamClient:
@@ -898,6 +1167,7 @@ def test_observed_proxy_records_mid_stream_failure_and_preserves_identity(
                 **self._additional_args,
             )
             request_clients.append(self.llm_client)
+            wrapped_streams.append(response_stream)
             async for response in response_stream:
                 yield response
 
@@ -931,6 +1201,14 @@ def test_observed_proxy_records_mid_stream_failure_and_preserves_identity(
     assert events[0]["status"] == "error"
     assert events[1]["status"] == "error"
     assert events[1]["error"]["message"] == "stream failed"
+    partial_stream = events[1]["payload"]["partial_stream"]
+    assert partial_stream["complete"] is False
+    assert partial_stream["response"]["id"] == "chatcmpl-partial"
+    assert (
+        partial_stream["response"]["choices"][0]["message"]["content"]
+        == "partial"
+    )
+    assert wrapped_streams[0].buffered_chunk_count() == 0
     assert request_clients[0].active_stream_count() == 0
 
 
@@ -2678,6 +2956,9 @@ def test_observed_litellm_real_mock_stream_records_after_exhaustion(
         boundary_collector=collector,
     )
     model._additional_args["mock_response"] = "stream hello"
+    model._additional_args["stream_options"] = {
+        "include_usage": True
+    }
     request = LlmRequest(
         model="openai/test",
         contents=[
@@ -2705,6 +2986,16 @@ def test_observed_litellm_real_mock_stream_records_after_exhaustion(
     ]
     assert events[0]["status"] == "success"
     assert events[1]["status"] == "success"
+    response = events[1]["payload"]["response"]
+    assert response["id"].startswith("chatcmpl-")
+    assert response["model"] == "test"
+    assert response["object"] == "chat.completion"
+    assert response["choices"][0]["finish_reason"] == "stop"
+    assert response["choices"][0]["message"]["content"] == (
+        "stream hello"
+    )
+    assert response["usage"]["completion_tokens"] == 2
+    assert response["usage"]["total_tokens"] == 10
 
 
 def test_observed_pre_provider_failure_reraises_same_exception_without_events(
