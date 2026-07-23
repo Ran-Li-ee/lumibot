@@ -1192,6 +1192,127 @@ class BoundaryTraceCollector:
             ),
         )
 
+    def finalize_call_instance(
+        self,
+        call_instance_id: str,
+        *,
+        b08_recorded: bool,
+    ) -> bool:
+        finalized_at = utc_iso_timestamp()
+        with self._lock:
+            state = self._call_index.get(call_instance_id)
+            if state is None:
+                return False
+            if not b08_recorded:
+                state.pop("function_response_claimed", None)
+                return False
+
+            retained_keys = {
+                "model_turn_id",
+                "tool_batch_id",
+                "call_sequence",
+                "call_instance_id",
+                "trace_call_id",
+                "call_id_source",
+                "provider_call_id",
+                "provider_runtime_call_id",
+                "provider_runtime_alias_relation",
+                "provider_id_ambiguity",
+                "tool_name",
+                "dispatch_observed_at",
+                "dispatch_completed_at",
+                "completion_sequence",
+                "batch_completion_sequence",
+                "response_created_at",
+                "tool_response_pruned",
+                "function_tool_response_type",
+                "model_facing_response_type",
+                "parallel_overlap_confirmed",
+                "overlapping_call_instance_ids",
+            }
+            compacted = {
+                key: value
+                for key, value in state.items()
+                if key in retained_keys
+            }
+            compacted["b08_recorded"] = True
+            compacted["call_state_compacted"] = True
+            compacted["finalized_at"] = finalized_at
+            self._call_index[call_instance_id] = compacted
+
+            for alias, instance_ids in list(
+                self._call_alias_index.items()
+            ):
+                remaining = [
+                    instance_id
+                    for instance_id in instance_ids
+                    if instance_id != call_instance_id
+                ]
+                if remaining:
+                    self._call_alias_index[alias] = remaining
+                else:
+                    self._call_alias_index.pop(alias, None)
+
+            for observation_id, observation in list(
+                self._observation_index.items()
+            ):
+                if observation.get("call_instance_id") == call_instance_id:
+                    self._observation_index.pop(observation_id, None)
+
+            batch_id = compacted.get("tool_batch_id")
+            if isinstance(batch_id, str) and all(
+                (
+                    self._call_index.get(instance_id)
+                    or {}
+                ).get("call_state_compacted")
+                for instance_id in self._batch_call_instances.get(
+                    batch_id,
+                    [],
+                )
+            ):
+                self._batch_completion_number.pop(batch_id, None)
+            return True
+
+    def call_state_stats(self) -> dict[str, int]:
+        heavy_keys = {
+            "function_tool_response",
+            "model_facing_response",
+            "wrapper_received_arguments",
+            "wrapper_argument_types",
+            "final_positional_arguments",
+            "final_keyword_arguments",
+            "effective_arguments",
+            "raw_arguments",
+            "raw_response",
+        }
+        claim_keys = {
+            "dispatch_claimed",
+            "function_tool_claimed",
+            "after_tool_claimed",
+            "function_response_claimed",
+        }
+        with self._lock:
+            states = list(self._call_index.values())
+            return {
+                "call_instance_count": len(states),
+                "alias_instance_count": sum(
+                    len(instance_ids)
+                    for instance_ids in self._call_alias_index.values()
+                ),
+                "fingerprint_count": sum(
+                    "call_fingerprint" in state for state in states
+                ),
+                "pending_claim_count": sum(
+                    any(key in state for key in claim_keys)
+                    for state in states
+                ),
+                "heavy_payload_call_count": sum(
+                    any(key in state for key in heavy_keys)
+                    for state in states
+                ),
+                "observation_count": len(self._observation_index),
+            }
+
     def note_dispatch_started(
         self,
         call_instance_id: str,

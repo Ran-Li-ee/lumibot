@@ -1,5 +1,7 @@
 import asyncio
+import gzip
 import inspect
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -1677,6 +1679,7 @@ def test_normalize_event_records_scalar_mapping_and_merged_responses(tmp_path):
     assert b08_events[0]["adk_invocation_id"] == "invocation-1"
     assert b08_events[0]["payload"]["event_id"] == "event-1"
     assert b08_events[0]["payload"]["response_id"] == "call_A"
+    assert b08_events[0]["payload"]["response_id_source"] == "provider"
     assert b08_events[0]["payload"]["function_response"] == {
         "result": "ready"
     }
@@ -1698,6 +1701,216 @@ def test_normalize_event_records_scalar_mapping_and_merged_responses(tmp_path):
         "function_response_index": 1,
         "call_ids": ["call_A", "call_B"],
     }
+
+
+def test_b08_marks_unmatched_nonempty_runtime_id_as_unknown(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    request = make_runtime_request(collector)
+    GoogleADKRuntime()._before_tool_boundary_callback(request)(
+        tool=SimpleNamespace(name="echo"),
+        args={"value": "ready"},
+        tool_context=SimpleNamespace(
+            function_call_id="runtime-unmatched",
+            invocation_id="invocation-1",
+        ),
+    )
+    b03 = _events(collector, "B03_ADK_TO_FUNCTION_TOOL")[0]
+    assert b03["payload"]["call_id_source"] == (
+        "unknown_nonempty_runtime_id"
+    )
+    assert b03["payload"]["provider_call_id"] is None
+    assert b03["payload"]["provider_runtime_call_id"] == (
+        "runtime-unmatched"
+    )
+    event = SimpleNamespace(
+        id="event-unmatched",
+        invocation_id="invocation-1",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part.from_function_response(
+                    name="echo",
+                    response={"value": "ready"},
+                )
+            ],
+        ),
+        usage_metadata=None,
+    )
+    event.content.parts[0].function_response.id = "runtime-unmatched"
+
+    _normalize_event(event, collector=collector)
+
+    b08 = _events(collector, "B08_FUNCTION_TOOL_TO_ADK")[0]
+    assert b08["payload"]["response_id_source"] == (
+        "unknown_nonempty_runtime_id"
+    )
+
+
+def test_b08_record_failure_preserves_state_for_retry(
+    monkeypatch,
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    registered = collector.register_tool_calls(
+        turn_id,
+        [
+            {
+                "trace_call_id": "call_A",
+                "provider_call_id": "call_A",
+                "provider_runtime_call_id": "call_A",
+                "call_id_source": "provider",
+                "tool_name": "echo",
+                "call_fingerprint": "large-fingerprint",
+            }
+        ],
+    )
+    call_instance_id = registered["calls"][0]["call_instance_id"]
+    collector.note_function_tool_response(
+        call_instance_id,
+        unpruned_response={"value": "x" * 5_000},
+        model_facing_response={"value": "x" * 5_000},
+        pruned=False,
+    )
+    event = SimpleNamespace(
+        id="event-retry",
+        invocation_id="invocation-1",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part.from_function_response(
+                    name="echo",
+                    response={"value": "x" * 5_000},
+                )
+            ],
+        ),
+        usage_metadata=None,
+    )
+    event.content.parts[0].function_response.id = "call_A"
+    original_record = collector.record
+    fail_b08 = True
+
+    def flaky_record(**boundary):
+        if (
+            fail_b08
+            and boundary["transition"] == "B08_FUNCTION_TOOL_TO_ADK"
+        ):
+            raise RuntimeError("B08 recorder unavailable")
+        return original_record(**boundary)
+
+    monkeypatch.setattr(collector, "record", flaky_record)
+
+    _normalize_event(event, collector=collector)
+
+    preserved = collector.call_state(call_instance_id)
+    assert preserved["function_tool_response"]["value"] == "x" * 5_000
+    assert preserved["call_fingerprint"] == "large-fingerprint"
+
+    fail_b08 = False
+    _normalize_event(event, collector=collector)
+
+    assert len(_events(collector, "B08_FUNCTION_TOOL_TO_ADK")) == 1
+    compacted = collector.call_state(call_instance_id)
+    assert compacted["call_state_compacted"] is True
+    assert "function_tool_response" not in compacted
+    assert "model_facing_response" not in compacted
+    assert "call_fingerprint" not in compacted
+
+
+def test_b08_compacts_large_multi_call_state_after_sidecar_record(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+        inline_payload_limit=200,
+    )
+    turn_id = collector.start_model_turn()
+    registered = collector.register_tool_calls(
+        turn_id,
+        [
+            {
+                "trace_call_id": call_id,
+                "provider_call_id": call_id,
+                "provider_runtime_call_id": call_id,
+                "call_id_source": "provider",
+                "tool_name": "echo",
+                "call_fingerprint": f"fingerprint-{index}",
+            }
+            for index, call_id in enumerate(("call_A", "call_B"), start=1)
+        ],
+    )
+    markers = {
+        "call_A": "A" * 5_000,
+        "call_B": "B" * 5_000,
+    }
+    for call in registered["calls"]:
+        call_id = call["trace_call_id"]
+        collector.note_function_tool_response(
+            call["call_instance_id"],
+            unpruned_response={"large": markers[call_id]},
+            model_facing_response={"large": markers[call_id]},
+            pruned=False,
+        )
+    event = SimpleNamespace(
+        id="event-large",
+        invocation_id="invocation-1",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part.from_function_response(
+                    name="echo",
+                    response={"large": markers[call_id]},
+                )
+                for call_id in ("call_A", "call_B")
+            ],
+        ),
+        usage_metadata=None,
+    )
+    for part, call_id in zip(
+        event.content.parts,
+        ("call_A", "call_B"),
+    ):
+        part.function_response.id = call_id
+
+    _normalize_event(event, collector=collector)
+
+    b08_events = _events(collector, "B08_FUNCTION_TOOL_TO_ADK")
+    assert len(b08_events) == 2
+    for boundary in b08_events:
+        sidecar_path = boundary["payload_meta"]["sidecar_path"]
+        assert sidecar_path
+        with gzip.open(
+            tmp_path / sidecar_path,
+            mode="rt",
+            encoding="utf-8",
+        ) as sidecar:
+            retained_payload = json.load(sidecar)
+        call_id = boundary["call_id"]
+        assert retained_payload["function_response"]["large"] == (
+            markers[call_id]
+        )
+        assert retained_payload["function_tool_response"]["large"] == (
+            markers[call_id]
+        )
+
+    for call in registered["calls"]:
+        state = collector.call_state(call["call_instance_id"])
+        assert state["call_state_compacted"] is True
+        assert "function_tool_response" not in state
+        assert "model_facing_response" not in state
+        assert "call_fingerprint" not in state
+    stats = collector.call_state_stats()
+    assert stats["heavy_payload_call_count"] == 0
+    assert stats["fingerprint_count"] == 0
+    assert stats["pending_claim_count"] == 0
+    assert stats["alias_instance_count"] == 0
 
 
 def test_b08_preserves_parallel_completion_order_separate_from_model_order(
@@ -2390,7 +2603,9 @@ def test_live_adk_missing_id_assignment_and_cleanup_are_observation_pure(
         "reconciled_generated_fallback"
     )
     b08 = _events(collector, "B08_FUNCTION_TOOL_TO_ADK")[0]
-    assert b08["payload"]["response_id_source"] == "provider"
+    assert b08["payload"]["response_id_source"] == (
+        "adk_generated_missing_provider_id"
+    )
     assert b08["payload"]["trace_call_id_source"] == (
         "generated_missing_provider_id"
     )

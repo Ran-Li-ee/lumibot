@@ -195,13 +195,42 @@ def _add_trace_diagnostic(
 def _record_tool_boundary(
     collector: BoundaryTraceCollector | None,
     **event: Any,
-) -> None:
+) -> dict[str, Any]:
     if collector is None:
-        return
+        return {}
     try:
-        collector.record(**event)
+        return collector.record(**event)
     except Exception as exc:
         _add_trace_diagnostic(collector, "record_failed", exc)
+        return {}
+
+
+def _function_response_id_source(
+    provider_response_id: str | None,
+    state: dict[str, Any],
+) -> str:
+    if provider_response_id is None:
+        return "generated_missing_adk_function_response_id"
+    if (
+        state.get("call_id_source") == "provider"
+        and state.get("provider_call_id") == provider_response_id
+    ):
+        return "provider"
+    if (
+        state.get("call_id_source")
+        in {
+            "adk_generated_missing_provider_id",
+            "generated_missing_provider_id",
+            "generated_missing_adk_dispatch_id",
+            "generated_missing_source_event_call_id",
+            "generated_missing_after_tool_id",
+        }
+        and state.get("provider_call_id") is None
+        and state.get("provider_runtime_call_id")
+        == provider_response_id
+    ):
+        return "adk_generated_missing_provider_id"
+    return "unknown_nonempty_runtime_id"
 
 
 def _wrap_tool_callable(
@@ -1516,9 +1545,12 @@ def _normalize_event(
         provider_response_id = (
             str(getattr(function_response, "id", None) or "") or None
         )
-        call_id_source = "provider"
+        response_id_source = (
+            "unknown_nonempty_runtime_id"
+            if provider_response_id is not None
+            else "generated_missing_adk_function_response_id"
+        )
         if provider_response_id is None and collector is not None:
-            call_id_source = "generated_missing_adk_function_response_id"
             _add_trace_diagnostic(
                 collector,
                 "generated_missing_adk_function_response_call_id",
@@ -1529,7 +1561,7 @@ def _normalize_event(
                 function_response,
                 tool_name,
                 provider_response_id,
-                call_id_source,
+                response_id_source,
             )
         )
     merged_call_ids = [
@@ -1586,7 +1618,7 @@ def _normalize_event(
                 _,
                 tool_name,
                 provider_response_id,
-                call_id_source,
+                response_id_source,
             ) = function_response_entries[function_response_index]
             function_response_index += 1
             state: dict[str, Any] = {}
@@ -1598,7 +1630,7 @@ def _normalize_event(
             trace_call_id = provider_response_id
             call_instance_id = None
             batch_call_ids: list[str] = []
-            trace_call_id_source = call_id_source
+            trace_call_id_source = response_id_source
             if collector is not None:
                 try:
                     state = collector.claim_function_response(
@@ -1640,91 +1672,111 @@ def _normalize_event(
                         "function_response_batch_lookup_failed",
                         exc,
                     )
-                _record_tool_boundary(
-                    collector,
-                    transition="B08_FUNCTION_TOOL_TO_ADK",
-                    from_module="function_tool",
-                    to_module="google_adk",
-                    adk_invocation_id=invocation_id,
-                    model_turn_id=state.get("model_turn_id"),
-                    tool_batch_id=state.get("tool_batch_id"),
-                    call_id=trace_call_id,
-                    call_instance_id=call_instance_id,
-                    payload={
-                        "event_id": event_id,
-                        "invocation_id": invocation_id,
-                        "response_id": (
-                            provider_response_id or trace_call_id
-                        ),
-                        "response_id_source": call_id_source,
-                        "trace_call_id": trace_call_id,
-                        "trace_call_id_source": (
-                            trace_call_id_source
-                        ),
-                        "call_instance_id": call_instance_id,
-                        "provider_call_id": state.get(
-                            "provider_call_id"
-                        ),
-                        "provider_runtime_call_id": (
-                            provider_response_id
-                            or state.get(
-                                "provider_runtime_call_id"
-                            )
-                        ),
-                        "provider_runtime_alias_relation": (
-                            state.get(
-                                "provider_runtime_alias_relation"
-                            )
-                        ),
-                        "provider_id_ambiguity": state.get(
-                            "provider_id_ambiguity"
-                        ),
-                        "function_name": tool_name,
-                        "function_response": _adk_object_payload(
-                            response
-                        ),
-                        "authoritative_next_model_data": True,
-                        "function_tool_response": state.get(
-                            "function_tool_response"
-                        ),
-                        "model_facing_response": state.get(
-                            "model_facing_response"
-                        ),
-                        "tool_response_pruned": state.get(
-                            "tool_response_pruned"
-                        ),
-                        "completion_sequence": state.get(
-                            "completion_sequence"
-                        ),
-                        "batch_completion_sequence": state.get(
-                            "batch_completion_sequence"
-                        ),
-                        "response_created_at": state.get(
-                            "response_created_at"
-                        ),
-                        "scalar_wrapping": (
-                            _scalar_wrapping_metadata(
-                                response,
-                                state,
-                            )
-                        ),
-                        "parallel_execution": (
-                            _parallel_execution_evidence(
-                                state,
-                                batch_call_ids,
-                            )
-                        ),
-                        "merged_event": {
-                            "function_response_count": len(
-                                function_response_entries
-                            ),
-                            "function_response_index": (
-                                function_response_index
-                            ),
-                            "call_ids": merged_call_ids,
-                        },
-                    },
+                response_id_source = _function_response_id_source(
+                    provider_response_id,
+                    state,
                 )
+                b08_recorded = False
+                try:
+                    recorded_event = _record_tool_boundary(
+                        collector,
+                        transition="B08_FUNCTION_TOOL_TO_ADK",
+                        from_module="function_tool",
+                        to_module="google_adk",
+                        adk_invocation_id=invocation_id,
+                        model_turn_id=state.get("model_turn_id"),
+                        tool_batch_id=state.get("tool_batch_id"),
+                        call_id=trace_call_id,
+                        call_instance_id=call_instance_id,
+                        payload={
+                            "event_id": event_id,
+                            "invocation_id": invocation_id,
+                            "response_id": (
+                                provider_response_id or trace_call_id
+                            ),
+                            "response_id_source": response_id_source,
+                            "trace_call_id": trace_call_id,
+                            "trace_call_id_source": (
+                                trace_call_id_source
+                            ),
+                            "call_instance_id": call_instance_id,
+                            "provider_call_id": state.get(
+                                "provider_call_id"
+                            ),
+                            "provider_runtime_call_id": (
+                                provider_response_id
+                                or state.get(
+                                    "provider_runtime_call_id"
+                                )
+                            ),
+                            "provider_runtime_alias_relation": (
+                                state.get(
+                                    "provider_runtime_alias_relation"
+                                )
+                            ),
+                            "provider_id_ambiguity": state.get(
+                                "provider_id_ambiguity"
+                            ),
+                            "function_name": tool_name,
+                            "function_response": _adk_object_payload(
+                                response
+                            ),
+                            "authoritative_next_model_data": True,
+                            "function_tool_response": state.get(
+                                "function_tool_response"
+                            ),
+                            "model_facing_response": state.get(
+                                "model_facing_response"
+                            ),
+                            "tool_response_pruned": state.get(
+                                "tool_response_pruned"
+                            ),
+                            "completion_sequence": state.get(
+                                "completion_sequence"
+                            ),
+                            "batch_completion_sequence": state.get(
+                                "batch_completion_sequence"
+                            ),
+                            "response_created_at": state.get(
+                                "response_created_at"
+                            ),
+                            "scalar_wrapping": (
+                                _scalar_wrapping_metadata(
+                                    response,
+                                    state,
+                                )
+                            ),
+                            "parallel_execution": (
+                                _parallel_execution_evidence(
+                                    state,
+                                    batch_call_ids,
+                                )
+                            ),
+                            "merged_event": {
+                                "function_response_count": len(
+                                    function_response_entries
+                                ),
+                                "function_response_index": (
+                                    function_response_index
+                                ),
+                                "call_ids": merged_call_ids,
+                            },
+                        },
+                    )
+                    b08_recorded = bool(recorded_event)
+                finally:
+                    if call_instance_id:
+                        try:
+                            collector.finalize_call_instance(
+                                call_instance_id,
+                                b08_recorded=b08_recorded,
+                            )
+                        except Exception as exc:
+                            _add_trace_diagnostic(
+                                collector,
+                                "function_response_finalize_failed",
+                                exc,
+                            )
             for chunk in _extract_tool_text(response):
                 normalized.append(
                     AgentTraceEvent(
@@ -3230,7 +3282,7 @@ class GoogleADKRuntime:
                     or f"generated:adk_dispatch:{uuid4().hex}"
                 )
                 call_id_source = (
-                    "provider"
+                    "unknown_nonempty_runtime_id"
                     if provider_call_id
                     else "generated_missing_adk_dispatch_id"
                 )
@@ -3281,6 +3333,23 @@ class GoogleADKRuntime:
                             source_call,
                             "args",
                         )
+                        source_call_id_source = (
+                            "adk_generated_missing_provider_id"
+                            if (
+                                source_provider_call_id
+                                and source_provider_call_id.startswith(
+                                    "adk-"
+                                )
+                            )
+                            else (
+                                "provider"
+                                if source_provider_call_id
+                                else (
+                                    "generated_missing_"
+                                    "source_event_call_id"
+                                )
+                            )
+                        )
                         source_call_records.append(
                             {
                                 "trace_call_id": (
@@ -3288,22 +3357,28 @@ class GoogleADKRuntime:
                                 ),
                                 "provider_call_id": (
                                     source_provider_call_id
+                                    if source_call_id_source
+                                    == "provider"
+                                    else None
                                 ),
                                 "provider_runtime_call_id": (
                                     source_provider_call_id
                                 ),
                                 "provider_runtime_alias_relation": (
-                                    "same_as_trace_call_id"
+                                    (
+                                        "same_as_trace_call_id"
+                                        if source_call_id_source
+                                        == "provider"
+                                        else (
+                                            "adk_runtime_id_without_"
+                                            "provider_id"
+                                        )
+                                    )
                                     if source_provider_call_id
                                     else None
                                 ),
                                 "call_id_source": (
-                                    "provider"
-                                    if source_provider_call_id
-                                    else (
-                                        "generated_missing_"
-                                        "source_event_call_id"
-                                    )
+                                    source_call_id_source
                                 ),
                                 "tool_name": source_name,
                                 "call_fingerprint": (
@@ -3320,14 +3395,12 @@ class GoogleADKRuntime:
                         else [
                             {
                                 "trace_call_id": trace_call_id,
-                                "provider_call_id": (
-                                    provider_call_id
-                                ),
+                                "provider_call_id": None,
                                 "provider_runtime_call_id": (
                                     provider_call_id
                                 ),
                                 "provider_runtime_alias_relation": (
-                                    "same_as_trace_call_id"
+                                    "runtime_id_without_provider_provenance"
                                     if provider_call_id
                                     else None
                                 ),
@@ -3359,6 +3432,10 @@ class GoogleADKRuntime:
                         ids = collector.call_ids(
                             call_instance_id
                         )
+                    call_id_source = (
+                        ids.get("call_id_source")
+                        or call_id_source
+                    )
                     if source_call_records:
                         call_lookup_status = (
                             "reconstructed_source_event_batch"
