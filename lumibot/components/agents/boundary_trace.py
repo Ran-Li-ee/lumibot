@@ -6,7 +6,6 @@ import contextvars
 import copy
 import gzip
 import hashlib
-import inspect
 import itertools
 import json
 import math
@@ -18,7 +17,14 @@ import threading
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
-from pathlib import Path, PurePath
+from pathlib import (
+    Path,
+    PosixPath,
+    PurePath,
+    PurePosixPath,
+    PureWindowsPath,
+    WindowsPath,
+)
 from typing import Any, Iterator
 from uuid import UUID, uuid4
 
@@ -34,7 +40,7 @@ _SAFE_SPAN_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 _QUOTED_ABSOLUTE_PATH_RE = re.compile(
     r"(?P<quote>[\"'])(?:(?:[A-Za-z]:[\\/]|\\\\)|/).*?(?P=quote)"
 )
-_PATH_MESSAGE_END = r"(?=[,;\r\n]|$)"
+_PATH_MESSAGE_END = r"(?=[\r\n]|$)"
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\).*?"
     + _PATH_MESSAGE_END,
@@ -55,6 +61,12 @@ _TRUSTED_SHAPE_TYPE_EXPORTS = {
     ("pandas.core.frame", "DataFrame"): ("pandas", "DataFrame"),
     ("pandas.core.series", "Series"): ("pandas", "Series"),
 }
+_STANDARD_PATH_TYPES = (
+    PosixPath,
+    PurePosixPath,
+    PureWindowsPath,
+    WindowsPath,
+)
 
 
 def utc_iso_timestamp() -> str:
@@ -66,52 +78,145 @@ def current_tool_call_context() -> dict[str, Any] | None:
     return dict(value) if isinstance(value, dict) else None
 
 
+def _hook_free_mro(value_type: type) -> tuple[type, ...]:
+    try:
+        mro = type.__getattribute__(value_type, "__mro__")
+    except Exception:
+        return ()
+    return mro if type(mro) is tuple else ()
+
+
+def _type_mro_contains(value_type: type, base_type: type) -> bool:
+    return any(candidate is base_type for candidate in _hook_free_mro(value_type))
+
+
+def _type_is_one_of(value_type: type, candidates: tuple[type, ...]) -> bool:
+    return any(value_type is candidate for candidate in candidates)
+
+
+def _type_is_subclass(value_type: type, base_type: type) -> bool:
+    if _type_mro_contains(value_type, base_type):
+        return True
+    try:
+        return issubclass(value_type, base_type)
+    except Exception:
+        return False
+
+
+def _is_mapping_type(value_type: type) -> bool:
+    return _type_is_subclass(value_type, collections.abc.Mapping)
+
+
+def _mapping_items(value: Any, value_type: type) -> Any:
+    if _type_mro_contains(value_type, dict):
+        return dict.items(value)
+    return collections.abc.Mapping.items(value)
+
+
+def _mapping_keys(value: Any, value_type: type) -> Any:
+    if _type_mro_contains(value_type, dict):
+        return dict.__iter__(value)
+    return iter(value)
+
+
+def _sequence_iterator(value: Any, value_type: type) -> Any:
+    for sequence_type in (list, tuple):
+        if _type_mro_contains(value_type, sequence_type):
+            return sequence_type.__iter__(value)
+    raise TypeError("unsupported sequence type")
+
+
+def _set_iterator(value: Any, value_type: type) -> Any:
+    for set_type in (set, frozenset):
+        if _type_mro_contains(value_type, set_type):
+            return set_type.__iter__(value)
+    raise TypeError("unsupported set type")
+
+
+def _container_length(value: Any, value_type: type) -> int:
+    for container_type in (dict, list, tuple, set, frozenset):
+        if _type_mro_contains(value_type, container_type):
+            return container_type.__len__(value)
+    return len(value)
+
+
 def _semantic_trace_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, str, int)):
+    actual_type = type(value)
+    if value is None or actual_type is bool:
         return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, (Decimal, UUID)):
-        return str(value)
-    if isinstance(value, PurePath):
+    if _type_mro_contains(actual_type, str):
+        return str.encode(value, errors="surrogatepass").decode(
+            errors="surrogatepass"
+        )
+    if _type_mro_contains(actual_type, int):
+        return int.__int__(value)
+    if _type_mro_contains(actual_type, float):
+        normalized_float = float.__float__(value)
+        return normalized_float if math.isfinite(normalized_float) else None
+    if _type_mro_contains(actual_type, datetime):
+        return datetime.isoformat(value)
+    if _type_mro_contains(actual_type, date):
+        return date.isoformat(value)
+    if _type_mro_contains(actual_type, Decimal):
+        return Decimal.__str__(value)
+    if _type_mro_contains(actual_type, UUID):
+        return UUID.__str__(value)
+    if _type_is_one_of(actual_type, _STANDARD_PATH_TYPES):
         return _portable_path_value(value)
-    if isinstance(value, Enum):
-        return _semantic_trace_value(value.value)
-    if isinstance(value, collections.abc.Iterator):
+    if _type_is_subclass(actual_type, Enum):
+        try:
+            enum_value = object.__getattribute__(value, "_value_")
+        except Exception:
+            return _DESCRIPTOR_ONLY
+        return _semantic_trace_value(enum_value)
+    if _type_is_subclass(actual_type, collections.abc.Iterator):
         return _DESCRIPTOR_ONLY
-    if isinstance(value, collections.abc.Mapping):
+    if _is_mapping_type(actual_type):
         normalized_mapping = {}
-        for key, item in value.items():
-            normalized_item = _semantic_trace_value(item)
-            if normalized_item is _DESCRIPTOR_ONLY:
-                return _DESCRIPTOR_ONLY
-            normalized_key, key_is_descriptor = _safe_mapping_key(key)
-            if key_is_descriptor:
-                return _DESCRIPTOR_ONLY
-            normalized_mapping[normalized_key] = normalized_item
+        try:
+            for key, item in _mapping_items(value, actual_type):
+                normalized_item = _semantic_trace_value(item)
+                if normalized_item is _DESCRIPTOR_ONLY:
+                    return _DESCRIPTOR_ONLY
+                normalized_key, key_is_descriptor = _safe_mapping_key(key)
+                if key_is_descriptor:
+                    return _DESCRIPTOR_ONLY
+                normalized_mapping[normalized_key] = normalized_item
+        except Exception:
+            return _DESCRIPTOR_ONLY
         return normalized_mapping
-    if isinstance(value, (list, tuple)):
+    if any(
+        _type_mro_contains(actual_type, sequence_type)
+        for sequence_type in (list, tuple)
+    ):
         normalized_sequence = []
-        for item in value:
-            normalized_item = _semantic_trace_value(item)
-            if normalized_item is _DESCRIPTOR_ONLY:
-                return _DESCRIPTOR_ONLY
-            normalized_sequence.append(normalized_item)
+        try:
+            for item in _sequence_iterator(value, actual_type):
+                normalized_item = _semantic_trace_value(item)
+                if normalized_item is _DESCRIPTOR_ONLY:
+                    return _DESCRIPTOR_ONLY
+                normalized_sequence.append(normalized_item)
+        except Exception:
+            return _DESCRIPTOR_ONLY
         return normalized_sequence
-    if isinstance(value, (set, frozenset)):
+    if any(
+        _type_mro_contains(actual_type, set_type)
+        for set_type in (set, frozenset)
+    ):
         normalized_set = []
-        for item in value:
-            normalized_item = _semantic_trace_value(item)
-            if normalized_item is _DESCRIPTOR_ONLY:
-                return _DESCRIPTOR_ONLY
-            normalized_set.append(normalized_item)
+        try:
+            for item in _set_iterator(value, actual_type):
+                normalized_item = _semantic_trace_value(item)
+                if normalized_item is _DESCRIPTOR_ONLY:
+                    return _DESCRIPTOR_ONLY
+                normalized_set.append(normalized_item)
+        except Exception:
+            return _DESCRIPTOR_ONLY
         return sorted(
             normalized_set,
             key=lambda item: json.dumps(item, sort_keys=True),
         )
-    if isinstance(value, BaseModel):
+    if _type_is_subclass(actual_type, BaseModel):
         try:
             return _semantic_trace_value(
                 BaseModel.model_dump(value, mode="json")
@@ -212,12 +317,17 @@ def _type_based_preview(descriptor: dict[str, Any]) -> str:
     return f"<{descriptor['qualified_type']} instance>"
 
 
-def _safe_static_shape(value: Any) -> list[int | None] | None:
-    try:
-        shape = inspect.getattr_static(value, "shape")
-    except Exception:
-        return None
-    return _safe_shape_tuple(shape)
+def _safe_static_shape(value_type: type) -> list[int | None] | None:
+    for candidate in _hook_free_mro(value_type):
+        try:
+            namespace = type.__getattribute__(candidate, "__dict__")
+            shape = namespace.get("shape")
+        except Exception:
+            continue
+        safe_shape = _safe_shape_tuple(shape)
+        if safe_shape is not None:
+            return safe_shape
+    return None
 
 
 def _safe_shape_tuple(shape: Any) -> list[int | None] | None:
@@ -246,11 +356,11 @@ def _is_trusted_shape_type(value_type: type) -> bool:
     return vars(loaded_module).get(export_name) is value_type
 
 
-def _safe_shape(value: Any) -> list[int | None] | None:
-    static_shape = _safe_static_shape(value)
+def _safe_shape(value: Any, value_type: type) -> list[int | None] | None:
+    static_shape = _safe_static_shape(value_type)
     if static_shape is not None:
         return static_shape
-    if not _is_trusted_shape_type(type(value)):
+    if not _is_trusted_shape_type(value_type):
         return None
     try:
         return _safe_shape_tuple(
@@ -261,7 +371,11 @@ def _safe_shape(value: Any) -> list[int | None] | None:
 
 
 def _safe_mapping_key(value: Any) -> tuple[str, bool]:
-    if type(value) in {str, int, float, bool, type(None), Decimal, UUID}:
+    actual_type = type(value)
+    if _type_is_one_of(
+        actual_type,
+        (str, int, float, bool, type(None), Decimal, UUID),
+    ):
         return str(value), False
     descriptor = _descriptor_type(value)
     return f"<{descriptor['python_type']}>", True
@@ -406,33 +520,43 @@ class BoundaryTraceCollector:
         *,
         include_safe_preview: bool,
     ) -> dict[str, Any]:
+        actual_type = type(value)
         descriptor = _descriptor_type(value)
-        if isinstance(value, collections.abc.Iterator):
+        if _type_is_subclass(actual_type, collections.abc.Iterator):
             descriptor["one_shot"] = True
             return descriptor
-        shape = _safe_shape(value)
+        shape = _safe_shape(value, actual_type)
         if shape is not None:
             descriptor["shape"] = shape
-        if isinstance(value, collections.abc.Mapping):
+        if _is_mapping_type(actual_type):
             try:
                 descriptor["keys"] = [
                     _safe_mapping_key(key)[0]
-                    for key in itertools.islice(value.keys(), 100)
+                    for key in itertools.islice(
+                        _mapping_keys(value, actual_type),
+                        100,
+                    )
                 ]
             except Exception:
                 pass
             try:
-                descriptor["length"] = len(value)
+                descriptor["length"] = _container_length(value, actual_type)
             except Exception:
                 pass
             return descriptor
-        if isinstance(value, (list, tuple, set, frozenset)):
+        if any(
+            _type_mro_contains(actual_type, container_type)
+            for container_type in (list, tuple, set, frozenset)
+        ):
             try:
-                descriptor["length"] = len(value)
+                descriptor["length"] = _container_length(value, actual_type)
             except Exception:
                 pass
             return descriptor
-        if include_safe_preview and type(value) in {bytes, bytearray}:
+        if include_safe_preview and _type_is_one_of(
+            actual_type,
+            (bytes, bytearray),
+        ):
             descriptor["preview"] = repr(value)
         elif include_safe_preview:
             descriptor["preview"] = _type_based_preview(descriptor)
@@ -522,65 +646,113 @@ class BoundaryTraceCollector:
         *,
         nested: bool,
     ) -> tuple[Any, bool]:
-        if value is None or isinstance(value, (bool, str, int)):
+        actual_type = type(value)
+        if value is None or actual_type is bool:
             return value, False
-        if isinstance(value, float):
-            return (value if math.isfinite(value) else None), False
-        if isinstance(value, (datetime, date)):
-            return value.isoformat(), False
-        if isinstance(value, (Decimal, UUID)):
-            return str(value), False
-        if isinstance(value, PurePath):
+        if _type_mro_contains(actual_type, str):
+            normalized_string = str.encode(
+                value,
+                errors="surrogatepass",
+            ).decode(errors="surrogatepass")
+            return normalized_string, False
+        if _type_mro_contains(actual_type, int):
+            return int.__int__(value), False
+        if _type_mro_contains(actual_type, float):
+            normalized_float = float.__float__(value)
+            return (
+                normalized_float if math.isfinite(normalized_float) else None
+            ), False
+        if _type_mro_contains(actual_type, datetime):
+            return datetime.isoformat(value), False
+        if _type_mro_contains(actual_type, date):
+            return date.isoformat(value), False
+        if _type_mro_contains(actual_type, Decimal):
+            return Decimal.__str__(value), False
+        if _type_mro_contains(actual_type, UUID):
+            return UUID.__str__(value), False
+        if _type_is_one_of(actual_type, _STANDARD_PATH_TYPES):
             return _portable_path_value(value), False
-        if isinstance(value, Enum):
-            return self._snapshot_trace_value(value.value, nested=nested)
-        if isinstance(value, collections.abc.Iterator):
+        if _type_is_subclass(actual_type, Enum):
+            try:
+                enum_value = object.__getattribute__(value, "_value_")
+            except Exception:
+                enum_value = _DESCRIPTOR_ONLY
+            if enum_value is not _DESCRIPTOR_ONLY:
+                return self._snapshot_trace_value(
+                    enum_value,
+                    nested=nested,
+                )
+        if _type_is_subclass(actual_type, collections.abc.Iterator):
             descriptor = _descriptor_type(value)
             descriptor["one_shot"] = True
             return descriptor, True
-        if isinstance(value, collections.abc.Mapping):
+        if _is_mapping_type(actual_type):
             normalized_mapping = {}
             descriptor_only = False
-            for key, item in value.items():
-                normalized_item, item_is_descriptor = self._snapshot_trace_value(
-                    item,
-                    nested=True,
-                )
-                normalized_key, key_is_descriptor = _safe_mapping_key(key)
-                normalized_mapping[normalized_key] = normalized_item
-                descriptor_only = (
-                    descriptor_only
-                    or item_is_descriptor
-                    or key_is_descriptor
-                )
-            return normalized_mapping, descriptor_only
-        if isinstance(value, (list, tuple)):
+            try:
+                for key, item in _mapping_items(value, actual_type):
+                    (
+                        normalized_item,
+                        item_is_descriptor,
+                    ) = self._snapshot_trace_value(
+                        item,
+                        nested=True,
+                    )
+                    normalized_key, key_is_descriptor = _safe_mapping_key(key)
+                    normalized_mapping[normalized_key] = normalized_item
+                    descriptor_only = (
+                        descriptor_only
+                        or item_is_descriptor
+                        or key_is_descriptor
+                    )
+                return normalized_mapping, descriptor_only
+            except Exception:
+                pass
+        if any(
+            _type_mro_contains(actual_type, sequence_type)
+            for sequence_type in (list, tuple)
+        ):
             normalized_sequence = []
             descriptor_only = False
-            for item in value:
-                normalized_item, item_is_descriptor = self._snapshot_trace_value(
-                    item,
-                    nested=True,
-                )
-                normalized_sequence.append(normalized_item)
-                descriptor_only = descriptor_only or item_is_descriptor
-            return normalized_sequence, descriptor_only
-        if isinstance(value, (set, frozenset)):
+            try:
+                for item in _sequence_iterator(value, actual_type):
+                    (
+                        normalized_item,
+                        item_is_descriptor,
+                    ) = self._snapshot_trace_value(
+                        item,
+                        nested=True,
+                    )
+                    normalized_sequence.append(normalized_item)
+                    descriptor_only = descriptor_only or item_is_descriptor
+                return normalized_sequence, descriptor_only
+            except Exception:
+                pass
+        if any(
+            _type_mro_contains(actual_type, set_type)
+            for set_type in (set, frozenset)
+        ):
             normalized_set = []
             descriptor_only = False
-            for item in value:
-                normalized_item, item_is_descriptor = self._snapshot_trace_value(
-                    item,
-                    nested=True,
+            try:
+                for item in _set_iterator(value, actual_type):
+                    (
+                        normalized_item,
+                        item_is_descriptor,
+                    ) = self._snapshot_trace_value(
+                        item,
+                        nested=True,
+                    )
+                    normalized_set.append(normalized_item)
+                    descriptor_only = descriptor_only or item_is_descriptor
+                return (
+                    sorted(normalized_set, key=_canonical_json_bytes),
+                    descriptor_only,
                 )
-                normalized_set.append(normalized_item)
-                descriptor_only = descriptor_only or item_is_descriptor
-            return (
-                sorted(normalized_set, key=_canonical_json_bytes),
-                descriptor_only,
-            )
+            except Exception:
+                pass
 
-        if isinstance(value, BaseModel):
+        if _type_is_subclass(actual_type, BaseModel):
             try:
                 return self._snapshot_trace_value(
                     BaseModel.model_dump(value, mode="json"),

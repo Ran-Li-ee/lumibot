@@ -495,6 +495,34 @@ def test_descriptor_type_identity_bypasses_adversarial_metaclass(tmp_path):
     assert "0x" not in descriptor["preview"]
 
 
+def test_observation_never_accesses_adversarial_class_property(tmp_path):
+    class AdversarialClassValue:
+        def __init__(self):
+            self.class_accesses = 0
+
+        @property
+        def __class__(self):
+            self.class_accesses += 1
+            return object
+
+    value = AdversarialClassValue()
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    descriptor = collector.describe_raw_value(value)
+    event = collector.record(
+        transition="B06_PYTHON_TOOL_TO_WRAPPER",
+        from_module="python_tool",
+        to_module="lumibot_tool_wrapper",
+        payload={"value": value},
+    )
+
+    assert value.class_accesses == 0
+    assert descriptor["fidelity"] == "descriptor_only"
+    assert descriptor["python_type"] == "AdversarialClassValue"
+    assert event["payload"]["value"]["fidelity"] == "descriptor_only"
+    assert event["payload"]["value"]["python_type"] == "AdversarialClassValue"
+
+
 def test_descriptor_preview_redacts_complete_safe_preview_before_truncating(tmp_path):
     secret = b"quoted-secret-" + (b"s" * 600)
     value = b"{'api_key': '" + secret + b"'}"
@@ -784,6 +812,32 @@ def test_unquoted_conjunction_directory_is_scrubbed_through_end_of_line(
     assert safe_message == "failed at [ABSOLUTE_PATH]"
     assert "Tom" not in safe_message
     assert "Jerry" not in safe_message
+    assert "trace" not in safe_message
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\Users\Smith, John\trace\event.json",
+        "/home/Smith, John/trace/event.json",
+        r"C:\Users\Alpha; Beta\trace\event.json",
+        "/home/Alpha; Beta/trace/event.json",
+    ],
+)
+def test_unquoted_punctuation_directory_is_scrubbed_through_end_of_line(
+    tmp_path,
+    path,
+):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    collector.add_diagnostic("path_failure", OSError(f"failed at {path}"))
+
+    safe_message = collector.export()["diagnostics"][0]["message"]
+    assert safe_message == "failed at [ABSOLUTE_PATH]"
+    assert "Smith" not in safe_message
+    assert "John" not in safe_message
+    assert "Alpha" not in safe_message
+    assert "Beta" not in safe_message
     assert "trace" not in safe_message
 
 
