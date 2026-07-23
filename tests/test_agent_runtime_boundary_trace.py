@@ -75,7 +75,10 @@ def test_observed_function_tool_correlates_validated_wrapper_arguments(tmp_path)
         received["asset_type"] = asset_type
         return {"symbol": request.symbol, "asset_type": asset_type}
 
-    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
     turn_id = collector.start_model_turn()
     batch_id = collector.register_tool_batch(turn_id, ["call_A"])
     observed = _build_observed_function_tool(
@@ -903,6 +906,7 @@ def test_before_model_records_post_pruning_request(tmp_path):
     collector = BoundaryTraceCollector(
         agent_run_id="run-1",
         artifact_root=tmp_path,
+        inline_payload_limit=500_000,
     )
     request = make_runtime_request(
         collector,
@@ -927,6 +931,7 @@ def test_before_model_records_post_pruning_request(tmp_path):
         model="openai/gpt-5.4-mini",
     )
     runtime = GoogleADKRuntime()
+    before_pruning = agent_runtime._adk_object_payload(llm_request)
 
     prune = runtime._before_model_context_pruning_callback(request)
     capture = runtime._before_model_boundary_callback(request)
@@ -934,6 +939,7 @@ def test_before_model_records_post_pruning_request(tmp_path):
     prune(callback_context=None, llm_request=llm_request)
     capture(callback_context=None, llm_request=llm_request)
     assert _events(collector, "B09_ADK_TO_LITELLM") == []
+    after_pruning = agent_runtime._adk_object_payload(llm_request)
 
     llm_request.config.labels = {"adk_agent_name": "agent"}
     runtime._model_entry_boundary_observer(request)(llm_request)
@@ -941,10 +947,20 @@ def test_before_model_records_post_pruning_request(tmp_path):
     assert b09["model_turn_id"] == collector.active_model_turn()
     assert b09["payload"]["previous_model_turn_id"] is None
     assert b09["payload"]["current_model_turn_id"] == b09["model_turn_id"]
-    assert b09["payload"]["context_pruning"] == {
-        "pruned": True,
-        "pruned_tool_results": 1,
-    }
+    pruning = b09["payload"]["context_pruning"]
+    assert pruning["pruned"] is True
+    assert pruning["pruned_tool_results"] == 1
+    assert pruning["omitted_function_response_count"] == 1
+    assert pruning["omitted_function_response_bytes"] > 0
+    assert pruning["reason"] == "older_tool_result_history_limit"
+    assert pruning["before"]["request"] == before_pruning
+    assert pruning["before"]["function_response_count"] == 5
+    assert pruning["after"]["request"] == after_pruning
+    assert pruning["after"]["function_response_count"] == 5
+    assert pruning["before"]["request_bytes"] > (
+        pruning["after"]["request_bytes"]
+    )
+    assert pruning["notices"]
     assert b09["payload"]["llm_request"]["config"]["labels"] == {
         "adk_agent_name": "agent"
     }
@@ -954,6 +970,52 @@ def test_before_model_records_post_pruning_request(tmp_path):
         "recent visible tool results or call a targeted tool again if this older "
         "detail is still required."
     ) in str(b09["payload"]["llm_request"])
+
+
+def test_pruning_forensics_uses_boundary_sidecar_when_payload_is_large(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+        inline_payload_limit=200,
+    )
+    request = make_runtime_request(
+        collector,
+        model="openai/gpt-5.4-mini",
+    )
+    llm_request = SimpleNamespace(
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_function_response(
+                        name=f"tool_{index}",
+                        response={"value": "x" * 500},
+                    )
+                ],
+            )
+            for index in range(5)
+        ],
+        config=types.GenerateContentConfig(),
+        model=request.model,
+    )
+    runtime = GoogleADKRuntime()
+
+    runtime._before_model_context_pruning_callback(request)(
+        llm_request=llm_request
+    )
+    runtime._before_model_boundary_callback(request)(
+        llm_request=llm_request
+    )
+    runtime._model_entry_boundary_observer(request)(llm_request)
+
+    b09 = _events(collector, "B09_ADK_TO_LITELLM")[0]
+    sidecar_path = b09["payload_meta"]["sidecar_path"]
+    assert sidecar_path
+    assert (tmp_path / sidecar_path).is_file()
+    assert b09["payload_meta"]["compression"] == "gzip"
+    assert b09["payload_meta"]["truncated"] is False
 
 
 def test_observed_litellm_captures_final_live_adk_request_labels(tmp_path):
@@ -1249,9 +1311,12 @@ def test_after_model_marks_generated_fallback_call_id_and_missing_turn(
     b02 = _events(collector, "B02_LITELLM_TO_ADK")[0]
     call = b02["payload"]["tool_calls"][0]
     assert b02["model_turn_id"].startswith("run-1:turn:")
-    assert call["call_id"].startswith("generated:")
-    assert response.content.parts[0].function_call.id == call["call_id"]
+    assert call["trace_call_id"].startswith("generated:")
+    # Trace correlation must not alter the ADK object that is later finalized.
+    assert response.content.parts[0].function_call.id is None
     assert call["call_id_source"] == "generated_missing_provider_id"
+    assert call["provider_runtime_call_id"] is None
+    assert call["call_instance_id"]
     diagnostic_kinds = {
         item["kind"] for item in collector.export()["diagnostics"]
     }
@@ -1313,7 +1378,7 @@ def test_before_tool_records_authoritative_parallel_dispatch(tmp_path):
     )
     assert b03["payload"]["dispatch_observed_at"]
     assert b03["payload"]["dispatch_timestamp_source"] == (
-        "before_tool_callback_entry_after_adk_task_schedule"
+        "before_tool_callback_entry"
     )
     assert b03["payload"]["call_lookup_status"] == "matched_batch"
     assert b03["payload"]["selected_function_tool"] == {
@@ -1329,10 +1394,17 @@ def test_before_tool_records_authoritative_parallel_dispatch(tmp_path):
     }
     assert b03["payload"]["call_sequence"] == 1
     assert b03["payload"]["batch_call_ids"] == ["call_A", "call_B"]
+    # Batch membership is candidate evidence; only overlapping windows prove
+    # that these calls actually ran concurrently.
     assert b03["payload"]["parallel_scheduling"] == {
-        "status": "confirmed_by_installed_adk_dispatch",
+        "status": "batch_candidate_only",
         "google_adk_version": "2.1.0",
-        "mechanism": "asyncio.create_task_per_filtered_function_call",
+        "installed_dispatch_semantics": {
+            "verification": "verified_google_adk_2_1_source",
+            "mechanism": (
+                "asyncio.create_task_per_filtered_function_call"
+            ),
+        },
         "batch_candidate_count": 2,
         "batch_membership_evidence": "candidate_only",
         "sibling_task_creation_observed": False,
@@ -1340,7 +1412,7 @@ def test_before_tool_records_authoritative_parallel_dispatch(tmp_path):
     }
 
 
-def test_missing_dispatch_id_is_mutated_for_downstream_consistency(tmp_path):
+def test_missing_dispatch_id_is_observed_without_mutating_adk_context(tmp_path):
     collector = BoundaryTraceCollector(
         agent_run_id="run-1",
         artifact_root=tmp_path,
@@ -1359,7 +1431,8 @@ def test_missing_dispatch_id_is_mutated_for_downstream_consistency(tmp_path):
 
     b03 = _events(collector, "B03_ADK_TO_FUNCTION_TOOL")[0]
     assert b03["call_id"].startswith("generated:adk_dispatch:")
-    assert tool_context.function_call_id == b03["call_id"]
+    # ADK owns function_call_id and tracing remains a pure observer.
+    assert tool_context.function_call_id is None
     assert b03["payload"]["call_id_source"] == (
         "generated_missing_adk_dispatch_id"
     )
@@ -1394,6 +1467,54 @@ def test_before_tool_marks_unmatched_provider_call_id(tmp_path):
     assert b03["payload"]["call_lookup_status"] == "unmatched"
     assert b03["payload"]["parallel_scheduling"]["status"] == (
         "single_call_no_parallel_schedule"
+    )
+
+
+def test_native_b03_reconstructs_ordered_batch_from_source_event(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    parts = [
+        types.Part.from_function_call(
+            name="echo",
+            args={"value": value},
+        )
+        for value in ("A", "B")
+    ]
+    for part, call_id in zip(parts, ("call_A", "call_B")):
+        part.function_call.id = call_id
+    source_event = SimpleNamespace(
+        id="native-function-call-event",
+        content=types.Content(role="model", parts=parts),
+    )
+    runtime = GoogleADKRuntime()
+    request = make_runtime_request(
+        collector,
+        model="gemini-test",
+    )
+
+    runtime._before_tool_boundary_callback(request)(
+        tool=SimpleNamespace(name="echo"),
+        args={"value": "B"},
+        tool_context=SimpleNamespace(
+            function_call_id="call_B",
+            session=SimpleNamespace(events=[source_event]),
+        ),
+    )
+
+    b03 = _events(collector, "B03_ADK_TO_FUNCTION_TOOL")[0]
+    assert b03["payload"]["batch_call_ids"] == ["call_A", "call_B"]
+    assert b03["payload"]["call_sequence"] == 2
+    assert b03["payload"]["call_lookup_status"] == (
+        "reconstructed_source_event_batch"
+    )
+    assert b03["payload"]["parallel_scheduling"]["status"] == (
+        "batch_candidate_only"
     )
 
 
@@ -1649,6 +1770,251 @@ def test_b08_preserves_parallel_completion_order_separate_from_model_order(
     ] == 2
 
 
+def test_sequential_batch_reports_candidate_without_confirmed_overlap(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    collector.register_tool_batch(turn_id, ["call_A", "call_B"])
+    runtime = GoogleADKRuntime()
+    request = make_runtime_request(collector)
+    before_tool = runtime._before_tool_boundary_callback(request)
+    after_tool = runtime._after_tool_boundary_and_pruning_callback(
+        request
+    )
+
+    for call_id, value in (("call_A", "A"), ("call_B", "B")):
+        context = SimpleNamespace(function_call_id=call_id)
+        before_tool(
+            tool=SimpleNamespace(name="echo"),
+            args={"value": value},
+            tool_context=context,
+        )
+        after_tool(
+            tool=SimpleNamespace(name="echo"),
+            args={"value": value},
+            tool_context=context,
+            tool_response={"value": value},
+        )
+
+    event = SimpleNamespace(
+        id="sequential-event",
+        invocation_id="invocation-1",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part.from_function_response(
+                    name="echo",
+                    response={"value": value},
+                )
+                for value in ("A", "B")
+            ],
+        ),
+        usage_metadata=None,
+    )
+    for part, call_id in zip(
+        event.content.parts,
+        ("call_A", "call_B"),
+    ):
+        part.function_response.id = call_id
+    _normalize_event(event, collector=collector)
+
+    assert {
+        item["payload"]["parallel_execution"]["status"]
+        for item in _events(collector, "B08_FUNCTION_TOOL_TO_ADK")
+    } == {"batch_candidate_only_no_overlap_observed"}
+
+
+def test_overlapping_async_dispatch_is_confirmed_only_after_completion(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    collector.register_tool_batch(turn_id, ["call_A", "call_B"])
+    runtime = GoogleADKRuntime()
+    request = make_runtime_request(collector)
+    before_tool = runtime._before_tool_boundary_callback(request)
+    after_tool = runtime._after_tool_boundary_and_pruning_callback(
+        request
+    )
+
+    async def run_overlapping():
+        both_started = asyncio.Event()
+        started = 0
+        lock = asyncio.Lock()
+
+        async def execute(call_id, value):
+            nonlocal started
+            context = SimpleNamespace(function_call_id=call_id)
+            before_tool(
+                tool=SimpleNamespace(name="echo"),
+                args={"value": value},
+                tool_context=context,
+            )
+            async with lock:
+                started += 1
+                if started == 2:
+                    both_started.set()
+            await both_started.wait()
+            if value == "A":
+                await asyncio.sleep(0.02)
+            after_tool(
+                tool=SimpleNamespace(name="echo"),
+                args={"value": value},
+                tool_context=context,
+                tool_response={"value": value},
+            )
+
+        await asyncio.gather(
+            execute("call_A", "A"),
+            execute("call_B", "B"),
+        )
+
+    asyncio.run(run_overlapping())
+    event = SimpleNamespace(
+        id="overlap-event",
+        invocation_id="invocation-1",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part.from_function_response(
+                    name="echo",
+                    response={"value": value},
+                )
+                for value in ("A", "B")
+            ],
+        ),
+        usage_metadata=None,
+    )
+    for part, call_id in zip(
+        event.content.parts,
+        ("call_A", "call_B"),
+    ):
+        part.function_response.id = call_id
+    _normalize_event(event, collector=collector)
+
+    assert {
+        item["payload"]["parallel_execution"]["status"]
+        for item in _events(collector, "B08_FUNCTION_TOOL_TO_ADK")
+    } == {"confirmed_actual_dispatch_overlap"}
+    assert {
+        item["payload"]["parallel_execution"]["evidence"]
+        for item in _events(collector, "B08_FUNCTION_TOOL_TO_ADK")
+    } == {"overlapping_before_tool_to_after_tool_windows"}
+
+
+def test_duplicate_provider_ids_keep_unique_instances_and_reversed_completion(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    runtime = GoogleADKRuntime()
+    request = make_runtime_request(collector)
+    runtime._before_model_boundary_callback(request)(
+        llm_request=SimpleNamespace(contents=[], model=request.model),
+    )
+    response = SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part.from_function_call(
+                    name="echo",
+                    args={"value": value},
+                )
+                for value in ("A", "B")
+            ],
+        ),
+        usage_metadata=None,
+        finish_reason="tool_calls",
+    )
+    for part in response.content.parts:
+        part.function_call.id = "duplicate-provider-id"
+    runtime._after_model_boundary_callback(request)(
+        llm_response=response,
+    )
+
+    b02_calls = _events(collector, "B02_LITELLM_TO_ADK")[0][
+        "payload"
+    ]["tool_calls"]
+    assert [item["call_sequence"] for item in b02_calls] == [1, 2]
+    assert len(
+        {item["call_instance_id"] for item in b02_calls}
+    ) == 2
+
+    before_tool = runtime._before_tool_boundary_callback(request)
+    after_tool = runtime._after_tool_boundary_and_pruning_callback(
+        request
+    )
+
+    async def execute(value, delay):
+        context = SimpleNamespace(
+            function_call_id="duplicate-provider-id"
+        )
+        before_tool(
+            tool=SimpleNamespace(name="echo"),
+            args={"value": value},
+            tool_context=context,
+        )
+        await asyncio.sleep(delay)
+        after_tool(
+            tool=SimpleNamespace(name="echo"),
+            args={"value": value},
+            tool_context=context,
+            tool_response={"value": value},
+        )
+
+    async def run_reversed_completion():
+        await asyncio.gather(
+            execute("A", 0.02),
+            execute("B", 0),
+        )
+
+    asyncio.run(run_reversed_completion())
+    event = SimpleNamespace(
+        id="duplicate-event",
+        invocation_id="invocation-1",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part.from_function_response(
+                    name="echo",
+                    response={"value": value},
+                )
+                for value in ("A", "B")
+            ],
+        ),
+        usage_metadata=None,
+    )
+    for part in event.content.parts:
+        part.function_response.id = "duplicate-provider-id"
+    _normalize_event(event, collector=collector)
+
+    b03_events = _events(collector, "B03_ADK_TO_FUNCTION_TOOL")
+    b08_events = _events(collector, "B08_FUNCTION_TOOL_TO_ADK")
+    assert len({item["call_instance_id"] for item in b03_events}) == 2
+    assert len({item["call_instance_id"] for item in b08_events}) == 2
+    b08_by_value = {
+        item["payload"]["function_response"]["value"]: item
+        for item in b08_events
+    }
+    assert b08_by_value["B"]["payload"]["completion_sequence"] == 1
+    assert b08_by_value["A"]["payload"]["completion_sequence"] == 2
+    assert {
+        item["payload"]["provider_id_ambiguity"]["status"]
+        for item in b08_events
+    } == {"duplicate_provider_runtime_id"}
+
+
 def test_completion_sequence_is_allocated_before_response_snapshot(
     monkeypatch,
     tmp_path,
@@ -1732,7 +2098,7 @@ def test_reused_provider_call_id_gets_new_turn_completion_state(tmp_path):
     assert second_state["function_tool_response"] == {"turn": 2}
 
 
-def test_generated_call_id_is_consistent_across_b02_b03_b04_and_b08(
+def test_missing_provider_id_reconciles_without_mutating_adk_history(
     tmp_path,
 ):
     collector = BoundaryTraceCollector(
@@ -1760,9 +2126,15 @@ def test_generated_call_id_is_consistent_across_b02_b03_b04_and_b08(
     runtime._after_model_boundary_callback(request)(
         llm_response=response,
     )
-    call_id = response.content.parts[0].function_call.id
+    b02_call = _events(collector, "B02_LITELLM_TO_ADK")[0][
+        "payload"
+    ]["tool_calls"][0]
+    trace_call_id = b02_call["trace_call_id"]
+    call_instance_id = b02_call["call_instance_id"]
+    assert response.content.parts[0].function_call.id is None
+    provider_runtime_call_id = "adk-runtime-call-1"
     tool_context = SimpleNamespace(
-        function_call_id=call_id,
+        function_call_id=provider_runtime_call_id,
         tool_confirmation=None,
     )
     runtime._before_tool_boundary_callback(request)(
@@ -1806,30 +2178,222 @@ def test_generated_call_id_is_consistent_across_b02_b03_b04_and_b08(
         ),
         usage_metadata=None,
     )
-    event.content.parts[0].function_response.id = call_id
+    event.content.parts[0].function_response.id = (
+        provider_runtime_call_id
+    )
     _normalize_event(event, collector=collector)
 
+    assert b02_call["provider_runtime_call_id"] is None
+    assert b02_call["call_id_source"] == (
+        "generated_missing_provider_id"
+    )
     for transition in (
-        "B02_LITELLM_TO_ADK",
         "B03_ADK_TO_FUNCTION_TOOL",
         "B04_FUNCTION_TOOL_TO_WRAPPER",
         "B08_FUNCTION_TOOL_TO_ADK",
     ):
-        assert _events(collector, transition)[0]["call_id"] in {
-            None,
-            call_id,
-        }
-    assert _events(collector, "B02_LITELLM_TO_ADK")[0]["payload"][
-        "tool_calls"
-    ][0]["call_id"] == call_id
-    assert {
-        _events(collector, transition)[0]["call_id"]
-        for transition in (
-            "B03_ADK_TO_FUNCTION_TOOL",
-            "B04_FUNCTION_TOOL_TO_WRAPPER",
-            "B08_FUNCTION_TOOL_TO_ADK",
+        boundaries = _events(collector, transition)
+        assert boundaries, (
+            [
+                event["transition"]
+                for event in collector.export()["events"]
+            ],
+            collector.export()["diagnostics"],
         )
-    } == {call_id}
+        boundary = boundaries[0]
+        assert boundary["call_id"] == trace_call_id
+        assert boundary["call_instance_id"] == call_instance_id
+        assert boundary["payload"]["trace_call_id"] == trace_call_id
+        assert boundary["payload"]["provider_runtime_call_id"] == (
+            provider_runtime_call_id
+        )
+        assert boundary["payload"]["provider_runtime_alias_relation"] == (
+            "adk_runtime_alias_for_trace_call"
+        )
+
+
+def test_live_adk_missing_id_assignment_and_cleanup_are_observation_pure(
+    tmp_path,
+):
+    from google.adk.agents.llm_agent import LlmAgent
+    from google.adk.agents.run_config import RunConfig
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.adk.runners import InMemoryRunner
+
+    async def run_probe(collector):
+        request_snapshots = []
+
+        class MissingIdModel(BaseLlm):
+            async def generate_content_async(
+                self,
+                llm_request,
+                stream=False,
+            ):
+                request_snapshots.append(
+                    agent_runtime._adk_object_payload(llm_request)
+                )
+                has_function_response = any(
+                    getattr(part, "function_response", None)
+                    is not None
+                    for content in llm_request.contents
+                    for part in (content.parts or [])
+                )
+                if not has_function_response:
+                    yield LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[
+                                types.Part.from_function_call(
+                                    name="echo",
+                                    args={"value": "ready"},
+                                )
+                            ],
+                        ),
+                        partial=False,
+                        turn_complete=True,
+                    )
+                    return
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part(text="done")],
+                    ),
+                    partial=False,
+                    turn_complete=True,
+                )
+
+        runtime = GoogleADKRuntime()
+        request = (
+            make_runtime_request(collector)
+            if collector is not None
+            else None
+        )
+        tool = _build_observed_function_tool(
+            FunctionTool,
+            BoundTool(
+                name="echo",
+                description="echo",
+                function=lambda value: value,
+            ),
+            collector=collector,
+            shared_tool_context={},
+        )
+        agent = LlmAgent(
+            name="agent",
+            model=MissingIdModel(model="missing-id-probe"),
+            instruction="Use echo once.",
+            tools=[tool],
+            after_model_callback=(
+                runtime._after_model_boundary_callback(request)
+                if request is not None
+                else None
+            ),
+            before_tool_callback=(
+                runtime._before_tool_boundary_callback(request)
+                if request is not None
+                else None
+            ),
+            after_tool_callback=(
+                runtime._after_tool_boundary_and_pruning_callback(
+                    request
+                )
+                if request is not None
+                else None
+            ),
+        )
+        runner = InMemoryRunner(
+            agent=agent,
+            app_name="missing-id-probe",
+        )
+        await runner.session_service.create_session(
+            app_name=runner.app_name,
+            user_id="probe-user",
+            session_id="probe-session",
+        )
+        events = [
+            event
+            async for event in runner.run_async(
+                user_id="probe-user",
+                session_id="probe-session",
+                new_message=types.Content(
+                    role="user",
+                    parts=[types.Part(text="probe")],
+                ),
+                run_config=RunConfig(),
+            )
+        ]
+        return request_snapshots, events
+
+    baseline_requests, baseline_events = asyncio.run(run_probe(None))
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    traced_requests, traced_events = asyncio.run(run_probe(collector))
+    for event in traced_events:
+        _normalize_event(event, collector=collector)
+
+    def event_call_ids(events):
+        return [
+            function_call.id
+            for event in events
+            for function_call in event.get_function_calls()
+        ]
+
+    def event_response_ids(events):
+        return [
+            function_response.id
+            for event in events
+            for function_response in event.get_function_responses()
+        ]
+
+    baseline_call_id = event_call_ids(baseline_events)[0]
+    traced_call_id = event_call_ids(traced_events)[0]
+    assert baseline_call_id.startswith("adk-")
+    assert traced_call_id.startswith("adk-")
+    assert event_response_ids(baseline_events) == [baseline_call_id]
+    assert event_response_ids(traced_events) == [traced_call_id]
+    assert len(baseline_requests) == len(traced_requests) == 2
+    for snapshots in (baseline_requests, traced_requests):
+        second_contents = snapshots[1]["contents"]
+        serialized = str(second_contents)
+        assert "adk-" not in serialized
+        assert "function_call" in serialized
+        assert "function_response" in serialized
+
+    b02_call = _events(collector, "B02_LITELLM_TO_ADK")[0][
+        "payload"
+    ]["tool_calls"][0]
+    assert b02_call["trace_call_id"].startswith("generated:")
+    assert b02_call["provider_runtime_call_id"] is None
+    for transition in (
+        "B03_ADK_TO_FUNCTION_TOOL",
+        "B04_FUNCTION_TOOL_TO_WRAPPER",
+        "B08_FUNCTION_TOOL_TO_ADK",
+    ):
+        boundaries = _events(collector, transition)
+        assert boundaries, (
+            [
+                event["transition"]
+                for event in collector.export()["events"]
+            ],
+            collector.export()["diagnostics"],
+        )
+        boundary = boundaries[0]
+        assert boundary["call_id"] == b02_call["trace_call_id"]
+        assert boundary["payload"]["provider_runtime_call_id"] == (
+            traced_call_id
+        )
+    b03 = _events(collector, "B03_ADK_TO_FUNCTION_TOOL")[0]
+    assert b03["payload"]["call_lookup_status"] == (
+        "reconciled_generated_fallback"
+    )
+    b08 = _events(collector, "B08_FUNCTION_TOOL_TO_ADK")[0]
+    assert b08["payload"]["response_id_source"] == "provider"
+    assert b08["payload"]["trace_call_id_source"] == (
+        "generated_missing_provider_id"
+    )
 
 
 def test_boundary_callbacks_are_fail_open_and_adk_payloads_are_safe(
@@ -1972,10 +2536,16 @@ def test_collector_public_reads_are_deep_detached(tmp_path):
     call_state = collector.call_state("call_A")
     pending = collector.pending_model_turn(turn_id)
     batch = collector.batch_call_ids(call_ids["tool_batch_id"])
+    batch_instances = collector.batch_call_instances(
+        call_ids["tool_batch_id"]
+    )
     call_ids["function_tool_response"]["nested"]["value"] = "changed"
     call_state["model_facing_response"]["nested"]["value"] = "changed"
     pending["context_pruning"]["nested"]["count"] = 99
     batch.append("call_B")
+    batch_instances[0]["function_tool_response"]["nested"][
+        "value"
+    ] = "changed"
 
     assert collector.call_ids("call_A")[
         "function_tool_response"
@@ -1989,6 +2559,9 @@ def test_collector_public_reads_are_deep_detached(tmp_path):
     assert collector.batch_call_ids(call_ids["tool_batch_id"]) == [
         "call_A"
     ]
+    assert collector.batch_call_instances(
+        call_ids["tool_batch_id"]
+    )[0]["function_tool_response"]["nested"]["value"] == "original"
     assert collector.active_model_turn() == turn_id
 
 
@@ -2083,6 +2656,7 @@ def test_diagnostic_sink_failure_is_fail_open_for_all_boundary_callbacks(
     )
     normalized = _normalize_event(event, collector=collector)
     assert any(item.kind == "tool_result" for item in normalized)
+    assert event.content.parts[0].function_response.id is None
 
 
 def test_run_async_builds_every_bound_tool_with_request_collector(
@@ -2144,12 +2718,23 @@ def test_run_async_builds_every_bound_tool_with_request_collector(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+        # Keep this wiring assertion inline despite the larger forensic
+        # snapshots; sidecar behavior has a dedicated regression above.
+        inline_payload_limit=500_000,
+    )
     tools = [
         BoundTool(name="one", description="one", function=lambda: 1),
         BoundTool(name="two", description="two", function=lambda: 2),
     ]
-    request = make_runtime_request(collector, tools=tools, model="gemini-test")
+    request = make_runtime_request(
+        collector,
+        tools=tools,
+        # This test asserts LiteLLM model-entry wiring, so use that route.
+        model="openai/test",
+    )
     runtime = GoogleADKRuntime()
     model_entry_observers = []
     monkeypatch.setattr(agent_runtime, "_build_observed_function_tool", build)
@@ -2233,6 +2818,125 @@ def test_run_async_builds_every_bound_tool_with_request_collector(
     assert callable(agent_kwargs["after_model_callback"])
     assert callable(agent_kwargs["before_tool_callback"])
     assert callable(agent_kwargs["after_tool_callback"])
+
+
+def test_native_gemini_multi_turn_run_has_no_litellm_boundaries_or_pending(
+    monkeypatch,
+    tmp_path,
+):
+    agent_kwargs = {}
+    model_entry_observers = []
+
+    class FakeTypes:
+        class GenerateContentConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class Part:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class Content:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            agent_kwargs.update(kwargs)
+
+    class FakeSessionService:
+        async def create_session(self, **_kwargs):
+            return None
+
+    class FakeRunner:
+        def __init__(self, *, agent, app_name):
+            self.agent = agent
+            self.app_name = app_name
+            self.session_service = FakeSessionService()
+
+        async def run_async(self, **_kwargs):
+            for index in range(3):
+                llm_request = SimpleNamespace(
+                    contents=[],
+                    model="gemini-test",
+                )
+                callbacks = (
+                    agent_kwargs.get("before_model_callback") or []
+                )
+                if not isinstance(callbacks, list):
+                    callbacks = [callbacks]
+                for callback in callbacks:
+                    callback(llm_request=llm_request)
+                after_model = agent_kwargs.get(
+                    "after_model_callback"
+                )
+                if after_model is not None:
+                    after_model(
+                        llm_response=SimpleNamespace(
+                            content=types.Content(
+                                role="model",
+                                parts=[
+                                    types.Part(text=f"turn {index}")
+                                ],
+                            )
+                        )
+                    )
+                yield SimpleNamespace(
+                    id=f"event-{index}",
+                    invocation_id="invocation-1",
+                    content=None,
+                    usage_metadata=None,
+                )
+
+    class FakeRunConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    request = make_runtime_request(collector, model="gemini-test")
+    runtime = GoogleADKRuntime()
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_adk",
+        lambda: (FakeAgent, FakeRunner, FakeTypes, FunctionTool),
+    )
+    monkeypatch.setattr(
+        agent_runtime,
+        "_resolve_model_for_adk",
+        lambda model, **kwargs: (
+            model_entry_observers.append(
+                kwargs.get("model_entry_observer")
+            )
+            or model
+        ),
+    )
+    monkeypatch.setattr(
+        agent_runtime.importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(RunConfig=FakeRunConfig)
+            if name == "google.adk.agents.run_config"
+            else pytest.fail(f"unexpected import: {name}")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_maybe_build_gemini_thinking_planner",
+        lambda *_args: None,
+    )
+
+    result = asyncio.run(runtime._run_async(request))
+
+    assert len(result.events) == 0
+    assert model_entry_observers == [None]
+    assert agent_kwargs["after_model_callback"] is None
+    assert _events(collector, "B09_ADK_TO_LITELLM") == []
+    assert _events(collector, "B02_LITELLM_TO_ADK") == []
+    assert collector.pending_model_turn_count() == 0
+    assert collector.active_model_turn().endswith(":turn:0003")
 
 
 def test_wrapper_records_raw_and_serialized_results_separately(tmp_path):

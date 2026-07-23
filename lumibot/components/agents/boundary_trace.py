@@ -15,6 +15,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -84,18 +85,6 @@ _SAFE_NUMERIC_USAGE_FIELDS = {
     "total_token_count",
     "total_tokens",
 }
-_CALL_RESPONSE_STATE_KEYS = {
-    "batch_completion_sequence",
-    "completion_sequence",
-    "function_tool_response",
-    "function_tool_response_type",
-    "model_facing_response",
-    "model_facing_response_type",
-    "response_created_at",
-    "tool_response_pruned",
-}
-
-
 class _TraceDescriptor(dict):
     pass
 
@@ -545,6 +534,8 @@ class BoundaryTraceCollector:
         self._batch_number_by_turn: dict[str, int] = {}
         self._batch_completion_number: dict[str, int] = {}
         self._call_index: dict[str, dict[str, Any]] = {}
+        self._call_alias_index: dict[str, list[str]] = {}
+        self._batch_call_instances: dict[str, list[str]] = {}
         self._observation_index: dict[str, dict[str, Any]] = {}
         self._pending_model_turns: dict[str, dict[str, Any]] = {}
         self._active_model_turn_id: str | None = None
@@ -552,6 +543,12 @@ class BoundaryTraceCollector:
             str | None
         ] = contextvars.ContextVar(
             f"lumibot_boundary_model_turn_{id(self)}",
+            default=None,
+        )
+        self._active_call_instance_context: contextvars.ContextVar[
+            str | None
+        ] = contextvars.ContextVar(
+            f"lumibot_boundary_call_instance_{id(self)}",
             default=None,
         )
         self._completion_number = 0
@@ -605,9 +602,20 @@ class BoundaryTraceCollector:
         self,
         model_turn_id: str,
     ) -> dict[str, Any]:
+        snapshot_error: Exception | None = None
         with self._lock:
-            state = dict(
-                self._pending_model_turns.get(model_turn_id) or {}
+            try:
+                state = copy.deepcopy(
+                    self._pending_model_turns.get(model_turn_id)
+                    or {}
+                )
+            except Exception as exc:
+                snapshot_error = exc
+                state = {}
+        if snapshot_error is not None:
+            self._try_add_diagnostic(
+                "pending_model_turn_locked_snapshot_failed",
+                snapshot_error,
             )
         return self._detached_state(
             state,
@@ -621,10 +629,21 @@ class BoundaryTraceCollector:
         self,
         model_turn_id: str,
     ) -> dict[str, Any]:
+        snapshot_error: Exception | None = None
         with self._lock:
-            state = dict(
-                self._pending_model_turns.pop(model_turn_id, None)
-                or {}
+            pending = self._pending_model_turns.pop(
+                model_turn_id,
+                None,
+            ) or {}
+            try:
+                state = copy.deepcopy(pending)
+            except Exception as exc:
+                snapshot_error = exc
+                state = {}
+        if snapshot_error is not None:
+            self._try_add_diagnostic(
+                "pending_model_turn_take_locked_snapshot_failed",
+                snapshot_error,
             )
         return self._detached_state(
             state,
@@ -636,51 +655,306 @@ class BoundaryTraceCollector:
             ),
         )
 
-    def register_tool_batch(self, model_turn_id: str, call_ids: list[str]) -> str:
+    def pending_model_turn_count(self) -> int:
         with self._lock:
-            number = self._batch_number_by_turn.get(model_turn_id, 0) + 1
+            return len(self._pending_model_turns)
+
+    def _append_call_alias_locked(
+        self,
+        alias: str | None,
+        call_instance_id: str,
+    ) -> None:
+        if not isinstance(alias, str) or not alias:
+            return
+        instances = self._call_alias_index.setdefault(alias, [])
+        if call_instance_id not in instances:
+            instances.append(call_instance_id)
+
+    def _instance_ids_for_identifier_locked(
+        self,
+        identifier: str,
+    ) -> list[str]:
+        if identifier in self._call_index:
+            return [identifier]
+        return list(self._call_alias_index.get(identifier) or [])
+
+    def register_tool_calls(
+        self,
+        model_turn_id: str,
+        calls: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        duplicate_provider_ids: list[str] = []
+        snapshot_error: Exception | None = None
+        with self._lock:
+            number = self._batch_number_by_turn.get(
+                model_turn_id,
+                0,
+            ) + 1
             self._batch_number_by_turn[model_turn_id] = number
             batch_id = f"{model_turn_id}:batch:{number:04d}"
-            for index, call_id in enumerate(call_ids, start=1):
-                state = self._call_index.setdefault(call_id, {})
-                if (
-                    state.get("model_turn_id") is not None
-                    and state.get("model_turn_id") != model_turn_id
-                ):
-                    for key in _CALL_RESPONSE_STATE_KEYS:
-                        state.pop(key, None)
-                state.update(
+            call_instance_ids: list[str] = []
+            for index, call in enumerate(calls, start=1):
+                call_instance_id = (
+                    f"{batch_id}:call:{index:04d}"
+                )
+                trace_call_id = str(
+                    call.get("trace_call_id")
+                    or call.get("call_id")
+                    or call_instance_id
+                )
+                provider_call_id = call.get("provider_call_id")
+                provider_runtime_call_id = call.get(
+                    "provider_runtime_call_id"
+                )
+                state = {
+                    "model_turn_id": model_turn_id,
+                    "tool_batch_id": batch_id,
+                    "call_sequence": index,
+                    "call_instance_id": call_instance_id,
+                    "trace_call_id": trace_call_id,
+                    "call_id_source": call.get(
+                        "call_id_source",
+                        "provider",
+                    ),
+                    "provider_call_id": provider_call_id,
+                    "provider_runtime_call_id": (
+                        provider_runtime_call_id
+                    ),
+                    "provider_runtime_alias_relation": (
+                        call.get(
+                            "provider_runtime_alias_relation"
+                        )
+                    ),
+                    "tool_name": call.get("tool_name"),
+                    "call_fingerprint": call.get(
+                        "call_fingerprint"
+                    ),
+                }
+                self._call_index[call_instance_id] = state
+                self._append_call_alias_locked(
+                    trace_call_id,
+                    call_instance_id,
+                )
+                self._append_call_alias_locked(
+                    (
+                        str(provider_call_id)
+                        if provider_call_id
+                        else None
+                    ),
+                    call_instance_id,
+                )
+                self._append_call_alias_locked(
+                    (
+                        str(provider_runtime_call_id)
+                        if provider_runtime_call_id
+                        else None
+                    ),
+                    call_instance_id,
+                )
+                call_instance_ids.append(call_instance_id)
+            self._batch_call_instances[batch_id] = call_instance_ids
+            provider_id_counts: dict[str, int] = {}
+            for call_instance_id in call_instance_ids:
+                provider_call_id = self._call_index[
+                    call_instance_id
+                ].get("provider_call_id")
+                if provider_call_id:
+                    provider_id_counts[str(provider_call_id)] = (
+                        provider_id_counts.get(
+                            str(provider_call_id),
+                            0,
+                        )
+                        + 1
+                    )
+            duplicate_provider_ids = [
+                provider_call_id
+                for provider_call_id, count in (
+                    provider_id_counts.items()
+                )
+                if count > 1
+            ]
+            for provider_call_id in duplicate_provider_ids:
+                ambiguity = {
+                    "status": "duplicate_provider_runtime_id",
+                    "provider_runtime_call_id": provider_call_id,
+                    "candidate_count": provider_id_counts[
+                        provider_call_id
+                    ],
+                    "claiming": (
+                        "name_canonical_args_fingerprint_then_"
+                        "batch_sequence"
+                    ),
+                }
+                for call_instance_id in call_instance_ids:
+                    state = self._call_index[call_instance_id]
+                    if (
+                        state.get("provider_call_id")
+                        == provider_call_id
+                    ):
+                        state["provider_id_ambiguity"] = ambiguity
+            try:
+                result = copy.deepcopy(
                     {
-                        "model_turn_id": model_turn_id,
                         "tool_batch_id": batch_id,
-                        "call_sequence": index,
+                        "calls": [
+                            self._call_index[call_instance_id]
+                            for call_instance_id in call_instance_ids
+                        ],
                     }
                 )
-            return batch_id
+            except Exception as exc:
+                snapshot_error = exc
+                result = {
+                    "tool_batch_id": batch_id,
+                    "calls": [],
+                }
+        for provider_call_id in duplicate_provider_ids:
+            self._try_add_diagnostic(
+                "duplicate_provider_call_id",
+                provider_call_id,
+            )
+        if snapshot_error is not None:
+            self._try_add_diagnostic(
+                "tool_batch_locked_snapshot_failed",
+                snapshot_error,
+            )
+        return self._detached_state(
+            result,
+            snapshot_diagnostic="tool_batch_snapshot_failed",
+            normalization_diagnostic=(
+                "tool_batch_normalization_failed"
+            ),
+        )
+
+    def register_tool_batch(self, model_turn_id: str, call_ids: list[str]) -> str:
+        registered = self.register_tool_calls(
+            model_turn_id,
+            [
+                {
+                    "trace_call_id": call_id,
+                    "provider_call_id": call_id,
+                    "call_id_source": "provider",
+                }
+                for call_id in call_ids
+            ],
+        )
+        return str(registered["tool_batch_id"])
 
     def batch_call_ids(self, tool_batch_id: str | None) -> list[str]:
         if not tool_batch_id:
             return []
         with self._lock:
             calls = [
-                (state.get("call_sequence"), call_id)
-                for call_id, state in self._call_index.items()
-                if state.get("tool_batch_id") == tool_batch_id
+                (
+                    (
+                        self._call_index.get(call_instance_id)
+                        or {}
+                    ).get("call_sequence"),
+                    (
+                        self._call_index.get(call_instance_id)
+                        or {}
+                    ).get("trace_call_id"),
+                )
+                for call_instance_id in self._batch_call_instances.get(
+                    tool_batch_id,
+                    [],
+                )
             ]
         return [
-            call_id
-            for _, call_id in sorted(
+            str(trace_call_id)
+            for _, trace_call_id in sorted(
                 calls,
                 key=lambda item: (
-                    item[0] if isinstance(item[0], int) else sys.maxsize,
-                    item[1],
+                    item[0]
+                    if isinstance(item[0], int)
+                    else sys.maxsize
                 ),
             )
+            if trace_call_id
         ]
 
-    def call_ids(self, call_id: str) -> dict[str, Any]:
+    def batch_call_instances(
+        self,
+        tool_batch_id: str | None,
+    ) -> list[dict[str, Any]]:
+        if not tool_batch_id:
+            return []
+        snapshot_error: Exception | None = None
         with self._lock:
-            state = dict(self._call_index.get(call_id) or {})
+            try:
+                states = copy.deepcopy(
+                    [
+                        self._call_index.get(call_instance_id)
+                        or {}
+                        for call_instance_id in (
+                            self._batch_call_instances.get(
+                                tool_batch_id,
+                                [],
+                            )
+                        )
+                    ]
+                )
+            except Exception as exc:
+                snapshot_error = exc
+                states = []
+        if snapshot_error is not None:
+            self._try_add_diagnostic(
+                "batch_call_instances_locked_snapshot_failed",
+                snapshot_error,
+            )
+        detached = self._safe_observation_value(
+            states,
+            snapshot_diagnostic=(
+                "batch_call_instances_snapshot_failed"
+            ),
+            normalization_diagnostic=(
+                "batch_call_instances_normalization_failed"
+            ),
+        )
+        return detached if type(detached) is list else []
+
+    def _state_for_identifier(
+        self,
+        identifier: str,
+    ) -> dict[str, Any]:
+        snapshot_error: Exception | None = None
+        with self._lock:
+            instance_ids = self._instance_ids_for_identifier_locked(
+                identifier
+            )
+            try:
+                state = (
+                    copy.deepcopy(
+                        self._call_index.get(instance_ids[-1])
+                        or {}
+                    )
+                    if instance_ids
+                    else {}
+                )
+            except Exception as exc:
+                snapshot_error = exc
+                state = (
+                    dict(
+                        self._call_index.get(instance_ids[-1])
+                        or {}
+                    )
+                    if instance_ids
+                    else {}
+                )
+            if len(instance_ids) > 1:
+                state["call_id_lookup_ambiguity"] = {
+                    "status": "multiple_call_instances",
+                    "call_instance_ids": list(instance_ids),
+                }
+        if snapshot_error is not None:
+            self._try_add_diagnostic(
+                "call_identifier_locked_snapshot_failed",
+                snapshot_error,
+            )
+        return state
+
+    def call_ids(self, call_id: str) -> dict[str, Any]:
+        state = self._state_for_identifier(call_id)
         return self._detached_state(
             state,
             snapshot_diagnostic="call_ids_snapshot_failed",
@@ -689,8 +963,252 @@ class BoundaryTraceCollector:
 
     def note_call_id_source(self, call_id: str, source: str) -> None:
         with self._lock:
-            state = self._call_index.setdefault(call_id, {})
-            state["call_id_source"] = source
+            instance_ids = self._instance_ids_for_identifier_locked(
+                call_id
+            )
+            if not instance_ids:
+                return
+            self._call_index[instance_ids[-1]][
+                "call_id_source"
+            ] = source
+
+    def set_active_call_instance(
+        self,
+        call_instance_id: str | None,
+    ) -> None:
+        self._active_call_instance_context.set(call_instance_id)
+
+    def active_call_instance(self) -> str | None:
+        return self._active_call_instance_context.get()
+
+    def claim_tool_call(
+        self,
+        *,
+        provider_runtime_call_id: str | None,
+        tool_name: str | None,
+        call_fingerprint: str | None,
+        model_turn_id: str | None,
+        stage: str,
+    ) -> dict[str, Any]:
+        claim_key = f"{stage}_claimed"
+        ambiguity: dict[str, Any] | None = None
+        snapshot_error: Exception | None = None
+        with self._lock:
+            candidates: list[dict[str, Any]] = []
+            if provider_runtime_call_id:
+                candidates = [
+                    self._call_index[call_instance_id]
+                    for call_instance_id in (
+                        self._instance_ids_for_identifier_locked(
+                            provider_runtime_call_id
+                        )
+                    )
+                    if call_instance_id in self._call_index
+                ]
+            if model_turn_id:
+                candidates = [
+                    state
+                    for state in candidates
+                    if state.get("model_turn_id") == model_turn_id
+                ]
+            available = [
+                state
+                for state in candidates
+                if not state.get(claim_key)
+            ]
+            fingerprint_matches = [
+                state
+                for state in available
+                if call_fingerprint
+                and state.get("call_fingerprint")
+                == call_fingerprint
+            ]
+            if fingerprint_matches:
+                available = fingerprint_matches
+            if not available:
+                available = [
+                    state
+                    for state in self._call_index.values()
+                    if not state.get(claim_key)
+                    and (
+                        not model_turn_id
+                        or state.get("model_turn_id")
+                        == model_turn_id
+                    )
+                    and (
+                        not tool_name
+                        or not state.get("tool_name")
+                        or state.get("tool_name") == tool_name
+                    )
+                    and (
+                        not call_fingerprint
+                        or state.get("call_fingerprint")
+                        == call_fingerprint
+                    )
+                ]
+            available.sort(
+                key=lambda state: (
+                    str(state.get("tool_batch_id") or ""),
+                    state.get("call_sequence")
+                    if isinstance(
+                        state.get("call_sequence"),
+                        int,
+                    )
+                    else sys.maxsize,
+                )
+            )
+            if not available:
+                return {}
+            state = available[0]
+            state[claim_key] = True
+            trace_call_id = state.get("trace_call_id")
+            if provider_runtime_call_id:
+                state["provider_runtime_call_id"] = (
+                    provider_runtime_call_id
+                )
+                relation = (
+                    "same_as_trace_call_id"
+                    if provider_runtime_call_id == trace_call_id
+                    else "adk_runtime_alias_for_trace_call"
+                )
+                state["provider_runtime_alias_relation"] = relation
+                self._append_call_alias_locked(
+                    provider_runtime_call_id,
+                    str(state["call_instance_id"]),
+                )
+            duplicate_candidates = [
+                candidate
+                for candidate in self._call_index.values()
+                if provider_runtime_call_id
+                and candidate.get("model_turn_id")
+                == state.get("model_turn_id")
+                and (
+                    candidate.get("provider_call_id")
+                    == provider_runtime_call_id
+                    or candidate.get("provider_runtime_call_id")
+                    == provider_runtime_call_id
+                )
+            ]
+            if len(duplicate_candidates) > 1:
+                ambiguity = {
+                    "status": "duplicate_provider_runtime_id",
+                    "provider_runtime_call_id": (
+                        provider_runtime_call_id
+                    ),
+                    "candidate_count": len(duplicate_candidates),
+                    "claiming": (
+                        "name_canonical_args_fingerprint_then_"
+                        "batch_sequence"
+                    ),
+                }
+                for candidate in duplicate_candidates:
+                    candidate["provider_id_ambiguity"] = ambiguity
+            try:
+                result = copy.deepcopy(state)
+            except Exception as exc:
+                snapshot_error = exc
+                result = {}
+        if ambiguity is not None:
+            self._try_add_diagnostic(
+                "duplicate_provider_runtime_call_id",
+                str(provider_runtime_call_id),
+            )
+        if snapshot_error is not None:
+            self._try_add_diagnostic(
+                "tool_call_claim_locked_snapshot_failed",
+                snapshot_error,
+            )
+        return self._detached_state(
+            result,
+            snapshot_diagnostic="tool_call_claim_snapshot_failed",
+            normalization_diagnostic=(
+                "tool_call_claim_normalization_failed"
+            ),
+        )
+
+    def claim_function_response(
+        self,
+        *,
+        provider_runtime_call_id: str | None,
+        tool_name: str | None,
+    ) -> dict[str, Any]:
+        snapshot_error: Exception | None = None
+        with self._lock:
+            candidates = [
+                self._call_index[call_instance_id]
+                for call_instance_id in (
+                    self._instance_ids_for_identifier_locked(
+                        provider_runtime_call_id
+                    )
+                    if provider_runtime_call_id
+                    else []
+                )
+                if call_instance_id in self._call_index
+            ]
+            if not candidates and provider_runtime_call_id is None:
+                candidates = list(self._call_index.values())
+            available = [
+                state
+                for state in candidates
+                if not state.get("function_response_claimed")
+                and (
+                    not tool_name
+                    or not state.get("tool_name")
+                    or state.get("tool_name") == tool_name
+                )
+            ]
+            available.sort(
+                key=lambda state: (
+                    str(state.get("tool_batch_id") or ""),
+                    state.get("call_sequence")
+                    if isinstance(
+                        state.get("call_sequence"),
+                        int,
+                    )
+                    else sys.maxsize,
+                )
+            )
+            if not available:
+                return {}
+            state = available[0]
+            state["function_response_claimed"] = True
+            try:
+                result = copy.deepcopy(state)
+            except Exception as exc:
+                snapshot_error = exc
+                result = {}
+        if snapshot_error is not None:
+            self._try_add_diagnostic(
+                "function_response_claim_locked_snapshot_failed",
+                snapshot_error,
+            )
+        return self._detached_state(
+            result,
+            snapshot_diagnostic=(
+                "function_response_claim_snapshot_failed"
+            ),
+            normalization_diagnostic=(
+                "function_response_claim_normalization_failed"
+            ),
+        )
+
+    def note_dispatch_started(
+        self,
+        call_instance_id: str,
+        *,
+        dispatch_observed_at: str,
+        monotonic_started: float | None = None,
+    ) -> None:
+        with self._lock:
+            state = self._call_index.get(call_instance_id)
+            if state is None:
+                return
+            state["dispatch_observed_at"] = dispatch_observed_at
+            state["_dispatch_started_monotonic"] = (
+                monotonic_started
+                if monotonic_started is not None
+                else time.perf_counter()
+            )
 
     def note_function_tool_response(
         self,
@@ -701,8 +1219,14 @@ class BoundaryTraceCollector:
         pruned: bool,
         response_created_at: str | None = None,
     ) -> None:
+        completed_monotonic = time.perf_counter()
         with self._lock:
-            state = self._call_index.setdefault(call_id, {})
+            instance_ids = self._instance_ids_for_identifier_locked(
+                call_id
+            )
+            if not instance_ids:
+                return
+            state = self._call_index[instance_ids[-1]]
             if "completion_sequence" not in state:
                 self._completion_number += 1
                 state["completion_sequence"] = self._completion_number
@@ -721,6 +1245,70 @@ class BoundaryTraceCollector:
                     state["batch_completion_sequence"] = (
                         batch_completion
                     )
+                state["_dispatch_completed_monotonic"] = (
+                    completed_monotonic
+                )
+                state["dispatch_completed_at"] = (
+                    response_created_at or utc_iso_timestamp()
+                )
+                started = state.get("_dispatch_started_monotonic")
+                for sibling_instance_id in (
+                    self._batch_call_instances.get(batch_id, [])
+                    if isinstance(batch_id, str)
+                    else []
+                ):
+                    if sibling_instance_id == state.get(
+                        "call_instance_id"
+                    ):
+                        continue
+                    sibling = self._call_index.get(
+                        sibling_instance_id
+                    )
+                    if sibling is None:
+                        continue
+                    sibling_started = sibling.get(
+                        "_dispatch_started_monotonic"
+                    )
+                    sibling_completed = sibling.get(
+                        "_dispatch_completed_monotonic"
+                    )
+                    if not isinstance(started, (int, float)) or (
+                        not isinstance(
+                            sibling_started,
+                            (int, float),
+                        )
+                    ):
+                        continue
+                    if (
+                        started < (
+                            sibling_completed
+                            if isinstance(
+                                sibling_completed,
+                                (int, float),
+                            )
+                            else completed_monotonic
+                        )
+                        and sibling_started < completed_monotonic
+                    ):
+                        state["parallel_overlap_confirmed"] = True
+                        sibling["parallel_overlap_confirmed"] = True
+                        state_overlaps = state.setdefault(
+                            "overlapping_call_instance_ids",
+                            [],
+                        )
+                        if sibling_instance_id not in state_overlaps:
+                            state_overlaps.append(sibling_instance_id)
+                        sibling_overlaps = sibling.setdefault(
+                            "overlapping_call_instance_ids",
+                            [],
+                        )
+                        state_instance_id = str(
+                            state.get("call_instance_id")
+                        )
+                        if state_instance_id not in sibling_overlaps:
+                            sibling_overlaps.append(
+                                state_instance_id
+                            )
         safe_unpruned = self._safe_observation_value(
             unpruned_response,
             snapshot_diagnostic="function_tool_response_snapshot_failed",
@@ -742,7 +1330,12 @@ class BoundaryTraceCollector:
             "python_type"
         ]
         with self._lock:
-            state = self._call_index.setdefault(call_id, {})
+            instance_ids = self._instance_ids_for_identifier_locked(
+                call_id
+            )
+            if not instance_ids:
+                return
+            state = self._call_index[instance_ids[-1]]
             state["function_tool_response"] = safe_unpruned
             state["model_facing_response"] = safe_model_facing
             state["tool_response_pruned"] = bool(pruned)
@@ -918,12 +1511,27 @@ class BoundaryTraceCollector:
             )
 
     def call_state(self, observation_id: str) -> dict[str, Any]:
+        snapshot_error: Exception | None = None
         with self._lock:
-            state = dict(
-                self._observation_index.get(observation_id)
-                or self._call_index.get(observation_id)
-                or {}
+            observation_state = self._observation_index.get(
+                observation_id
             )
+            try:
+                state = (
+                    copy.deepcopy(observation_state)
+                    if observation_state is not None
+                    else None
+                )
+            except Exception as exc:
+                snapshot_error = exc
+                state = {}
+        if snapshot_error is not None:
+            self._try_add_diagnostic(
+                "call_state_locked_snapshot_failed",
+                snapshot_error,
+            )
+        if state is None:
+            state = self._state_for_identifier(observation_id)
         return self._detached_state(
             state,
             snapshot_diagnostic="call_state_snapshot_failed",
@@ -968,6 +1576,7 @@ class BoundaryTraceCollector:
         model_turn_id: str | None = None,
         tool_batch_id: str | None = None,
         call_id: str | None = None,
+        call_instance_id: str | None = None,
         parent_span_id: str | None = None,
         started_at: str | None = None,
         ended_at: str | None = None,
@@ -994,6 +1603,7 @@ class BoundaryTraceCollector:
                     "model_turn_id": model_turn_id,
                     "tool_batch_id": tool_batch_id,
                     "call_id": call_id,
+                    "call_instance_id": call_instance_id,
                     "span_id": span_id,
                     "parent_span_id": parent_span_id,
                     "started_at": started_at,

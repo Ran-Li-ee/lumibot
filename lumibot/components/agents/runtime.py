@@ -247,6 +247,9 @@ def _wrap_tool_callable(
             "model_turn_id": call_context.get("model_turn_id"),
             "tool_batch_id": call_context.get("tool_batch_id"),
             "call_id": call_context.get("call_id"),
+            "call_instance_id": call_context.get(
+                "call_instance_id"
+            ),
         }
         if pre_invoke_observer is not None:
             try:
@@ -488,6 +491,26 @@ def _build_observed_function_tool(
             "call_id_source": function_tool_context.get(
                 "call_id_source"
             ),
+            "trace_call_id": function_tool_context.get("call_id"),
+            "call_instance_id": function_tool_context.get(
+                "call_instance_id"
+            ),
+            "provider_call_id": function_tool_context.get(
+                "provider_call_id"
+            ),
+            "provider_runtime_call_id": (
+                function_tool_context.get(
+                    "provider_runtime_call_id"
+                )
+            ),
+            "provider_runtime_alias_relation": (
+                function_tool_context.get(
+                    "provider_runtime_alias_relation"
+                )
+            ),
+            "provider_id_ambiguity": function_tool_context.get(
+                "provider_id_ambiguity"
+            ),
             "model_arguments": model_arguments,
             "adk_function_call_arguments": model_arguments,
             "function_tool_preprocessed_arguments": (
@@ -592,6 +615,9 @@ def _build_observed_function_tool(
             model_turn_id=function_tool_context.get("model_turn_id"),
             tool_batch_id=function_tool_context.get("tool_batch_id"),
             call_id=function_tool_context.get("call_id"),
+            call_instance_id=function_tool_context.get(
+                "call_instance_id"
+            ),
             payload=build_boundary_payload(
                 state,
                 function_tool_context,
@@ -704,12 +730,31 @@ def _build_observed_function_tool(
                 model_turn_id=ids.get("model_turn_id"),
                 tool_batch_id=ids.get("tool_batch_id"),
                 call_id=call_id,
+                call_instance_id=ids.get("call_instance_id"),
                 payload={
                     **build_boundary_payload(
                         state,
                         {
                             "observation_id": observation_id,
                             "call_id_source": call_id_source,
+                            "call_id": call_id,
+                            "call_instance_id": ids.get(
+                                "call_instance_id"
+                            ),
+                            "provider_call_id": ids.get(
+                                "provider_call_id"
+                            ),
+                            "provider_runtime_call_id": ids.get(
+                                "provider_runtime_call_id"
+                            ),
+                            "provider_runtime_alias_relation": (
+                                ids.get(
+                                    "provider_runtime_alias_relation"
+                                )
+                            ),
+                            "provider_id_ambiguity": ids.get(
+                                "provider_id_ambiguity"
+                            ),
                             "confirmation_status": (
                                 confirmation_status
                             ),
@@ -739,40 +784,68 @@ def _build_observed_function_tool(
         ) -> Any:
             ids: dict[str, Any] = {}
             try:
-                provider_call_id = getattr(
+                raw_provider_call_id = getattr(
                     tool_context,
                     "function_call_id",
                     None,
                 )
-                if provider_call_id:
-                    call_id = str(provider_call_id)
-                    call_id_source = "provider"
-                else:
-                    call_id = f"generated:function_tool:{uuid4().hex}"
-                    call_id_source = (
-                        "generated_missing_function_tool_id"
-                    )
+                provider_runtime_call_id = (
+                    str(raw_provider_call_id)
+                    if raw_provider_call_id
+                    else None
+                )
             except Exception as exc:
                 _add_trace_diagnostic(
                     collector,
                     "function_call_id_observation_failed",
                     exc,
                 )
-                call_id = f"generated:function_tool:{uuid4().hex}"
-                call_id_source = "generated_missing_function_tool_id"
+                provider_runtime_call_id = None
 
             observation_id = f"function_tool:{uuid4().hex}"
+            call_fingerprint = _tool_call_fingerprint(
+                tool.name,
+                args,
+            )
             try:
-                ids = collector.call_ids(call_id)
-                call_id_source = (
-                    ids.get("call_id_source") or call_id_source
+                active_call_instance = (
+                    collector.active_call_instance()
                 )
+                if active_call_instance:
+                    ids = collector.call_ids(
+                        active_call_instance
+                    )
+                if not ids:
+                    ids = collector.claim_tool_call(
+                        provider_runtime_call_id=(
+                            provider_runtime_call_id
+                        ),
+                        tool_name=tool.name,
+                        call_fingerprint=call_fingerprint,
+                        model_turn_id=(
+                            collector.active_model_turn()
+                        ),
+                        stage="function_tool",
+                    )
             except Exception as exc:
                 _add_trace_diagnostic(
                     collector,
                     "function_tool_call_lookup_failed",
                     exc,
                 )
+            call_id = str(
+                ids.get("trace_call_id")
+                or provider_runtime_call_id
+                or f"generated:function_tool:{uuid4().hex}"
+            )
+            call_id_source = str(
+                ids.get("call_id_source")
+                or (
+                    "provider"
+                    if provider_runtime_call_id
+                    else "generated_missing_function_tool_id"
+                )
+            )
 
             tool_confirmation = None
             try:
@@ -821,6 +894,7 @@ def _build_observed_function_tool(
             try:
                 trace_context = collector.tool_call_context(
                     call_id=call_id,
+                    call_instance_id=ids.get("call_instance_id"),
                     call_id_source=call_id_source,
                     observation_id=observation_id,
                     tool_name=tool.name,
@@ -832,6 +906,17 @@ def _build_observed_function_tool(
                     model_turn_id=ids.get("model_turn_id"),
                     tool_batch_id=ids.get("tool_batch_id"),
                     model_arguments=args,
+                    provider_call_id=ids.get("provider_call_id"),
+                    provider_runtime_call_id=(
+                        provider_runtime_call_id
+                        or ids.get("provider_runtime_call_id")
+                    ),
+                    provider_runtime_alias_relation=ids.get(
+                        "provider_runtime_alias_relation"
+                    ),
+                    provider_id_ambiguity=ids.get(
+                        "provider_id_ambiguity"
+                    ),
                     confirmation_status=confirmation_status,
                     tool_confirmation_present=(
                         tool_confirmation_present
@@ -1069,6 +1154,31 @@ def _provider_exposed_thought_parts(value: Any) -> list[Any]:
         return []
 
 
+def _tool_call_fingerprint(
+    tool_name: Any,
+    arguments: Any,
+) -> str:
+    canonical = {
+        "name": _safe_optional_string(tool_name),
+        "arguments": _adk_object_payload(arguments),
+    }
+    try:
+        encoded = json.dumps(
+            canonical,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except Exception:
+        encoded = repr(
+            {
+                "name": canonical["name"],
+                "arguments_type": _safe_type_name(arguments),
+            }
+        ).encode("utf-8", errors="replace")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _safe_optional_string(value: Any) -> str | None:
     try:
         return str(value) if value else None
@@ -1097,10 +1207,10 @@ def _safe_object_identity(value: Any) -> dict[str, str | None]:
     }
 
 
-def _source_function_call_event_id(
+def _source_function_call_event(
     tool_context: Any,
     call_id: str,
-) -> str | None:
+) -> Any | None:
     try:
         events = getattr(
             getattr(tool_context, "session", None),
@@ -1122,9 +1232,7 @@ def _source_function_call_event_id(
                     getattr(function_call, "id", None)
                 )
                 if event_call_id == call_id:
-                    return _safe_optional_string(
-                        getattr(event, "id", None)
-                    )
+                    return event
     except Exception:
         return None
     return None
@@ -1140,26 +1248,72 @@ def _installed_google_adk_version() -> str:
 def _parallel_scheduling_evidence(
     batch_call_ids: list[str],
 ) -> dict[str, Any]:
+    adk_version = _installed_google_adk_version()
+    installed_dispatch_semantics = {
+        "verification": (
+            "verified_google_adk_2_1_source"
+            if adk_version == "2.1.0"
+            else "not_verified_for_installed_version"
+        ),
+        "mechanism": (
+            "asyncio.create_task_per_filtered_function_call"
+            if adk_version == "2.1.0"
+            else None
+        ),
+    }
     if len(batch_call_ids) <= 1:
         return {
             "status": "single_call_no_parallel_schedule",
-            "google_adk_version": _installed_google_adk_version(),
-            "mechanism": None,
+            "google_adk_version": adk_version,
+            "installed_dispatch_semantics": (
+                installed_dispatch_semantics
+            ),
             "batch_candidate_count": len(batch_call_ids),
             "batch_membership_evidence": "candidate_only",
             "sibling_task_creation_observed": False,
             "completion_order_claim": "not_observed_at_dispatch",
         }
     return {
-        "status": "confirmed_by_installed_adk_dispatch",
-        "google_adk_version": _installed_google_adk_version(),
-        "mechanism": (
-            "asyncio.create_task_per_filtered_function_call"
+        "status": "batch_candidate_only",
+        "google_adk_version": adk_version,
+        "installed_dispatch_semantics": (
+            installed_dispatch_semantics
         ),
         "batch_candidate_count": len(batch_call_ids),
         "batch_membership_evidence": "candidate_only",
         "sibling_task_creation_observed": False,
         "completion_order_claim": "not_observed_at_dispatch",
+    }
+
+
+def _parallel_execution_evidence(
+    state: dict[str, Any],
+    batch_call_ids: list[str],
+) -> dict[str, Any]:
+    if len(batch_call_ids) <= 1:
+        return {
+            "status": "single_call_no_parallel_candidate",
+            "evidence": "single_batch_member",
+            "batch_candidate_count": len(batch_call_ids),
+            "overlapping_call_instance_ids": [],
+        }
+    if state.get("parallel_overlap_confirmed") is True:
+        return {
+            "status": "confirmed_actual_dispatch_overlap",
+            "evidence": (
+                "overlapping_before_tool_to_after_tool_windows"
+            ),
+            "batch_candidate_count": len(batch_call_ids),
+            "overlapping_call_instance_ids": state.get(
+                "overlapping_call_instance_ids"
+            )
+            or [],
+        }
+    return {
+        "status": "batch_candidate_only_no_overlap_observed",
+        "evidence": "completed_dispatch_windows_did_not_overlap",
+        "batch_candidate_count": len(batch_call_ids),
+        "overlapping_call_instance_ids": [],
     }
 
 
@@ -1363,36 +1517,18 @@ def _normalize_event(
             str(getattr(function_response, "id", None) or "") or None
         )
         call_id_source = "provider"
-        call_id = provider_response_id
-        if call_id is None and collector is not None:
-            call_id = f"generated:adk_function_response:{uuid4().hex}"
+        if provider_response_id is None and collector is not None:
             call_id_source = "generated_missing_adk_function_response_id"
             _add_trace_diagnostic(
                 collector,
                 "generated_missing_adk_function_response_call_id",
-                RuntimeError(call_id),
+                "ADK FunctionResponse had no call ID",
             )
-            try:
-                function_response.id = call_id
-            except Exception as exc:
-                _add_trace_diagnostic(
-                    collector,
-                    "generated_function_response_call_id_not_mutable",
-                    exc,
-                )
-            try:
-                collector.note_call_id_source(call_id, call_id_source)
-            except Exception as exc:
-                _add_trace_diagnostic(
-                    collector,
-                    "function_response_call_id_source_failed",
-                    exc,
-                )
         function_response_entries.append(
             (
                 function_response,
                 tool_name,
-                call_id,
+                provider_response_id,
                 call_id_source,
             )
         )
@@ -1449,7 +1585,7 @@ def _normalize_event(
             (
                 _,
                 tool_name,
-                call_id,
+                provider_response_id,
                 call_id_source,
             ) = function_response_entries[function_response_index]
             function_response_index += 1
@@ -1459,16 +1595,49 @@ def _normalize_event(
                 "response",
                 None,
             )
-            if collector is not None and call_id is not None:
+            trace_call_id = provider_response_id
+            call_instance_id = None
+            batch_call_ids: list[str] = []
+            trace_call_id_source = call_id_source
+            if collector is not None:
                 try:
-                    state = collector.call_state(call_id)
-                    call_id_source = (
-                        state.get("call_id_source") or call_id_source
+                    state = collector.claim_function_response(
+                        provider_runtime_call_id=(
+                            provider_response_id
+                        ),
+                        tool_name=tool_name,
+                    )
+                    if not state and provider_response_id:
+                        state = collector.call_state(
+                            provider_response_id
+                        )
+                    trace_call_id_source = (
+                        state.get("call_id_source")
+                        or trace_call_id_source
                     )
                 except Exception as exc:
                     _add_trace_diagnostic(
                         collector,
                         "function_response_state_lookup_failed",
+                        exc,
+                    )
+                trace_call_id = (
+                    state.get("trace_call_id")
+                    or provider_response_id
+                    or (
+                        "generated:adk_function_response:"
+                        f"{uuid4().hex}"
+                    )
+                )
+                call_instance_id = state.get("call_instance_id")
+                try:
+                    batch_call_ids = collector.batch_call_ids(
+                        state.get("tool_batch_id")
+                    )
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "function_response_batch_lookup_failed",
                         exc,
                     )
                 _record_tool_boundary(
@@ -1479,12 +1648,37 @@ def _normalize_event(
                     adk_invocation_id=invocation_id,
                     model_turn_id=state.get("model_turn_id"),
                     tool_batch_id=state.get("tool_batch_id"),
-                    call_id=call_id,
+                    call_id=trace_call_id,
+                    call_instance_id=call_instance_id,
                     payload={
                         "event_id": event_id,
                         "invocation_id": invocation_id,
-                        "response_id": call_id,
+                        "response_id": (
+                            provider_response_id or trace_call_id
+                        ),
                         "response_id_source": call_id_source,
+                        "trace_call_id": trace_call_id,
+                        "trace_call_id_source": (
+                            trace_call_id_source
+                        ),
+                        "call_instance_id": call_instance_id,
+                        "provider_call_id": state.get(
+                            "provider_call_id"
+                        ),
+                        "provider_runtime_call_id": (
+                            provider_response_id
+                            or state.get(
+                                "provider_runtime_call_id"
+                            )
+                        ),
+                        "provider_runtime_alias_relation": (
+                            state.get(
+                                "provider_runtime_alias_relation"
+                            )
+                        ),
+                        "provider_id_ambiguity": state.get(
+                            "provider_id_ambiguity"
+                        ),
                         "function_name": tool_name,
                         "function_response": _adk_object_payload(
                             response
@@ -1514,6 +1708,12 @@ def _normalize_event(
                                 state,
                             )
                         ),
+                        "parallel_execution": (
+                            _parallel_execution_evidence(
+                                state,
+                                batch_call_ids,
+                            )
+                        ),
                         "merged_event": {
                             "function_response_count": len(
                                 function_response_entries
@@ -1531,7 +1731,7 @@ def _normalize_event(
                         kind="text",
                         text=chunk,
                         tool_name=tool_name,
-                        call_id=call_id,
+                        call_id=trace_call_id,
                         **event_metadata,
                     )
                 )
@@ -1540,7 +1740,7 @@ def _normalize_event(
                     kind="tool_result",
                     tool_name=tool_name,
                     payload=_extract_structured_content(response or {}),
-                    call_id=call_id,
+                    call_id=trace_call_id,
                     **event_metadata,
                 )
             )
@@ -2080,6 +2280,84 @@ def _prune_request_contents_for_context_window(
         "before_chars": before_chars,
         "after_chars": after_chars,
         "max_chars": max_chars,
+        "reasons": [
+            reason
+            for reason, applies in (
+                ("provider_context_window", should_prune_for_size),
+                (
+                    "older_tool_result_history_limit",
+                    should_prune_for_history,
+                ),
+            )
+            if applies
+        ],
+        "notice": replacement_message,
+    }
+
+
+def _json_payload_byte_count(value: Any) -> int:
+    try:
+        return len(
+            json.dumps(
+                value,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+    except Exception:
+        return 0
+
+
+def _request_pruning_snapshot(llm_request: Any) -> dict[str, Any]:
+    request_payload = _adk_object_payload(llm_request)
+    contents = getattr(llm_request, "contents", None)
+    contents_payload = _adk_object_payload(contents or [])
+    content_count = 0
+    part_count = 0
+    function_response_count = 0
+    function_response_bytes = 0
+    notices: list[str] = []
+    try:
+        content_count = len(contents or [])
+        for content in contents or []:
+            parts = getattr(content, "parts", None) or []
+            part_count += len(parts)
+            for part in parts:
+                function_response = getattr(
+                    part,
+                    "function_response",
+                    None,
+                )
+                if function_response is None:
+                    continue
+                function_response_count += 1
+                response = getattr(
+                    function_response,
+                    "response",
+                    None,
+                )
+                function_response_bytes += _json_payload_byte_count(
+                    _adk_object_payload(response)
+                )
+                if (
+                    isinstance(response, dict)
+                    and response.get("lumibot_context_pruned")
+                    and isinstance(response.get("message"), str)
+                ):
+                    notices.append(response["message"])
+    except Exception:
+        pass
+    return {
+        "request": request_payload,
+        "contents": contents_payload,
+        "content_count": content_count,
+        "part_count": part_count,
+        "function_response_count": function_response_count,
+        "function_response_bytes": function_response_bytes,
+        "request_bytes": _json_payload_byte_count(request_payload),
+        "contents_bytes": _json_payload_byte_count(contents_payload),
+        "notices": notices,
     }
 
 
@@ -2313,20 +2591,37 @@ class GoogleADKRuntime:
 
     def _before_model_context_pruning_callback(self, request: RuntimeRequest):
         context_limit = _model_context_limit_tokens(request.model)
-        if not context_limit:
+        collector = request.boundary_collector
+        trace_litellm_entry = (
+            collector is not None
+            and not _is_native_gemini_model(request.model)
+        )
+        if not context_limit and not trace_litellm_entry:
             return None
 
         def _callback(*args: Any, callback_context: Any = None, llm_request: Any = None, **_kwargs: Any) -> None:
             if llm_request is None and len(args) >= 2:
                 llm_request = args[1]
             contents = getattr(llm_request, "contents", None)
-            if not isinstance(contents, list):
-                return None
-            pruning = _prune_request_contents_for_context_window(
-                contents,
-                context_limit_tokens=context_limit,
-                always_prune_older_tool_results=True,
-            )
+            before_snapshot: dict[str, Any] = {}
+            if trace_litellm_entry:
+                try:
+                    before_snapshot = _request_pruning_snapshot(
+                        llm_request
+                    )
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "pre_pruning_request_capture_failed",
+                        exc,
+                    )
+            pruning = None
+            if isinstance(contents, list) and context_limit:
+                pruning = _prune_request_contents_for_context_window(
+                    contents,
+                    context_limit_tokens=context_limit,
+                    always_prune_older_tool_results=True,
+                )
             if pruning:
                 logging.getLogger(__name__).warning(
                     "Pruned %s older tool result payload(s) for model=%s before provider context window overflow "
@@ -2337,6 +2632,116 @@ class GoogleADKRuntime:
                     pruning["after_chars"],
                     pruning["max_chars"],
                 )
+            if trace_litellm_entry:
+                try:
+                    after_snapshot = _request_pruning_snapshot(
+                        llm_request
+                    )
+                    previous_model_turn_id = (
+                        collector.active_model_turn()
+                    )
+                    model_turn_id = collector.start_model_turn()
+                    collector.set_active_model_turn(model_turn_id)
+                    reasons = (
+                        list(pruning.get("reasons") or [])
+                        if pruning
+                        else []
+                    )
+                    notices = list(
+                        dict.fromkeys(
+                            [
+                                *(
+                                    [pruning.get("notice")]
+                                    if pruning
+                                    and pruning.get("notice")
+                                    else []
+                                ),
+                                *(
+                                    after_snapshot.get("notices")
+                                    or []
+                                ),
+                            ]
+                        )
+                    )
+                    context_pruning = {
+                        "pruned": bool(pruning),
+                        "pruned_tool_results": (
+                            int(
+                                pruning.get(
+                                    "pruned_tool_results",
+                                    0,
+                                )
+                            )
+                            if pruning
+                            else 0
+                        ),
+                        "omitted_function_response_count": (
+                            int(
+                                pruning.get(
+                                    "pruned_tool_results",
+                                    0,
+                                )
+                            )
+                            if pruning
+                            else 0
+                        ),
+                        "omitted_function_response_bytes": max(
+                            int(
+                                before_snapshot.get(
+                                    "function_response_bytes",
+                                    0,
+                                )
+                            )
+                            - int(
+                                after_snapshot.get(
+                                    "function_response_bytes",
+                                    0,
+                                )
+                            ),
+                            0,
+                        ),
+                        "reason": (
+                            reasons[0]
+                            if len(reasons) == 1
+                            else (
+                                "multiple_pruning_reasons"
+                                if reasons
+                                else "not_pruned"
+                            )
+                        ),
+                        "reasons": reasons,
+                        "notices": notices,
+                        "before": before_snapshot,
+                        "after": after_snapshot,
+                        "max_chars": (
+                            pruning.get("max_chars")
+                            if pruning
+                            else (
+                                int(context_limit * 3.0)
+                                if context_limit
+                                else None
+                            )
+                        ),
+                    }
+                    collector.note_pending_model_turn(
+                        model_turn_id,
+                        previous_model_turn_id=(
+                            previous_model_turn_id
+                        ),
+                        context_pruning=context_pruning,
+                        adk_invocation_id=_safe_optional_string(
+                            _safe_attribute(
+                                callback_context,
+                                "invocation_id",
+                            )
+                        ),
+                    )
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "pruning_forensics_capture_failed",
+                        exc,
+                    )
             return None
 
         return _callback
@@ -2355,7 +2760,36 @@ class GoogleADKRuntime:
             if llm_request is None and len(args) >= 2:
                 llm_request = args[1]
             try:
-                previous_model_turn_id = collector.active_model_turn()
+                active_model_turn_id = collector.active_model_turn()
+                pending = (
+                    collector.pending_model_turn(
+                        active_model_turn_id
+                    )
+                    if active_model_turn_id
+                    else {}
+                )
+                if pending:
+                    collector.note_pending_model_turn(
+                        active_model_turn_id,
+                        previous_model_turn_id=pending.get(
+                            "previous_model_turn_id"
+                        ),
+                        context_pruning=pending.get(
+                            "context_pruning"
+                        )
+                        or {},
+                        adk_invocation_id=(
+                            _safe_optional_string(
+                                _safe_attribute(
+                                    callback_context,
+                                    "invocation_id",
+                                )
+                            )
+                            or pending.get("adk_invocation_id")
+                        ),
+                    )
+                    return None
+                previous_model_turn_id = active_model_turn_id
                 model_turn_id = collector.start_model_turn()
                 collector.set_active_model_turn(model_turn_id)
                 pruned_parts = 0
@@ -2376,21 +2810,33 @@ class GoogleADKRuntime:
                             "lumibot_context_pruned"
                         ):
                             pruned_parts += 1
-                collector.note_pending_model_turn(
-                    model_turn_id,
-                    previous_model_turn_id=previous_model_turn_id,
-                    context_pruning={
-                        "pruned": pruned_parts > 0,
-                        "pruned_tool_results": pruned_parts,
-                    },
-                    adk_invocation_id=_safe_optional_string(
-                        getattr(
-                            callback_context,
-                            "invocation_id",
-                            None,
-                        )
-                    ),
-                )
+                if not _is_native_gemini_model(request.model):
+                    collector.note_pending_model_turn(
+                        model_turn_id,
+                        previous_model_turn_id=previous_model_turn_id,
+                        context_pruning={
+                            "pruned": pruned_parts > 0,
+                            "pruned_tool_results": pruned_parts,
+                            "omitted_function_response_count": (
+                                pruned_parts
+                            ),
+                            "omitted_function_response_bytes": 0,
+                            "reason": (
+                                "previous_pruning_notice_observed"
+                                if pruned_parts
+                                else "not_pruned"
+                            ),
+                            "reasons": [],
+                            "notices": [],
+                        },
+                        adk_invocation_id=_safe_optional_string(
+                            getattr(
+                                callback_context,
+                                "invocation_id",
+                                None,
+                            )
+                        ),
+                    )
             except Exception as exc:
                 _add_trace_diagnostic(
                     collector,
@@ -2483,7 +2929,7 @@ class GoogleADKRuntime:
 
     def _after_model_boundary_callback(self, request: RuntimeRequest):
         collector = request.boundary_collector
-        if collector is None:
+        if collector is None or _is_native_gemini_model(request.model):
             return None
 
         def _callback(
@@ -2547,11 +2993,11 @@ class GoogleADKRuntime:
                         )
                         provider_call_id = None
                     if provider_call_id:
-                        call_id = provider_call_id
+                        trace_call_id = provider_call_id
                         call_id_source = "provider"
                     else:
                         turn_segment = model_turn_id or "missing_turn"
-                        call_id = (
+                        trace_call_id = (
                             f"generated:{turn_segment}:{index:04d}:"
                             f"{uuid4().hex}"
                         )
@@ -2561,31 +3007,41 @@ class GoogleADKRuntime:
                         _add_trace_diagnostic(
                             collector,
                             "generated_missing_provider_call_id",
-                            call_id,
+                            trace_call_id,
                         )
-                        try:
-                            function_call.id = call_id
-                        except Exception as exc:
-                            _add_trace_diagnostic(
-                                collector,
-                                "generated_provider_call_id_not_mutable",
-                                exc,
-                            )
-                    call_ids.append(call_id)
+                    function_name = getattr(
+                        function_call,
+                        "name",
+                        None,
+                    )
+                    function_arguments = getattr(
+                        function_call,
+                        "args",
+                        None,
+                    )
+                    call_ids.append(trace_call_id)
                     call_records.append(
                         {
-                            "call_id": call_id,
-                            "call_id_source": call_id_source,
-                            "name": getattr(
-                                function_call,
-                                "name",
-                                None,
+                            "call_id": trace_call_id,
+                            "trace_call_id": trace_call_id,
+                            "provider_call_id": provider_call_id,
+                            "provider_runtime_call_id": (
+                                provider_call_id
                             ),
+                            "provider_runtime_alias_relation": (
+                                "same_as_trace_call_id"
+                                if provider_call_id
+                                else None
+                            ),
+                            "call_id_source": call_id_source,
+                            "name": function_name,
                             "arguments": _adk_object_payload(
-                                getattr(
-                                    function_call,
-                                    "args",
-                                    None,
+                                function_arguments
+                            ),
+                            "call_fingerprint": (
+                                _tool_call_fingerprint(
+                                    function_name,
+                                    function_arguments,
                                 )
                             ),
                             "call_sequence": index,
@@ -2601,14 +3057,49 @@ class GoogleADKRuntime:
             batch_id = None
             if model_turn_id and call_ids:
                 try:
-                    batch_id = collector.register_tool_batch(
+                    registered_batch = collector.register_tool_calls(
                         model_turn_id,
-                        call_ids,
+                        [
+                            {
+                                "trace_call_id": call_record[
+                                    "trace_call_id"
+                                ],
+                                "provider_call_id": call_record[
+                                    "provider_call_id"
+                                ],
+                                "provider_runtime_call_id": (
+                                    call_record[
+                                        "provider_runtime_call_id"
+                                    ]
+                                ),
+                                "provider_runtime_alias_relation": (
+                                    call_record[
+                                        "provider_runtime_alias_relation"
+                                    ]
+                                ),
+                                "call_id_source": call_record[
+                                    "call_id_source"
+                                ],
+                                "tool_name": call_record["name"],
+                                "call_fingerprint": call_record[
+                                    "call_fingerprint"
+                                ],
+                            }
+                            for call_record in call_records
+                        ],
                     )
-                    for call_record in call_records:
-                        collector.note_call_id_source(
-                            call_record["call_id"],
-                            call_record["call_id_source"],
+                    batch_id = registered_batch["tool_batch_id"]
+                    for call_record, registered_call in zip(
+                        call_records,
+                        registered_batch["calls"],
+                    ):
+                        call_record.update(
+                            {
+                                "call_instance_id": registered_call[
+                                    "call_instance_id"
+                                ],
+                                "tool_batch_id": batch_id,
+                            }
                         )
                 except Exception as exc:
                     _add_trace_diagnostic(
@@ -2651,6 +3142,7 @@ class GoogleADKRuntime:
             **_kwargs: Any,
         ) -> None:
             dispatch_observed_at = _utc_iso_timestamp()
+            dispatch_started_monotonic = time.perf_counter()
             if tool is None and positional:
                 tool = positional[0]
             if args is None and len(positional) >= 2:
@@ -2675,32 +3167,38 @@ class GoogleADKRuntime:
                 )
                 provider_call_id = None
 
-            if provider_call_id:
-                call_id = provider_call_id
-                call_id_source = "provider"
-                call_lookup_status = "unmatched"
-            else:
-                call_id = f"generated:adk_dispatch:{uuid4().hex}"
-                call_id_source = (
-                    "generated_missing_adk_dispatch_id"
+            tool_name = _safe_optional_string(
+                _safe_attribute(tool, "name")
+            )
+            call_fingerprint = _tool_call_fingerprint(
+                tool_name,
+                model_arguments,
+            )
+            source_function_call_event = (
+                _source_function_call_event(
+                    tool_context,
+                    provider_call_id,
                 )
-                call_lookup_status = "generated"
+                if provider_call_id
+                else None
+            )
+            try:
+                model_turn_id = collector.active_model_turn()
+            except Exception as exc:
                 _add_trace_diagnostic(
                     collector,
-                    "generated_missing_adk_dispatch_call_id",
-                    call_id,
+                    "adk_dispatch_active_turn_lookup_failed",
+                    exc,
                 )
-                try:
-                    tool_context.function_call_id = call_id
-                except Exception as exc:
-                    _add_trace_diagnostic(
-                        collector,
-                        "generated_adk_dispatch_call_id_not_mutable",
-                        exc,
-                    )
-
+                model_turn_id = None
             try:
-                ids = collector.call_ids(call_id)
+                ids = collector.claim_tool_call(
+                    provider_runtime_call_id=provider_call_id,
+                    tool_name=tool_name,
+                    call_fingerprint=call_fingerprint,
+                    model_turn_id=model_turn_id,
+                    stage="dispatch",
+                )
             except Exception as exc:
                 _add_trace_diagnostic(
                     collector,
@@ -2708,14 +3206,44 @@ class GoogleADKRuntime:
                     exc,
                 )
                 ids = {}
-            call_id_source = (
-                ids.get("call_id_source") or call_id_source
-            )
-            if ids.get("tool_batch_id"):
-                call_lookup_status = "matched_batch"
-            if not ids.get("model_turn_id"):
+            if ids:
+                call_id_source = (
+                    ids.get("call_id_source")
+                    or (
+                        "provider"
+                        if provider_call_id
+                        else "generated_missing_adk_dispatch_id"
+                    )
+                )
+                call_lookup_status = (
+                    "reconciled_generated_fallback"
+                    if (
+                        provider_call_id
+                        and ids.get("trace_call_id")
+                        != provider_call_id
+                    )
+                    else "matched_batch"
+                )
+            else:
+                trace_call_id = (
+                    provider_call_id
+                    or f"generated:adk_dispatch:{uuid4().hex}"
+                )
+                call_id_source = (
+                    "provider"
+                    if provider_call_id
+                    else "generated_missing_adk_dispatch_id"
+                )
+                call_lookup_status = (
+                    "unmatched" if provider_call_id else "generated"
+                )
+                if not provider_call_id:
+                    _add_trace_diagnostic(
+                        collector,
+                        "generated_missing_adk_dispatch_call_id",
+                        trace_call_id,
+                    )
                 try:
-                    model_turn_id = collector.active_model_turn()
                     if not model_turn_id:
                         model_turn_id = collector.start_model_turn()
                         collector.set_active_model_turn(model_turn_id)
@@ -2724,19 +3252,148 @@ class GoogleADKRuntime:
                             "generated_missing_active_model_turn",
                             model_turn_id,
                         )
-                    collector.register_tool_batch(
+                    source_call_records = []
+                    for index, source_call in enumerate(
+                        _parts_function_calls(
+                            source_function_call_event
+                        ),
+                        start=1,
+                    ):
+                        source_provider_call_id = (
+                            _safe_optional_string(
+                                _safe_attribute(
+                                    source_call,
+                                    "id",
+                                )
+                            )
+                        )
+                        source_trace_call_id = (
+                            source_provider_call_id
+                            or (
+                                "generated:source_function_call:"
+                                f"{index:04d}:{uuid4().hex}"
+                            )
+                        )
+                        source_name = _safe_optional_string(
+                            _safe_attribute(source_call, "name")
+                        )
+                        source_arguments = _safe_attribute(
+                            source_call,
+                            "args",
+                        )
+                        source_call_records.append(
+                            {
+                                "trace_call_id": (
+                                    source_trace_call_id
+                                ),
+                                "provider_call_id": (
+                                    source_provider_call_id
+                                ),
+                                "provider_runtime_call_id": (
+                                    source_provider_call_id
+                                ),
+                                "provider_runtime_alias_relation": (
+                                    "same_as_trace_call_id"
+                                    if source_provider_call_id
+                                    else None
+                                ),
+                                "call_id_source": (
+                                    "provider"
+                                    if source_provider_call_id
+                                    else (
+                                        "generated_missing_"
+                                        "source_event_call_id"
+                                    )
+                                ),
+                                "tool_name": source_name,
+                                "call_fingerprint": (
+                                    _tool_call_fingerprint(
+                                        source_name,
+                                        source_arguments,
+                                    )
+                                ),
+                            }
+                        )
+                    registration_calls = (
+                        source_call_records
+                        if source_call_records
+                        else [
+                            {
+                                "trace_call_id": trace_call_id,
+                                "provider_call_id": (
+                                    provider_call_id
+                                ),
+                                "provider_runtime_call_id": (
+                                    provider_call_id
+                                ),
+                                "provider_runtime_alias_relation": (
+                                    "same_as_trace_call_id"
+                                    if provider_call_id
+                                    else None
+                                ),
+                                "call_id_source": call_id_source,
+                                "tool_name": tool_name,
+                                "call_fingerprint": (
+                                    call_fingerprint
+                                ),
+                            }
+                        ]
+                    )
+                    registered = collector.register_tool_calls(
                         model_turn_id,
-                        [call_id],
+                        registration_calls,
                     )
-                    collector.note_call_id_source(
-                        call_id,
-                        call_id_source,
+                    call_instance_id = registered["calls"][0][
+                        "call_instance_id"
+                    ]
+                    ids = collector.claim_tool_call(
+                        provider_runtime_call_id=(
+                            provider_call_id
+                        ),
+                        tool_name=tool_name,
+                        call_fingerprint=call_fingerprint,
+                        model_turn_id=model_turn_id,
+                        stage="dispatch",
                     )
-                    ids = collector.call_ids(call_id)
+                    if not ids:
+                        ids = collector.call_ids(
+                            call_instance_id
+                        )
+                    if source_call_records:
+                        call_lookup_status = (
+                            "reconstructed_source_event_batch"
+                        )
                 except Exception as exc:
                     _add_trace_diagnostic(
                         collector,
                         "adk_dispatch_fallback_registration_failed",
+                        exc,
+                    )
+                    ids = {}
+            trace_call_id = str(
+                ids.get("trace_call_id")
+                or provider_call_id
+                or f"generated:adk_dispatch:{uuid4().hex}"
+            )
+            call_instance_id = _safe_optional_string(
+                ids.get("call_instance_id")
+            )
+            if call_instance_id:
+                try:
+                    collector.set_active_call_instance(
+                        call_instance_id
+                    )
+                    collector.note_dispatch_started(
+                        call_instance_id,
+                        dispatch_observed_at=dispatch_observed_at,
+                        monotonic_started=(
+                            dispatch_started_monotonic
+                        ),
+                    )
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "adk_dispatch_window_capture_failed",
                         exc,
                     )
             try:
@@ -2764,11 +3421,27 @@ class GoogleADKRuntime:
                 adk_invocation_id=adk_invocation_id,
                 model_turn_id=ids.get("model_turn_id"),
                 tool_batch_id=ids.get("tool_batch_id"),
-                call_id=call_id,
+                call_id=trace_call_id,
+                call_instance_id=call_instance_id,
                 payload={
-                    "tool_name": _safe_attribute(tool, "name"),
+                    "tool_name": tool_name,
                     "selected_function_tool": (
                         _safe_object_identity(tool)
+                    ),
+                    "trace_call_id": trace_call_id,
+                    "call_instance_id": call_instance_id,
+                    "provider_call_id": ids.get(
+                        "provider_call_id"
+                    ),
+                    "provider_runtime_call_id": (
+                        provider_call_id
+                        or ids.get("provider_runtime_call_id")
+                    ),
+                    "provider_runtime_alias_relation": ids.get(
+                        "provider_runtime_alias_relation"
+                    ),
+                    "provider_id_ambiguity": ids.get(
+                        "provider_id_ambiguity"
                     ),
                     "call_id_source": call_id_source,
                     "call_lookup_status": call_lookup_status,
@@ -2777,15 +3450,16 @@ class GoogleADKRuntime:
                     "parallel_batch": parallel_batch,
                     "batch_call_ids": batch_call_ids,
                     "source_function_call_event_id": (
-                        _source_function_call_event_id(
-                            tool_context,
-                            call_id,
+                        _safe_optional_string(
+                            _safe_attribute(
+                                source_function_call_event,
+                                "id",
+                            )
                         )
                     ),
                     "dispatch_observed_at": dispatch_observed_at,
                     "dispatch_timestamp_source": (
-                        "before_tool_callback_entry_"
-                        "after_adk_task_schedule"
+                        "before_tool_callback_entry"
                     ),
                     "parallel_scheduling": (
                         _parallel_scheduling_evidence(
@@ -2859,40 +3533,112 @@ class GoogleADKRuntime:
                     "function_call_id",
                     None,
                 )
-                call_id = str(raw_call_id) if raw_call_id else ""
+                provider_runtime_call_id = (
+                    str(raw_call_id) if raw_call_id else None
+                )
             except Exception as exc:
                 _add_trace_diagnostic(
                     collector,
                     "after_tool_call_id_observation_failed",
                     exc,
                 )
-                call_id = ""
-            if not call_id:
-                call_id = f"generated:after_tool:{uuid4().hex}"
+                provider_runtime_call_id = None
+            tool_name = _safe_optional_string(
+                _safe_attribute(tool, "name")
+            )
+            call_fingerprint = _tool_call_fingerprint(
+                tool_name,
+                args if isinstance(args, dict) else {},
+            )
+            ids: dict[str, Any] = {}
+            try:
+                active_call_instance = (
+                    collector.active_call_instance()
+                )
+                if active_call_instance:
+                    ids = collector.call_ids(
+                        active_call_instance
+                    )
+                if not ids:
+                    ids = collector.claim_tool_call(
+                        provider_runtime_call_id=(
+                            provider_runtime_call_id
+                        ),
+                        tool_name=tool_name,
+                        call_fingerprint=call_fingerprint,
+                        model_turn_id=(
+                            collector.active_model_turn()
+                        ),
+                        stage="after_tool",
+                    )
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "after_tool_call_lookup_failed",
+                    exc,
+                )
+            if not ids:
+                trace_call_id = (
+                    provider_runtime_call_id
+                    or f"generated:after_tool:{uuid4().hex}"
+                )
+                call_id_source = (
+                    "provider"
+                    if provider_runtime_call_id
+                    else "generated_missing_after_tool_id"
+                )
+                try:
+                    model_turn_id = collector.active_model_turn()
+                    if not model_turn_id:
+                        model_turn_id = collector.start_model_turn()
+                        collector.set_active_model_turn(model_turn_id)
+                    registered = collector.register_tool_calls(
+                        model_turn_id,
+                        [
+                            {
+                                "trace_call_id": trace_call_id,
+                                "provider_call_id": (
+                                    provider_runtime_call_id
+                                ),
+                                "provider_runtime_call_id": (
+                                    provider_runtime_call_id
+                                ),
+                                "provider_runtime_alias_relation": (
+                                    "same_as_trace_call_id"
+                                    if provider_runtime_call_id
+                                    else None
+                                ),
+                                "call_id_source": call_id_source,
+                                "tool_name": tool_name,
+                                "call_fingerprint": (
+                                    call_fingerprint
+                                ),
+                            }
+                        ],
+                    )
+                    ids = collector.call_ids(
+                        registered["calls"][0][
+                            "call_instance_id"
+                        ]
+                    )
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "after_tool_fallback_registration_failed",
+                        exc,
+                    )
+            call_id = str(
+                ids.get("call_instance_id")
+                or ids.get("trace_call_id")
+                or provider_runtime_call_id
+                or f"generated:after_tool:{uuid4().hex}"
+            )
+            if provider_runtime_call_id is None:
                 _add_trace_diagnostic(
                     collector,
                     "generated_missing_after_tool_call_id",
-                    call_id,
+                    str(ids.get("trace_call_id") or call_id),
                 )
-                try:
-                    tool_context.function_call_id = call_id
-                except Exception as exc:
-                    _add_trace_diagnostic(
-                        collector,
-                        "generated_after_tool_call_id_not_mutable",
-                        exc,
-                    )
-                try:
-                    collector.note_call_id_source(
-                        call_id,
-                        "generated_missing_after_tool_id",
-                    )
-                except Exception as exc:
-                    _add_trace_diagnostic(
-                        collector,
-                        "after_tool_call_id_source_failed",
-                        exc,
-                    )
 
             try:
                 collector.note_function_tool_response(
@@ -2934,6 +3680,14 @@ class GoogleADKRuntime:
                 _add_trace_diagnostic(
                     collector,
                     "function_tool_response_state_capture_failed",
+                    exc,
+                )
+            try:
+                collector.set_active_call_instance(None)
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "after_tool_call_context_cleanup_failed",
                     exc,
                 )
             return pruned_response
@@ -3056,6 +3810,9 @@ class GoogleADKRuntime:
         except Exception:
             pass
         planner = self._maybe_build_gemini_thinking_planner(request.model, genai_types)
+        uses_litellm_boundaries = not _is_native_gemini_model(
+            request.model
+        )
         before_model_callbacks = [
             callback
             for callback in (
@@ -3072,7 +3829,10 @@ class GoogleADKRuntime:
                 model_request_timeout_seconds=model_request_timeout_seconds,
                 model_entry_observer=(
                     self._model_entry_boundary_observer(request)
-                    if request.boundary_collector is not None
+                    if (
+                        request.boundary_collector is not None
+                        and uses_litellm_boundaries
+                    )
                     else None
                 ),
             ),
@@ -3081,7 +3841,11 @@ class GoogleADKRuntime:
             generate_content_config=genai_types.GenerateContentConfig(**config_kwargs),
             planner=planner,
             before_model_callback=before_model_callbacks or None,
-            after_model_callback=self._after_model_boundary_callback(request),
+            after_model_callback=(
+                self._after_model_boundary_callback(request)
+                if uses_litellm_boundaries
+                else None
+            ),
             before_tool_callback=self._before_tool_boundary_callback(request),
             after_tool_callback=(
                 self._after_tool_boundary_and_pruning_callback(request)
