@@ -84,6 +84,16 @@ _SAFE_NUMERIC_USAGE_FIELDS = {
     "total_token_count",
     "total_tokens",
 }
+_CALL_RESPONSE_STATE_KEYS = {
+    "batch_completion_sequence",
+    "completion_sequence",
+    "function_tool_response",
+    "function_tool_response_type",
+    "model_facing_response",
+    "model_facing_response_type",
+    "response_created_at",
+    "tool_response_pruned",
+}
 
 
 class _TraceDescriptor(dict):
@@ -533,9 +543,18 @@ class BoundaryTraceCollector:
         self._sequence = itertools.count(1)
         self._turn_number = 0
         self._batch_number_by_turn: dict[str, int] = {}
+        self._batch_completion_number: dict[str, int] = {}
         self._call_index: dict[str, dict[str, Any]] = {}
         self._observation_index: dict[str, dict[str, Any]] = {}
+        self._pending_model_turns: dict[str, dict[str, Any]] = {}
         self._active_model_turn_id: str | None = None
+        self._active_model_turn_context: contextvars.ContextVar[
+            str | None
+        ] = contextvars.ContextVar(
+            f"lumibot_boundary_model_turn_{id(self)}",
+            default=None,
+        )
+        self._completion_number = 0
         self._lock = threading.Lock()
 
     def start_model_turn(self) -> str:
@@ -544,12 +563,78 @@ class BoundaryTraceCollector:
             return f"{self.agent_run_id}:turn:{self._turn_number:04d}"
 
     def set_active_model_turn(self, model_turn_id: str) -> None:
+        self._active_model_turn_context.set(model_turn_id)
         with self._lock:
             self._active_model_turn_id = model_turn_id
 
     def active_model_turn(self) -> str | None:
+        contextual_turn = self._active_model_turn_context.get()
+        if contextual_turn is not None:
+            return contextual_turn
         with self._lock:
             return self._active_model_turn_id
+
+    def note_pending_model_turn(
+        self,
+        model_turn_id: str,
+        *,
+        previous_model_turn_id: str | None,
+        context_pruning: dict[str, Any],
+        adk_invocation_id: str | None = None,
+    ) -> None:
+        safe_pruning = self._safe_observation_value(
+            context_pruning,
+            snapshot_diagnostic="model_turn_pruning_snapshot_failed",
+            normalization_diagnostic=(
+                "model_turn_pruning_normalization_failed"
+            ),
+        )
+        with self._lock:
+            self._pending_model_turns[model_turn_id] = {
+                "model_turn_id": model_turn_id,
+                "previous_model_turn_id": previous_model_turn_id,
+                "adk_invocation_id": adk_invocation_id,
+                "context_pruning": (
+                    safe_pruning
+                    if type(safe_pruning) is dict
+                    else {}
+                ),
+            }
+
+    def pending_model_turn(
+        self,
+        model_turn_id: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            state = dict(
+                self._pending_model_turns.get(model_turn_id) or {}
+            )
+        return self._detached_state(
+            state,
+            snapshot_diagnostic="pending_model_turn_snapshot_failed",
+            normalization_diagnostic=(
+                "pending_model_turn_normalization_failed"
+            ),
+        )
+
+    def take_pending_model_turn(
+        self,
+        model_turn_id: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            state = dict(
+                self._pending_model_turns.pop(model_turn_id, None)
+                or {}
+            )
+        return self._detached_state(
+            state,
+            snapshot_diagnostic=(
+                "pending_model_turn_take_snapshot_failed"
+            ),
+            normalization_diagnostic=(
+                "pending_model_turn_take_normalization_failed"
+            ),
+        )
 
     def register_tool_batch(self, model_turn_id: str, call_ids: list[str]) -> str:
         with self._lock:
@@ -558,6 +643,12 @@ class BoundaryTraceCollector:
             batch_id = f"{model_turn_id}:batch:{number:04d}"
             for index, call_id in enumerate(call_ids, start=1):
                 state = self._call_index.setdefault(call_id, {})
+                if (
+                    state.get("model_turn_id") is not None
+                    and state.get("model_turn_id") != model_turn_id
+                ):
+                    for key in _CALL_RESPONSE_STATE_KEYS:
+                        state.pop(key, None)
                 state.update(
                     {
                         "model_turn_id": model_turn_id,
@@ -589,7 +680,12 @@ class BoundaryTraceCollector:
 
     def call_ids(self, call_id: str) -> dict[str, Any]:
         with self._lock:
-            return dict(self._call_index.get(call_id) or {})
+            state = dict(self._call_index.get(call_id) or {})
+        return self._detached_state(
+            state,
+            snapshot_diagnostic="call_ids_snapshot_failed",
+            normalization_diagnostic="call_ids_normalization_failed",
+        )
 
     def note_call_id_source(self, call_id: str, source: str) -> None:
         with self._lock:
@@ -603,7 +699,28 @@ class BoundaryTraceCollector:
         unpruned_response: Any,
         model_facing_response: Any,
         pruned: bool,
+        response_created_at: str | None = None,
     ) -> None:
+        with self._lock:
+            state = self._call_index.setdefault(call_id, {})
+            if "completion_sequence" not in state:
+                self._completion_number += 1
+                state["completion_sequence"] = self._completion_number
+                state["response_created_at"] = (
+                    response_created_at or utc_iso_timestamp()
+                )
+                batch_id = state.get("tool_batch_id")
+                if isinstance(batch_id, str) and batch_id:
+                    batch_completion = (
+                        self._batch_completion_number.get(batch_id, 0)
+                        + 1
+                    )
+                    self._batch_completion_number[batch_id] = (
+                        batch_completion
+                    )
+                    state["batch_completion_sequence"] = (
+                        batch_completion
+                    )
         safe_unpruned = self._safe_observation_value(
             unpruned_response,
             snapshot_diagnostic="function_tool_response_snapshot_failed",
@@ -618,11 +735,29 @@ class BoundaryTraceCollector:
                 "model_facing_response_normalization_failed"
             ),
         )
+        unpruned_type = _descriptor_type(unpruned_response)[
+            "python_type"
+        ]
+        model_facing_type = _descriptor_type(model_facing_response)[
+            "python_type"
+        ]
         with self._lock:
             state = self._call_index.setdefault(call_id, {})
             state["function_tool_response"] = safe_unpruned
             state["model_facing_response"] = safe_model_facing
             state["tool_response_pruned"] = bool(pruned)
+            state["function_tool_response_type"] = unpruned_type
+            state["model_facing_response_type"] = model_facing_type
+
+    def _try_add_diagnostic(
+        self,
+        kind: str,
+        exc: BaseException | str,
+    ) -> None:
+        try:
+            self.add_diagnostic(kind, exc)
+        except Exception:
+            return
 
     def _safe_observation_value(
         self,
@@ -634,7 +769,7 @@ class BoundaryTraceCollector:
         try:
             detached_value = copy.deepcopy(value)
         except Exception as exc:
-            self.add_diagnostic(snapshot_diagnostic, exc)
+            self._try_add_diagnostic(snapshot_diagnostic, exc)
             detached_value = value
         try:
             safe_value, _ = self._snapshot_trace_value(
@@ -643,7 +778,28 @@ class BoundaryTraceCollector:
             )
             return safe_value
         except Exception as exc:
-            self.add_diagnostic(normalization_diagnostic, exc)
+            self._try_add_diagnostic(normalization_diagnostic, exc)
+            return {}
+
+    def _detached_state(
+        self,
+        state: dict[str, Any],
+        *,
+        snapshot_diagnostic: str,
+        normalization_diagnostic: str,
+    ) -> dict[str, Any]:
+        try:
+            return copy.deepcopy(state)
+        except Exception as exc:
+            self._try_add_diagnostic(snapshot_diagnostic, exc)
+        try:
+            safe_state, _ = self._snapshot_trace_value(
+                state,
+                nested=False,
+            )
+            return safe_state if type(safe_state) is dict else {}
+        except Exception as exc:
+            self._try_add_diagnostic(normalization_diagnostic, exc)
             return {}
 
     @staticmethod
@@ -768,19 +924,11 @@ class BoundaryTraceCollector:
                 or self._call_index.get(observation_id)
                 or {}
             )
-        try:
-            return copy.deepcopy(state)
-        except Exception as exc:
-            self.add_diagnostic("call_state_snapshot_failed", exc)
-        try:
-            safe_state, _ = self._snapshot_trace_value(
-                state,
-                nested=False,
-            )
-            return safe_state if type(safe_state) is dict else {}
-        except Exception as exc:
-            self.add_diagnostic("call_state_normalization_failed", exc)
-            return {"wrapper_invoked": state.get("wrapper_invoked") is True}
+        return self._detached_state(
+            state,
+            snapshot_diagnostic="call_state_snapshot_failed",
+            normalization_diagnostic="call_state_normalization_failed",
+        )
 
     def clear_function_tool_observation(
         self,

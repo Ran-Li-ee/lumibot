@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
+from importlib.metadata import version
 from types import SimpleNamespace
 from typing import Any, Callable
 from uuid import UUID, uuid4
@@ -181,7 +182,7 @@ def _fallback_callable_signature(original: Any) -> inspect.Signature | None:
 def _add_trace_diagnostic(
     collector: BoundaryTraceCollector | None,
     kind: str,
-    exc: Exception,
+    exc: BaseException | str,
 ) -> None:
     if collector is None:
         return
@@ -912,7 +913,8 @@ def _build_observed_function_tool(
                                 },
                             )
                         else:
-                            collector.add_diagnostic(
+                            _add_trace_diagnostic(
+                                collector,
                                 "function_tool_wrapper_entry_unobserved",
                                 "FunctionTool returned without a validation "
                                 "error or wrapper-entry observation",
@@ -1065,6 +1067,137 @@ def _provider_exposed_thought_parts(value: Any) -> list[Any]:
         ]
     except Exception:
         return []
+
+
+def _safe_optional_string(value: Any) -> str | None:
+    try:
+        return str(value) if value else None
+    except Exception:
+        return None
+
+
+def _safe_attribute(value: Any, name: str) -> Any:
+    try:
+        return getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def _safe_object_identity(value: Any) -> dict[str, str | None]:
+    metadata = _safe_callable_metadata(value)
+    qualified_type = None
+    if metadata["module"] and metadata["qualname"]:
+        qualified_type = (
+            f"{metadata['module']}.{metadata['qualname']}"
+        )
+    return {
+        "name": _safe_optional_string(_safe_attribute(value, "name")),
+        "python_type": _safe_type_name(value),
+        "qualified_type": qualified_type,
+    }
+
+
+def _source_function_call_event_id(
+    tool_context: Any,
+    call_id: str,
+) -> str | None:
+    try:
+        events = getattr(
+            getattr(tool_context, "session", None),
+            "events",
+            None,
+        )
+        if not isinstance(events, list):
+            return None
+        for event in reversed(events):
+            parts = (
+                getattr(getattr(event, "content", None), "parts", None)
+                or []
+            )
+            for part in parts:
+                function_call = getattr(part, "function_call", None)
+                if function_call is None:
+                    continue
+                event_call_id = _safe_optional_string(
+                    getattr(function_call, "id", None)
+                )
+                if event_call_id == call_id:
+                    return _safe_optional_string(
+                        getattr(event, "id", None)
+                    )
+    except Exception:
+        return None
+    return None
+
+
+def _installed_google_adk_version() -> str:
+    try:
+        return version("google-adk")
+    except Exception:
+        return "unknown"
+
+
+def _parallel_scheduling_evidence(
+    batch_call_ids: list[str],
+) -> dict[str, Any]:
+    if len(batch_call_ids) <= 1:
+        return {
+            "status": "single_call_no_parallel_schedule",
+            "google_adk_version": _installed_google_adk_version(),
+            "mechanism": None,
+            "batch_candidate_count": len(batch_call_ids),
+            "batch_membership_evidence": "candidate_only",
+            "sibling_task_creation_observed": False,
+            "completion_order_claim": "not_observed_at_dispatch",
+        }
+    return {
+        "status": "confirmed_by_installed_adk_dispatch",
+        "google_adk_version": _installed_google_adk_version(),
+        "mechanism": (
+            "asyncio.create_task_per_filtered_function_call"
+        ),
+        "batch_candidate_count": len(batch_call_ids),
+        "batch_membership_evidence": "candidate_only",
+        "sibling_task_creation_observed": False,
+        "completion_order_claim": "not_observed_at_dispatch",
+    }
+
+
+def _scalar_wrapping_metadata(
+    function_response: Any,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    function_tool_result_type = state.get(
+        "function_tool_response_type"
+    )
+    detected = (
+        type(function_response) is dict
+        and set(function_response) == {"result"}
+        and function_tool_result_type not in (None, "dict")
+    )
+    result_value = (
+        dict.get(function_response, "result")
+        if type(function_response) is dict
+        else None
+    )
+    return {
+        "detected": detected,
+        "source": (
+            "function_tool_scalar_to_adk_response_mapping"
+            if detected
+            else "no_scalar_wrapping_observed"
+        ),
+        "function_tool_result_type": function_tool_result_type,
+        "adk_function_response_type": _safe_type_name(
+            function_response
+        ),
+        "adk_result_value_type": (
+            _safe_type_name(result_value)
+            if detected
+            else None
+        ),
+        "wrapped_key": "result" if detected else None,
+    }
 
 
 def _to_serializable_dict(value: Any) -> dict[str, Any] | None:
@@ -1321,6 +1454,11 @@ def _normalize_event(
             ) = function_response_entries[function_response_index]
             function_response_index += 1
             state: dict[str, Any] = {}
+            response = getattr(
+                function_response,
+                "response",
+                None,
+            )
             if collector is not None and call_id is not None:
                 try:
                     state = collector.call_state(call_id)
@@ -1349,7 +1487,7 @@ def _normalize_event(
                         "response_id_source": call_id_source,
                         "function_name": tool_name,
                         "function_response": _adk_object_payload(
-                            function_response.response
+                            response
                         ),
                         "authoritative_next_model_data": True,
                         "function_tool_response": state.get(
@@ -1360,6 +1498,21 @@ def _normalize_event(
                         ),
                         "tool_response_pruned": state.get(
                             "tool_response_pruned"
+                        ),
+                        "completion_sequence": state.get(
+                            "completion_sequence"
+                        ),
+                        "batch_completion_sequence": state.get(
+                            "batch_completion_sequence"
+                        ),
+                        "response_created_at": state.get(
+                            "response_created_at"
+                        ),
+                        "scalar_wrapping": (
+                            _scalar_wrapping_metadata(
+                                response,
+                                state,
+                            )
                         ),
                         "merged_event": {
                             "function_response_count": len(
@@ -1372,11 +1525,6 @@ def _normalize_event(
                         },
                     },
                 )
-            response = getattr(
-                function_response,
-                "response",
-                None,
-            )
             for chunk in _extract_tool_text(response):
                 normalized.append(
                     AgentTraceEvent(
@@ -1972,11 +2120,40 @@ def _is_native_gemini_model(model: Any) -> bool:
     return lower.startswith("gemini-") or lower.startswith("models/gemini")
 
 
+def _build_observed_litellm_type(
+    base_type: type[Any],
+    *,
+    on_model_entry: Callable[[Any], None],
+) -> type[Any]:
+    """Build a request-local LiteLLM adapter with extensible entry hooks."""
+
+    class ObservedLiteLlm(base_type):
+        async def generate_content_async(
+            self,
+            llm_request: Any,
+            stream: bool = False,
+        ):
+            try:
+                on_model_entry(llm_request)
+            except Exception:
+                pass
+            async for response in super().generate_content_async(
+                llm_request,
+                stream=stream,
+            ):
+                yield response
+
+    ObservedLiteLlm.__name__ = f"Observed{base_type.__name__}"
+    ObservedLiteLlm.__qualname__ = ObservedLiteLlm.__name__
+    return ObservedLiteLlm
+
+
 def _resolve_model_for_adk(
     model: Any,
     *,
     prompt_cache_key: str | None = None,
     model_request_timeout_seconds: float | None = None,
+    model_entry_observer: Callable[[Any], None] | None = None,
 ) -> Any:
     # Native Gemini IDs take ADK's fast path as plain strings. Any other
     # provider prefix (e.g. "openai/...", "xai/...", "anthropic/...") is
@@ -2027,7 +2204,16 @@ def _resolve_model_for_adk(
         elif lower.startswith("xai/"):
             # xAI recommends x-grok-conv-id for Chat Completions cache routing.
             kwargs["headers"] = {"x-grok-conv-id": prompt_cache_key}
-    model_type = CerebrasLiteLlm if lower.startswith("cerebras/") else LiteLlm
+    model_type = (
+        CerebrasLiteLlm
+        if lower.startswith("cerebras/")
+        else LiteLlm
+    )
+    if model_entry_observer is not None:
+        model_type = _build_observed_litellm_type(
+            model_type,
+            on_model_entry=model_entry_observer,
+        )
     return model_type(model=model, **kwargs)
 
 
@@ -2164,6 +2350,7 @@ class GoogleADKRuntime:
             if llm_request is None and len(args) >= 2:
                 llm_request = args[1]
             try:
+                previous_model_turn_id = collector.active_model_turn()
                 model_turn_id = collector.start_model_turn()
                 collector.set_active_model_turn(model_turn_id)
                 pruned_parts = 0
@@ -2184,29 +2371,110 @@ class GoogleADKRuntime:
                             "lumibot_context_pruned"
                         ):
                             pruned_parts += 1
-                _record_tool_boundary(
-                    collector,
-                    transition="B09_ADK_TO_LITELLM",
-                    from_module="google_adk",
-                    to_module="litellm",
-                    model_turn_id=model_turn_id,
-                    payload={
-                        "llm_request": _adk_object_payload(llm_request),
-                        "context_pruning": {
-                            "pruned": pruned_parts > 0,
-                            "pruned_tool_results": pruned_parts,
-                        },
+                collector.note_pending_model_turn(
+                    model_turn_id,
+                    previous_model_turn_id=previous_model_turn_id,
+                    context_pruning={
+                        "pruned": pruned_parts > 0,
+                        "pruned_tool_results": pruned_parts,
                     },
+                    adk_invocation_id=_safe_optional_string(
+                        getattr(
+                            callback_context,
+                            "invocation_id",
+                            None,
+                        )
+                    ),
                 )
             except Exception as exc:
                 _add_trace_diagnostic(
                     collector,
-                    "before_model_boundary_capture_failed",
+                    "before_model_turn_observation_failed",
                     exc,
                 )
             return None
 
         return _callback
+
+    def _model_entry_boundary_observer(
+        self,
+        request: RuntimeRequest,
+    ) -> Callable[[Any], None]:
+        collector = request.boundary_collector
+
+        def _observe(llm_request: Any) -> None:
+            if collector is None:
+                return
+            try:
+                model_turn_id = collector.active_model_turn()
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "model_entry_active_turn_lookup_failed",
+                    exc,
+                )
+                model_turn_id = None
+            if not model_turn_id:
+                try:
+                    model_turn_id = collector.start_model_turn()
+                    collector.set_active_model_turn(model_turn_id)
+                    collector.note_pending_model_turn(
+                        model_turn_id,
+                        previous_model_turn_id=None,
+                        context_pruning={
+                            "pruned": False,
+                            "pruned_tool_results": 0,
+                        },
+                    )
+                    _add_trace_diagnostic(
+                        collector,
+                        "generated_missing_active_model_turn",
+                        model_turn_id,
+                    )
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "model_entry_turn_generation_failed",
+                        exc,
+                    )
+                    return
+            try:
+                pending = collector.take_pending_model_turn(model_turn_id)
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "pending_model_turn_lookup_failed",
+                    exc,
+                )
+                pending = {}
+            _record_tool_boundary(
+                collector,
+                transition="B09_ADK_TO_LITELLM",
+                from_module="google_adk",
+                to_module="litellm",
+                adk_invocation_id=pending.get("adk_invocation_id"),
+                model_turn_id=model_turn_id,
+                payload={
+                    "llm_request": _adk_object_payload(llm_request),
+                    "context_pruning": pending.get(
+                        "context_pruning"
+                    )
+                    or {
+                        "pruned": False,
+                        "pruned_tool_results": 0,
+                    },
+                    "previous_model_turn_id": pending.get(
+                        "previous_model_turn_id"
+                    ),
+                    "current_model_turn_id": model_turn_id,
+                    "capture_point": (
+                        "observed_litellm_"
+                        "generate_content_async_entry"
+                    ),
+                },
+            )
+
+        return _observe
 
     def _after_model_boundary_callback(self, request: RuntimeRequest):
         collector = request.boundary_collector
@@ -2234,7 +2502,8 @@ class GoogleADKRuntime:
                 try:
                     model_turn_id = collector.start_model_turn()
                     collector.set_active_model_turn(model_turn_id)
-                    collector.add_diagnostic(
+                    _add_trace_diagnostic(
+                        collector,
                         "generated_missing_active_model_turn",
                         model_turn_id,
                     )
@@ -2284,7 +2553,8 @@ class GoogleADKRuntime:
                         call_id_source = (
                             "generated_missing_provider_id"
                         )
-                        collector.add_diagnostic(
+                        _add_trace_diagnostic(
+                            collector,
                             "generated_missing_provider_call_id",
                             call_id,
                         )
@@ -2375,6 +2645,7 @@ class GoogleADKRuntime:
             tool_context: Any = None,
             **_kwargs: Any,
         ) -> None:
+            dispatch_observed_at = _utc_iso_timestamp()
             if tool is None and positional:
                 tool = positional[0]
             if args is None and len(positional) >= 2:
@@ -2402,12 +2673,15 @@ class GoogleADKRuntime:
             if provider_call_id:
                 call_id = provider_call_id
                 call_id_source = "provider"
+                call_lookup_status = "unmatched"
             else:
                 call_id = f"generated:adk_dispatch:{uuid4().hex}"
                 call_id_source = (
                     "generated_missing_adk_dispatch_id"
                 )
-                collector.add_diagnostic(
+                call_lookup_status = "generated"
+                _add_trace_diagnostic(
+                    collector,
                     "generated_missing_adk_dispatch_call_id",
                     call_id,
                 )
@@ -2432,13 +2706,16 @@ class GoogleADKRuntime:
             call_id_source = (
                 ids.get("call_id_source") or call_id_source
             )
+            if ids.get("tool_batch_id"):
+                call_lookup_status = "matched_batch"
             if not ids.get("model_turn_id"):
                 try:
                     model_turn_id = collector.active_model_turn()
                     if not model_turn_id:
                         model_turn_id = collector.start_model_turn()
                         collector.set_active_model_turn(model_turn_id)
-                        collector.add_diagnostic(
+                        _add_trace_diagnostic(
+                            collector,
                             "generated_missing_active_model_turn",
                             model_turn_id,
                         )
@@ -2458,13 +2735,8 @@ class GoogleADKRuntime:
                         exc,
                     )
             try:
-                parallel_batch = (
-                    len(
-                        collector.batch_call_ids(
-                            ids.get("tool_batch_id")
-                        )
-                    )
-                    > 1
+                batch_call_ids = collector.batch_call_ids(
+                    ids.get("tool_batch_id")
                 )
             except Exception as exc:
                 _add_trace_diagnostic(
@@ -2472,22 +2744,49 @@ class GoogleADKRuntime:
                     "adk_dispatch_batch_lookup_failed",
                     exc,
                 )
-                parallel_batch = False
+                batch_call_ids = []
+            parallel_batch = len(batch_call_ids) > 1
+            adk_invocation_id = _safe_optional_string(
+                _safe_attribute(tool_context, "invocation_id")
+            )
 
             _record_tool_boundary(
                 collector,
                 transition="B03_ADK_TO_FUNCTION_TOOL",
                 from_module="google_adk",
                 to_module="function_tool",
+                started_at=dispatch_observed_at,
+                adk_invocation_id=adk_invocation_id,
                 model_turn_id=ids.get("model_turn_id"),
                 tool_batch_id=ids.get("tool_batch_id"),
                 call_id=call_id,
                 payload={
-                    "tool_name": getattr(tool, "name", None),
+                    "tool_name": _safe_attribute(tool, "name"),
+                    "selected_function_tool": (
+                        _safe_object_identity(tool)
+                    ),
                     "call_id_source": call_id_source,
+                    "call_lookup_status": call_lookup_status,
                     "model_arguments": model_arguments,
                     "call_sequence": ids.get("call_sequence"),
                     "parallel_batch": parallel_batch,
+                    "batch_call_ids": batch_call_ids,
+                    "source_function_call_event_id": (
+                        _source_function_call_event_id(
+                            tool_context,
+                            call_id,
+                        )
+                    ),
+                    "dispatch_observed_at": dispatch_observed_at,
+                    "dispatch_timestamp_source": (
+                        "before_tool_callback_entry_"
+                        "after_adk_task_schedule"
+                    ),
+                    "parallel_scheduling": (
+                        _parallel_scheduling_evidence(
+                            batch_call_ids
+                        )
+                    ),
                 },
             )
             return None
@@ -2540,6 +2839,7 @@ class GoogleADKRuntime:
             tool_response: Any = None,
             **_kwargs: Any,
         ) -> Any | None:
+            response_created_at = _utc_iso_timestamp()
             if tool is None and positional:
                 tool = positional[0]
             if args is None and len(positional) >= 2:
@@ -2564,7 +2864,8 @@ class GoogleADKRuntime:
                 call_id = ""
             if not call_id:
                 call_id = f"generated:after_tool:{uuid4().hex}"
-                collector.add_diagnostic(
+                _add_trace_diagnostic(
+                    collector,
                     "generated_missing_after_tool_call_id",
                     call_id,
                 )
@@ -2594,6 +2895,7 @@ class GoogleADKRuntime:
                     unpruned_response=tool_response,
                     model_facing_response=tool_response,
                     pruned=False,
+                    response_created_at=response_created_at,
                 )
             except Exception as exc:
                 _add_trace_diagnostic(
@@ -2621,6 +2923,7 @@ class GoogleADKRuntime:
                     unpruned_response=tool_response,
                     model_facing_response=model_facing_response,
                     pruned=pruned_response is not None,
+                    response_created_at=response_created_at,
                 )
             except Exception as exc:
                 _add_trace_diagnostic(
@@ -2762,6 +3065,11 @@ class GoogleADKRuntime:
                 request.model,
                 prompt_cache_key=request.provider_prompt_cache_key or _provider_prompt_cache_key(request),
                 model_request_timeout_seconds=model_request_timeout_seconds,
+                model_entry_observer=(
+                    self._model_entry_boundary_observer(request)
+                    if request.boundary_collector is not None
+                    else None
+                ),
             ),
             instruction=self._instruction_for(request),
             tools=tools,

@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -932,12 +933,20 @@ def test_before_model_records_post_pruning_request(tmp_path):
     assert prune is not None
     prune(callback_context=None, llm_request=llm_request)
     capture(callback_context=None, llm_request=llm_request)
+    assert _events(collector, "B09_ADK_TO_LITELLM") == []
 
+    llm_request.config.labels = {"adk_agent_name": "agent"}
+    runtime._model_entry_boundary_observer(request)(llm_request)
     b09 = _events(collector, "B09_ADK_TO_LITELLM")[0]
     assert b09["model_turn_id"] == collector.active_model_turn()
+    assert b09["payload"]["previous_model_turn_id"] is None
+    assert b09["payload"]["current_model_turn_id"] == b09["model_turn_id"]
     assert b09["payload"]["context_pruning"] == {
         "pruned": True,
         "pruned_tool_results": 1,
+    }
+    assert b09["payload"]["llm_request"]["config"]["labels"] == {
+        "adk_agent_name": "agent"
     }
     assert (
         "Older tool result omitted by Lumibot before this model call because "
@@ -945,6 +954,117 @@ def test_before_model_records_post_pruning_request(tmp_path):
         "recent visible tool results or call a targeted tool again if this older "
         "detail is still required."
     ) in str(b09["payload"]["llm_request"])
+
+
+def test_observed_litellm_captures_final_live_adk_request_labels(tmp_path):
+    from google.adk.agents.llm_agent import LlmAgent
+    from google.adk.agents.run_config import RunConfig
+    from google.adk.models.lite_llm import LiteLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.adk.runners import InMemoryRunner
+
+    actual_model_entry_labels = []
+
+    class ProbeLiteLlm(LiteLlm):
+        async def generate_content_async(
+            self,
+            llm_request,
+            stream=False,
+        ):
+            actual_model_entry_labels.append(
+                dict(llm_request.config.labels)
+            )
+            yield LlmResponse(
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part(text="probe complete")],
+                ),
+                partial=False,
+                turn_complete=True,
+            )
+
+    async def run_probe():
+        collector = BoundaryTraceCollector(
+            agent_run_id="run-1",
+            artifact_root=tmp_path,
+        )
+        request = make_runtime_request(collector)
+        runtime = GoogleADKRuntime()
+        observed_type = agent_runtime._build_observed_litellm_type(
+            ProbeLiteLlm,
+            on_model_entry=runtime._model_entry_boundary_observer(
+                request
+            ),
+        )
+        agent = LlmAgent(
+            name="agent",
+            model=observed_type(model="openai/test"),
+            instruction="Respond briefly.",
+            before_model_callback=runtime._before_model_boundary_callback(
+                request
+            ),
+        )
+        runner = InMemoryRunner(agent=agent, app_name="boundary-probe")
+        await runner.session_service.create_session(
+            app_name=runner.app_name,
+            user_id="probe-user",
+            session_id="probe-session",
+        )
+        events = [
+            event
+            async for event in runner.run_async(
+                user_id="probe-user",
+                session_id="probe-session",
+                new_message=types.Content(
+                    role="user",
+                    parts=[types.Part(text="probe")],
+                ),
+                run_config=RunConfig(),
+            )
+        ]
+        return collector, events
+
+    collector, events = asyncio.run(run_probe())
+
+    assert events
+    assert actual_model_entry_labels == [{"adk_agent_name": "agent"}]
+    b09 = _events(collector, "B09_ADK_TO_LITELLM")[0]
+    traced_labels = b09["payload"]["llm_request"]["config"]["labels"]
+    assert traced_labels == actual_model_entry_labels[0]
+    assert b09["payload"]["capture_point"] == (
+        "observed_litellm_generate_content_async_entry"
+    )
+
+
+def test_model_entry_records_previous_and_current_turn_ids(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    request = make_runtime_request(collector)
+    runtime = GoogleADKRuntime()
+    before = runtime._before_model_boundary_callback(request)
+    observe = runtime._model_entry_boundary_observer(request)
+
+    for index in range(2):
+        llm_request = SimpleNamespace(
+            contents=[],
+            config=types.GenerateContentConfig(
+                labels={"adk_agent_name": "agent"}
+            ),
+            model=f"model-{index}",
+        )
+        before(llm_request=llm_request)
+        observe(llm_request)
+
+    first, second = _events(collector, "B09_ADK_TO_LITELLM")
+    assert first["payload"]["previous_model_turn_id"] is None
+    assert second["payload"]["previous_model_turn_id"] == (
+        first["model_turn_id"]
+    )
+    assert second["payload"]["current_model_turn_id"] == (
+        second["model_turn_id"]
+    )
 
 
 def test_after_model_assigns_one_batch_and_preserves_exposed_thoughts(tmp_path):
@@ -1064,27 +1184,70 @@ def test_before_tool_records_authoritative_parallel_dispatch(tmp_path):
     runtime = GoogleADKRuntime()
     request = make_runtime_request(collector)
     args = {"symbol": "QQQ", "nested": {"limit": 3}}
+    function_call_part = types.Part.from_function_call(
+        name="market_last_price",
+        args={"symbol": "QQQ"},
+    )
+    function_call_part.function_call.id = "call_A"
+    source_event = SimpleNamespace(
+        id="function-call-event-1",
+        content=types.Content(
+            role="model",
+            parts=[function_call_part],
+        ),
+    )
+
+    def market_last_price(symbol):
+        return {"symbol": symbol}
+
+    selected_tool = FunctionTool(market_last_price)
+    tool_context = SimpleNamespace(
+        function_call_id="call_A",
+        invocation_id="invocation-1",
+        session=SimpleNamespace(events=[source_event]),
+    )
 
     runtime._before_tool_boundary_callback(request)(
-        tool=SimpleNamespace(name="market_last_price"),
+        tool=selected_tool,
         args=args,
-        tool_context=SimpleNamespace(function_call_id="call_A"),
+        tool_context=tool_context,
     )
     args["nested"]["limit"] = 99
 
     b03 = _events(collector, "B03_ADK_TO_FUNCTION_TOOL")[0]
+    assert b03["adk_invocation_id"] == "invocation-1"
     assert b03["model_turn_id"] == turn_id
     assert b03["tool_batch_id"] == batch_id
     assert b03["call_id"] == "call_A"
-    assert b03["payload"] == {
-        "tool_name": "market_last_price",
-        "call_id_source": "provider",
-        "model_arguments": {
-            "symbol": "QQQ",
-            "nested": {"limit": 3},
-        },
-        "call_sequence": 1,
-        "parallel_batch": True,
+    assert b03["payload"]["source_function_call_event_id"] == (
+        "function-call-event-1"
+    )
+    assert b03["payload"]["dispatch_observed_at"]
+    assert b03["payload"]["dispatch_timestamp_source"] == (
+        "before_tool_callback_entry_after_adk_task_schedule"
+    )
+    assert b03["payload"]["call_lookup_status"] == "matched_batch"
+    assert b03["payload"]["selected_function_tool"] == {
+        "name": "market_last_price",
+        "python_type": "FunctionTool",
+        "qualified_type": (
+            "google.adk.tools.function_tool.FunctionTool"
+        ),
+    }
+    assert b03["payload"]["model_arguments"] == {
+        "symbol": "QQQ",
+        "nested": {"limit": 3},
+    }
+    assert b03["payload"]["call_sequence"] == 1
+    assert b03["payload"]["batch_call_ids"] == ["call_A", "call_B"]
+    assert b03["payload"]["parallel_scheduling"] == {
+        "status": "confirmed_by_installed_adk_dispatch",
+        "google_adk_version": "2.1.0",
+        "mechanism": "asyncio.create_task_per_filtered_function_call",
+        "batch_candidate_count": 2,
+        "batch_membership_evidence": "candidate_only",
+        "sibling_task_creation_observed": False,
+        "completion_order_claim": "not_observed_at_dispatch",
     }
 
 
@@ -1111,10 +1274,37 @@ def test_missing_dispatch_id_is_mutated_for_downstream_consistency(tmp_path):
     assert b03["payload"]["call_id_source"] == (
         "generated_missing_adk_dispatch_id"
     )
+    assert b03["payload"]["call_lookup_status"] == "generated"
     assert collector.call_ids(b03["call_id"])["model_turn_id"] == turn_id
     assert any(
         item["kind"] == "generated_missing_adk_dispatch_call_id"
         for item in collector.export()["diagnostics"]
+    )
+
+
+def test_before_tool_marks_unmatched_provider_call_id(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    runtime = GoogleADKRuntime()
+    request = make_runtime_request(collector)
+
+    runtime._before_tool_boundary_callback(request)(
+        tool=SimpleNamespace(name="echo"),
+        args={"value": "ready"},
+        tool_context=SimpleNamespace(
+            function_call_id="provider-call-without-b02",
+            invocation_id="invocation-1",
+        ),
+    )
+
+    b03 = _events(collector, "B03_ADK_TO_FUNCTION_TOOL")[0]
+    assert b03["payload"]["call_lookup_status"] == "unmatched"
+    assert b03["payload"]["parallel_scheduling"]["status"] == (
+        "single_call_no_parallel_schedule"
     )
 
 
@@ -1281,12 +1471,176 @@ def test_normalize_event_records_scalar_mapping_and_merged_responses(tmp_path):
         "result": "ready"
     }
     assert b08_events[0]["payload"]["function_tool_response"] == "ready"
+    assert b08_events[0]["payload"]["completion_sequence"] == 1
+    assert b08_events[0]["payload"]["batch_completion_sequence"] == 1
+    assert b08_events[0]["payload"]["response_created_at"]
+    assert b08_events[0]["payload"]["scalar_wrapping"] == {
+        "detected": True,
+        "source": "function_tool_scalar_to_adk_response_mapping",
+        "function_tool_result_type": "str",
+        "adk_function_response_type": "dict",
+        "adk_result_value_type": "str",
+        "wrapped_key": "result",
+    }
     assert b08_events[0]["payload"]["authoritative_next_model_data"] is True
     assert b08_events[0]["payload"]["merged_event"] == {
         "function_response_count": 2,
         "function_response_index": 1,
         "call_ids": ["call_A", "call_B"],
     }
+
+
+def test_b08_preserves_parallel_completion_order_separate_from_model_order(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.register_tool_batch(turn_id, ["call_A", "call_B"])
+    runtime = GoogleADKRuntime()
+    request = make_runtime_request(collector)
+    after_tool = runtime._after_tool_boundary_and_pruning_callback(
+        request
+    )
+
+    after_tool(
+        tool=SimpleNamespace(name="tool_b"),
+        args={},
+        tool_context=SimpleNamespace(function_call_id="call_B"),
+        tool_response={"value": "B"},
+    )
+    after_tool(
+        tool=SimpleNamespace(name="tool_a"),
+        args={},
+        tool_context=SimpleNamespace(function_call_id="call_A"),
+        tool_response={"value": "A"},
+    )
+    event = SimpleNamespace(
+        id="merged-event",
+        invocation_id="invocation-1",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part.from_function_response(
+                    name="tool_a",
+                    response={"value": "A"},
+                ),
+                types.Part.from_function_response(
+                    name="tool_b",
+                    response={"value": "B"},
+                ),
+            ],
+        ),
+        usage_metadata=None,
+    )
+    event.content.parts[0].function_response.id = "call_A"
+    event.content.parts[1].function_response.id = "call_B"
+
+    _normalize_event(event, collector=collector)
+
+    b08_by_call = {
+        item["call_id"]: item
+        for item in _events(collector, "B08_FUNCTION_TOOL_TO_ADK")
+    }
+    assert b08_by_call["call_B"]["payload"]["completion_sequence"] == 1
+    assert b08_by_call["call_B"]["payload"][
+        "batch_completion_sequence"
+    ] == 1
+    assert b08_by_call["call_A"]["payload"]["completion_sequence"] == 2
+    assert b08_by_call["call_A"]["payload"][
+        "batch_completion_sequence"
+    ] == 2
+    assert b08_by_call["call_A"]["payload"]["merged_event"][
+        "function_response_index"
+    ] == 1
+    assert b08_by_call["call_B"]["payload"]["merged_event"][
+        "function_response_index"
+    ] == 2
+
+
+def test_completion_sequence_is_allocated_before_response_snapshot(
+    monkeypatch,
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.register_tool_batch(turn_id, ["call_slow", "call_fast"])
+    snapshot_started = Event()
+    release_snapshot = Event()
+    original_safe_value = collector._safe_observation_value
+
+    def delayed_safe_value(value, **kwargs):
+        if value == {"value": "slow"}:
+            snapshot_started.set()
+            assert release_snapshot.wait(timeout=5)
+        return original_safe_value(value, **kwargs)
+
+    monkeypatch.setattr(
+        collector,
+        "_safe_observation_value",
+        delayed_safe_value,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(
+            collector.note_function_tool_response,
+            "call_slow",
+            unpruned_response={"value": "slow"},
+            model_facing_response={"value": "slow"},
+            pruned=False,
+        )
+        assert snapshot_started.wait(timeout=5)
+        collector.note_function_tool_response(
+            "call_fast",
+            unpruned_response={"value": "fast"},
+            model_facing_response={"value": "fast"},
+            pruned=False,
+        )
+        release_snapshot.set()
+        slow.result(timeout=5)
+
+    assert collector.call_state("call_slow")[
+        "completion_sequence"
+    ] == 1
+    assert collector.call_state("call_fast")[
+        "completion_sequence"
+    ] == 2
+
+
+def test_reused_provider_call_id_gets_new_turn_completion_state(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    first_turn = collector.start_model_turn()
+    collector.register_tool_batch(first_turn, ["call_A"])
+    collector.note_function_tool_response(
+        "call_A",
+        unpruned_response={"turn": 1},
+        model_facing_response={"turn": 1},
+        pruned=False,
+    )
+    first_state = collector.call_state("call_A")
+
+    second_turn = collector.start_model_turn()
+    collector.register_tool_batch(second_turn, ["call_A"])
+    collector.note_function_tool_response(
+        "call_A",
+        unpruned_response={"turn": 2},
+        model_facing_response={"turn": 2},
+        pruned=False,
+    )
+    second_state = collector.call_state("call_A")
+
+    assert first_state["completion_sequence"] == 1
+    assert second_state["completion_sequence"] == 2
+    assert second_state["batch_completion_sequence"] == 1
+    assert second_state["function_tool_response"] == {"turn": 2}
 
 
 def test_generated_call_id_is_consistent_across_b02_b03_b04_and_b08(
@@ -1505,6 +1859,143 @@ def test_collector_turn_batch_and_response_state_are_concurrency_safe(
         )
 
 
+def test_collector_public_reads_are_deep_detached(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    collector.register_tool_batch(turn_id, ["call_A"])
+    collector.note_function_tool_response(
+        "call_A",
+        unpruned_response={"nested": {"value": "original"}},
+        model_facing_response={"nested": {"value": "original"}},
+        pruned=False,
+    )
+    collector.note_pending_model_turn(
+        turn_id,
+        previous_model_turn_id=None,
+        context_pruning={"nested": {"count": 1}},
+    )
+
+    call_ids = collector.call_ids("call_A")
+    call_state = collector.call_state("call_A")
+    pending = collector.pending_model_turn(turn_id)
+    batch = collector.batch_call_ids(call_ids["tool_batch_id"])
+    call_ids["function_tool_response"]["nested"]["value"] = "changed"
+    call_state["model_facing_response"]["nested"]["value"] = "changed"
+    pending["context_pruning"]["nested"]["count"] = 99
+    batch.append("call_B")
+
+    assert collector.call_ids("call_A")[
+        "function_tool_response"
+    ]["nested"]["value"] == "original"
+    assert collector.call_state("call_A")[
+        "model_facing_response"
+    ]["nested"]["value"] == "original"
+    assert collector.pending_model_turn(turn_id)[
+        "context_pruning"
+    ]["nested"]["count"] == 1
+    assert collector.batch_call_ids(call_ids["tool_batch_id"]) == [
+        "call_A"
+    ]
+    assert collector.active_model_turn() == turn_id
+
+
+def test_diagnostic_sink_failure_is_fail_open_for_all_boundary_callbacks(
+    monkeypatch,
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+    )
+    runtime = GoogleADKRuntime()
+    request = make_runtime_request(
+        collector,
+        model="openai/gpt-5.4-mini",
+    )
+    monkeypatch.setattr(
+        collector,
+        "add_diagnostic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("diagnostic sink failed")
+        ),
+    )
+
+    monkeypatch.setattr(
+        collector,
+        "start_model_turn",
+        lambda: (_ for _ in ()).throw(RuntimeError("turn failed")),
+    )
+    assert (
+        runtime._before_model_boundary_callback(request)(
+            llm_request=SimpleNamespace(contents=[])
+        )
+        is None
+    )
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        collector,
+        "add_diagnostic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("diagnostic sink failed")
+        ),
+    )
+
+    response = SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part.from_function_call(
+                    name="echo",
+                    args={"value": "ready"},
+                )
+            ],
+        )
+    )
+    assert (
+        runtime._after_model_boundary_callback(request)(
+            llm_response=response
+        )
+        is None
+    )
+    tool_context = SimpleNamespace(function_call_id=None)
+    assert (
+        runtime._before_tool_boundary_callback(request)(
+            tool=SimpleNamespace(name="echo"),
+            args={"value": "ready"},
+            tool_context=tool_context,
+        )
+        is None
+    )
+    pruned = runtime._after_tool_boundary_and_pruning_callback(request)(
+        tool=SimpleNamespace(name="large_tool"),
+        args={},
+        tool_context=SimpleNamespace(function_call_id=None),
+        tool_response={"value": "x" * 5_000},
+    )
+    assert pruned["lumibot_tool_result_pruned"] is True
+
+    event = SimpleNamespace(
+        id="event-1",
+        invocation_id="invocation-1",
+        content=types.Content(
+            role="user",
+            parts=[
+                types.Part.from_function_response(
+                    name="echo",
+                    response={"result": "ready"},
+                )
+            ],
+        ),
+        usage_metadata=None,
+    )
+    normalized = _normalize_event(event, collector=collector)
+    assert any(item.kind == "tool_result" for item in normalized)
+
+
 def test_run_async_builds_every_bound_tool_with_request_collector(
     monkeypatch, tmp_path
 ):
@@ -1571,7 +2062,18 @@ def test_run_async_builds_every_bound_tool_with_request_collector(
     ]
     request = make_runtime_request(collector, tools=tools, model="gemini-test")
     runtime = GoogleADKRuntime()
+    model_entry_observers = []
     monkeypatch.setattr(agent_runtime, "_build_observed_function_tool", build)
+    monkeypatch.setattr(
+        agent_runtime,
+        "_resolve_model_for_adk",
+        lambda model, **kwargs: (
+            model_entry_observers.append(
+                kwargs.get("model_entry_observer")
+            )
+            or model
+        ),
+    )
     monkeypatch.setattr(
         runtime,
         "_ensure_adk",
@@ -1633,6 +2135,9 @@ def test_run_async_builds_every_bound_tool_with_request_collector(
     )
     for callback in before_model_callbacks:
         callback(llm_request=llm_request)
+    assert _events(collector, "B09_ADK_TO_LITELLM") == []
+    assert len(model_entry_observers) == 1
+    model_entry_observers[0](llm_request)
     assert _events(collector, "B09_ADK_TO_LITELLM")[0]["payload"][
         "context_pruning"
     ]["pruned"] is True
