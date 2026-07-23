@@ -674,6 +674,41 @@ def _build_observed_function_tool(
         return function_tool_type(wrapped)
 
     class ObservedFunctionTool(function_tool_type):
+        async def _invoke_callable(
+            self,
+            target: Callable[..., Any],
+            args_to_call: dict[str, Any],
+        ) -> Any:
+            is_async = inspect.iscoroutinefunction(target) or (
+                hasattr(target, "__call__")
+                and inspect.iscoroutinefunction(target.__call__)
+            )
+            if is_async:
+                return await super()._invoke_callable(
+                    target,
+                    args_to_call,
+                )
+            try:
+                context = collector.current_tool_call() or {}
+                batch_call_ids = collector.batch_call_ids(
+                    context.get("tool_batch_id")
+                )
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "parallel_tool_batch_lookup_failed",
+                    exc,
+                )
+                batch_call_ids = []
+            if len(batch_call_ids) <= 1:
+                return await super()._invoke_callable(
+                    target,
+                    args_to_call,
+                )
+            # ADK schedules a task per call, but its synchronous invocation
+            # blocks the event loop unless parallel batch work is offloaded.
+            return await asyncio.to_thread(target, **args_to_call)
+
         def _preprocess_args(
             self,
             args: dict[str, Any],

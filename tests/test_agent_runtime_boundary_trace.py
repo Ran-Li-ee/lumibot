@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import gzip
 import inspect
 import json
@@ -13,6 +14,12 @@ import pytest
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types
+from litellm.types.utils import (
+    ChatCompletionMessageToolCall,
+    Function,
+    Message,
+    ModelResponse,
+)
 from pydantic import BaseModel, ConfigDict
 
 from lumibot.components.agents import runtime as agent_runtime
@@ -53,6 +60,248 @@ def make_runtime_request(collector, *, tools=None, model="openai/test"):
         agent_run_id=collector.agent_run_id,
         boundary_collector=collector,
     )
+
+
+def _model_response(*, response_id, tool_calls=None, text=None):
+    calls = (
+        [
+            ChatCompletionMessageToolCall(
+                id=call_id,
+                type="function",
+                function=Function(
+                    name="market_last_price",
+                    arguments=json.dumps({"symbol": symbol}),
+                ),
+            )
+            for call_id, symbol in tool_calls
+        ]
+        if tool_calls is not None
+        else None
+    )
+    return ModelResponse(
+        id=response_id,
+        model="openai/test",
+        choices=[
+            {
+                "index": 0,
+                "message": Message(
+                    role="assistant",
+                    content=text,
+                    tool_calls=calls,
+                ),
+                "finish_reason": (
+                    "tool_calls" if tool_calls is not None else "stop"
+                ),
+            }
+        ],
+        usage={
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+        },
+    )
+
+
+def delayed_price_tool(symbol: str):
+    time.sleep(0.03 if symbol == "QQQ" else 0.005)
+    return {
+        "symbol": symbol,
+        "price": {
+            "QQQ": 100.0,
+            "SPY": 90.0,
+            "IWM": 80.0,
+        }[symbol],
+    }
+
+
+def install_scripted_acompletion(monkeypatch):
+    from google.adk.models.lite_llm import LiteLLMClient
+
+    responses = iter(
+        [
+            _model_response(
+                response_id="response-turn-1",
+                tool_calls=[
+                    ("call_A", "QQQ"),
+                    ("call_B", "SPY"),
+                ],
+            ),
+            _model_response(
+                response_id="response-turn-2",
+                tool_calls=[("call_C", "IWM")],
+            ),
+            _model_response(
+                response_id="response-turn-3",
+                text="RESULT: complete",
+            ),
+        ]
+    )
+    provider_requests = []
+
+    async def scripted_acompletion(
+        _client,
+        model,
+        messages,
+        tools,
+        **kwargs,
+    ):
+        callback_counts = {}
+        safe_kwargs = {}
+        for key, value in kwargs.items():
+            if "callback" in key:
+                callback_counts[key] = len(
+                    value
+                    if type(value) in (list, tuple)
+                    else [value]
+                )
+            else:
+                safe_kwargs[key] = copy.deepcopy(value)
+        provider_requests.append(
+            {
+                "model": model,
+                "messages": copy.deepcopy(messages),
+                "tools": copy.deepcopy(tools),
+                "kwargs": safe_kwargs,
+                "callback_counts": callback_counts,
+            }
+        )
+        return next(responses)
+
+    monkeypatch.setattr(
+        LiteLLMClient,
+        "acompletion",
+        scripted_acompletion,
+    )
+    return provider_requests
+
+
+def _trace_events(trace, transition):
+    return [
+        event
+        for event in trace["events"]
+        if event["transition"] == transition
+    ]
+
+
+def model_turn_ids(trace):
+    return list(
+        dict.fromkeys(
+            event["model_turn_id"]
+            for event in trace["events"]
+            if event.get("model_turn_id")
+        )
+    )
+
+
+def _batch_id(trace, batch):
+    batch_ids = list(
+        dict.fromkeys(
+            event["tool_batch_id"]
+            for event in _trace_events(
+                trace,
+                "B03_ADK_TO_FUNCTION_TOOL",
+            )
+        )
+    )
+    return batch_ids[batch - 1]
+
+
+def calls_in_model_order(trace, *, batch):
+    batch_id = _batch_id(trace, batch)
+    calls = [
+        event
+        for event in _trace_events(
+            trace,
+            "B03_ADK_TO_FUNCTION_TOOL",
+        )
+        if event["tool_batch_id"] == batch_id
+    ]
+    return [
+        event["call_id"]
+        for event in sorted(
+            calls,
+            key=lambda event: event["payload"]["call_sequence"],
+        )
+    ]
+
+
+def calls_in_completion_order(trace, *, batch):
+    batch_id = _batch_id(trace, batch)
+    calls = [
+        event
+        for event in _trace_events(
+            trace,
+            "B08_FUNCTION_TOOL_TO_ADK",
+        )
+        if event["tool_batch_id"] == batch_id
+    ]
+    return [
+        event["call_id"]
+        for event in sorted(
+            calls,
+            key=lambda event: event["payload"][
+                "completion_sequence"
+            ],
+        )
+    ]
+
+
+def response_for(trace, call_id):
+    event = next(
+        event
+        for event in _trace_events(
+            trace,
+            "B08_FUNCTION_TOOL_TO_ADK",
+        )
+        if event["call_id"] == call_id
+    )
+    return event["payload"]["function_response"]
+
+
+def next_provider_request(trace, *, after_call):
+    response_event = next(
+        event
+        for event in _trace_events(
+            trace,
+            "B08_FUNCTION_TOOL_TO_ADK",
+        )
+        if event["call_id"] == after_call
+    )
+    return next(
+        event
+        for event in _trace_events(
+            trace,
+            "B10_LITELLM_TO_PROVIDER",
+        )
+        if event["sequence"] > response_event["sequence"]
+        and after_call
+        in json.dumps(event["payload"], sort_keys=True)
+    )
+
+
+def _litellm_global_callback_state():
+    import litellm
+    from litellm.litellm_core_utils import litellm_logging
+
+    return {
+        "callbacks": tuple(litellm.callbacks),
+        "input_callback": tuple(litellm.input_callback),
+        "success_callback": tuple(litellm.success_callback),
+        "failure_callback": tuple(litellm.failure_callback),
+        "async_input_callback": tuple(
+            litellm._async_input_callback
+        ),
+        "async_success_callback": tuple(
+            litellm._async_success_callback
+        ),
+        "async_failure_callback": tuple(
+            litellm._async_failure_callback
+        ),
+        "callback_registry": tuple(
+            litellm.logging_callback_manager._get_all_callbacks()
+        ),
+        "custom_logger": litellm_logging.customLogger,
+    }
 
 
 class SymbolInput(BaseModel):
@@ -3681,3 +3930,306 @@ def test_wrapper_remains_usable_without_collector():
             {},
             None,
         )
+
+
+def test_full_boundary_loop_preserves_turns_batches_and_reversed_parallel_completion(
+    monkeypatch,
+    tmp_path,
+):
+    expected_transitions = {
+        "B01_PROVIDER_TO_LITELLM",
+        "B02_LITELLM_TO_ADK",
+        "B03_ADK_TO_FUNCTION_TOOL",
+        "B04_FUNCTION_TOOL_TO_WRAPPER",
+        "B05_WRAPPER_TO_PYTHON_TOOL",
+        "B06_PYTHON_TOOL_TO_WRAPPER",
+        "B07_WRAPPER_TO_FUNCTION_TOOL",
+        "B08_FUNCTION_TOOL_TO_ADK",
+        "B09_ADK_TO_LITELLM",
+        "B10_LITELLM_TO_PROVIDER",
+    }
+    global_callbacks_before = _litellm_global_callback_state()
+    created_loggers = []
+    logger_type = agent_runtime.LiteLLMBoundaryLogger
+
+    def tracked_logger(*args, **kwargs):
+        logger = logger_type(*args, **kwargs)
+        created_loggers.append(logger)
+        return logger
+
+    monkeypatch.setattr(
+        agent_runtime,
+        "LiteLLMBoundaryLogger",
+        tracked_logger,
+    )
+    provider_requests = install_scripted_acompletion(monkeypatch)
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-1",
+        artifact_root=tmp_path,
+        inline_payload_limit=500_000,
+    )
+    runtime = GoogleADKRuntime()
+    request = make_runtime_request(
+        collector,
+        tools=[
+            BoundTool(
+                name="market_last_price",
+                description="price",
+                function=delayed_price_tool,
+            )
+        ],
+    )
+
+    result = runtime.run(request)
+    trace = result.boundary_trace
+
+    assert result.summary == "RESULT: complete"
+    assert trace is not None
+    assert {
+        event["transition"] for event in trace["events"]
+    } >= expected_transitions
+    assert model_turn_ids(trace) == [
+        "run-1:turn:0001",
+        "run-1:turn:0002",
+        "run-1:turn:0003",
+    ]
+    for transition in (
+        "B01_PROVIDER_TO_LITELLM",
+        "B02_LITELLM_TO_ADK",
+        "B09_ADK_TO_LITELLM",
+        "B10_LITELLM_TO_PROVIDER",
+    ):
+        assert len(_trace_events(trace, transition)) == 3
+    assert len(provider_requests) == 3
+
+    assert calls_in_model_order(trace, batch=1) == [
+        "call_A",
+        "call_B",
+    ]
+    # B08 may retain ADK's list order. The authoritative forensic order is
+    # the completion sequence allocated when each local call finishes.
+    assert calls_in_completion_order(trace, batch=1) == [
+        "call_B",
+        "call_A",
+    ]
+    assert calls_in_model_order(trace, batch=2) == ["call_C"]
+    b02_events = _trace_events(trace, "B02_LITELLM_TO_ADK")
+    assert [
+        call["provider_call_id"]
+        for call in b02_events[0]["payload"]["tool_calls"]
+    ] == ["call_A", "call_B"]
+    assert [
+        call["provider_call_id"]
+        for call in b02_events[1]["payload"]["tool_calls"]
+    ] == ["call_C"]
+
+    expected_symbols = {
+        "call_A": "QQQ",
+        "call_B": "SPY",
+        "call_C": "IWM",
+    }
+    call_instances = {}
+    for call_id, symbol in expected_symbols.items():
+        call_events = [
+            event
+            for event in trace["events"]
+            if event.get("call_id") == call_id
+            and event["transition"]
+            in {
+                "B03_ADK_TO_FUNCTION_TOOL",
+                "B04_FUNCTION_TOOL_TO_WRAPPER",
+                "B05_WRAPPER_TO_PYTHON_TOOL",
+                "B06_PYTHON_TOOL_TO_WRAPPER",
+                "B07_WRAPPER_TO_FUNCTION_TOOL",
+                "B08_FUNCTION_TOOL_TO_ADK",
+            }
+        ]
+        assert [
+            event["transition"] for event in call_events
+        ] == [
+            "B03_ADK_TO_FUNCTION_TOOL",
+            "B04_FUNCTION_TOOL_TO_WRAPPER",
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+            "B08_FUNCTION_TOOL_TO_ADK",
+        ]
+        instance_ids = {
+            event["call_instance_id"] for event in call_events
+        }
+        assert None not in instance_ids
+        assert len(instance_ids) == 1
+        call_instances[call_id] = instance_ids.pop()
+
+        b03, b04, b05, _b06, b07, b08 = call_events
+        assert b03["payload"]["provider_call_id"] == call_id
+        assert b03["payload"]["tool_name"] == "market_last_price"
+        assert b04["payload"]["model_arguments"] == {
+            "symbol": symbol
+        }
+        assert b04["payload"]["wrapper_received_arguments"] == {
+            "symbol": symbol
+        }
+        assert b04["payload"][
+            "effective_python_arguments_with_defaults"
+        ] == {"symbol": symbol}
+        assert b05["payload"]["effective_arguments"] == {
+            "symbol": symbol
+        }
+        assert b07["payload"]["serialized_result"]["symbol"] == symbol
+        assert b08["payload"]["function_response"]["symbol"] == symbol
+        assert response_for(trace, call_id)["symbol"] == symbol
+    assert len(set(call_instances.values())) == 3
+
+    first_batch_b08 = [
+        event
+        for event in _trace_events(
+            trace,
+            "B08_FUNCTION_TOOL_TO_ADK",
+        )
+        if event["call_id"] in {"call_A", "call_B"}
+    ]
+    second_request_event = next_provider_request(
+        trace,
+        after_call="call_A",
+    )
+    assert second_request_event["sequence"] > max(
+        event["sequence"] for event in first_batch_b08
+    )
+    second_request = second_request_event["payload"]["request"]
+    second_request_json = json.dumps(second_request, sort_keys=True)
+    second_tool_responses = {
+        message["tool_call_id"]: json.loads(message["content"])
+        for message in second_request["messages"]
+        if message.get("role") == "tool"
+    }
+    for call_id, symbol in (
+        ("call_A", "QQQ"),
+        ("call_B", "SPY"),
+    ):
+        assert call_id in second_request_json
+        assert symbol in second_request_json
+        assert second_tool_responses[call_id] == response_for(
+            trace,
+            call_id,
+        )
+
+    call_c_b08 = next(
+        event
+        for event in _trace_events(
+            trace,
+            "B08_FUNCTION_TOOL_TO_ADK",
+        )
+        if event["call_id"] == "call_C"
+    )
+    final_request_event = next_provider_request(
+        trace,
+        after_call="call_C",
+    )
+    assert final_request_event["sequence"] > call_c_b08["sequence"]
+    final_request_json = json.dumps(
+        final_request_event["payload"]["request"],
+        sort_keys=True,
+    )
+    assert "call_C" in final_request_json
+    assert "IWM" in final_request_json
+    final_tool_responses = {
+        message["tool_call_id"]: json.loads(message["content"])
+        for message in final_request_event["payload"]["request"][
+            "messages"
+        ]
+        if message.get("role") == "tool"
+    }
+    assert final_tool_responses["call_C"] == response_for(
+        trace,
+        "call_C",
+    )
+
+    b09_events = _trace_events(trace, "B09_ADK_TO_LITELLM")
+    b10_events = _trace_events(trace, "B10_LITELLM_TO_PROVIDER")
+    for provider_request, b09, b10 in zip(
+        provider_requests,
+        b09_events,
+        b10_events,
+    ):
+        assert b09["model_turn_id"] == b10["model_turn_id"]
+        assert b09["payload"]["capture_point"] == (
+            "observed_litellm_generate_content_async_entry"
+        )
+        assert "contents" in b09["payload"]["llm_request"]
+        assert b10["payload"]["capture_type"] == (
+            "provider_adapter_request"
+        )
+        assert b10["payload"]["boundary_distinction"] == (
+            "litellm_provider_adapter_request_not_adk_model_entry"
+        )
+        assert "messages" in b10["payload"]["request"]
+        assert b10["payload"]["request"]["messages"] == (
+            provider_request["messages"]
+        )
+        assert (
+            b09["payload"]["llm_request"]
+            != b10["payload"]["request"]
+        )
+
+    provider_responses = [
+        event["payload"]["response"]
+        for event in _trace_events(
+            trace,
+            "B01_PROVIDER_TO_LITELLM",
+        )
+    ]
+    assert [
+        response["id"] for response in provider_responses
+    ] == [
+        "response-turn-1",
+        "response-turn-2",
+        "response-turn-3",
+    ]
+    assert [
+        response["choices"][0]["finish_reason"]
+        for response in provider_responses
+    ] == ["tool_calls", "tool_calls", "stop"]
+    assert [
+        response["usage"] for response in provider_responses
+    ] == [
+        {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+        }
+    ] * 3
+
+    forbidden_provider_keys = {
+        "api_base",
+        "api_key",
+        "authorization",
+        "base_url",
+        "token",
+    }
+    for provider_request in provider_requests:
+        assert provider_request["callback_counts"][
+            "success_callback"
+        ] == 1
+        assert provider_request["callback_counts"][
+            "failure_callback"
+        ] == 1
+        assert not (
+            forbidden_provider_keys
+            & {
+                key.lower()
+                for key in provider_request["kwargs"]
+            }
+        )
+    assert _litellm_global_callback_state() == (
+        global_callbacks_before
+    )
+    assert len(created_loggers) == 1
+    assert created_loggers[0].pending_attempt_count() == 0
+    assert collector.pending_model_turn_count() == 0
+    assert trace == collector.export()
+
+    events_at_return = copy.deepcopy(trace["events"])
+    time.sleep(0.05)
+    assert collector.export()["events"] == events_at_return
+    assert result.boundary_trace["events"] == events_at_return
