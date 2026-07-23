@@ -157,6 +157,24 @@ def _safe_callable_annotations(original: Any) -> dict[str, Any] | None:
     return dict(annotations) if isinstance(annotations, dict) else None
 
 
+def _fallback_callable_signature(original: Any) -> inspect.Signature | None:
+    try:
+        raw_call = inspect.getattr_static(type(original), "__call__")
+        if isinstance(raw_call, (staticmethod, classmethod)):
+            call = object.__getattribute__(raw_call, "__func__")
+            remove_receiver = isinstance(raw_call, classmethod)
+        else:
+            call = raw_call
+            remove_receiver = True
+        signature = inspect.signature(call)
+        parameters = list(signature.parameters.values())
+        if remove_receiver and parameters:
+            signature = signature.replace(parameters=parameters[1:])
+        return signature
+    except Exception:
+        return None
+
+
 def _add_trace_diagnostic(
     collector: BoundaryTraceCollector | None,
     kind: str,
@@ -193,7 +211,7 @@ def _wrap_tool_callable(
     try:
         callable_signature = inspect.signature(original)
     except Exception:
-        callable_signature = None
+        callable_signature = _fallback_callable_signature(original)
 
     def wrapper(*args, **kwargs):
         result: Any

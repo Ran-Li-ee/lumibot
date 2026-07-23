@@ -324,8 +324,8 @@ def test_wrapper_falls_back_when_explicit_signature_hook_raises(tmp_path):
                 raise RuntimeError("signature unavailable")
             return object.__getattribute__(self, name)
 
-        def __call__(self, symbol="QQQ"):
-            return {"symbol": symbol}
+        def __call__(self, symbol="QQQ", *, venue="lit"):
+            return {"symbol": symbol, "venue": venue}
 
     original = ThrowingSignatureTool()
     collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
@@ -334,10 +334,17 @@ def test_wrapper_falls_back_when_explicit_signature_hook_raises(tmp_path):
         collector=collector,
     )
 
-    assert wrapped(symbol="SPY") == {"symbol": "SPY"}
+    assert wrapped() == {"symbol": "QQQ", "venue": "lit"}
     assert original.signature_reads == 1
+    signature = inspect.signature(wrapped)
+    assert list(signature.parameters) == ["symbol", "venue"]
+    assert signature.parameters["symbol"].default == "QQQ"
+    assert signature.parameters["venue"].default == "lit"
     b05 = _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL")[0]
-    assert b05["payload"]["effective_arguments"] == {"symbol": "SPY"}
+    assert b05["payload"]["effective_arguments"] == {
+        "symbol": "QQQ",
+        "venue": "lit",
+    }
 
 
 def test_wrapper_remains_usable_without_collector():
