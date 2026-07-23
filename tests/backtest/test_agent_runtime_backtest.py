@@ -264,6 +264,15 @@ class BoundaryResultRuntime:
         )
 
 
+class NoBoundaryResultRuntime:
+    def run(self, request):
+        return AgentRunResult(
+            summary="RESULT: no boundary capture",
+            model=request.model,
+            events=[_event("text", text="RESULT: no boundary capture")],
+        )
+
+
 class UsageTelemetryRuntime:
     call_count = 0
 
@@ -693,10 +702,11 @@ class BoundaryTraceTestStrategy:
         return None
 
 
-def _build_boundary_trace_handle(monkeypatch, tmp_path, *, is_backtesting):
+def _build_boundary_trace_handle(monkeypatch, tmp_path, *, is_backtesting, runtime=None):
     monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path))
     strategy = BoundaryTraceTestStrategy(is_backtesting=is_backtesting)
-    runtime = BoundaryResultRuntime()
+    if runtime is None:
+        runtime = BoundaryResultRuntime()
     handle = strategy.agents.create(
         name="trace_agent",
         system_prompt="test",
@@ -708,6 +718,51 @@ def _build_boundary_trace_handle(monkeypatch, tmp_path, *, is_backtesting):
     monkeypatch.setattr(handle, "_append_run_artifact_summary", lambda result, context: None)
     monkeypatch.setattr(handle, "_log_run_summary", lambda result, context: None)
     return handle, runtime
+
+
+def test_google_adk_runtime_exports_request_boundary_collector(monkeypatch, tmp_path):
+    from lumibot.components.agents.boundary_trace import BoundaryTraceCollector
+    from lumibot.components.agents.runtime import GoogleADKRuntime, RuntimeRequest
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="google-run",
+        artifact_root=tmp_path,
+    )
+    request = RuntimeRequest(
+        agent_name="google_agent",
+        model="test-model",
+        system_prompt="test",
+        task_prompt="test",
+        context=None,
+        runtime_context=None,
+        memory_state=None,
+        memory_notes=[],
+        bound_tools=[],
+        agent_run_id="google-run",
+        boundary_collector=collector,
+        run_timeout_seconds=None,
+    )
+    runtime = GoogleADKRuntime()
+
+    async def successful_run(_request):
+        return AgentRunResult(
+            summary="RESULT: done",
+            model=_request.model,
+            events=[_event("text", text="RESULT: done")],
+        )
+
+    monkeypatch.setattr(runtime, "_run_async", successful_run)
+
+    result = runtime.run(request)
+
+    assert result.boundary_trace == {
+        "schema_version": 1,
+        "agent_run_id": "google-run",
+        "capture_scope": "semantic_boundaries",
+        "provider_wire_capture": False,
+        "events": [],
+        "diagnostics": [],
+    }
 
 
 def test_agent_run_result_accepts_boundary_trace():
@@ -737,6 +792,64 @@ def test_agent_trace_persists_boundary_trace_without_changing_legacy_events(monk
     assert payload["boundary_trace"]["schema_version"] == 1
     assert payload["boundary_trace"]["agent_run_id"]
     assert list(trace_path.parent.glob("*.tmp")) == []
+
+
+def test_agent_trace_atomic_replace_uses_same_directory(monkeypatch, tmp_path):
+    from lumibot.components.agents import manager as manager_module
+
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+    replace_calls = []
+    real_replace = manager_module.os.replace
+
+    def observed_replace(source, target):
+        source_path = Path(source)
+        target_path = Path(target)
+        replace_calls.append((source_path, target_path))
+        assert source_path.parent == target_path.parent
+        assert source_path.is_file()
+        assert not target_path.exists()
+        real_replace(source, target)
+
+    monkeypatch.setattr(manager_module.os, "replace", observed_replace)
+
+    trace_path = handle._write_trace(
+        AgentRunResult(summary="done", model="test-model", events=[]),
+        {"summary": "done"},
+    )
+
+    assert len(replace_calls) == 1
+    assert replace_calls[0][1] == trace_path
+    assert trace_path.is_file()
+    assert list(trace_path.parent.glob("*.tmp")) == []
+
+
+def test_agent_trace_replace_failure_cleans_temp_without_partial_target(monkeypatch, tmp_path):
+    from lumibot.components.agents import manager as manager_module
+
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+    replace_calls = []
+
+    def failing_replace(source, target):
+        source_path = Path(source)
+        target_path = Path(target)
+        replace_calls.append((source_path, target_path))
+        assert source_path.parent == target_path.parent
+        assert source_path.is_file()
+        assert not target_path.exists()
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(manager_module.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        handle._write_trace(
+            AgentRunResult(summary="done", model="test-model", events=[]),
+            {"summary": "done"},
+        )
+
+    assert len(replace_calls) == 1
+    trace_dir = tmp_path / "agent_runtime" / "traces" / "trace_agent"
+    assert list(trace_dir.glob("*.tmp")) == []
+    assert list(trace_dir.glob("*.json")) == []
 
 
 def test_agent_replay_cache_uses_portable_boundary_trace_reference(monkeypatch, tmp_path):
@@ -776,8 +889,13 @@ def test_agent_replay_cache_uses_portable_boundary_trace_reference(monkeypatch, 
         assert "\\" not in portable_path
         assert (tmp_path / "agent_runtime" / portable_path).is_file()
     assert reference["trace_path"].startswith("traces/trace_agent/")
-    assert live_result.payload["trace_path"] == payload_trace_path
-    assert cached_result.payload["trace_path"] == payload_trace_path
+    live_trace_path = Path(live_result.payload["trace_path"])
+    cached_trace_path = Path(cached_result.payload["trace_path"])
+    assert live_trace_path.is_absolute()
+    assert cached_trace_path.is_absolute()
+    assert live_trace_path.is_file()
+    assert cached_trace_path.is_file()
+    assert live_trace_path == cached_trace_path
     assert cached_payload["events"][0]["call_id"] == "call-1"
     assert cached_payload["events"][0]["event_id"] == "event-1"
     assert cached_payload["events"][0]["invocation_id"] == "invocation-1"
@@ -797,6 +915,9 @@ def test_agent_replay_cache_uses_portable_boundary_trace_reference(monkeypatch, 
 
 def test_legacy_agent_replay_cache_marks_boundary_trace_unavailable(monkeypatch, tmp_path):
     handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=True)
+    trace_path = tmp_path / "agent_runtime" / "traces" / "trace_agent" / "legacy.json"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text("{}", encoding="utf-8")
 
     result = handle._result_from_cached(
         {
@@ -811,7 +932,8 @@ def test_legacy_agent_replay_cache_marks_boundary_trace_unavailable(monkeypatch,
         "legacy-key",
     )
 
-    assert result.payload["trace_path"] == "traces/trace_agent/legacy.json"
+    assert Path(result.payload["trace_path"]) == trace_path.resolve()
+    assert Path(result.payload["trace_path"]).is_file()
     assert result.boundary_trace == {
         "schema_version": 1,
         "status": "unavailable_legacy_cache",
@@ -819,6 +941,104 @@ def test_legacy_agent_replay_cache_marks_boundary_trace_unavailable(monkeypatch,
         "events": [],
         "diagnostics": [],
     }
+
+
+def test_agent_replay_cache_marks_missing_boundary_capture_unavailable(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=NoBoundaryResultRuntime(),
+    )
+
+    live_result = handle.run(task_prompt="test")
+    cached_result = handle.run(task_prompt="test")
+
+    cache_path = next((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz"))
+    with gzip.open(cache_path, "rt", encoding="utf-8") as cache_file:
+        cached_payload = json.load(cache_file)
+    assert cached_payload["boundary_trace_ref"] == {
+        "status": "unavailable_no_boundary_capture",
+        "trace_path": cached_payload["payload"]["trace_path"],
+    }
+    assert Path(live_result.payload["trace_path"]).is_file()
+    assert Path(cached_result.payload["trace_path"]).is_file()
+    assert cached_result.boundary_trace == {
+        **cached_payload["boundary_trace_ref"],
+        "schema_version": 1,
+        "execution_source": "replay_cache",
+        "events": [],
+        "diagnostics": [],
+    }
+
+
+def test_remote_cache_uses_sanitized_reference_as_authoritative_path(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=True)
+    trace_path = tmp_path / "agent_runtime" / "traces" / "trace_agent" / "remote.json"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text("{}", encoding="utf-8")
+
+    result = handle._result_from_cached(
+        {
+            "summary": "Cached.",
+            "model": "test-model",
+            "events": [],
+            "warnings": [],
+            "payload": {
+                "trace_path": "D:/wrong/agent_runtime/traces/trace_agent/wrong.json",
+            },
+            "boundary_trace_ref": {
+                "status": "available_original_trace",
+                "trace_path": "C:/remote/agent_runtime/traces/trace_agent/remote.json",
+                "agent_run_id": "remote-run",
+            },
+        },
+        "remote-key",
+    )
+
+    assert result.boundary_trace["trace_path"] == "traces/trace_agent/remote.json"
+    assert Path(result.payload["trace_path"]) == trace_path.resolve()
+    assert Path(result.payload["trace_path"]).is_file()
+
+
+@pytest.mark.parametrize(
+    "malicious_path",
+    [
+        "agent_runtime/C:/secret/trace.json",
+        "agent_runtime//server/share/trace.json",
+        r"agent_runtime\\server\share\trace.json",
+        "agent_runtime/../traces/trace_agent/escape.json",
+        "C:/outside/trace.json",
+        "/outside/trace.json",
+    ],
+)
+def test_cached_boundary_reference_rejects_nonportable_paths(monkeypatch, tmp_path, malicious_path):
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=True)
+
+    result = handle._result_from_cached(
+        {
+            "summary": "Cached.",
+            "model": "test-model",
+            "events": [],
+            "warnings": [],
+            "payload": {"trace_path": "traces/trace_agent/untrusted-fallback.json"},
+            "boundary_trace_ref": {
+                "status": "available_original_trace",
+                "trace_path": malicious_path,
+                "agent_run_id": "remote-run",
+            },
+        },
+        "malicious-key",
+    )
+
+    assert result.boundary_trace == {
+        "schema_version": 1,
+        "status": "unavailable_invalid_trace_reference",
+        "execution_source": "replay_cache",
+        "events": [],
+        "diagnostics": [],
+    }
+    assert result.payload["trace_path"] is None
 
 
 @pytest.mark.usefixtures("disable_datasource_override")

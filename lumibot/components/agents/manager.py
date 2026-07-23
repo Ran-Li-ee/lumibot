@@ -1151,21 +1151,71 @@ class AgentHandle:
         if not raw_path:
             return ""
 
-        posix_path = PurePosixPath(raw_path.replace("\\", "/"))
-        parts = posix_path.parts
-        if "agent_runtime" in parts:
-            portable_parts = parts[parts.index("agent_runtime") + 1 :]
-            if portable_parts and ".." not in portable_parts:
-                return PurePosixPath(*portable_parts).as_posix()
+        normalized = raw_path.replace("\\", "/")
+        raw_parts = normalized.split("/")
+        if "agent_runtime" in raw_parts:
+            artifact_index = len(raw_parts) - 1 - raw_parts[::-1].index("agent_runtime")
+            candidate = "/".join(raw_parts[artifact_index + 1 :])
+        else:
+            candidate = normalized
+        candidate_parts = candidate.split("/")
+        if (
+            not candidate
+            or candidate.startswith("/")
+            or any(part in {"", ".", ".."} or ":" in part for part in candidate_parts)
+        ):
             return ""
+
+        posix_path = PurePosixPath(candidate)
+        windows_path = PureWindowsPath(candidate)
         if (
             posix_path.is_absolute()
-            or PureWindowsPath(raw_path).drive
-            or PureWindowsPath(raw_path).is_absolute()
-            or ".." in parts
+            or windows_path.drive
+            or windows_path.is_absolute()
+            or not posix_path.parts
+            or posix_path.parts[0] != "traces"
         ):
             return ""
         return posix_path.as_posix()
+
+    def _resolved_runtime_trace_path(self, portable_path: Any) -> str | None:
+        normalized = self._portable_runtime_trace_path(portable_path)
+        if not normalized:
+            return None
+        artifact_root = self._runtime_artifact_dir().resolve()
+        target = (artifact_root / Path(*PurePosixPath(normalized).parts)).resolve()
+        try:
+            target.relative_to(artifact_root)
+        except ValueError:
+            return None
+        return str(target) if target.is_file() else None
+
+    def _sanitize_boundary_trace_reference(self, value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        portable_path = self._portable_runtime_trace_path(value.get("trace_path"))
+        if not portable_path:
+            return {"status": "unavailable_invalid_trace_reference"}
+
+        status = str(value.get("status") or "")
+        agent_run_id = str(value.get("agent_run_id") or "").strip()
+        if status == "available_original_trace":
+            if not agent_run_id:
+                return {
+                    "status": "unavailable_no_boundary_capture",
+                    "trace_path": portable_path,
+                }
+            return {
+                "status": status,
+                "trace_path": portable_path,
+                "agent_run_id": agent_run_id,
+            }
+        if status == "unavailable_no_boundary_capture":
+            return {
+                "status": status,
+                "trace_path": portable_path,
+            }
+        return {"status": "unavailable_invalid_trace_reference"}
 
     def _runtime_artifact_dir(self) -> Path:
         runtime_dir = self._cache_root() / "agent_runtime"
@@ -1244,8 +1294,12 @@ class AgentHandle:
             if isinstance(event, dict)
         ]
         timing = cached.get("timing") if isinstance(cached.get("timing"), dict) else {}
-        boundary_trace_ref = cached.get("boundary_trace_ref")
-        if isinstance(boundary_trace_ref, dict):
+        has_boundary_trace_ref = "boundary_trace_ref" in cached
+        raw_boundary_trace_ref = cached.get("boundary_trace_ref")
+        boundary_trace_ref = self._sanitize_boundary_trace_reference(raw_boundary_trace_ref)
+        if has_boundary_trace_ref and boundary_trace_ref is None:
+            boundary_trace_ref = {"status": "unavailable_invalid_trace_reference"}
+        if boundary_trace_ref is not None:
             boundary_trace = {
                 **boundary_trace_ref,
                 "schema_version": 1,
@@ -1264,15 +1318,13 @@ class AgentHandle:
         payload = cached.get("payload")
         if isinstance(payload, dict):
             payload = dict(payload)
-            reference_trace_path = (
+            portable_trace_source = (
                 boundary_trace_ref.get("trace_path")
-                if isinstance(boundary_trace_ref, dict)
-                else None
+                if has_boundary_trace_ref and isinstance(boundary_trace_ref, dict)
+                else payload.get("trace_path")
             )
-            portable_trace_path = self._portable_runtime_trace_path(
-                reference_trace_path or payload.get("trace_path")
-            )
-            payload["trace_path"] = portable_trace_path or None
+            portable_trace_path = self._portable_runtime_trace_path(portable_trace_source)
+            payload["trace_path"] = self._resolved_runtime_trace_path(portable_trace_path)
         return AgentRunResult(
             summary=cached.get("summary"),
             model=cached.get("model") or self.default_model,
@@ -1761,10 +1813,28 @@ class AgentHandle:
         trace_path = self._write_trace(result, trace_payload)
         portable_trace_path = trace_path.relative_to(self._runtime_artifact_dir()).as_posix()
         result.payload = {
-            "trace_path": portable_trace_path,
+            "trace_path": str(trace_path.resolve()),
             "warnings": result.warnings,
         }
         if should_replay:
+            cached_payload = dict(result.payload)
+            cached_payload["trace_path"] = portable_trace_path
+            boundary_agent_run_id = ""
+            if isinstance(result.boundary_trace, dict):
+                boundary_agent_run_id = str(
+                    result.boundary_trace.get("agent_run_id") or ""
+                ).strip()
+            if boundary_agent_run_id:
+                boundary_trace_ref = {
+                    "status": "available_original_trace",
+                    "trace_path": portable_trace_path,
+                    "agent_run_id": boundary_agent_run_id,
+                }
+            else:
+                boundary_trace_ref = {
+                    "status": "unavailable_no_boundary_capture",
+                    "trace_path": portable_trace_path,
+                }
             self.manager.replay_cache.save(
                 cache_key,
                 {
@@ -1773,13 +1843,9 @@ class AgentHandle:
                     "events": trace_payload["events"],
                     "warnings": result.warnings,
                     "usage": result.usage,
-                    "payload": result.payload,
+                    "payload": cached_payload,
                     "timing": _runtime_timing_payload(result),
-                    "boundary_trace_ref": {
-                        "status": "available_original_trace",
-                        "trace_path": portable_trace_path,
-                        "agent_run_id": (result.boundary_trace or {}).get("agent_run_id"),
-                    },
+                    "boundary_trace_ref": boundary_trace_ref,
                 },
             )
         self.manager._record_agent_observability(

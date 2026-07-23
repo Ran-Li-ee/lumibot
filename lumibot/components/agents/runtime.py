@@ -1427,8 +1427,12 @@ class GoogleADKRuntime:
         for attempt in range(1, max_attempts + 1):
             try:
                 if timeout_seconds is None:
-                    return asyncio.run(self._run_async(request))
-                return asyncio.run(self._run_async_with_timeout(request, timeout_seconds))
+                    result = asyncio.run(self._run_async(request))
+                else:
+                    result = asyncio.run(self._run_async_with_timeout(request, timeout_seconds))
+                if result.boundary_trace is None and request.boundary_collector is not None:
+                    result.boundary_trace = request.boundary_collector.export()
+                return result
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as exc:  # noqa: BLE001 - intentional broad catch for retry
