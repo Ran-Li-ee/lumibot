@@ -157,27 +157,6 @@ def _safe_callable_annotations(original: Any) -> dict[str, Any] | None:
     return dict(annotations) if isinstance(annotations, dict) else None
 
 
-def _safe_callable_signature(original: Any) -> inspect.Signature:
-    if inspect.ismethod(original):
-        target = object.__getattribute__(original, "__func__")
-        signature = inspect.signature(target)
-        parameters = list(signature.parameters.values())
-        return signature.replace(parameters=parameters[1:])
-    if inspect.isfunction(original) or inspect.isbuiltin(original) or inspect.isclass(original):
-        return inspect.signature(original)
-
-    actual_type = type(original)
-    for base in type.__getattribute__(actual_type, "__mro__"):
-        namespace = type.__getattribute__(base, "__dict__")
-        target = namespace.get("__call__")
-        if target is None:
-            continue
-        signature = inspect.signature(target)
-        parameters = list(signature.parameters.values())
-        return signature.replace(parameters=parameters[1:])
-    raise ValueError("callable signature is unavailable")
-
-
 def _add_trace_diagnostic(
     collector: BoundaryTraceCollector | None,
     kind: str,
@@ -211,6 +190,10 @@ def _wrap_tool_callable(
 ):
     original = tool.function
     callable_metadata = _safe_callable_metadata(original)
+    try:
+        callable_signature = inspect.signature(original)
+    except Exception:
+        callable_signature = None
 
     def wrapper(*args, **kwargs):
         result: Any
@@ -227,13 +210,13 @@ def _wrap_tool_callable(
         started_at = _utc_iso_timestamp()
         started_perf = time.perf_counter()
         effective_arguments = dict(kwargs)
-        try:
-            signature = _safe_callable_signature(original)
-            bound = signature.bind_partial(*args, **kwargs)
-            bound.apply_defaults()
-            effective_arguments = dict(bound.arguments)
-        except (TypeError, ValueError):
-            pass
+        if callable_signature is not None:
+            try:
+                bound = callable_signature.bind_partial(*args, **kwargs)
+                bound.apply_defaults()
+                effective_arguments = dict(bound.arguments)
+            except (TypeError, ValueError):
+                pass
 
         trace_ids = {
             "model_turn_id": call_context.get("model_turn_id"),
@@ -323,10 +306,8 @@ def _wrap_tool_callable(
     wrapper.__name__ = _tool_function_name(tool.name)
     wrapper.__qualname__ = wrapper.__name__
     wrapper.__doc__ = tool.description
-    try:
-        wrapper.__signature__ = _safe_callable_signature(original)
-    except (TypeError, ValueError):
-        pass
+    if callable_signature is not None:
+        wrapper.__signature__ = callable_signature
     annotations = _safe_callable_annotations(original)
     if annotations is not None:
         wrapper.__annotations__ = annotations

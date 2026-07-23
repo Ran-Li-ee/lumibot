@@ -1,4 +1,6 @@
+import inspect
 from datetime import datetime, timezone
+from functools import partial
 
 import pytest
 
@@ -180,7 +182,9 @@ def test_wrapper_reads_callable_metadata_without_instance_hooks(tmp_path):
             self.metadata_accesses = []
 
         def __getattribute__(self, name):
-            if name in {"__module__", "__qualname__", "__annotations__"}:
+            # Signature inspection is callable behavior; trace metadata must not
+            # probe these instance attributes.
+            if name in {"__module__", "__qualname__"}:
                 object.__getattribute__(self, "metadata_accesses").append(name)
             return object.__getattribute__(self, name)
 
@@ -199,6 +203,141 @@ def test_wrapper_reads_callable_metadata_without_instance_hooks(tmp_path):
     metadata = _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL")[0]["payload"]
     assert metadata["callable_module"] == __name__
     assert metadata["callable_qualname"].endswith(".CallableTool")
+
+
+def test_wrapper_preserves_partial_signature_without_collector():
+    def quote(symbol: str, asset_type: str = "stock", currency: str = "USD"):
+        return {
+            "symbol": symbol,
+            "asset_type": asset_type,
+            "currency": currency,
+        }
+
+    original = partial(quote, asset_type="option")
+    wrapped = _wrap_tool_callable(
+        BoundTool(name="quote", description="quote", function=original)
+    )
+
+    assert inspect.signature(wrapped) == inspect.signature(original)
+    assert wrapped("QQQ") == {
+        "symbol": "QQQ",
+        "asset_type": "option",
+        "currency": "USD",
+    }
+
+
+def test_wrapper_uses_partial_signature_defaults_for_b05(tmp_path):
+    def quote(symbol: str, asset_type: str = "stock", currency: str = "USD"):
+        return {"symbol": symbol, "asset_type": asset_type, "currency": currency}
+
+    original = partial(quote, asset_type="option")
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    wrapped = _wrap_tool_callable(
+        BoundTool(name="quote", description="quote", function=original),
+        collector=collector,
+    )
+
+    assert wrapped("QQQ")["asset_type"] == "option"
+    b05 = _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL")[0]
+    assert b05["payload"]["effective_arguments"] == {
+        "symbol": "QQQ",
+        "asset_type": "option",
+        "currency": "USD",
+    }
+
+
+def test_wrapper_preserves_explicit_instance_signature_without_collector():
+    class ExplicitSignatureTool:
+        def __init__(self):
+            self.__signature__ = inspect.Signature(
+                [
+                    inspect.Parameter(
+                        "symbol",
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        annotation=str,
+                    ),
+                    inspect.Parameter(
+                        "venue",
+                        inspect.Parameter.KEYWORD_ONLY,
+                        default="lit",
+                        annotation=str,
+                    ),
+                ]
+            )
+
+        def __call__(self, symbol, *, venue="lit"):
+            return {"symbol": symbol, "venue": venue}
+
+    original = ExplicitSignatureTool()
+    wrapped = _wrap_tool_callable(
+        BoundTool(name="route", description="route", function=original)
+    )
+
+    assert inspect.signature(wrapped) == inspect.signature(original)
+    assert wrapped("QQQ") == {"symbol": "QQQ", "venue": "lit"}
+
+
+def test_wrapper_uses_explicit_instance_signature_defaults_for_b05(tmp_path):
+    class ExplicitSignatureTool:
+        def __init__(self):
+            self.__signature__ = inspect.Signature(
+                [
+                    inspect.Parameter(
+                        "symbol",
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    ),
+                    inspect.Parameter(
+                        "venue",
+                        inspect.Parameter.KEYWORD_ONLY,
+                        default="lit",
+                    ),
+                ]
+            )
+
+        def __call__(self, symbol, *, venue="lit"):
+            return {"symbol": symbol, "venue": venue}
+
+    original = ExplicitSignatureTool()
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    wrapped = _wrap_tool_callable(
+        BoundTool(name="route", description="route", function=original),
+        collector=collector,
+    )
+
+    assert wrapped("QQQ")["venue"] == "lit"
+    b05 = _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL")[0]
+    assert b05["payload"]["effective_arguments"] == {
+        "symbol": "QQQ",
+        "venue": "lit",
+    }
+
+
+def test_wrapper_falls_back_when_explicit_signature_hook_raises(tmp_path):
+    class ThrowingSignatureTool:
+        def __init__(self):
+            self.signature_reads = 0
+
+        def __getattribute__(self, name):
+            if name == "__signature__":
+                reads = object.__getattribute__(self, "signature_reads")
+                object.__setattr__(self, "signature_reads", reads + 1)
+                raise RuntimeError("signature unavailable")
+            return object.__getattribute__(self, name)
+
+        def __call__(self, symbol="QQQ"):
+            return {"symbol": symbol}
+
+    original = ThrowingSignatureTool()
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    wrapped = _wrap_tool_callable(
+        BoundTool(name="throwing", description="throwing", function=original),
+        collector=collector,
+    )
+
+    assert wrapped(symbol="SPY") == {"symbol": "SPY"}
+    assert original.signature_reads == 1
+    b05 = _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL")[0]
+    assert b05["payload"]["effective_arguments"] == {"symbol": "SPY"}
 
 
 def test_wrapper_remains_usable_without_collector():
