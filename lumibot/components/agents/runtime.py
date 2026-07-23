@@ -252,8 +252,10 @@ def _wrap_tool_callable(
     except Exception:
         callable_signature = _fallback_callable_signature(original)
 
-    def wrapper(*args, **kwargs):
-        result: Any
+    def begin_invocation(
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
         call_context: dict[str, Any] = {}
         if collector is not None:
             try:
@@ -263,7 +265,6 @@ def _wrap_tool_callable(
             else:
                 if isinstance(current_context, dict):
                     call_context = current_context
-
         wrapper_started_at = _utc_iso_timestamp()
         started_perf = time.perf_counter()
         wrapper_received_arguments = dict(kwargs)
@@ -301,13 +302,12 @@ def _wrap_tool_callable(
                     exc,
                 )
         observation_id = call_context.get("observation_id")
-        b05_started_at = _utc_iso_timestamp()
         _record_tool_boundary(
             collector,
             transition="B05_WRAPPER_TO_PYTHON_TOOL",
             from_module="lumibot_tool_wrapper",
             to_module="python_tool",
-            started_at=b05_started_at,
+            started_at=_utc_iso_timestamp(),
             payload={
                 "tool_name": tool.name,
                 "source": tool.source,
@@ -320,28 +320,29 @@ def _wrap_tool_callable(
             },
             **trace_ids,
         )
+        return {
+            "wrapper_started_at": wrapper_started_at,
+            "started_perf": started_perf,
+            "trace_ids": trace_ids,
+            "observation_id": observation_id,
+        }
 
-        tool_started_at: str | None = None
-        tool_ended_at: str | None = None
-        tool_duration_ms = 0.0
-        try:
-            with agent_tool_context(tool_context):
-                tool_started_at = _utc_iso_timestamp()
-                tool_started_perf = time.perf_counter()
-                try:
-                    raw_result = original(*args, **kwargs)
-                finally:
-                    tool_ended_perf = time.perf_counter()
-                    tool_ended_at = _utc_iso_timestamp()
-                    tool_duration_ms = max(
-                        (tool_ended_perf - tool_started_perf) * 1000,
-                        0.0,
-                    )
-        except Exception as exc:
+    def finish_invocation(
+        state: dict[str, Any],
+        kwargs: dict[str, Any],
+        *,
+        raw_result: Any = None,
+        error: Exception | None = None,
+        tool_started_at: str | None,
+        tool_ended_at: str | None,
+        tool_duration_ms: float,
+    ) -> Any:
+        observation_id = state["observation_id"]
+        trace_ids = state["trace_ids"]
+        if error is not None:
             if tool_started_at is None:
                 tool_started_at = _utc_iso_timestamp()
                 tool_ended_at = tool_started_at
-            error = _safe_exception_details(exc)
             _record_tool_boundary(
                 collector,
                 transition="B06_PYTHON_TOOL_TO_WRAPPER",
@@ -355,10 +356,14 @@ def _wrap_tool_callable(
                     "tool_name": tool.name,
                     "observation_id": observation_id,
                 },
-                error=error,
+                error=_safe_exception_details(error),
                 **trace_ids,
             )
-            result = _tool_error_payload(tool.name, kwargs, exc)
+            result = _tool_error_payload(
+                tool.name,
+                kwargs,
+                error,
+            )
         else:
             if collector is not None:
                 try:
@@ -383,8 +388,12 @@ def _wrap_tool_callable(
                     )
             try:
                 result = _json_safe_value(raw_result)
-            except Exception as exc:
-                result = _tool_error_payload(tool.name, kwargs, exc)
+            except Exception as serialization_error:
+                result = _tool_error_payload(
+                    tool.name,
+                    kwargs,
+                    serialization_error,
+                )
         if isinstance(tool_context, dict):
             calls = tool_context.setdefault("tool_calls", [])
             if isinstance(calls, list):
@@ -400,8 +409,15 @@ def _wrap_tool_callable(
             transition="B07_WRAPPER_TO_FUNCTION_TOOL",
             from_module="lumibot_tool_wrapper",
             to_module="function_tool",
-            started_at=wrapper_started_at,
-            duration_ms=max((time.perf_counter() - started_perf) * 1000, 0.0),
+            started_at=state["wrapper_started_at"],
+            duration_ms=max(
+                (
+                    time.perf_counter()
+                    - state["started_perf"]
+                )
+                * 1000,
+                0.0,
+            ),
             payload={
                 "serialized_result": result,
                 "observation_id": observation_id,
@@ -410,6 +426,97 @@ def _wrap_tool_callable(
         )
         return result
 
+    def sync_wrapper(*args, **kwargs):
+        state = begin_invocation(args, kwargs)
+        tool_started_at: str | None = None
+        tool_ended_at: str | None = None
+        tool_duration_ms = 0.0
+        raw_result: Any = None
+        error: Exception | None = None
+        try:
+            with agent_tool_context(tool_context):
+                tool_started_at = _utc_iso_timestamp()
+                tool_started_perf = time.perf_counter()
+                try:
+                    raw_result = original(*args, **kwargs)
+                finally:
+                    tool_ended_perf = time.perf_counter()
+                    tool_ended_at = _utc_iso_timestamp()
+                    tool_duration_ms = max(
+                        (
+                            tool_ended_perf
+                            - tool_started_perf
+                        )
+                        * 1000,
+                        0.0,
+                    )
+        except Exception as exc:
+            error = exc
+        return finish_invocation(
+            state,
+            kwargs,
+            raw_result=raw_result,
+            error=error,
+            tool_started_at=tool_started_at,
+            tool_ended_at=tool_ended_at,
+            tool_duration_ms=tool_duration_ms,
+        )
+
+    async def async_wrapper(*args, **kwargs):
+        state = begin_invocation(args, kwargs)
+        tool_started_at: str | None = None
+        tool_ended_at: str | None = None
+        tool_duration_ms = 0.0
+        raw_result: Any = None
+        error: Exception | None = None
+        try:
+            with agent_tool_context(tool_context):
+                tool_started_at = _utc_iso_timestamp()
+                tool_started_perf = time.perf_counter()
+                try:
+                    raw_result = await original(
+                        *args,
+                        **kwargs,
+                    )
+                finally:
+                    tool_ended_perf = time.perf_counter()
+                    tool_ended_at = _utc_iso_timestamp()
+                    tool_duration_ms = max(
+                        (
+                            tool_ended_perf
+                            - tool_started_perf
+                        )
+                        * 1000,
+                        0.0,
+                    )
+        except Exception as exc:
+            error = exc
+        return finish_invocation(
+            state,
+            kwargs,
+            raw_result=raw_result,
+            error=error,
+            tool_started_at=tool_started_at,
+            tool_ended_at=tool_ended_at,
+            tool_duration_ms=tool_duration_ms,
+        )
+
+    try:
+        call_method = inspect.getattr_static(
+            original,
+            "__call__",
+            None,
+        )
+    except Exception:
+        call_method = None
+    wrapper = (
+        async_wrapper
+        if (
+            inspect.iscoroutinefunction(original)
+            or inspect.iscoroutinefunction(call_method)
+        )
+        else sync_wrapper
+    )
     wrapper.__name__ = _tool_function_name(tool.name)
     wrapper.__qualname__ = wrapper.__name__
     wrapper.__doc__ = tool.description
@@ -674,41 +781,6 @@ def _build_observed_function_tool(
         return function_tool_type(wrapped)
 
     class ObservedFunctionTool(function_tool_type):
-        async def _invoke_callable(
-            self,
-            target: Callable[..., Any],
-            args_to_call: dict[str, Any],
-        ) -> Any:
-            is_async = inspect.iscoroutinefunction(target) or (
-                hasattr(target, "__call__")
-                and inspect.iscoroutinefunction(target.__call__)
-            )
-            if is_async:
-                return await super()._invoke_callable(
-                    target,
-                    args_to_call,
-                )
-            try:
-                context = collector.current_tool_call() or {}
-                batch_call_ids = collector.batch_call_ids(
-                    context.get("tool_batch_id")
-                )
-            except Exception as exc:
-                _add_trace_diagnostic(
-                    collector,
-                    "parallel_tool_batch_lookup_failed",
-                    exc,
-                )
-                batch_call_ids = []
-            if len(batch_call_ids) <= 1:
-                return await super()._invoke_callable(
-                    target,
-                    args_to_call,
-                )
-            # ADK schedules a task per call, but its synchronous invocation
-            # blocks the event loop unless parallel batch work is offloaded.
-            return await asyncio.to_thread(target, **args_to_call)
-
         def _preprocess_args(
             self,
             args: dict[str, Any],

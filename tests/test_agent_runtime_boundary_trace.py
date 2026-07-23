@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import gc
 import gzip
 import inspect
 import json
@@ -32,6 +33,9 @@ from lumibot.components.agents.runtime import (
     _wrap_tool_callable,
 )
 from lumibot.components.agents.schemas import BoundTool
+from lumibot.components.agents.tool_context import (
+    current_agent_tool_context,
+)
 
 
 def _events(collector, transition):
@@ -102,8 +106,8 @@ def _model_response(*, response_id, tool_calls=None, text=None):
     )
 
 
-def delayed_price_tool(symbol: str):
-    time.sleep(0.03 if symbol == "QQQ" else 0.005)
+async def delayed_price_tool(symbol: str):
+    await asyncio.sleep(0.03 if symbol == "QQQ" else 0.005)
     return {
         "symbol": symbol,
         "price": {
@@ -3930,6 +3934,270 @@ def test_wrapper_remains_usable_without_collector():
             {},
             None,
         )
+
+
+def test_sync_parallel_batch_order_and_timing_match_with_and_without_collector(
+    tmp_path,
+):
+    class ParallelToolContext(FakeToolContext):
+        def __init__(self, call_id):
+            self.function_call_id = call_id
+
+    def exercise(collector):
+        completions = []
+        windows = {}
+
+        def sync_tool(value: str):
+            started = time.perf_counter()
+            time.sleep(0.03 if value == "A" else 0.005)
+            windows[value] = (started, time.perf_counter())
+            completions.append(value)
+            return {"value": value}
+
+        if collector is not None:
+            turn_id = collector.start_model_turn()
+            collector.set_active_model_turn(turn_id)
+            collector.register_tool_batch(
+                turn_id,
+                ["call_A", "call_B"],
+            )
+        observed = _build_observed_function_tool(
+            FunctionTool,
+            BoundTool(
+                name="sync_tool",
+                description="sync",
+                function=sync_tool,
+            ),
+            collector=collector,
+            shared_tool_context={},
+        )
+
+        async def run_pair():
+            return await asyncio.gather(
+                observed.run_async(
+                    args={"value": "A"},
+                    tool_context=ParallelToolContext("call_A"),
+                ),
+                observed.run_async(
+                    args={"value": "B"},
+                    tool_context=ParallelToolContext("call_B"),
+                ),
+            )
+
+        return asyncio.run(run_pair()), completions, windows
+
+    untraced = exercise(None)
+    traced = exercise(
+        BoundaryTraceCollector(
+            agent_run_id="run-sync-parity",
+            artifact_root=tmp_path,
+        )
+    )
+
+    assert traced[:2] == untraced[:2] == (
+        [{"value": "A"}, {"value": "B"}],
+        ["A", "B"],
+    )
+    for _, _, windows in (untraced, traced):
+        assert windows["B"][0] >= windows["A"][1]
+
+
+@pytest.mark.parametrize("with_collector", [False, True])
+def test_async_tool_is_awaited_by_adk_with_matching_trace_semantics(
+    tmp_path,
+    with_collector,
+    recwarn,
+):
+    contexts = []
+
+    async def async_tool(symbol: str, venue: str = "lit"):
+        contexts.append(current_agent_tool_context())
+        await asyncio.sleep(0)
+        contexts.append(current_agent_tool_context())
+        return {"symbol": symbol, "venue": venue}
+
+    collector = (
+        BoundaryTraceCollector(
+            agent_run_id="run-async",
+            artifact_root=tmp_path,
+        )
+        if with_collector
+        else None
+    )
+    if collector is not None:
+        turn_id = collector.start_model_turn()
+        collector.set_active_model_turn(turn_id)
+        collector.register_tool_batch(turn_id, ["call_A"])
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(
+            name="async_tool",
+            description="async",
+            function=async_tool,
+        ),
+        collector=collector,
+        shared_tool_context={"marker": "visible"},
+    )
+
+    assert inspect.iscoroutinefunction(observed.func)
+    result = asyncio.run(
+        observed.run_async(
+            args={"symbol": "QQQ"},
+            tool_context=FakeToolContext(),
+        )
+    )
+    if inspect.isawaitable(result):
+        result.close()
+    gc.collect()
+
+    assert not inspect.isawaitable(result)
+    assert result == {"symbol": "QQQ", "venue": "lit"}
+    assert contexts == [
+        {"marker": "visible"},
+        {"marker": "visible"},
+    ]
+    assert not [
+        warning
+        for warning in recwarn
+        if "was never awaited" in str(warning.message)
+    ]
+    if collector is not None:
+        assert [
+            event["transition"]
+            for event in collector.export()["events"]
+            if event["call_id"] == "call_A"
+            and event["transition"]
+            in {
+                "B04_FUNCTION_TOOL_TO_WRAPPER",
+                "B05_WRAPPER_TO_PYTHON_TOOL",
+                "B06_PYTHON_TOOL_TO_WRAPPER",
+                "B07_WRAPPER_TO_FUNCTION_TOOL",
+            }
+        ] == [
+            "B04_FUNCTION_TOOL_TO_WRAPPER",
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+        ]
+
+
+@pytest.mark.parametrize("with_collector", [False, True])
+def test_async_callable_object_preserves_signature_defaults_and_metadata(
+    tmp_path,
+    with_collector,
+):
+    class AsyncPriceTool:
+        async def __call__(
+            self,
+            symbol: str,
+            *,
+            venue: str = "lit",
+        ):
+            await asyncio.sleep(0)
+            return {"symbol": symbol, "venue": venue}
+
+    collector = (
+        BoundaryTraceCollector(
+            agent_run_id="run-async-callable",
+            artifact_root=tmp_path,
+        )
+        if with_collector
+        else None
+    )
+    if collector is not None:
+        turn_id = collector.start_model_turn()
+        collector.set_active_model_turn(turn_id)
+        collector.register_tool_batch(turn_id, ["call_A"])
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(
+            name="async_price",
+            description="async price",
+            function=AsyncPriceTool(),
+        ),
+        collector=collector,
+        shared_tool_context={},
+    )
+    wrapped = observed.func
+
+    assert inspect.iscoroutinefunction(wrapped)
+    signature = inspect.signature(wrapped)
+    assert list(signature.parameters) == ["symbol", "venue"]
+    assert signature.parameters["venue"].default == "lit"
+    assert signature.parameters["symbol"].annotation is str
+    result = asyncio.run(
+        observed.run_async(
+            args={"symbol": "QQQ"},
+            tool_context=FakeToolContext(),
+        )
+    )
+
+    assert result == {"symbol": "QQQ", "venue": "lit"}
+    if collector is not None:
+        b05 = _events(
+            collector,
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+        )[0]
+        assert b05["payload"]["callable_module"] == __name__
+        assert b05["payload"]["callable_qualname"].endswith(
+            "AsyncPriceTool"
+        )
+        assert b05["payload"]["effective_arguments"] == {
+            "symbol": "QQQ",
+            "venue": "lit",
+        }
+
+
+def test_async_tool_error_records_await_timing_and_restores_context(
+    tmp_path,
+):
+    seen_contexts = []
+
+    async def broken(symbol: str):
+        seen_contexts.append(current_agent_tool_context())
+        await asyncio.sleep(0.01)
+        seen_contexts.append(current_agent_tool_context())
+        raise ValueError(f"bad symbol {symbol}")
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-async-error",
+        artifact_root=tmp_path,
+    )
+    wrapped = _wrap_tool_callable(
+        BoundTool(
+            name="broken_async",
+            description="broken",
+            function=broken,
+        ),
+        {"marker": "async-context"},
+        collector=collector,
+    )
+
+    assert inspect.iscoroutinefunction(wrapped)
+    with collector.tool_call_context(call_id="call_A"):
+        result = asyncio.run(wrapped(symbol="BAD"))
+
+    assert result["tool_error"] is True
+    assert result["error"] == {
+        "type": "ValueError",
+        "message": "bad symbol BAD",
+    }
+    assert seen_contexts == [
+        {"marker": "async-context"},
+        {"marker": "async-context"},
+    ]
+    assert current_agent_tool_context() == {}
+    b06 = _events(collector, "B06_PYTHON_TOOL_TO_WRAPPER")[0]
+    b07 = _events(collector, "B07_WRAPPER_TO_FUNCTION_TOOL")[0]
+    assert b06["status"] == "error"
+    assert b06["duration_ms"] > 0
+    assert _event_timestamp(b06["started_at"]) < _event_timestamp(
+        b06["ended_at"]
+    )
+    assert _event_timestamp(b06["ended_at"]) <= _event_timestamp(
+        b07["ended_at"]
+    )
+    assert b07["payload"]["serialized_result"] == result
 
 
 def test_full_boundary_loop_preserves_turns_batches_and_reversed_parallel_completion(
