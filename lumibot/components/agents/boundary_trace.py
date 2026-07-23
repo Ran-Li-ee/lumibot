@@ -480,6 +480,7 @@ class BoundaryTraceCollector:
         self._turn_number = 0
         self._batch_number_by_turn: dict[str, int] = {}
         self._call_index: dict[str, dict[str, Any]] = {}
+        self._observation_index: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     def start_model_turn(self) -> str:
@@ -504,44 +505,150 @@ class BoundaryTraceCollector:
         with self._lock:
             return dict(self._call_index.get(call_id) or {})
 
-    def note_wrapper_arguments(
+    def _safe_observation_value(
         self,
-        call_id: str,
+        value: Any,
+        *,
+        snapshot_diagnostic: str,
+        normalization_diagnostic: str,
+    ) -> Any:
+        try:
+            detached_value = copy.deepcopy(value)
+        except Exception as exc:
+            self.add_diagnostic(snapshot_diagnostic, exc)
+            detached_value = value
+        try:
+            safe_value, _ = self._snapshot_trace_value(
+                detached_value,
+                nested=False,
+            )
+            return safe_value
+        except Exception as exc:
+            self.add_diagnostic(normalization_diagnostic, exc)
+            return {}
+
+    @staticmethod
+    def _argument_type_names(arguments: dict[str, Any]) -> dict[str, str]:
+        return {
+            name: _descriptor_type(value)["python_type"]
+            for name, value in dict.items(arguments)
+            if type(name) is str
+        }
+
+    def begin_function_tool_observation(
+        self,
+        observation_id: str,
+        *,
+        model_arguments: dict[str, Any],
+    ) -> None:
+        safe_arguments = self._safe_observation_value(
+            model_arguments,
+            snapshot_diagnostic="model_arguments_snapshot_failed",
+            normalization_diagnostic="model_arguments_normalization_failed",
+        )
+        argument_types = self._argument_type_names(model_arguments)
+        with self._lock:
+            self._observation_index[observation_id] = {
+                "wrapper_invoked": False,
+                "model_arguments": (
+                    safe_arguments
+                    if type(safe_arguments) is dict
+                    else {}
+                ),
+                "model_argument_types": argument_types,
+            }
+
+    def note_function_tool_preprocessed_arguments(
+        self,
+        observation_id: str,
         arguments: dict[str, Any],
     ) -> None:
+        safe_arguments = self._safe_observation_value(
+            arguments,
+            snapshot_diagnostic="preprocessed_arguments_snapshot_failed",
+            normalization_diagnostic=(
+                "preprocessed_arguments_normalization_failed"
+            ),
+        )
+        argument_types = self._argument_type_names(arguments)
         with self._lock:
-            state = self._call_index.setdefault(call_id, {})
+            state = self._observation_index.setdefault(
+                observation_id,
+                {},
+            )
+            state["function_tool_preprocessed_arguments"] = (
+                safe_arguments
+                if type(safe_arguments) is dict
+                else {}
+            )
+            state["preprocessed_argument_types"] = argument_types
+
+    def note_wrapper_arguments(
+        self,
+        observation_id: str,
+        arguments: dict[str, Any],
+        *,
+        final_positional_arguments: list[Any] | None = None,
+        final_keyword_arguments: dict[str, Any] | None = None,
+        effective_arguments: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock:
+            state = self._observation_index.setdefault(
+                observation_id,
+                {},
+            )
             state["wrapper_invoked"] = True
             state["wrapper_received_arguments"] = None
 
-        try:
-            detached_arguments = copy.deepcopy(arguments)
-        except Exception as exc:
-            self.add_diagnostic("wrapper_arguments_snapshot_failed", exc)
-            detached_arguments = arguments
-
-        try:
-            safe_arguments, _ = self._snapshot_trace_value(
-                detached_arguments,
-                nested=False,
-            )
-            if type(safe_arguments) is not dict:
-                safe_arguments = {}
-        except Exception as exc:
-            self.add_diagnostic(
-                "wrapper_arguments_normalization_failed",
-                exc,
-            )
-            safe_arguments = {}
+        safe_arguments = self._safe_observation_value(
+            arguments,
+            snapshot_diagnostic="wrapper_arguments_snapshot_failed",
+            normalization_diagnostic="wrapper_arguments_normalization_failed",
+        )
+        safe_positional = self._safe_observation_value(
+            list(final_positional_arguments or []),
+            snapshot_diagnostic="positional_arguments_snapshot_failed",
+            normalization_diagnostic="positional_arguments_normalization_failed",
+        )
+        safe_keyword = self._safe_observation_value(
+            dict(final_keyword_arguments or {}),
+            snapshot_diagnostic="keyword_arguments_snapshot_failed",
+            normalization_diagnostic="keyword_arguments_normalization_failed",
+        )
+        safe_effective = self._safe_observation_value(
+            dict(effective_arguments or {}),
+            snapshot_diagnostic="effective_arguments_snapshot_failed",
+            normalization_diagnostic="effective_arguments_normalization_failed",
+        )
+        argument_types = self._argument_type_names(arguments)
 
         with self._lock:
-            state = self._call_index.setdefault(call_id, {})
+            state = self._observation_index.setdefault(
+                observation_id,
+                {},
+            )
             state["wrapper_invoked"] = True
-            state["wrapper_received_arguments"] = safe_arguments
+            state["wrapper_received_arguments"] = (
+                safe_arguments if type(safe_arguments) is dict else {}
+            )
+            state["wrapper_argument_types"] = argument_types
+            state["final_positional_arguments"] = (
+                safe_positional if type(safe_positional) is list else []
+            )
+            state["final_keyword_arguments"] = (
+                safe_keyword if type(safe_keyword) is dict else {}
+            )
+            state["effective_arguments"] = (
+                safe_effective if type(safe_effective) is dict else {}
+            )
 
-    def call_state(self, call_id: str) -> dict[str, Any]:
+    def call_state(self, observation_id: str) -> dict[str, Any]:
         with self._lock:
-            state = dict(self._call_index.get(call_id) or {})
+            state = dict(
+                self._observation_index.get(observation_id)
+                or self._call_index.get(observation_id)
+                or {}
+            )
         try:
             return copy.deepcopy(state)
         except Exception as exc:
@@ -555,6 +662,13 @@ class BoundaryTraceCollector:
         except Exception as exc:
             self.add_diagnostic("call_state_normalization_failed", exc)
             return {"wrapper_invoked": state.get("wrapper_invoked") is True}
+
+    def clear_function_tool_observation(
+        self,
+        observation_id: str,
+    ) -> None:
+        with self._lock:
+            self._observation_index.pop(observation_id, None)
 
     def clear_wrapper_call_state(self, call_id: str) -> None:
         with self._lock:

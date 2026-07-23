@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID, uuid4
 
 from .boundary_trace import BoundaryTraceCollector
@@ -205,6 +205,7 @@ def _wrap_tool_callable(
     tool_context: dict[str, Any] | None = None,
     *,
     collector: BoundaryTraceCollector | None = None,
+    pre_invoke_observer: Callable[..., None] | None = None,
 ):
     original = tool.function
     callable_metadata = _safe_callable_metadata(original)
@@ -225,7 +226,7 @@ def _wrap_tool_callable(
                 if isinstance(current_context, dict):
                     call_context = current_context
 
-        started_at = _utc_iso_timestamp()
+        wrapper_started_at = _utc_iso_timestamp()
         started_perf = time.perf_counter()
         wrapper_received_arguments = dict(kwargs)
         effective_arguments = dict(kwargs)
@@ -243,25 +244,29 @@ def _wrap_tool_callable(
             "tool_batch_id": call_context.get("tool_batch_id"),
             "call_id": call_context.get("call_id"),
         }
-        call_id = trace_ids["call_id"]
-        if collector is not None and call_id is not None:
+        if pre_invoke_observer is not None:
             try:
-                collector.note_wrapper_arguments(
-                    str(call_id),
-                    wrapper_received_arguments,
+                pre_invoke_observer(
+                    final_positional_arguments=list(args),
+                    final_keyword_arguments=dict(kwargs),
+                    wrapper_received_arguments=wrapper_received_arguments,
+                    effective_arguments=effective_arguments,
+                    function_tool_context=call_context,
                 )
             except Exception as exc:
                 _add_trace_diagnostic(
                     collector,
-                    "note_wrapper_arguments_failed",
+                    "pre_invoke_observation_failed",
                     exc,
                 )
+        observation_id = call_context.get("observation_id")
+        b05_started_at = _utc_iso_timestamp()
         _record_tool_boundary(
             collector,
             transition="B05_WRAPPER_TO_PYTHON_TOOL",
             from_module="lumibot_tool_wrapper",
             to_module="python_tool",
-            started_at=started_at,
+            started_at=b05_started_at,
             payload={
                 "tool_name": tool.name,
                 "source": tool.source,
@@ -270,6 +275,7 @@ def _wrap_tool_callable(
                 "positional_arguments": list(args),
                 "keyword_arguments": dict(kwargs),
                 "effective_arguments": effective_arguments,
+                "observation_id": observation_id,
             },
             **trace_ids,
         )
@@ -304,7 +310,10 @@ def _wrap_tool_callable(
                 started_at=tool_started_at,
                 ended_at=tool_ended_at,
                 duration_ms=tool_duration_ms,
-                payload={"tool_name": tool.name},
+                payload={
+                    "tool_name": tool.name,
+                    "observation_id": observation_id,
+                },
                 error=error,
                 **trace_ids,
             )
@@ -325,7 +334,10 @@ def _wrap_tool_callable(
                         started_at=tool_started_at,
                         ended_at=tool_ended_at,
                         duration_ms=tool_duration_ms,
-                        payload={"raw_result": raw_description},
+                        payload={
+                            "raw_result": raw_description,
+                            "observation_id": observation_id,
+                        },
                         **trace_ids,
                     )
             try:
@@ -347,9 +359,12 @@ def _wrap_tool_callable(
             transition="B07_WRAPPER_TO_FUNCTION_TOOL",
             from_module="lumibot_tool_wrapper",
             to_module="function_tool",
-            started_at=started_at,
+            started_at=wrapper_started_at,
             duration_ms=max((time.perf_counter() - started_perf) * 1000, 0.0),
-            payload={"serialized_result": result},
+            payload={
+                "serialized_result": result,
+                "observation_id": observation_id,
+            },
             **trace_ids,
         )
         return result
@@ -372,15 +387,346 @@ def _build_observed_function_tool(
     collector: BoundaryTraceCollector | None,
     shared_tool_context: dict[str, Any],
 ):
+    def build_boundary_payload(
+        state: dict[str, Any],
+        function_tool_context: dict[str, Any],
+        *,
+        missing_mandatory_arguments: list[str],
+        validation_error: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        model_arguments = state.get("model_arguments") or {}
+        preprocessed_arguments = state.get(
+            "function_tool_preprocessed_arguments"
+        )
+        wrapper_invoked = state.get("wrapper_invoked") is True
+        wrapper_arguments = state.get("wrapper_received_arguments")
+        context_parameter = function_tool_context.get(
+            "context_parameter"
+        )
+
+        filtered_arguments: dict[str, Any] | None = None
+        filtered_source = "unavailable_before_wrapper_entry"
+        if wrapper_invoked and isinstance(wrapper_arguments, dict):
+            filtered_arguments = {
+                name: value
+                for name, value in wrapper_arguments.items()
+                if name != context_parameter
+            }
+            filtered_source = (
+                "authoritative wrapper arguments excluding "
+                "ADK-injected context"
+            )
+        elif isinstance(preprocessed_arguments, dict):
+            try:
+                valid_parameters = set(
+                    inspect.signature(wrapped).parameters
+                )
+                filtered_arguments = {
+                    name: value
+                    for name, value in preprocessed_arguments.items()
+                    if name in valid_parameters
+                    and name != context_parameter
+                }
+                filtered_source = (
+                    "derived with installed FunctionTool signature "
+                    "filter semantics; wrapper not invoked"
+                )
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "function_tool_filtered_arguments_failed",
+                    exc,
+                )
+
+        model_types = state.get("model_argument_types") or {}
+        preprocessed_types = (
+            state.get("preprocessed_argument_types") or {}
+        )
+        converted_arguments = [
+            {
+                "name": name,
+                "from_type": model_types[name],
+                "to_type": preprocessed_types[name],
+            }
+            for name in model_arguments
+            if name in model_types
+            and name in preprocessed_types
+            and model_types[name] != preprocessed_types[name]
+        ]
+
+        effective_arguments = state.get("effective_arguments")
+        defaulted_arguments: list[dict[str, Any]] = []
+        if (
+            isinstance(effective_arguments, dict)
+            and isinstance(wrapper_arguments, dict)
+        ):
+            defaulted_arguments = [
+                {"name": name, "value": value}
+                for name, value in effective_arguments.items()
+                if name not in wrapper_arguments
+            ]
+
+        removed_arguments = (
+            sorted(set(model_arguments) - set(filtered_arguments))
+            if isinstance(filtered_arguments, dict)
+            else []
+        )
+        wrapper_source = (
+            "authoritative _wrap_tool_callable entry"
+            if wrapper_invoked
+            else "unavailable; wrapper not invoked"
+        )
+        return {
+            "tool_name": tool.name,
+            "observation_id": function_tool_context.get(
+                "observation_id"
+            ),
+            "call_id_source": function_tool_context.get(
+                "call_id_source"
+            ),
+            "model_arguments": model_arguments,
+            "adk_function_call_arguments": model_arguments,
+            "function_tool_preprocessed_arguments": (
+                preprocessed_arguments
+            ),
+            "function_tool_filtered_arguments": filtered_arguments,
+            "wrapper_received_arguments": wrapper_arguments,
+            "final_positional_arguments": state.get(
+                "final_positional_arguments"
+            ),
+            "final_keyword_arguments": state.get(
+                "final_keyword_arguments"
+            ),
+            "effective_python_arguments_with_defaults": (
+                effective_arguments
+            ),
+            "removed_arguments": removed_arguments,
+            "converted_arguments": converted_arguments,
+            "defaulted_arguments": defaulted_arguments,
+            "missing_mandatory_arguments": (
+                missing_mandatory_arguments
+            ),
+            "confirmation_status": function_tool_context.get(
+                "confirmation_status",
+                "not_present",
+            ),
+            "tool_confirmation_present": bool(
+                function_tool_context.get(
+                    "tool_confirmation_present"
+                )
+            ),
+            "validation_error": validation_error,
+            "argument_stage_fidelity": {
+                "model_arguments": {
+                    "fidelity": "semantic_snapshot",
+                    "source": "ObservedFunctionTool.run_async args",
+                },
+                "adk_function_call_arguments": {
+                    "fidelity": "same_snapshot_as_model_arguments",
+                    "source": "FunctionTool.run_async args",
+                },
+                "function_tool_preprocessed_arguments": {
+                    "fidelity": (
+                        "semantic_snapshot"
+                        if preprocessed_arguments is not None
+                        else "unavailable"
+                    ),
+                    "source": "FunctionTool._preprocess_args return",
+                },
+                "function_tool_filtered_arguments": {
+                    "fidelity": (
+                        "semantic_snapshot"
+                        if filtered_arguments is not None
+                        else "unavailable"
+                    ),
+                    "source": filtered_source,
+                },
+                "wrapper_received_arguments": {
+                    "fidelity": (
+                        "semantic_snapshot"
+                        if wrapper_invoked
+                        else "unavailable"
+                    ),
+                    "source": wrapper_source,
+                },
+                "effective_python_arguments_with_defaults": {
+                    "fidelity": (
+                        "semantic_snapshot"
+                        if effective_arguments is not None
+                        else "unavailable"
+                    ),
+                    "source": wrapper_source,
+                },
+            },
+        }
+
+    def observe_wrapper_entry(
+        *,
+        final_positional_arguments: list[Any],
+        final_keyword_arguments: dict[str, Any],
+        wrapper_received_arguments: dict[str, Any],
+        effective_arguments: dict[str, Any],
+        function_tool_context: dict[str, Any],
+    ) -> None:
+        observation_id = function_tool_context.get("observation_id")
+        if not isinstance(observation_id, str) or not observation_id:
+            return
+        collector.note_wrapper_arguments(
+            observation_id,
+            wrapper_received_arguments,
+            final_positional_arguments=final_positional_arguments,
+            final_keyword_arguments=final_keyword_arguments,
+            effective_arguments=effective_arguments,
+        )
+        state = collector.call_state(observation_id)
+        _record_tool_boundary(
+            collector,
+            transition="B04_FUNCTION_TOOL_TO_WRAPPER",
+            from_module="function_tool",
+            to_module="lumibot_tool_wrapper",
+            status="success",
+            model_turn_id=function_tool_context.get("model_turn_id"),
+            tool_batch_id=function_tool_context.get("tool_batch_id"),
+            call_id=function_tool_context.get("call_id"),
+            payload=build_boundary_payload(
+                state,
+                function_tool_context,
+                missing_mandatory_arguments=[],
+                validation_error=None,
+            ),
+        )
+
     wrapped = _wrap_tool_callable(
         tool,
         shared_tool_context,
         collector=collector,
+        pre_invoke_observer=(
+            observe_wrapper_entry
+            if collector is not None
+            else None
+        ),
     )
     if collector is None:
         return function_tool_type(wrapped)
 
     class ObservedFunctionTool(function_tool_type):
+        def _preprocess_args(
+            self,
+            args: dict[str, Any],
+        ) -> dict[str, Any]:
+            preprocessed = super()._preprocess_args(args)
+            try:
+                context = collector.current_tool_call() or {}
+                observation_id = context.get("observation_id")
+                if isinstance(observation_id, str) and observation_id:
+                    collector.note_function_tool_preprocessed_arguments(
+                        observation_id,
+                        preprocessed,
+                    )
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "function_tool_preprocess_observation_failed",
+                    exc,
+                )
+            return preprocessed
+
+        def _missing_mandatory_arguments(
+            self,
+            args: dict[str, Any],
+        ) -> list[str]:
+            get_mandatory_args = getattr(
+                self,
+                "_get_mandatory_args",
+                None,
+            )
+            if callable(get_mandatory_args):
+                mandatory_arguments = get_mandatory_args()
+            else:
+                signature = inspect.signature(wrapped)
+                mandatory_arguments = [
+                    name
+                    for name, parameter in signature.parameters.items()
+                    if parameter.default is inspect.Parameter.empty
+                    and parameter.kind
+                    not in (
+                        inspect.Parameter.VAR_POSITIONAL,
+                        inspect.Parameter.VAR_KEYWORD,
+                    )
+                ]
+            context_parameter = getattr(
+                self,
+                "_context_param_name",
+                "tool_context",
+            )
+            return [
+                name
+                for name in mandatory_arguments
+                if name != context_parameter and name not in args
+            ]
+
+        def _record_uninvoked_boundary(
+            self,
+            *,
+            status: str,
+            args: dict[str, Any],
+            observation_id: str,
+            call_id: str,
+            call_id_source: str,
+            ids: dict[str, Any],
+            confirmation_status: str,
+            tool_confirmation_present: bool,
+            validation_error: dict[str, Any],
+        ) -> None:
+            state = collector.call_state(observation_id)
+            if state.get("wrapper_invoked"):
+                return
+            missing: list[str] = []
+            if status == "blocked":
+                try:
+                    missing = self._missing_mandatory_arguments(args)
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "function_tool_missing_arguments_failed",
+                        exc,
+                    )
+            _record_tool_boundary(
+                collector,
+                transition="B04_FUNCTION_TOOL_TO_WRAPPER",
+                from_module="function_tool",
+                to_module="lumibot_tool_wrapper",
+                status=status,
+                model_turn_id=ids.get("model_turn_id"),
+                tool_batch_id=ids.get("tool_batch_id"),
+                call_id=call_id,
+                payload={
+                    **build_boundary_payload(
+                        state,
+                        {
+                            "observation_id": observation_id,
+                            "call_id_source": call_id_source,
+                            "confirmation_status": (
+                                confirmation_status
+                            ),
+                            "tool_confirmation_present": (
+                                tool_confirmation_present
+                            ),
+                            "context_parameter": getattr(
+                                self,
+                                "_context_param_name",
+                                "tool_context",
+                            ),
+                        },
+                        missing_mandatory_arguments=missing,
+                        validation_error=validation_error,
+                    )
+                },
+                error=(
+                    validation_error if status == "error" else None
+                ),
+            )
+
         async def run_async(
             self,
             *,
@@ -410,6 +756,7 @@ def _build_observed_function_tool(
                 call_id = f"generated:function_tool:{uuid4().hex}"
                 call_id_source = "generated_missing_function_tool_id"
 
+            observation_id = f"function_tool:{uuid4().hex}"
             ids: dict[str, Any] = {}
             try:
                 ids = collector.call_ids(call_id)
@@ -419,12 +766,47 @@ def _build_observed_function_tool(
                     "function_tool_call_lookup_failed",
                     exc,
                 )
+
+            tool_confirmation = None
             try:
-                collector.clear_wrapper_call_state(call_id)
+                tool_confirmation = getattr(
+                    tool_context,
+                    "tool_confirmation",
+                    None,
+                )
             except Exception as exc:
                 _add_trace_diagnostic(
                     collector,
-                    "function_tool_call_state_cleanup_failed",
+                    "tool_confirmation_observation_failed",
+                    exc,
+                )
+            tool_confirmation_present = tool_confirmation is not None
+            confirmation_status = "not_present"
+            if tool_confirmation_present:
+                try:
+                    confirmed = getattr(
+                        tool_confirmation,
+                        "confirmed",
+                        None,
+                    )
+                except Exception:
+                    confirmed = None
+                if confirmed is True:
+                    confirmation_status = "confirmed"
+                elif confirmed is False:
+                    confirmation_status = "rejected"
+                else:
+                    confirmation_status = "present"
+
+            try:
+                collector.begin_function_tool_observation(
+                    observation_id,
+                    model_arguments=args,
+                )
+            except Exception as exc:
+                _add_trace_diagnostic(
+                    collector,
+                    "function_tool_observation_start_failed",
                     exc,
                 )
 
@@ -432,9 +814,21 @@ def _build_observed_function_tool(
             try:
                 trace_context = collector.tool_call_context(
                     call_id=call_id,
+                    call_id_source=call_id_source,
+                    observation_id=observation_id,
                     tool_name=tool.name,
+                    context_parameter=getattr(
+                        self,
+                        "_context_param_name",
+                        "tool_context",
+                    ),
                     model_turn_id=ids.get("model_turn_id"),
                     tool_batch_id=ids.get("tool_batch_id"),
+                    model_arguments=args,
+                    confirmation_status=confirmation_status,
+                    tool_confirmation_present=(
+                        tool_confirmation_present
+                    ),
                 )
                 trace_context.__enter__()
             except Exception as exc:
@@ -446,22 +840,85 @@ def _build_observed_function_tool(
                 )
 
             try:
-                result = await super().run_async(
-                    args=args,
-                    tool_context=tool_context,
-                )
-            except BaseException:
-                if trace_context is not None:
+                try:
+                    result = await super().run_async(
+                        args=args,
+                        tool_context=tool_context,
+                    )
+                except BaseException as exc:
                     try:
-                        trace_context.__exit__(*sys.exc_info())
-                    except Exception as exc:
+                        self._record_uninvoked_boundary(
+                            status="error",
+                            args=args,
+                            observation_id=observation_id,
+                            call_id=call_id,
+                            call_id_source=call_id_source,
+                            ids=ids,
+                            confirmation_status=confirmation_status,
+                            tool_confirmation_present=(
+                                tool_confirmation_present
+                            ),
+                            validation_error=_safe_exception_details(
+                                exc
+                            ),
+                        )
+                    except Exception as observation_exc:
                         _add_trace_diagnostic(
                             collector,
-                            "function_tool_context_exit_failed",
-                            exc,
+                            "function_tool_error_observation_failed",
+                            observation_exc,
                         )
-                raise
-            else:
+                    raise
+
+                try:
+                    state = collector.call_state(observation_id)
+                    if not state.get("wrapper_invoked"):
+                        error_message = ""
+                        if isinstance(result, dict):
+                            error_message = str(
+                                result.get("error") or ""
+                            )
+                        if error_message:
+                            blocked_confirmation_status = (
+                                "required_missing"
+                                if "requires confirmation"
+                                in error_message
+                                else confirmation_status
+                            )
+                            self._record_uninvoked_boundary(
+                                status="blocked",
+                                args=args,
+                                observation_id=observation_id,
+                                call_id=call_id,
+                                call_id_source=call_id_source,
+                                ids=ids,
+                                confirmation_status=(
+                                    blocked_confirmation_status
+                                ),
+                                tool_confirmation_present=(
+                                    tool_confirmation_present
+                                ),
+                                validation_error={
+                                    "type": (
+                                        "FunctionToolValidationBlocked"
+                                    ),
+                                    "message": error_message,
+                                },
+                            )
+                        else:
+                            collector.add_diagnostic(
+                                "function_tool_wrapper_entry_unobserved",
+                                "FunctionTool returned without a validation "
+                                "error or wrapper-entry observation",
+                            )
+                except Exception as exc:
+                    _add_trace_diagnostic(
+                        collector,
+                        "function_tool_blocked_observation_failed",
+                        exc,
+                    )
+                return result
+            finally:
                 if trace_context is not None:
                     try:
                         trace_context.__exit__(None, None, None)
@@ -471,109 +928,16 @@ def _build_observed_function_tool(
                             "function_tool_context_exit_failed",
                             exc,
                         )
-
-            state: dict[str, Any] = {}
-            try:
-                state = collector.call_state(call_id)
-            except Exception as exc:
-                _add_trace_diagnostic(
-                    collector,
-                    "function_tool_call_state_failed",
-                    exc,
-                )
-
-            try:
-                wrapper_arguments = state.get(
-                    "wrapper_received_arguments"
-                )
-                wrapper_invoked = bool(state.get("wrapper_invoked"))
-                missing: list[str] = []
-                if not wrapper_invoked and isinstance(result, dict):
-                    message = str(result.get("error") or "")
-                    if "mandatory input parameters" in message:
-                        try:
-                            get_mandatory_args = getattr(
-                                self,
-                                "_get_mandatory_args",
-                                None,
-                            )
-                            if callable(get_mandatory_args):
-                                mandatory_arguments = (
-                                    get_mandatory_args()
-                                )
-                            else:
-                                signature = inspect.signature(wrapped)
-                                mandatory_arguments = [
-                                    name
-                                    for name, parameter in signature.parameters.items()
-                                    if parameter.default
-                                    is inspect.Parameter.empty
-                                    and parameter.kind
-                                    not in (
-                                        inspect.Parameter.VAR_POSITIONAL,
-                                        inspect.Parameter.VAR_KEYWORD,
-                                    )
-                                ]
-                            context_parameter = getattr(
-                                self,
-                                "_context_param_name",
-                                "tool_context",
-                            )
-                            missing = [
-                                name
-                                for name in mandatory_arguments
-                                if name != context_parameter
-                                and name not in args
-                            ]
-                        except Exception as exc:
-                            _add_trace_diagnostic(
-                                collector,
-                                "function_tool_missing_arguments_failed",
-                                exc,
-                            )
-                accepted = set(wrapper_arguments or {})
-                _record_tool_boundary(
-                    collector,
-                    transition="B04_FUNCTION_TOOL_TO_WRAPPER",
-                    from_module="function_tool",
-                    to_module="lumibot_tool_wrapper",
-                    status=(
-                        "success"
-                        if wrapper_invoked
-                        else "blocked"
-                    ),
-                    model_turn_id=ids.get("model_turn_id"),
-                    tool_batch_id=ids.get("tool_batch_id"),
-                    call_id=call_id,
-                    payload={
-                        "tool_name": tool.name,
-                        "call_id_source": call_id_source,
-                        "model_arguments": dict(args),
-                        "wrapper_received_arguments": wrapper_arguments,
-                        "removed_arguments": (
-                            sorted(set(args) - accepted)
-                            if wrapper_arguments is not None
-                            else []
-                        ),
-                        "missing_mandatory_arguments": missing,
-                    },
-                )
-            except Exception as exc:
-                _add_trace_diagnostic(
-                    collector,
-                    "function_tool_boundary_observation_failed",
-                    exc,
-                )
-            finally:
                 try:
-                    collector.clear_wrapper_call_state(call_id)
+                    collector.clear_function_tool_observation(
+                        observation_id
+                    )
                 except Exception as exc:
                     _add_trace_diagnostic(
                         collector,
-                        "function_tool_call_state_cleanup_failed",
+                        "function_tool_observation_cleanup_failed",
                         exc,
                     )
-            return result
 
     return ObservedFunctionTool(wrapped)
 

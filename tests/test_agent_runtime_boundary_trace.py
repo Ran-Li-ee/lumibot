@@ -102,9 +102,68 @@ def test_observed_function_tool_correlates_validated_wrapper_arguments(tmp_path)
     assert b04["payload"]["wrapper_received_arguments"]["request"] == {
         "symbol": "QQQ"
     }
+    assert b04["payload"]["adk_function_call_arguments"] == {
+        "request": {"symbol": "QQQ"},
+        "unknown": "removed",
+    }
+    assert b04["payload"]["function_tool_preprocessed_arguments"] == {
+        "request": {"symbol": "QQQ"},
+        "unknown": "removed",
+    }
+    assert b04["payload"]["function_tool_filtered_arguments"] == {
+        "request": {"symbol": "QQQ"}
+    }
+    assert b04["payload"]["final_positional_arguments"] == []
+    assert b04["payload"]["final_keyword_arguments"]["request"] == {
+        "symbol": "QQQ"
+    }
+    assert b04["payload"][
+        "effective_python_arguments_with_defaults"
+    ] == {
+        "request": {"symbol": "QQQ"},
+        "asset_type": "stock",
+    }
     assert b04["payload"]["removed_arguments"] == ["unknown"]
+    assert b04["payload"]["converted_arguments"] == [
+        {
+            "name": "request",
+            "from_type": "dict",
+            "to_type": "SymbolInput",
+        }
+    ]
+    assert b04["payload"]["defaulted_arguments"] == [
+        {"name": "asset_type", "value": "stock"}
+    ]
+    assert b04["payload"]["confirmation_status"] == "not_present"
+    assert b04["payload"]["tool_confirmation_present"] is False
+    assert b04["payload"]["validation_error"] is None
+    assert b04["payload"]["argument_stage_fidelity"][
+        "function_tool_preprocessed_arguments"
+    ]["source"] == "FunctionTool._preprocess_args return"
+    assert collector.call_state(b04["payload"]["observation_id"]) == {}
     b05 = _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL")[0]
     assert b05["payload"]["effective_arguments"]["asset_type"] == "stock"
+    assert _event_timestamp(b04["ended_at"]) <= _event_timestamp(
+        b05["started_at"]
+    )
+    call_transitions = [
+        event["transition"]
+        for event in collector.export()["events"]
+        if event["call_id"] == "call_A"
+        and event["transition"]
+        in {
+            "B04_FUNCTION_TOOL_TO_WRAPPER",
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+        }
+    ]
+    assert call_transitions == [
+        "B04_FUNCTION_TOOL_TO_WRAPPER",
+        "B05_WRAPPER_TO_PYTHON_TOOL",
+        "B06_PYTHON_TOOL_TO_WRAPPER",
+        "B07_WRAPPER_TO_FUNCTION_TOOL",
+    ]
 
 
 def test_missing_required_argument_records_b04_without_local_execution(tmp_path):
@@ -133,6 +192,91 @@ def test_missing_required_argument_records_b04_without_local_execution(tmp_path)
     b04 = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")[0]
     assert b04["status"] == "blocked"
     assert b04["payload"]["missing_mandatory_arguments"] == ["symbol"]
+    assert _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL") == []
+    assert collector.call_state(b04["payload"]["observation_id"]) == {}
+
+
+def test_confirmation_metadata_precedes_confirmed_wrapper_execution(tmp_path):
+    class ConfirmedToolContext(FakeToolContext):
+        tool_confirmation = SimpleNamespace(confirmed=True)
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(
+            name="echo",
+            description="echo",
+            function=lambda value: value,
+        ),
+        collector=collector,
+        shared_tool_context={},
+    )
+    observed._require_confirmation = True
+
+    result = asyncio.run(
+        observed.run_async(
+            args={"value": "received"},
+            tool_context=ConfirmedToolContext(),
+        )
+    )
+
+    assert result == "received"
+    b04 = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")[0]
+    assert b04["status"] == "success"
+    assert b04["payload"]["confirmation_status"] == "confirmed"
+    assert b04["payload"]["tool_confirmation_present"] is True
+    transitions = [
+        event["transition"]
+        for event in collector.export()["events"]
+        if event["call_id"] == "call_A"
+    ]
+    assert transitions == [
+        "B04_FUNCTION_TOOL_TO_WRAPPER",
+        "B05_WRAPPER_TO_PYTHON_TOOL",
+        "B06_PYTHON_TOOL_TO_WRAPPER",
+        "B07_WRAPPER_TO_FUNCTION_TOOL",
+    ]
+
+
+def test_missing_confirmation_records_blocked_b04_without_b05(tmp_path):
+    class ConfirmationToolContext(FakeToolContext):
+        def __init__(self):
+            self.tool_confirmation = None
+            self.requested_confirmation = False
+
+        def request_confirmation(self, **_kwargs):
+            self.requested_confirmation = True
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(
+            name="echo",
+            description="echo",
+            function=lambda value: value,
+        ),
+        collector=collector,
+        shared_tool_context={},
+    )
+    observed._require_confirmation = True
+    tool_context = ConfirmationToolContext()
+
+    result = asyncio.run(
+        observed.run_async(
+            args={"value": "received"},
+            tool_context=tool_context,
+        )
+    )
+
+    assert "requires confirmation" in result["error"]
+    assert tool_context.requested_confirmation is True
+    b04 = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")[0]
+    assert b04["status"] == "blocked"
+    assert b04["payload"]["confirmation_status"] == "required_missing"
+    assert b04["payload"]["tool_confirmation_present"] is False
+    assert b04["payload"]["validation_error"]["type"] == (
+        "FunctionToolValidationBlocked"
+    )
     assert _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL") == []
 
 
@@ -163,6 +307,44 @@ def test_missing_required_arguments_exclude_adk_injected_tool_context(tmp_path):
     assert _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL") == []
 
 
+def test_preprocessing_error_records_b04_error_and_reraises_unchanged(tmp_path):
+    executed = []
+
+    def tool(symbol):
+        executed.append(symbol)
+        return {"symbol": symbol}
+
+    tool.__annotations__ = {"symbol": "MissingToolAnnotation"}
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(name="tool", description="tool", function=tool),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    with pytest.raises(NameError) as raised:
+        asyncio.run(
+            observed.run_async(
+                args={"symbol": "QQQ"},
+                tool_context=FakeToolContext(),
+            )
+        )
+
+    assert "MissingToolAnnotation" in str(raised.value)
+    assert executed == []
+    b04_events = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")
+    assert len(b04_events) == 1
+    b04 = b04_events[0]
+    assert b04["status"] == "error"
+    assert b04["error"]["type"] == "NameError"
+    assert b04["payload"]["validation_error"]["type"] == "NameError"
+    assert b04["payload"]["function_tool_preprocessed_arguments"] is None
+    assert b04["payload"]["wrapper_received_arguments"] is None
+    assert _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL") == []
+    assert collector.call_state(b04["payload"]["observation_id"]) == {}
+
+
 def test_collector_call_state_is_detached_from_mutable_arguments(tmp_path):
     collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
     arguments = {"request": {"symbol": "QQQ"}}
@@ -172,9 +354,13 @@ def test_collector_call_state_is_detached_from_mutable_arguments(tmp_path):
     first_state = collector.call_state("call_A")
     first_state["wrapper_received_arguments"]["request"]["symbol"] = "IWM"
 
-    assert collector.call_state("call_A") == {
-        "wrapper_invoked": True,
-        "wrapper_received_arguments": {"request": {"symbol": "QQQ"}},
+    detached_state = collector.call_state("call_A")
+    assert detached_state["wrapper_invoked"] is True
+    assert detached_state["wrapper_received_arguments"] == {
+        "request": {"symbol": "QQQ"}
+    }
+    assert detached_state["wrapper_argument_types"] == {
+        "request": "dict"
     }
 
 
@@ -384,6 +570,134 @@ def test_repeated_provider_call_id_does_not_reuse_wrapper_state(tmp_path):
     assert b04_events[1]["payload"]["missing_mandatory_arguments"] == ["symbol"]
 
 
+def test_parallel_distinct_call_ids_keep_observations_isolated(tmp_path):
+    class YieldingFunctionTool(FunctionTool):
+        async def _invoke_callable(self, target, args_to_call):
+            await asyncio.sleep(0)
+            return await super()._invoke_callable(target, args_to_call)
+
+    class ParallelToolContext(FakeToolContext):
+        def __init__(self, call_id):
+            self.function_call_id = call_id
+            self.tool_confirmation = None
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    turn_id = collector.start_model_turn()
+    collector.register_tool_batch(turn_id, ["call_A", "call_B"])
+    observed = _build_observed_function_tool(
+        YieldingFunctionTool,
+        BoundTool(
+            name="echo",
+            description="echo",
+            function=lambda value: {"value": value},
+        ),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    async def run_parallel():
+        return await asyncio.gather(
+            observed.run_async(
+                args={"value": "A"},
+                tool_context=ParallelToolContext("call_A"),
+            ),
+            observed.run_async(
+                args={"value": "B"},
+                tool_context=ParallelToolContext("call_B"),
+            ),
+        )
+
+    assert asyncio.run(run_parallel()) == [
+        {"value": "A"},
+        {"value": "B"},
+    ]
+    b04_events = _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER")
+    assert {
+        event["call_id"]: event["payload"]["model_arguments"]["value"]
+        for event in b04_events
+    } == {"call_A": "A", "call_B": "B"}
+    observation_ids = {
+        event["payload"]["observation_id"] for event in b04_events
+    }
+    assert len(observation_ids) == 2
+    assert all(
+        collector.call_state(observation_id) == {}
+        for observation_id in observation_ids
+    )
+
+
+def test_parallel_duplicate_provider_ids_use_unique_observation_state(tmp_path):
+    class YieldingFunctionTool(FunctionTool):
+        async def _invoke_callable(self, target, args_to_call):
+            await asyncio.sleep(0)
+            return await super()._invoke_callable(target, args_to_call)
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        YieldingFunctionTool,
+        BoundTool(
+            name="echo",
+            description="echo",
+            function=lambda value: {"value": value},
+        ),
+        collector=collector,
+        shared_tool_context={},
+    )
+
+    async def run_parallel():
+        return await asyncio.gather(
+            observed.run_async(
+                args={"value": "first"},
+                tool_context=FakeToolContext(),
+            ),
+            observed.run_async(
+                args={"value": "second"},
+                tool_context=FakeToolContext(),
+            ),
+        )
+
+    assert asyncio.run(run_parallel()) == [
+        {"value": "first"},
+        {"value": "second"},
+    ]
+    boundary_events = [
+        event
+        for event in collector.export()["events"]
+        if event["transition"]
+        in {
+            "B04_FUNCTION_TOOL_TO_WRAPPER",
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+        }
+    ]
+    assert {event["call_id"] for event in boundary_events} == {"call_A"}
+    by_observation = {}
+    for event in boundary_events:
+        observation_id = event["payload"]["observation_id"]
+        by_observation.setdefault(observation_id, []).append(event)
+
+    assert len(by_observation) == 2
+    assert {
+        events[0]["payload"]["model_arguments"]["value"]
+        for events in by_observation.values()
+    } == {"first", "second"}
+    assert all(
+        [event["transition"] for event in events]
+        == [
+            "B04_FUNCTION_TOOL_TO_WRAPPER",
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+        ]
+        for events in by_observation.values()
+    )
+    assert all(
+        collector.call_state(observation_id) == {}
+        for observation_id in by_observation
+    )
+
+
 def test_function_tool_observation_failures_preserve_success_result(
     monkeypatch, tmp_path
 ):
@@ -417,6 +731,55 @@ def test_function_tool_observation_failures_preserve_success_result(
     )
 
     assert result == {"value": "received"}
+
+
+def test_pre_invoke_observation_failure_does_not_block_wrapper(
+    monkeypatch, tmp_path
+):
+    executed = []
+
+    def tool(value):
+        executed.append(value)
+        return {"value": value}
+
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+    observed = _build_observed_function_tool(
+        FunctionTool,
+        BoundTool(name="echo", description="echo", function=tool),
+        collector=collector,
+        shared_tool_context={},
+    )
+    monkeypatch.setattr(
+        collector,
+        "note_wrapper_arguments",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("entry observation failed")
+        ),
+    )
+
+    result = asyncio.run(
+        observed.run_async(
+            args={"value": "received"},
+            tool_context=FakeToolContext(),
+        )
+    )
+
+    assert result == {"value": "received"}
+    assert executed == ["received"]
+    assert _events(collector, "B04_FUNCTION_TOOL_TO_WRAPPER") == []
+    assert [
+        event["transition"]
+        for event in collector.export()["events"]
+        if event["call_id"] == "call_A"
+    ] == [
+        "B05_WRAPPER_TO_PYTHON_TOOL",
+        "B06_PYTHON_TOOL_TO_WRAPPER",
+        "B07_WRAPPER_TO_FUNCTION_TOOL",
+    ]
+    assert any(
+        diagnostic["kind"] == "pre_invoke_observation_failed"
+        for diagnostic in collector.export()["diagnostics"]
+    )
 
 
 def test_b04_payload_observation_failure_preserves_success_result(
