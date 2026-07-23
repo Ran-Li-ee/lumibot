@@ -76,15 +76,27 @@ def _configure_google_sdk_noise_filters() -> None:
     _GOOGLE_SDK_NOISE_FILTERS_CONFIGURED = True
 
 
+def _safe_exception_details(exc: Exception) -> dict[str, str]:
+    try:
+        type_name = type.__getattribute__(type(exc), "__name__")
+    except Exception:
+        type_name = "Exception"
+    try:
+        message = str(exc)
+    except Exception:
+        message = "[exception message unavailable]"
+    return {
+        "type": type_name if isinstance(type_name, str) else "Exception",
+        "message": message,
+    }
+
+
 def _tool_error_payload(tool_name: str, args: dict[str, Any], exc: Exception) -> dict[str, Any]:
     return {
         "ok": False,
         "tool_error": True,
         "tool_name": tool_name,
-        "error": {
-            "type": exc.__class__.__name__,
-            "message": str(exc),
-        },
+        "error": _safe_exception_details(exc),
         "arguments": _json_safe_value(dict(args or {})),
     }
 
@@ -102,16 +114,190 @@ def _tool_function_name(value: str) -> str:
     return normalized
 
 
-def _wrap_tool_callable(tool: BoundTool, tool_context: dict[str, Any] | None = None):
+def _safe_callable_metadata(original: Any) -> dict[str, str | None]:
+    metadata_target = original
+    metadata_getter = object.__getattribute__
+    if inspect.ismethod(original):
+        try:
+            metadata_target = object.__getattribute__(original, "__func__")
+        except Exception:
+            metadata_target = type(original)
+            metadata_getter = type.__getattribute__
+    elif inspect.isfunction(original) or inspect.isbuiltin(original):
+        metadata_getter = object.__getattribute__
+    elif inspect.isclass(original):
+        metadata_getter = type.__getattribute__
+    else:
+        metadata_target = type(original)
+        metadata_getter = type.__getattribute__
+
+    values: dict[str, str | None] = {}
+    for key in ("__module__", "__qualname__"):
+        try:
+            value = metadata_getter(metadata_target, key)
+        except Exception:
+            value = None
+        values[key.removeprefix("__").removesuffix("__")] = value if isinstance(value, str) else None
+    return values
+
+
+def _safe_callable_annotations(original: Any) -> dict[str, Any] | None:
+    target = original
+    if inspect.ismethod(original):
+        try:
+            target = object.__getattribute__(original, "__func__")
+        except Exception:
+            return None
+    if not (inspect.isfunction(target) or inspect.isbuiltin(target)):
+        return None
+    try:
+        annotations = object.__getattribute__(target, "__annotations__")
+    except Exception:
+        return None
+    return dict(annotations) if isinstance(annotations, dict) else None
+
+
+def _safe_callable_signature(original: Any) -> inspect.Signature:
+    if inspect.ismethod(original):
+        target = object.__getattribute__(original, "__func__")
+        signature = inspect.signature(target)
+        parameters = list(signature.parameters.values())
+        return signature.replace(parameters=parameters[1:])
+    if inspect.isfunction(original) or inspect.isbuiltin(original) or inspect.isclass(original):
+        return inspect.signature(original)
+
+    actual_type = type(original)
+    for base in type.__getattribute__(actual_type, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        target = namespace.get("__call__")
+        if target is None:
+            continue
+        signature = inspect.signature(target)
+        parameters = list(signature.parameters.values())
+        return signature.replace(parameters=parameters[1:])
+    raise ValueError("callable signature is unavailable")
+
+
+def _add_trace_diagnostic(
+    collector: BoundaryTraceCollector | None,
+    kind: str,
+    exc: Exception,
+) -> None:
+    if collector is None:
+        return
+    try:
+        collector.add_diagnostic(kind, exc)
+    except Exception:
+        pass
+
+
+def _record_tool_boundary(
+    collector: BoundaryTraceCollector | None,
+    **event: Any,
+) -> None:
+    if collector is None:
+        return
+    try:
+        collector.record(**event)
+    except Exception as exc:
+        _add_trace_diagnostic(collector, "record_failed", exc)
+
+
+def _wrap_tool_callable(
+    tool: BoundTool,
+    tool_context: dict[str, Any] | None = None,
+    *,
+    collector: BoundaryTraceCollector | None = None,
+):
     original = tool.function
+    callable_metadata = _safe_callable_metadata(original)
 
     def wrapper(*args, **kwargs):
         result: Any
+        call_context: dict[str, Any] = {}
+        if collector is not None:
+            try:
+                current_context = collector.current_tool_call()
+            except Exception as exc:
+                _add_trace_diagnostic(collector, "tool_call_context_failed", exc)
+            else:
+                if isinstance(current_context, dict):
+                    call_context = current_context
+
+        started_at = _utc_iso_timestamp()
+        started_perf = time.perf_counter()
+        effective_arguments = dict(kwargs)
+        try:
+            signature = _safe_callable_signature(original)
+            bound = signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            effective_arguments = dict(bound.arguments)
+        except (TypeError, ValueError):
+            pass
+
+        trace_ids = {
+            "model_turn_id": call_context.get("model_turn_id"),
+            "tool_batch_id": call_context.get("tool_batch_id"),
+            "call_id": call_context.get("call_id"),
+        }
+        _record_tool_boundary(
+            collector,
+            transition="B05_WRAPPER_TO_PYTHON_TOOL",
+            from_module="lumibot_tool_wrapper",
+            to_module="python_tool",
+            started_at=started_at,
+            payload={
+                "tool_name": tool.name,
+                "source": tool.source,
+                "callable_module": callable_metadata["module"],
+                "callable_qualname": callable_metadata["qualname"],
+                "positional_arguments": list(args),
+                "keyword_arguments": dict(kwargs),
+                "effective_arguments": effective_arguments,
+            },
+            **trace_ids,
+        )
+
         try:
             with agent_tool_context(tool_context):
-                result = _json_safe_value(original(*args, **kwargs))
+                raw_result = original(*args, **kwargs)
         except Exception as exc:
+            error = _safe_exception_details(exc)
+            _record_tool_boundary(
+                collector,
+                transition="B06_PYTHON_TOOL_TO_WRAPPER",
+                from_module="python_tool",
+                to_module="lumibot_tool_wrapper",
+                status="error",
+                started_at=started_at,
+                duration_ms=max((time.perf_counter() - started_perf) * 1000, 0.0),
+                payload={"tool_name": tool.name},
+                error=error,
+                **trace_ids,
+            )
             result = _tool_error_payload(tool.name, kwargs, exc)
+        else:
+            if collector is not None:
+                try:
+                    raw_description = collector.describe_raw_value(raw_result)
+                except Exception as exc:
+                    _add_trace_diagnostic(collector, "describe_raw_value_failed", exc)
+                else:
+                    _record_tool_boundary(
+                        collector,
+                        transition="B06_PYTHON_TOOL_TO_WRAPPER",
+                        from_module="python_tool",
+                        to_module="lumibot_tool_wrapper",
+                        status="success",
+                        started_at=started_at,
+                        duration_ms=max((time.perf_counter() - started_perf) * 1000, 0.0),
+                        payload={"raw_result": raw_description},
+                        **trace_ids,
+                    )
+            try:
+                result = _json_safe_value(raw_result)
+            except Exception as exc:
+                result = _tool_error_payload(tool.name, kwargs, exc)
         if isinstance(tool_context, dict):
             calls = tool_context.setdefault("tool_calls", [])
             if isinstance(calls, list):
@@ -122,18 +308,28 @@ def _wrap_tool_callable(tool: BoundTool, tool_context: dict[str, Any] | None = N
                         "ok": not (isinstance(result, dict) and result.get("tool_error") is True),
                     }
                 )
+        _record_tool_boundary(
+            collector,
+            transition="B07_WRAPPER_TO_FUNCTION_TOOL",
+            from_module="lumibot_tool_wrapper",
+            to_module="function_tool",
+            started_at=started_at,
+            duration_ms=max((time.perf_counter() - started_perf) * 1000, 0.0),
+            payload={"serialized_result": result},
+            **trace_ids,
+        )
         return result
 
     wrapper.__name__ = _tool_function_name(tool.name)
     wrapper.__qualname__ = wrapper.__name__
     wrapper.__doc__ = tool.description
     try:
-        wrapper.__signature__ = inspect.signature(original)
+        wrapper.__signature__ = _safe_callable_signature(original)
     except (TypeError, ValueError):
         pass
-    annotations = getattr(original, "__annotations__", None)
-    if isinstance(annotations, dict):
-        wrapper.__annotations__ = dict(annotations)
+    annotations = _safe_callable_annotations(original)
+    if annotations is not None:
+        wrapper.__annotations__ = annotations
     return wrapper
 
 
