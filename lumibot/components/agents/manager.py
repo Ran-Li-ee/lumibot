@@ -63,6 +63,10 @@ def _normalize_json(value: Any) -> Any:
     return _get_replay_imports()[1](value)
 
 
+def _normalize_redacted_payload(value: Any) -> Any:
+    return redact_sensitive(_normalize_json(value))
+
+
 def _get_duckdb_query_layer_class():
     global _DUCKDB_QUERY_LAYER
     if _DUCKDB_QUERY_LAYER is None:
@@ -1281,9 +1285,8 @@ class AgentHandle:
             f"{result.cache_key or 'live'}-"
             f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.json"
         )
-        normalized_payload = _normalize_json(trace_payload)
         normalized = json.dumps(
-            redact_sensitive(normalized_payload),
+            trace_payload,
             indent=2,
             sort_keys=True,
         )
@@ -1324,9 +1327,35 @@ class AgentHandle:
             "trace_path": trace_path,
             "trace_relative_path": trace_relative_path,
         }
+        safe_record = _normalize_redacted_payload(record)
         with summary_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(_normalize_json(record), sort_keys=True))
+            handle.write(json.dumps(safe_record, sort_keys=True))
             handle.write("\n")
+
+    def _run_result_artifact_side_effects(
+        self,
+        *,
+        result: AgentRunResult,
+        runtime_context: dict[str, Any],
+        cache_payload: dict[str, Any],
+    ) -> None:
+        side_effects = (
+            functools.partial(
+                self.manager._record_agent_observability,
+                handle=self,
+                result=result,
+                runtime_context=runtime_context,
+                cache_payload=cache_payload,
+            ),
+            functools.partial(self._append_memory, result),
+            functools.partial(self._append_run_artifact_summary, result, runtime_context),
+            functools.partial(self._log_run_summary, result, runtime_context),
+        )
+        for side_effect in side_effects:
+            try:
+                side_effect()
+            except Exception:
+                pass
 
     def _result_from_cached(self, cached: dict[str, Any], cache_key: str) -> AgentRunResult:
         events = [
@@ -1661,15 +1690,11 @@ class AgentHandle:
             if cached is not None:
                 result = self._result_from_cached(cached, cache_key)
                 self._replay_cached_side_effects(result, bound_tools)
-                self.manager._record_agent_observability(
-                    handle=self,
+                self._run_result_artifact_side_effects(
                     result=result,
                     runtime_context=runtime_context,
                     cache_payload=cache_payload,
                 )
-                self._append_memory(result)
-                self._append_run_artifact_summary(result, runtime_context)
-                self._log_run_summary(result, runtime_context)
                 return result
 
         agent_run_id = uuid4().hex
@@ -1724,9 +1749,7 @@ class AgentHandle:
         started_perf = time.perf_counter()
         try:
             result = self._runtime.run(request)
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as exc:  # noqa: BLE001 - intentional broad catch
+        except Exception as exc:
             import traceback as _tb
 
             from .runtime import _classify_agent_error
@@ -1819,6 +1842,7 @@ class AgentHandle:
                     model_name=model_name,
                     cache_payload=cache_payload,
                 )
+                trace_payload = _normalize_redacted_payload(trace_payload)
                 trace_path = self._write_trace(result, trace_payload)
             except Exception as trace_exc:
                 boundary_collector.add_diagnostic("trace_write_failed", trace_exc)
@@ -1829,15 +1853,11 @@ class AgentHandle:
                 result.payload["trace_path"] = str(trace_path.resolve())
             # Record this skipped run in the agent's memory so the model on
             # the next iteration knows the previous cycle was skipped.
-            self.manager._record_agent_observability(
-                handle=self,
+            self._run_result_artifact_side_effects(
                 result=result,
                 runtime_context=runtime_context,
                 cache_payload=cache_payload,
             )
-            self._append_memory(result)
-            self._append_run_artifact_summary(result, runtime_context)
-            self._log_run_summary(result, runtime_context)
             return result
         self._finalize_runtime_timing(
             result,
@@ -1854,6 +1874,7 @@ class AgentHandle:
                 model_name=model_name,
                 cache_payload=cache_payload,
             )
+            trace_payload = _normalize_redacted_payload(trace_payload)
             trace_path = self._write_trace(result, trace_payload)
         except Exception as exc:
             boundary_collector.add_diagnostic("trace_write_failed", exc)
@@ -1873,6 +1894,7 @@ class AgentHandle:
             portable_trace_path = trace_path.relative_to(self._runtime_artifact_dir()).as_posix()
             cached_payload = dict(result.payload)
             cached_payload["trace_path"] = portable_trace_path
+            cached_payload["warnings"] = trace_payload["warnings"]
             boundary_agent_run_id = ""
             if isinstance(result.boundary_trace, dict):
                 boundary_agent_run_id = str(
@@ -1889,28 +1911,27 @@ class AgentHandle:
                     "status": "unavailable_no_boundary_capture",
                     "trace_path": portable_trace_path,
                 }
-            self.manager.replay_cache.save(
-                cache_key,
-                {
-                    "summary": result.summary,
-                    "model": model_name,
-                    "events": trace_payload["events"],
-                    "warnings": result.warnings,
-                    "usage": result.usage,
-                    "payload": cached_payload,
-                    "timing": _runtime_timing_payload(result),
-                    "boundary_trace_ref": boundary_trace_ref,
-                },
-            )
-        self.manager._record_agent_observability(
-            handle=self,
+            try:
+                self.manager.replay_cache.save(
+                    cache_key,
+                    {
+                        "summary": trace_payload["summary"],
+                        "model": trace_payload["model"],
+                        "events": trace_payload["events"],
+                        "warnings": trace_payload["warnings"],
+                        "usage": trace_payload["usage"],
+                        "payload": cached_payload,
+                        "timing": trace_payload["timing"],
+                        "boundary_trace_ref": boundary_trace_ref,
+                    },
+                )
+            except Exception:
+                pass
+        self._run_result_artifact_side_effects(
             result=result,
             runtime_context=runtime_context,
             cache_payload=cache_payload,
         )
-        self._append_memory(result)
-        self._append_run_artifact_summary(result, runtime_context)
-        self._log_run_summary(result, runtime_context)
         return result
 
 

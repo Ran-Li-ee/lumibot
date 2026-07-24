@@ -32,7 +32,10 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel
 
-from .trace_redaction import redact_sensitive
+from .trace_redaction import (
+    is_safe_numeric_token_usage_field,
+    redact_sensitive,
+)
 
 BOUNDARY_SCHEMA_VERSION = 1
 DEFAULT_INLINE_PAYLOAD_LIMIT = 64_000
@@ -64,31 +67,6 @@ _STANDARD_PATH_TYPES = (
     PureWindowsPath,
     WindowsPath,
 )
-_SAFE_NUMERIC_USAGE_FIELDS = {
-    "budget_tokens",
-    "cache_creation_input_tokens",
-    "cache_read_input_tokens",
-    "cached_content_token_count",
-    "cached_input_tokens",
-    "cached_prompt_tokens",
-    "cached_tokens",
-    "candidates_token_count",
-    "completion_tokens",
-    "input_tokens",
-    "max_completion_tokens",
-    "max_output_tokens",
-    "max_tokens",
-    "output_tokens",
-    "prompt_cache_hit_tokens",
-    "prompt_cache_miss_tokens",
-    "prompt_token_count",
-    "prompt_tokens",
-    "reasoning_tokens",
-    "thoughts_token_count",
-    "tool_use_prompt_token_count",
-    "total_token_count",
-    "total_tokens",
-}
 class _TraceDescriptor(dict):
     pass
 
@@ -266,10 +244,7 @@ def _restore_safe_numeric_usage_fields(source: Any, transformed: Any) -> Any:
         restored = dict(transformed)
         for key, item in dict.items(source):
             transformed_item = restored.get(key)
-            if (
-                key in _SAFE_NUMERIC_USAGE_FIELDS
-                and type(item) in (int, float)
-            ):
+            if is_safe_numeric_token_usage_field(key, item):
                 restored[key] = item
             elif key in restored:
                 restored[key] = _restore_safe_numeric_usage_fields(

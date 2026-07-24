@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import json
 import logging
@@ -265,6 +266,63 @@ class BoundaryResultRuntime:
                     invocation_id="invocation-1",
                 )
             ],
+            boundary_trace=collector.export(),
+        )
+
+
+class SensitiveReplayRuntime:
+    def __init__(self, api_token, bearer_token):
+        self.api_token = api_token
+        self.bearer_token = bearer_token
+        self.call_count = 0
+
+    def run(self, request):
+        self.call_count += 1
+        collector = request.boundary_collector
+        collector.record(
+            transition="B09_ADK_TO_LITELLM",
+            from_module="google_adk",
+            to_module="litellm",
+            payload={"model": request.model, "contents": []},
+        )
+        summary = (
+            f"RESULT: used {self.api_token}; "
+            f"Authorization: Bearer {self.bearer_token}"
+        )
+        return AgentRunResult(
+            summary=summary,
+            model=request.model,
+            events=[
+                _event(
+                    "tool_call",
+                    tool_name="secret_tool",
+                    payload={
+                        "api_key": self.api_token,
+                        "Authorization": f"Bearer {self.bearer_token}",
+                    },
+                    call_id="secret-call",
+                ),
+                _event(
+                    "tool_result",
+                    tool_name="secret_tool",
+                    payload={
+                        "tool_error": True,
+                        "error": {
+                            "type": "TimeoutError",
+                            "message": summary,
+                        },
+                    },
+                    call_id="secret-call",
+                ),
+                _event("text", text=summary),
+            ],
+            usage={
+                "prompt_tokens": 101,
+                "completion_tokens": 23,
+                "total_tokens": 124,
+                "prompt_tokens_details": {"cached_tokens": 80},
+                "completion_tokens_details": {"reasoning_tokens": 9},
+            },
             boundary_trace=collector.export(),
         )
 
@@ -873,6 +931,27 @@ def test_handled_agent_failure_redacts_secrets_from_complete_trace(monkeypatch, 
     assert trace["boundary_trace"]["diagnostics"][-1]["kind"] == "agent_runtime_failed"
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError],
+)
+def test_runtime_control_flow_exceptions_propagate(monkeypatch, tmp_path, error_type):
+    error = error_type("stop agent run")
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=False,
+        runtime=BoundaryFailingRuntime(error),
+    )
+
+    with pytest.raises(error_type) as exc_info:
+        handle.run(task_prompt="test")
+
+    assert exc_info.value is error
+    assert list((tmp_path / "agent_runtime" / "traces").rglob("*.json")) == []
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
 def test_trace_write_failure_does_not_change_successful_agent_result(monkeypatch, tmp_path):
     handle, _ = _build_boundary_trace_handle(
         monkeypatch,
@@ -1033,6 +1112,100 @@ def test_backtest_permanent_agent_errors_still_reraise(monkeypatch, tmp_path, er
     assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
 
 
+@pytest.mark.parametrize(
+    "side_effect_name",
+    [
+        "_record_agent_observability",
+        "_append_memory",
+        "_append_run_artifact_summary",
+        "_log_run_summary",
+    ],
+)
+@pytest.mark.parametrize("handled_failure", [False, True], ids=["success", "handled_failure"])
+def test_post_result_artifact_failures_do_not_replace_agent_result(
+    monkeypatch,
+    tmp_path,
+    side_effect_name,
+    handled_failure,
+):
+    runtime = (
+        BoundaryFailingRuntime(TimeoutError("provider timeout"))
+        if handled_failure
+        else BoundaryResultRuntime()
+    )
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=runtime,
+    )
+
+    def fail_side_effect(*_args, **_kwargs):
+        raise ValueError(f"{side_effect_name} unavailable")
+
+    target = handle.manager if side_effect_name == "_record_agent_observability" else handle
+    monkeypatch.setattr(target, side_effect_name, fail_side_effect)
+
+    result = handle.run(task_prompt="test")
+
+    if handled_failure:
+        assert "Skipped this iteration" in result.summary
+        assert "no trades placed" in result.summary
+        assert result.cache_key is None
+        assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+    else:
+        assert result.summary == "RESULT: done"
+        assert result.events[0].text == "RESULT: done"
+    assert Path(result.payload["trace_path"]).is_file()
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError],
+)
+def test_post_result_control_flow_exceptions_propagate(
+    monkeypatch,
+    tmp_path,
+    error_type,
+):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=False,
+    )
+    error = error_type("stop artifact finalization")
+
+    def cancel_memory(_result):
+        raise error
+
+    monkeypatch.setattr(handle, "_append_memory", cancel_memory)
+
+    with pytest.raises(error_type) as exc_info:
+        handle.run(task_prompt="test")
+
+    assert exc_info.value is error
+
+
+def test_replay_cache_write_failure_does_not_replace_successful_result(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+    )
+
+    def fail_cache_write(*_args, **_kwargs):
+        raise ValueError("replay cache unavailable")
+
+    monkeypatch.setattr(handle.manager.replay_cache, "save", fail_cache_write)
+
+    result = handle.run(task_prompt="test")
+
+    assert result.summary == "RESULT: done"
+    assert result.events[0].text == "RESULT: done"
+    assert Path(result.payload["trace_path"]).is_file()
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
 def test_agent_trace_atomic_replace_uses_same_directory(monkeypatch, tmp_path):
     from lumibot.components.agents import manager as manager_module
 
@@ -1063,6 +1236,8 @@ def test_agent_trace_atomic_replace_uses_same_directory(monkeypatch, tmp_path):
 
 
 def test_agent_trace_redaction_preserves_numeric_token_usage(monkeypatch, tmp_path):
+    from lumibot.components.agents.manager import _normalize_redacted_payload
+
     api_token = "sk-proj-synthetic-persisted-usage-secret"
     bearer_token = "synthetic-persisted-usage-bearer-secret"
     handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
@@ -1076,11 +1251,13 @@ def test_agent_trace_redaction_preserves_numeric_token_usage(monkeypatch, tmp_pa
 
     trace_path = handle._write_trace(
         AgentRunResult(summary="done", model="test-model", events=[]),
-        {
-            "usage": usage,
-            "api_key": api_token,
-            "header": f"Authorization: Bearer {bearer_token}",
-        },
+        _normalize_redacted_payload(
+            {
+                "usage": usage,
+                "api_key": api_token,
+                "header": f"Authorization: Bearer {bearer_token}",
+            }
+        ),
     )
 
     trace_text = trace_path.read_text(encoding="utf-8")
@@ -1090,6 +1267,55 @@ def test_agent_trace_redaction_preserves_numeric_token_usage(monkeypatch, tmp_pa
     assert trace["header"] == "Authorization: [REDACTED]"
     assert api_token not in trace_text
     assert bearer_token not in trace_text
+
+
+def test_agent_run_artifact_summary_redacts_complete_jsonl_record(monkeypatch, tmp_path):
+    api_token = "sk-proj-synthetic-run-summary-secret"
+    bearer_token = "synthetic-run-summary-bearer-secret"
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+    result = AgentRunResult(
+        summary=f"RESULT: {api_token}; Authorization: Bearer {bearer_token}",
+        model="test-model",
+        events=[
+            _event(
+                "tool_call",
+                tool_name=f"tool-{api_token}",
+                payload={"Authorization": f"Bearer {bearer_token}"},
+            )
+        ],
+        usage={
+            "prompt_tokens": 101,
+            "completion_tokens": 23,
+            "total_tokens": 124,
+            "completion_tokens_details": {"reasoning_tokens": 9},
+        },
+        warnings=[
+            {
+                "kind": "synthetic_warning",
+                "message": f"warning for {api_token}; Bearer {bearer_token}",
+            }
+        ],
+    )
+    result.payload = {"trace_path": None}
+
+    type(handle)._append_run_artifact_summary(
+        handle,
+        result,
+        {"mode": "live"},
+    )
+
+    summary_path = tmp_path / "agent_runtime" / "agent_run_summaries.jsonl"
+    summary_text = summary_path.read_text(encoding="utf-8")
+    summary_record = json.loads(summary_text)
+    assert api_token not in summary_text
+    assert bearer_token not in summary_text
+    assert summary_record["usage"]["input_tokens"] == 101
+    assert summary_record["usage"]["output_tokens"] == 23
+    assert summary_record["usage"]["total_tokens"] == 124
+    assert summary_record["usage"]["thinking_tokens"] == 9
+    assert "[REDACTED]" in summary_record["summary"]
+    assert "[REDACTED]" in summary_record["warning_messages"][0]
+    assert "[REDACTED]" in summary_record["tool_calls"][0]
 
 
 def test_agent_trace_replace_failure_cleans_temp_without_partial_target(monkeypatch, tmp_path):
@@ -1180,6 +1406,51 @@ def test_agent_replay_cache_uses_portable_boundary_trace_reference(monkeypatch, 
     assert cached_result.events[0].call_id == "call-1"
     assert cached_result.events[0].event_id == "event-1"
     assert cached_result.events[0].invocation_id == "invocation-1"
+
+
+def test_agent_replay_cache_uses_authoritative_redacted_trace_payload(monkeypatch, tmp_path):
+    api_token = "sk-proj-synthetic-replay-secret"
+    bearer_token = "synthetic-replay-bearer-secret"
+    runtime = SensitiveReplayRuntime(api_token, bearer_token)
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=runtime,
+    )
+
+    live_result = handle.run(task_prompt="test")
+
+    trace_path = Path(live_result.payload["trace_path"])
+    trace_text = trace_path.read_text(encoding="utf-8")
+    trace = json.loads(trace_text)
+    cache_path = next((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz"))
+    with gzip.open(cache_path, "rt", encoding="utf-8") as cache_file:
+        cache_text = cache_file.read()
+    cached_payload = json.loads(cache_text)
+    for secret in (api_token, bearer_token):
+        assert secret not in trace_text
+        assert secret not in cache_text
+    for field in ("summary", "events", "warnings", "usage", "timing"):
+        assert cached_payload[field] == trace[field]
+    assert cached_payload["usage"] == {
+        "prompt_tokens": 101,
+        "completion_tokens": 23,
+        "total_tokens": 124,
+        "prompt_tokens_details": {"cached_tokens": 80},
+        "completion_tokens_details": {"reasoning_tokens": 9},
+    }
+    reference = cached_payload["boundary_trace_ref"]
+    assert cached_payload["payload"]["trace_path"] == reference["trace_path"]
+    assert (tmp_path / "agent_runtime" / reference["trace_path"]).resolve() == trace_path.resolve()
+
+    replayed_result = handle.run(task_prompt="test")
+
+    assert runtime.call_count == 1
+    assert replayed_result.cache_hit is True
+    assert replayed_result.summary == trace["summary"]
+    assert replayed_result.usage == trace["usage"]
+    assert Path(replayed_result.payload["trace_path"]).resolve() == trace_path.resolve()
 
 
 def test_legacy_agent_replay_cache_marks_boundary_trace_unavailable(monkeypatch, tmp_path):

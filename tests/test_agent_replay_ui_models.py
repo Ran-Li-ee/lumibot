@@ -8,7 +8,12 @@ from lumibot.components.agents.replay_ui.models import (
     ToolCallReplay,
 )
 from lumibot.components.agents.replay_ui.redaction import redact_sensitive
-from lumibot.components.agents.trace_redaction import redact_sensitive as shared_redact_sensitive
+from lumibot.components.agents.trace_redaction import (
+    redact_public_preview,
+)
+from lumibot.components.agents.trace_redaction import (
+    redact_sensitive as shared_redact_sensitive,
+)
 
 
 def test_replay_ui_redact_sensitive_reexports_shared_function():
@@ -74,6 +79,33 @@ def test_redact_sensitive_preserves_safe_token_counts_only():
     assert redacted["Authorization"] == "[REDACTED]"
     assert api_token not in rendered
     assert bearer_token not in rendered
+
+
+def test_redact_public_preview_preserves_safe_token_counts_only():
+    secret = "sk-proj-synthetic-preview-secret"
+    payload = {
+        "usage": {
+            "Prompt_Tokens": 101,
+            "TOTAL_TOKENS": None,
+            "completion_tokens_details": {
+                "Reasoning_Tokens": 9,
+                "note": secret,
+            },
+            "output_tokens": secret,
+        },
+        "access_token": 123456,
+    }
+
+    preview = redact_public_preview(payload)
+    rendered = repr(preview)
+
+    assert preview["usage"]["Prompt_Tokens"] == 101
+    assert preview["usage"]["TOTAL_TOKENS"] is None
+    assert preview["usage"]["completion_tokens_details"]["Reasoning_Tokens"] == 9
+    assert preview["usage"]["completion_tokens_details"]["note"] == "[REDACTED]"
+    assert preview["usage"]["output_tokens"] == "[REDACTED]"
+    assert preview["access_token"] == "[REDACTED]"
+    assert secret not in rendered
 
 
 def test_redact_sensitive_masks_bearer_tokens_and_colon_labels():

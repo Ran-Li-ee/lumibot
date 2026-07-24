@@ -27,7 +27,7 @@ _SENSITIVE_COLON_RE = re.compile(
 )
 _BEARER_TOKEN_RE = re.compile(r"\b(Bearer\s+)([^\s,;&\"'}\]\)]+)([\"'}\]\)]?)", re.IGNORECASE)
 _SK_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]+")
-_SAFE_TOKEN_COUNT_KEYS = frozenset(
+SAFE_NUMERIC_TOKEN_USAGE_FIELDS = frozenset(
     {
         "budget_tokens",
         "cache_creation_input_tokens",
@@ -48,13 +48,16 @@ _SAFE_TOKEN_COUNT_KEYS = frozenset(
         "prompt_token_count",
         "prompt_tokens",
         "reasoning_tokens",
+        "thinking_tokens",
         "thoughts_token_count",
+        "tool_use_input_tokens",
         "tool_use_prompt_token_count",
         "total_token_count",
         "total_tokens",
+        "uncached_input_tokens",
     }
 )
-_TOKEN_COUNT_DETAIL_KEYS = frozenset(
+TOKEN_USAGE_DETAIL_FIELDS = frozenset(
     {
         "completion_tokens_details",
         "input_tokens_details",
@@ -84,25 +87,26 @@ def _redact_mapping_value(key: Any, value: Any) -> Any:
     if not _SENSITIVE_KEY_RE.search(key_text):
         return redact_sensitive(value)
 
-    normalized_key = key_text.lower()
-    if normalized_key in _SAFE_TOKEN_COUNT_KEYS and (
-        value is None or type(value) in (bool, int, float)
-    ):
+    normalized_key = key_text.casefold()
+    if is_safe_numeric_token_usage_field(key_text, value):
         return value
-    if normalized_key in _TOKEN_COUNT_DETAIL_KEYS and isinstance(value, dict):
-        return {
-            nested_key: (
-                nested_value
-                if str(nested_key).lower() in _SAFE_TOKEN_COUNT_KEYS
-                and (
-                    nested_value is None
-                    or type(nested_value) in (bool, int, float)
-                )
-                else REDACTED
-            )
-            for nested_key, nested_value in value.items()
-        }
+    if normalized_key in TOKEN_USAGE_DETAIL_FIELDS and isinstance(value, dict):
+        return _redact_token_usage_details(value)
     return REDACTED
+
+
+def is_safe_numeric_token_usage_field(key: Any, value: Any) -> bool:
+    return (
+        str(key).casefold() in SAFE_NUMERIC_TOKEN_USAGE_FIELDS
+        and (value is None or type(value) in (bool, int, float))
+    )
+
+
+def _redact_token_usage_details(value: dict[Any, Any]) -> dict[Any, Any]:
+    return {
+        key: item if is_safe_numeric_token_usage_field(key, item) else REDACTED
+        for key, item in value.items()
+    }
 
 
 def redact_public_preview(
@@ -119,12 +123,25 @@ def redact_public_preview(
         items = list(value.items())
         for key, item in items[:max_items]:
             key_text = str(key)
-            preview[key_text] = REDACTED if _SENSITIVE_KEY_RE.search(key_text) else redact_public_preview(
-                item,
-                max_text=max_text,
-                max_items=max_items,
-                max_depth=max_depth - 1,
-            )
+            if _SENSITIVE_KEY_RE.search(key_text):
+                safe_item = _redact_mapping_value(key, item)
+                preview[key_text] = (
+                    redact_public_preview(
+                        safe_item,
+                        max_text=max_text,
+                        max_items=max_items,
+                        max_depth=max_depth - 1,
+                    )
+                    if isinstance(safe_item, dict)
+                    else safe_item
+                )
+            else:
+                preview[key_text] = redact_public_preview(
+                    item,
+                    max_text=max_text,
+                    max_items=max_items,
+                    max_depth=max_depth - 1,
+                )
         omitted = len(items) - max_items
         if omitted > 0:
             preview["__truncated_items__"] = f"{omitted} additional entries omitted"
