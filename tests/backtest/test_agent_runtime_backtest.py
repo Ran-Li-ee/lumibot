@@ -1207,6 +1207,46 @@ def test_replay_cache_write_failure_does_not_replace_successful_result(monkeypat
     assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
 
 
+def test_corrupt_replay_cache_is_a_miss_after_partial_save_failure(monkeypatch, tmp_path):
+    runtime = BoundaryResultRuntime()
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=runtime,
+    )
+    replay_cache = handle.manager.replay_cache
+    real_save = replay_cache.save
+    partial_cache_path = None
+
+    def fail_with_partial_cache(cache_key, _payload):
+        nonlocal partial_cache_path
+        partial_cache_path = replay_cache._path_for(cache_key)
+        partial_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_cache_path.write_bytes(b"synthetic-partial-gzip")
+        raise OSError("synthetic replay cache save failure")
+
+    monkeypatch.setattr(replay_cache, "save", fail_with_partial_cache)
+
+    first_result = handle.run(task_prompt="test")
+
+    assert first_result.summary == "RESULT: done"
+    assert first_result.cache_hit is False
+    assert runtime.call_count == 1
+    assert partial_cache_path is not None
+    assert partial_cache_path.read_bytes() == b"synthetic-partial-gzip"
+
+    monkeypatch.setattr(replay_cache, "save", real_save)
+
+    second_result = handle.run(task_prompt="test")
+
+    assert second_result.summary == "RESULT: done"
+    assert second_result.cache_hit is False
+    assert second_result.cache_key == first_result.cache_key
+    assert runtime.call_count == 2
+    assert replay_cache.load(second_result.cache_key)["summary"] == "RESULT: done"
+
+
 def test_agent_trace_atomic_replace_uses_same_directory(monkeypatch, tmp_path):
     from lumibot.components.agents import manager as manager_module
 

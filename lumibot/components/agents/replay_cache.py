@@ -9,7 +9,7 @@ from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from lumibot.constants import LUMIBOT_CACHE_FOLDER
 
@@ -82,13 +82,26 @@ class AgentReplayCache:
         self.remote_cache.ensure_local_file(path)
         if not path.exists():
             return None
-        with gzip.open(path, "rt", encoding="utf-8") as handle:
-            return json.load(handle)
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def save(self, key: str, payload: dict[str, Any]) -> Path:
         path = self._path_for(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with gzip.open(path, "wt", encoding="utf-8") as handle:
-            json.dump(_normalize_json(payload), handle, sort_keys=True)
+        temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+        try:
+            with gzip.open(temp_path, "wt", encoding="utf-8") as handle:
+                json.dump(_normalize_json(payload), handle, sort_keys=True)
+            os.replace(temp_path, path)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
         self.remote_cache.on_local_update(path)
         return path
