@@ -96,38 +96,51 @@ def test_boundary_collector_allocates_stable_turn_batch_and_event_ids(tmp_path):
     assert exported["events"] == [first, second]
 
 
-def test_collector_handles_many_small_parallel_events_without_duplicate_growth(
-    tmp_path,
-):
-    collector = BoundaryTraceCollector(
-        agent_run_id="run-1",
-        artifact_root=tmp_path,
-        inline_payload_limit=10_000,
-    )
-    turn_id = collector.start_model_turn()
-    call_ids = [f"call_{index:04d}" for index in range(500)]
-    batch_id = collector.register_tool_batch(turn_id, call_ids)
-
-    for call_id in call_ids:
-        collector.record(
-            transition="B03_ADK_TO_FUNCTION_TOOL",
-            from_module="google_adk",
-            to_module="function_tool",
-            model_turn_id=turn_id,
-            tool_batch_id=batch_id,
-            call_id=call_id,
-            payload={"value": 1},
+def test_collector_export_growth_is_near_linear_for_many_small_events(tmp_path):
+    def build_export(event_count):
+        collector = BoundaryTraceCollector(
+            agent_run_id="run-1",
+            artifact_root=tmp_path,
+            inline_payload_limit=10_000,
         )
+        turn_id = collector.start_model_turn()
+        call_ids = [f"call_{index:04d}" for index in range(event_count)]
+        batch_id = collector.register_tool_batch(turn_id, call_ids)
 
-    exported = collector.export()
-    assert len(exported["events"]) == 500
+        for call_id in call_ids:
+            collector.record(
+                transition="B03_ADK_TO_FUNCTION_TOOL",
+                from_module="google_adk",
+                to_module="function_tool",
+                model_turn_id=turn_id,
+                tool_batch_id=batch_id,
+                call_id=call_id,
+                payload={"value": 1},
+            )
+
+        exported = collector.export()
+        serialized_size = len(
+            json.dumps(
+                exported,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        return exported, serialized_size
+
+    export_n, size_n = build_export(250)
+    export_2n, size_2n = build_export(500)
+
+    assert len(export_n["events"]) == 250
+    assert len(export_2n["events"]) == 500
     assert (
         sum(
             event["payload_meta"]["byte_count"]
-            for event in exported["events"]
+            for event in export_2n["events"]
         )
         < 20_000
     )
+    assert size_2n < size_n * 2.2
 
 
 def test_tool_call_context_restores_previous_value(tmp_path):

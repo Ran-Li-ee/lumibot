@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **AI-agent traces now preserve the complete model-to-tool semantic boundary.**
+  Versioned, redacted boundary events correlate LiteLLM provider requests and
+  responses, ADK model turns, parallel FunctionTool calls, validated wrapper
+  arguments, raw local results, serialized FunctionResponses, context pruning,
+  retries when exposed, and replay-cache provenance without capturing secrets
+  or raw HTTP traffic.
+
 ## 4.5.75 - 2026-07-13
 
 Deploy marker: `deploy 4.5.75`
@@ -9,12 +19,6 @@ Deploy marker: `deploy 4.5.75`
   boundary.** Local IBeam, externally managed Client Portal Gateway, and future
   OAuth-signed sessions can share the same broker, order, position, contract,
   and market-data implementation.
-- **AI-agent traces now preserve the complete model-to-tool semantic boundary.**
-  Versioned, redacted boundary events correlate LiteLLM provider requests and
-  responses, ADK model turns, parallel FunctionTool calls, validated wrapper
-  arguments, raw local results, serialized FunctionResponses, context pruning,
-  retries when exposed, and replay-cache provenance without capturing secrets
-  or raw HTTP traffic.
 
 ### Fixed
 - **Local IBKR REST startup is isolated and bounded.** IBeam now defaults to
