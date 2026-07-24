@@ -1247,6 +1247,41 @@ def test_corrupt_replay_cache_is_a_miss_after_partial_save_failure(monkeypatch, 
     assert replay_cache.load(second_result.cache_key)["summary"] == "RESULT: done"
 
 
+def test_remote_replay_cache_hydration_error_is_a_miss_and_recovers(monkeypatch, tmp_path):
+    runtime = BoundaryResultRuntime()
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=runtime,
+    )
+    replay_cache = handle.manager.replay_cache
+    real_ensure_local_file = replay_cache.remote_cache.ensure_local_file
+    hydration_attempts = 0
+
+    def fail_first_hydration(path):
+        nonlocal hydration_attempts
+        hydration_attempts += 1
+        if hydration_attempts == 1:
+            raise ValueError("synthetic remote hydration failure")
+        return real_ensure_local_file(path)
+
+    monkeypatch.setattr(
+        replay_cache.remote_cache,
+        "ensure_local_file",
+        fail_first_hydration,
+    )
+
+    first_result = handle.run(task_prompt="test")
+    second_result = handle.run(task_prompt="test")
+
+    assert first_result.summary == "RESULT: done"
+    assert first_result.cache_hit is False
+    assert second_result.cache_hit is True
+    assert runtime.call_count == 1
+    assert hydration_attempts == 2
+
+
 def test_agent_trace_atomic_replace_uses_same_directory(monkeypatch, tmp_path):
     from lumibot.components.agents import manager as manager_module
 

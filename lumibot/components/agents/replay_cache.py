@@ -79,10 +79,10 @@ class AgentReplayCache:
     def load(self, key: str) -> dict[str, Any] | None:
         path = self._path_for(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.remote_cache.ensure_local_file(path)
-        if not path.exists():
-            return None
         try:
+            self.remote_cache.ensure_local_file(path)
+            if not path.exists():
+                return None
             with gzip.open(path, "rt", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except Exception:

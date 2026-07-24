@@ -88,6 +88,60 @@ def test_replay_cache_load_treats_corrupt_local_entry_as_miss(replay_cache):
     assert remote_cache.ensure_calls == [cache_path]
 
 
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+def test_replay_cache_remote_hydration_error_is_miss_and_recovers(
+    monkeypatch,
+    replay_cache,
+    error_type,
+):
+    cache, remote_cache = replay_cache
+    cache_key = "e" * 64
+    cache_path = cache._path_for(cache_key)
+    attempts = 0
+
+    def flaky_hydration(path):
+        nonlocal attempts
+        attempts += 1
+        remote_cache.ensure_calls.append(Path(path))
+        if attempts == 1:
+            raise error_type("synthetic remote hydration failure")
+        return False
+
+    monkeypatch.setattr(remote_cache, "ensure_local_file", flaky_hydration)
+
+    assert cache.load(cache_key) is None
+
+    cache.save(cache_key, {"summary": "recovered"})
+
+    assert cache.load(cache_key) == {"summary": "recovered"}
+    assert attempts == 2
+    assert remote_cache.ensure_calls == [cache_path, cache_path]
+    assert remote_cache.update_calls == [cache_path]
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError],
+)
+def test_replay_cache_remote_hydration_propagates_control_flow(
+    monkeypatch,
+    replay_cache,
+    error_type,
+):
+    cache, remote_cache = replay_cache
+    error = error_type("stop remote cache hydration")
+
+    def raise_control_flow(_path):
+        raise error
+
+    monkeypatch.setattr(remote_cache, "ensure_local_file", raise_control_flow)
+
+    with pytest.raises(error_type) as exc_info:
+        cache.load("f" * 64)
+
+    assert exc_info.value is error
+
+
 @pytest.mark.parametrize(
     "error_type",
     [KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError],
