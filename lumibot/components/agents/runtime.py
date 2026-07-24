@@ -26,7 +26,8 @@ from types import (
     MethodType,
     SimpleNamespace,
 )
-from typing import Any, Callable
+from typing import Any, Callable, Literal
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel
@@ -191,7 +192,16 @@ def _fallback_callable_signature(original: Any) -> inspect.Signature | None:
         return None
 
 
-def _is_async_callable(original: Any) -> bool:
+_AsyncCallableClassification = Literal[
+    "definite_async",
+    "definite_sync",
+    "ambiguous",
+]
+
+
+def _classify_async_callable(
+    original: Any,
+) -> _AsyncCallableClassification:
     safe_coroutine_types = {
         FunctionType,
         MethodType,
@@ -200,29 +210,56 @@ def _is_async_callable(original: Any) -> bool:
     }
     seen: set[int] = set()
 
-    def classify(value: Any) -> bool:
+    def classify(
+        value: Any,
+        *,
+        inspect_instance_call: bool,
+    ) -> _AsyncCallableClassification:
         value_id = id(value)
         if value_id in seen:
-            return False
+            return "ambiguous"
         seen.add(value_id)
 
         value_type = type(value)
+        try:
+            if issubclass(value_type, AsyncMock):
+                return "definite_async"
+        except Exception:
+            return "ambiguous"
         if value_type in safe_coroutine_types:
-            return inspect.iscoroutinefunction(value)
+            return (
+                "definite_async"
+                if inspect.iscoroutinefunction(value)
+                else "definite_sync"
+            )
         if value_type in {staticmethod, classmethod}:
-            return classify(object.__getattribute__(value, "__func__"))
+            return classify(
+                object.__getattribute__(value, "__func__"),
+                inspect_instance_call=True,
+            )
         if value_type is functools.partialmethod:
-            return classify(object.__getattribute__(value, "func"))
+            return classify(
+                object.__getattribute__(value, "func"),
+                inspect_instance_call=True,
+            )
         if value_type is functools.partial:
-            return classify(object.__getattribute__(value, "func"))
+            return classify(
+                object.__getattribute__(value, "func"),
+                inspect_instance_call=True,
+            )
+        if not inspect_instance_call:
+            return "ambiguous"
 
         raw_call = inspect.getattr_static(value_type, "__call__")
-        return classify(raw_call)
+        return classify(
+            raw_call,
+            inspect_instance_call=False,
+        )
 
     try:
-        return classify(original)
+        return classify(original, inspect_instance_call=True)
     except Exception:
-        return False
+        return "ambiguous"
 
 
 def _add_trace_diagnostic(
@@ -288,10 +325,14 @@ def _wrap_tool_callable(
 ):
     original = tool.function
     callable_metadata = _safe_callable_metadata(original)
-    try:
-        callable_signature = inspect.signature(original)
-    except Exception:
+    async_classification = _classify_async_callable(original)
+    if async_classification == "ambiguous":
         callable_signature = _fallback_callable_signature(original)
+    else:
+        try:
+            callable_signature = inspect.signature(original)
+        except Exception:
+            callable_signature = _fallback_callable_signature(original)
 
     def begin_invocation(
         args: tuple[Any, ...],
@@ -515,9 +556,14 @@ def _wrap_tool_callable(
                 tool_started_at = _utc_iso_timestamp()
                 tool_started_perf = time.perf_counter()
                 try:
-                    raw_result = await original(
+                    pending_result = original(
                         *args,
                         **kwargs,
+                    )
+                    raw_result = (
+                        await pending_result
+                        if inspect.isawaitable(pending_result)
+                        else pending_result
                     )
                 finally:
                     tool_ended_perf = time.perf_counter()
@@ -542,7 +588,11 @@ def _wrap_tool_callable(
             tool_duration_ms=tool_duration_ms,
         )
 
-    wrapper = async_wrapper if _is_async_callable(original) else sync_wrapper
+    wrapper = (
+        sync_wrapper
+        if async_classification == "definite_sync"
+        else async_wrapper
+    )
     wrapper.__name__ = _tool_function_name(tool.name)
     wrapper.__qualname__ = wrapper.__name__
     wrapper.__doc__ = tool.description

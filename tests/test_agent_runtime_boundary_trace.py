@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from functools import partial, partialmethod
 from threading import Event
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from google.adk.tools.function_tool import FunctionTool
@@ -4418,6 +4419,198 @@ def test_guarded_sync_callable_wraps_without_unsafe_instance_probes(
             trace,
             "B06_PYTHON_TOOL_TO_WRAPPER",
         )[0]["status"] == "success"
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_async_callable_classifier_recognizes_guarded_async_mock_subclass():
+    guard_probes = False
+
+    class GuardedAsyncMock(AsyncMock):
+        def __getattribute__(self, name):
+            if guard_probes and name in {
+                "__call__",
+                "__code__",
+                "__name__",
+                "_is_coroutine_marker",
+            }:
+                raise AssertionError(f"unsafe instance probe: {name}")
+            return super().__getattribute__(name)
+
+    original = GuardedAsyncMock()
+    guard_probes = True
+
+    assert (
+        agent_runtime._classify_async_callable(original)
+        == "definite_async"
+    )
+
+
+def _make_adaptive_callable(callable_kind, raises):
+    invocations = []
+    descriptor_binds = []
+
+    async def execute_async():
+        invocations.append("called")
+        await asyncio.sleep(0.005)
+        if raises:
+            raise ValueError(f"{callable_kind} failed")
+        return {"status": f"{callable_kind} complete"}
+
+    if callable_kind == "async_mock":
+        return (
+            AsyncMock(side_effect=execute_async),
+            descriptor_binds,
+            invocations,
+        )
+
+    class CallDescriptor:
+        def __get__(self, instance, owner):
+            descriptor_binds.append((instance, owner))
+            if callable_kind == "descriptor_async":
+
+                async def bound():
+                    return await execute_async()
+
+            else:
+
+                def bound():
+                    invocations.append("called")
+                    if raises:
+                        raise ValueError(
+                            f"{callable_kind} failed"
+                        )
+                    return {
+                        "status": f"{callable_kind} complete"
+                    }
+
+            return bound
+
+    class DescriptorTool:
+        __call__ = CallDescriptor()
+
+    return DescriptorTool(), descriptor_binds, invocations
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+@pytest.mark.filterwarnings(
+    "error::pytest.PytestUnraisableExceptionWarning"
+)
+@pytest.mark.parametrize(
+    "callable_kind",
+    ["async_mock", "descriptor_async", "descriptor_sync"],
+)
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("with_collector", [False, True])
+@pytest.mark.parametrize("runtime_path", ["wrapper", "stub"])
+def test_adaptive_callable_invokes_once_and_awaits_once(
+    tmp_path,
+    callable_kind,
+    raises,
+    with_collector,
+    runtime_path,
+):
+    original, descriptor_binds, invocations = (
+        _make_adaptive_callable(callable_kind, raises)
+    )
+    collector = (
+        BoundaryTraceCollector(
+            agent_run_id=(
+                f"run-adaptive-{runtime_path}-{callable_kind}-{raises}"
+            ),
+            artifact_root=tmp_path,
+        )
+        if with_collector
+        else None
+    )
+    tool = BoundTool(
+        name=f"{callable_kind}_tool",
+        description=f"{callable_kind} tool",
+        function=original,
+    )
+    assert agent_runtime._classify_async_callable(original) == (
+        "definite_async"
+        if callable_kind == "async_mock"
+        else "ambiguous"
+    )
+    assert descriptor_binds == []
+
+    if runtime_path == "wrapper":
+        wrapped = _wrap_tool_callable(
+            tool,
+            {"marker": "adaptive"},
+            collector=collector,
+        )
+        assert descriptor_binds == []
+        assert inspect.iscoroutinefunction(wrapped)
+        outcome = asyncio.run(wrapped())
+        trace = collector.export() if collector is not None else None
+    else:
+        assert descriptor_binds == []
+        result = StubAgentRuntime().run(
+            make_runtime_request(collector, tools=[tool])
+        )
+        outcome = next(
+            event.payload
+            for event in result.events
+            if event.kind == "tool_result"
+        )
+        trace = result.boundary_trace
+
+    gc.collect()
+
+    if callable_kind == "async_mock":
+        assert original.call_count == 1
+        assert original.await_count == 1
+        assert descriptor_binds == []
+    else:
+        assert len(descriptor_binds) == 1
+        assert descriptor_binds[0][0] is original
+    assert invocations == ["called"]
+    assert not inspect.isawaitable(outcome)
+    if raises:
+        assert outcome["tool_error"] is True
+        assert outcome["error"] == {
+            "type": "ValueError",
+            "message": f"{callable_kind} failed",
+        }
+    else:
+        assert outcome == {
+            "status": f"{callable_kind} complete"
+        }
+    if collector is None:
+        assert trace is None
+    else:
+        assert trace == collector.export()
+        assert [
+            event["transition"]
+            for event in trace["events"]
+        ] == [
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+        ]
+        b06 = _trace_events(
+            trace,
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+        )[0]
+        b07 = _trace_events(
+            trace,
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+        )[0]
+        assert b06["status"] == ("error" if raises else "success")
+        assert b06["duration_ms"] > 0
+        if callable_kind == "descriptor_sync":
+            assert _event_timestamp(
+                b06["started_at"]
+            ) <= _event_timestamp(b06["ended_at"])
+        else:
+            assert _event_timestamp(
+                b06["started_at"]
+            ) < _event_timestamp(b06["ended_at"])
+        assert _event_timestamp(b06["ended_at"]) <= _event_timestamp(
+            b07["ended_at"]
+        )
+        assert b07["payload"]["serialized_result"] == outcome
 
 
 @pytest.mark.parametrize("callable_kind", ["function", "object"])
