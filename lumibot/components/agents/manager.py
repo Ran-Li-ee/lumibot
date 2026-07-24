@@ -18,6 +18,7 @@ from .duckdb_prompt import DUCKDB_SQL_GUIDANCE_PROMPT
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer, ToolDefinition
 from .tool_context import agent_tool_context
 from .tools import bind_callable_tool
+from .trace_redaction import redact_sensitive
 
 _TIMESTAMP_HINT_RE = re.compile(
     r"(time|date|datetime|published|updated|created|accepted|released|release|as_of|realtime)",
@@ -1280,8 +1281,9 @@ class AgentHandle:
             f"{result.cache_key or 'live'}-"
             f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.json"
         )
+        normalized_payload = _normalize_json(trace_payload)
         normalized = json.dumps(
-            _normalize_json(trace_payload),
+            redact_sensitive(normalized_payload),
             indent=2,
             sort_keys=True,
         )
@@ -1739,7 +1741,19 @@ class AgentHandle:
                 self._log_fatal_backtest_error(exc, category, model_name)
                 raise
 
-            error_detail = f"{exc.__class__.__name__}: {str(exc)[:400]}"
+            try:
+                safe_error_message = redact_sensitive(str(exc))
+                safe_traceback = redact_sensitive(
+                    "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+                )
+            except Exception as redaction_exc:
+                boundary_collector.add_diagnostic(
+                    "agent_runtime_error_redaction_failed",
+                    redaction_exc,
+                )
+                safe_error_message = "[error message unavailable: redaction failed]"
+                safe_traceback = "[traceback unavailable: redaction failed]"
+            error_detail = f"{exc.__class__.__name__}: {safe_error_message[:400]}"
             try:
                 sys.stderr.write(
                     f"[lumibot.agents] agent '{self.name}' (model={model_name!r}) call failed: "
@@ -1763,8 +1777,8 @@ class AgentHandle:
                     "runtime_error": True,
                     "error_category": category,
                     "error_class": exc.__class__.__name__,
-                    "error_message": str(exc)[:800],
-                    "traceback": "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))[-2000:],
+                    "error_message": safe_error_message[:800],
+                    "traceback": safe_traceback[-2000:],
                 },
             )
             result = AgentRunResult(
@@ -1788,7 +1802,7 @@ class AgentHandle:
                 "trace_path": None,
                 "runtime_error": True,
                 "error_class": exc.__class__.__name__,
-                "error_message": str(exc)[:800],
+                "error_message": safe_error_message[:800],
             }
             self._finalize_runtime_timing(
                 result,
@@ -1806,9 +1820,10 @@ class AgentHandle:
             )
             try:
                 trace_path = self._write_trace(result, trace_payload)
-            except OSError as trace_exc:
+            except Exception as trace_exc:
                 boundary_collector.add_diagnostic("trace_write_failed", trace_exc)
                 result.boundary_trace = boundary_collector.export()
+                result.payload["trace_path"] = None
                 result.payload["trace_write_error"] = True
             else:
                 result.payload["trace_path"] = str(trace_path.resolve())
@@ -1840,7 +1855,7 @@ class AgentHandle:
         )
         try:
             trace_path = self._write_trace(result, trace_payload)
-        except OSError as exc:
+        except Exception as exc:
             boundary_collector.add_diagnostic("trace_write_failed", exc)
             result.boundary_trace = boundary_collector.export()
             result.payload = {

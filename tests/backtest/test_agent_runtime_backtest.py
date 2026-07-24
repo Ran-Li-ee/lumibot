@@ -840,6 +840,39 @@ def test_handled_agent_failure_persists_partial_boundary_trace(monkeypatch, tmp_
     assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
 
 
+def test_handled_agent_failure_redacts_secrets_from_complete_trace(monkeypatch, tmp_path):
+    api_token = "sk-proj-synthetic-runtime-secret"
+    bearer_token = "synthetic-bearer-runtime-secret"
+    error = TimeoutError(
+        f"provider timeout for {api_token}; Authorization: Bearer {bearer_token}"
+    )
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(error),
+    )
+
+    result = handle.run(task_prompt="test")
+
+    trace_path = Path(result.payload["trace_path"])
+    trace_text = trace_path.read_text(encoding="utf-8")
+    trace = json.loads(trace_text)
+    for secret in (api_token, bearer_token):
+        assert secret not in trace_text
+        assert secret not in result.summary
+        assert secret not in result.events[0].text
+        assert secret not in json.dumps(result.events[0].payload)
+        assert secret not in json.dumps(result.warnings)
+        assert secret not in json.dumps(result.payload)
+    assert "category=transient" in result.summary
+    assert "TimeoutError" in result.summary
+    assert "[REDACTED]" in result.summary
+    assert "TimeoutError" in trace["events"][0]["payload"]["traceback"]
+    assert "[REDACTED]" in trace["events"][0]["payload"]["traceback"]
+    assert trace["boundary_trace"]["diagnostics"][-1]["kind"] == "agent_runtime_failed"
+
+
 def test_trace_write_failure_does_not_change_successful_agent_result(monkeypatch, tmp_path):
     handle, _ = _build_boundary_trace_handle(
         monkeypatch,
@@ -860,6 +893,85 @@ def test_trace_write_failure_does_not_change_successful_agent_result(monkeypatch
     assert result.payload["trace_path"] is None
     assert result.payload["trace_write_error"] is True
     assert result.boundary_trace["diagnostics"][-1]["kind"] == "trace_write_failed"
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_non_os_trace_write_failure_does_not_change_successful_agent_result(
+    monkeypatch,
+    tmp_path,
+):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+    )
+
+    def fail_trace_write(*_args, **_kwargs):
+        raise ValueError("trace serialization failed")
+
+    monkeypatch.setattr(handle, "_write_trace", fail_trace_write)
+
+    result = handle.run(task_prompt="test")
+
+    assert result.summary == "RESULT: done"
+    assert result.events[0].text == "RESULT: done"
+    assert result.events[0].call_id == "call-1"
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    diagnostic = result.boundary_trace["diagnostics"][-1]
+    assert diagnostic["kind"] == "trace_write_failed"
+    assert diagnostic["message"] == "trace serialization failed"
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_handled_failure_survives_non_os_trace_write_failure(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(TimeoutError("provider timeout")),
+    )
+
+    def fail_trace_write(*_args, **_kwargs):
+        raise TypeError("trace payload is not serializable")
+
+    monkeypatch.setattr(handle, "_write_trace", fail_trace_write)
+
+    result = handle.run(task_prompt="test")
+
+    assert "Skipped this iteration" in result.summary
+    assert "no trades placed" in result.summary
+    assert result.cache_key is None
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    diagnostic = result.boundary_trace["diagnostics"][-1]
+    assert diagnostic["kind"] == "trace_write_failed"
+    assert diagnostic["message"] == "trace payload is not serializable"
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Exception("invalid API key"),
+        Exception("invalid model"),
+        Exception("insufficient_quota"),
+    ],
+    ids=["auth", "config", "billing"],
+)
+def test_backtest_permanent_agent_errors_still_reraise(monkeypatch, tmp_path, error):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(error),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        handle.run(task_prompt="test")
+
+    assert exc_info.value is error
+    assert list((tmp_path / "agent_runtime" / "traces").rglob("*.json")) == []
     assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
 
 
