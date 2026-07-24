@@ -1227,6 +1227,54 @@ class AgentHandle:
         trace_dir.mkdir(parents=True, exist_ok=True)
         return trace_dir
 
+    def _build_trace_payload(
+        self,
+        *,
+        result: AgentRunResult,
+        model_name: str,
+        cache_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "agent": self.name,
+            "model": model_name,
+            "request": cache_payload,
+            "tool_calls": [
+                {
+                    "tool_name": event.tool_name,
+                    "payload": event.payload,
+                    "timestamp": event.timestamp,
+                }
+                for event in result.tool_calls
+            ],
+            "tool_results": [
+                {
+                    "tool_name": event.tool_name,
+                    "payload": event.payload,
+                    "timestamp": event.timestamp,
+                }
+                for event in result.tool_results
+            ],
+            "events": [
+                {
+                    "kind": event.kind,
+                    "text": event.text,
+                    "tool_name": event.tool_name,
+                    "payload": event.payload,
+                    "timestamp": event.timestamp,
+                    "call_id": event.call_id,
+                    "event_id": event.event_id,
+                    "invocation_id": event.invocation_id,
+                }
+                for event in result.events
+            ],
+            "boundary_trace": result.boundary_trace,
+            "warnings": result.warnings,
+            "summary": result.summary,
+            "usage": result.usage,
+            "timing": _runtime_timing_payload(result),
+            "duckdb_metrics": self.manager.duckdb.get_metrics(),
+        }
+
     def _write_trace(self, result: AgentRunResult, trace_payload: dict[str, Any]) -> Path:
         trace_path = self._trace_dir() / (
             f"{result.cache_key or 'live'}-"
@@ -1749,6 +1797,21 @@ class AgentHandle:
                 ended_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 ended_perf=time.perf_counter(),
             )
+            boundary_collector.add_diagnostic("agent_runtime_failed", exc)
+            result.boundary_trace = boundary_collector.export()
+            trace_payload = self._build_trace_payload(
+                result=result,
+                model_name=model_name,
+                cache_payload=cache_payload,
+            )
+            try:
+                trace_path = self._write_trace(result, trace_payload)
+            except OSError as trace_exc:
+                boundary_collector.add_diagnostic("trace_write_failed", trace_exc)
+                result.boundary_trace = boundary_collector.export()
+                result.payload["trace_write_error"] = True
+            else:
+                result.payload["trace_path"] = str(trace_path.resolve())
             # Record this skipped run in the agent's memory so the model on
             # the next iteration knows the previous cycle was skipped.
             self.manager._record_agent_observability(
@@ -1770,53 +1833,29 @@ class AgentHandle:
         )
         result.cache_key = cache_key
         result.warnings = self._derive_warnings(result, runtime_context, bound_tools)
-        trace_payload = {
-            "agent": self.name,
-            "model": model_name,
-            "request": cache_payload,
-            "tool_calls": [
-                {
-                    "tool_name": event.tool_name,
-                    "payload": event.payload,
-                    "timestamp": event.timestamp,
-                }
-                for event in result.tool_calls
-            ],
-            "tool_results": [
-                {
-                    "tool_name": event.tool_name,
-                    "payload": event.payload,
-                    "timestamp": event.timestamp,
-                }
-                for event in result.tool_results
-            ],
-            "events": [
-                {
-                    "kind": event.kind,
-                    "text": event.text,
-                    "tool_name": event.tool_name,
-                    "payload": event.payload,
-                    "timestamp": event.timestamp,
-                    "call_id": event.call_id,
-                    "event_id": event.event_id,
-                    "invocation_id": event.invocation_id,
-                }
-                for event in result.events
-            ],
-            "boundary_trace": result.boundary_trace,
-            "warnings": result.warnings,
-            "summary": result.summary,
-            "usage": result.usage,
-            "timing": _runtime_timing_payload(result),
-            "duckdb_metrics": self.manager.duckdb.get_metrics(),
-        }
-        trace_path = self._write_trace(result, trace_payload)
-        portable_trace_path = trace_path.relative_to(self._runtime_artifact_dir()).as_posix()
-        result.payload = {
-            "trace_path": str(trace_path.resolve()),
-            "warnings": result.warnings,
-        }
-        if should_replay:
+        trace_payload = self._build_trace_payload(
+            result=result,
+            model_name=model_name,
+            cache_payload=cache_payload,
+        )
+        try:
+            trace_path = self._write_trace(result, trace_payload)
+        except OSError as exc:
+            boundary_collector.add_diagnostic("trace_write_failed", exc)
+            result.boundary_trace = boundary_collector.export()
+            result.payload = {
+                "trace_path": None,
+                "warnings": result.warnings,
+                "trace_write_error": True,
+            }
+            trace_path = None
+        else:
+            result.payload = {
+                "trace_path": str(trace_path.resolve()),
+                "warnings": result.warnings,
+            }
+        if should_replay and trace_path is not None:
+            portable_trace_path = trace_path.relative_to(self._runtime_artifact_dir()).as_posix()
             cached_payload = dict(result.payload)
             cached_payload["trace_path"] = portable_trace_path
             boundary_agent_run_id = ""

@@ -264,6 +264,22 @@ class BoundaryResultRuntime:
         )
 
 
+class BoundaryFailingRuntime:
+    def __init__(self, error):
+        self.error = error
+
+    def run(self, request):
+        collector = request.boundary_collector
+        collector.record(
+            transition="B09_ADK_TO_LITELLM",
+            from_module="google_adk",
+            to_module="litellm",
+            model_turn_id=collector.start_model_turn(),
+            payload={"model": request.model, "contents": []},
+        )
+        raise self.error
+
+
 class NoBoundaryResultRuntime:
     def run(self, request):
         return AgentRunResult(
@@ -795,6 +811,50 @@ def test_agent_trace_persists_boundary_trace_without_changing_legacy_events(monk
     assert payload["boundary_trace"]["schema_version"] == 1
     assert payload["boundary_trace"]["agent_run_id"]
     assert list(trace_path.parent.glob("*.tmp")) == []
+
+
+def test_handled_agent_failure_persists_partial_boundary_trace(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(TimeoutError("provider timeout")),
+    )
+
+    result = handle.run(task_prompt="test")
+
+    assert "Skipped this iteration" in result.summary
+    trace_path = Path(result.payload["trace_path"])
+    assert trace_path.is_file()
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["boundary_trace"]["events"]
+    assert trace["boundary_trace"]["diagnostics"]
+    assert trace["boundary_trace"]["events"][0]["transition"] == "B09_ADK_TO_LITELLM"
+    assert "provider timeout" in trace["boundary_trace"]["diagnostics"][-1]["message"]
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_trace_write_failure_does_not_change_successful_agent_result(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+    )
+
+    def fail_trace_write(*_args, **_kwargs):
+        raise OSError("trace disk unavailable")
+
+    monkeypatch.setattr(handle, "_write_trace", fail_trace_write)
+
+    result = handle.run(task_prompt="test")
+
+    assert result.summary == "RESULT: done"
+    assert result.events[0].text == "RESULT: done"
+    assert result.events[0].call_id == "call-1"
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    assert result.boundary_trace["diagnostics"][-1]["kind"] == "trace_write_failed"
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
 
 
 def test_agent_trace_atomic_replace_uses_same_directory(monkeypatch, tmp_path):
