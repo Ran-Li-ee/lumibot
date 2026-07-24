@@ -4514,11 +4514,266 @@ def _make_signature_descriptor_async_tool():
     return SignatureDescriptorTool(), descriptor_binds, invocations
 
 
+def _make_property_descriptor_async_tool():
+    descriptor_contexts = []
+    invocations = []
+
+    class PropertyDescriptorTool:
+        @property
+        def __call__(self):
+            descriptor_contexts.append(
+                dict(current_agent_tool_context())
+            )
+
+            async def bound(
+                symbol: str,
+                venue: str = "lit",
+            ):
+                invocations.append((symbol, venue))
+                await asyncio.sleep(0)
+                return {"symbol": symbol, "venue": venue}
+
+            return bound
+
+    return PropertyDescriptorTool(), descriptor_contexts, invocations
+
+
 @pytest.mark.filterwarnings("error::RuntimeWarning")
 @pytest.mark.filterwarnings(
     "error::pytest.PytestUnraisableExceptionWarning"
 )
-def test_ambiguous_descriptor_signature_reaches_real_adk_once(
+def test_property_descriptor_signature_and_context_reach_real_adk(
+    tmp_path,
+):
+    def exercise(collector):
+        original, descriptor_contexts, invocations = (
+            _make_property_descriptor_async_tool()
+        )
+        if collector is not None:
+            turn_id = collector.start_model_turn()
+            collector.set_active_model_turn(turn_id)
+            collector.register_tool_batch(turn_id, ["call_A"])
+        observed = _build_observed_function_tool(
+            FunctionTool,
+            BoundTool(
+                name="property_price",
+                description="property price",
+                function=original,
+                source="local",
+            ),
+            collector=collector,
+            shared_tool_context={"marker": "property-context"},
+        )
+
+        signature = inspect.signature(observed.func)
+        assert list(signature.parameters) == ["symbol", "venue"]
+        assert signature.parameters["symbol"].default is inspect.Parameter.empty
+        assert signature.parameters["symbol"].annotation is str
+        assert signature.parameters["venue"].default == "lit"
+        assert descriptor_contexts == [{}]
+
+        result = asyncio.run(
+            observed.run_async(
+                args={"symbol": "QQQ"},
+                tool_context=FakeToolContext(),
+            )
+        )
+        gc.collect()
+
+        assert descriptor_contexts == [
+            {},
+            {"marker": "property-context"},
+        ]
+        assert invocations == [("QQQ", "lit")]
+        return result
+
+    untraced = exercise(None)
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-property-signature",
+        artifact_root=tmp_path,
+    )
+    traced = exercise(collector)
+
+    assert traced == untraced == {
+        "symbol": "QQQ",
+        "venue": "lit",
+    }
+    b05 = _trace_events(
+        collector.export(),
+        "B05_WRAPPER_TO_PYTHON_TOOL",
+    )[0]
+    assert b05["payload"]["callable_qualname"].endswith(
+        "PropertyDescriptorTool"
+    )
+    assert b05["payload"]["source"] == "local"
+    assert b05["payload"]["effective_arguments"] == {
+        "symbol": "QQQ",
+        "venue": "lit",
+    }
+
+    def exercise_stub(collector):
+        original, descriptor_contexts, invocations = (
+            _make_property_descriptor_async_tool()
+        )
+        result = StubAgentRuntime().run(
+            make_runtime_request(
+                collector,
+                tools=[
+                    BoundTool(
+                        name="property_price",
+                        description="property price",
+                        function=original,
+                    )
+                ],
+            )
+        )
+        payload = next(
+            event.payload
+            for event in result.events
+            if event.kind == "tool_result"
+        )
+        assert len(descriptor_contexts) == 2
+        assert descriptor_contexts[0] == {}
+        assert descriptor_contexts[1]["agent_name"] == "agent"
+        assert invocations == []
+        return payload, result.boundary_trace
+
+    stub_untraced, untraced_trace = exercise_stub(None)
+    stub_collector = BoundaryTraceCollector(
+        agent_run_id="run-stub-property-signature",
+        artifact_root=tmp_path,
+    )
+    stub_traced, traced_trace = exercise_stub(stub_collector)
+
+    assert stub_traced == stub_untraced
+    assert stub_traced["tool_error"] is True
+    assert stub_traced["error"]["type"] == "TypeError"
+    assert "symbol" in stub_traced["error"]["message"]
+    assert untraced_trace is None
+    assert traced_trace == stub_collector.export()
+
+
+def _make_stateful_descriptor_tool():
+    bind_count = 0
+
+    class StatefulDescriptor:
+        def __get__(self, instance, owner):
+            nonlocal bind_count
+            bind_count += 1
+            binding = bind_count
+
+            async def bound(symbol: str):
+                await asyncio.sleep(0)
+                return {"symbol": symbol, "binding": binding}
+
+            return bound
+
+    class StatefulTool:
+        __call__ = StatefulDescriptor()
+
+    return StatefulTool(), lambda: bind_count
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+@pytest.mark.parametrize("with_collector", [False, True])
+def test_ambiguous_descriptor_rebinds_for_each_invocation(
+    tmp_path,
+    with_collector,
+):
+    original, get_bind_count = _make_stateful_descriptor_tool()
+    collector = (
+        BoundaryTraceCollector(
+            agent_run_id="run-stateful-descriptor",
+            artifact_root=tmp_path,
+        )
+        if with_collector
+        else None
+    )
+    wrapped = _wrap_tool_callable(
+        BoundTool(
+            name="stateful_descriptor",
+            description="stateful descriptor",
+            function=original,
+        ),
+        {},
+        collector=collector,
+    )
+
+    assert get_bind_count() == 1
+    first = asyncio.run(wrapped(symbol="QQQ"))
+    second = asyncio.run(wrapped(symbol="SPY"))
+
+    assert first == {"symbol": "QQQ", "binding": 2}
+    assert second == {"symbol": "SPY", "binding": 3}
+    assert get_bind_count() == 3
+    if collector is not None:
+        assert len(
+            _events(collector, "B06_PYTHON_TOOL_TO_WRAPPER")
+        ) == 2
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+@pytest.mark.filterwarnings(
+    "error::pytest.PytestUnraisableExceptionWarning"
+)
+def test_concurrent_ambiguous_descriptor_calls_do_not_share_bound_state():
+    bind_count = 0
+
+    class IsolatedDescriptor:
+        def __get__(self, instance, owner):
+            nonlocal bind_count
+            bind_count += 1
+            binding = bind_count
+            local_state = []
+
+            async def bound(symbol: str):
+                local_state.append(symbol)
+                await asyncio.sleep(0.005)
+                return {
+                    "symbol": symbol,
+                    "binding": binding,
+                    "local_state": list(local_state),
+                }
+
+            return bound
+
+    class IsolatedTool:
+        __call__ = IsolatedDescriptor()
+
+    wrapped = _wrap_tool_callable(
+        BoundTool(
+            name="isolated_descriptor",
+            description="isolated descriptor",
+            function=IsolatedTool(),
+        ),
+        {},
+    )
+
+    async def run_pair():
+        return await asyncio.gather(
+            wrapped(symbol="QQQ"),
+            wrapped(symbol="SPY"),
+        )
+
+    results = asyncio.run(run_pair())
+    gc.collect()
+
+    assert bind_count == 3
+    assert {result["binding"] for result in results} == {2, 3}
+    assert {
+        (result["symbol"], tuple(result["local_state"]))
+        for result in results
+    } == {
+        ("QQQ", ("QQQ",)),
+        ("SPY", ("SPY",)),
+    }
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+@pytest.mark.filterwarnings(
+    "error::pytest.PytestUnraisableExceptionWarning"
+)
+def test_ambiguous_descriptor_signature_reaches_real_adk_per_invocation(
     tmp_path,
 ):
     def exercise(collector):
@@ -4559,7 +4814,8 @@ def test_ambiguous_descriptor_signature_reaches_real_adk_once(
         gc.collect()
 
         assert descriptor_binds == [
-            (original, type(original))
+            (original, type(original)),
+            (original, type(original)),
         ]
         assert invocations == [("QQQ", "lit")]
         return result
@@ -4634,7 +4890,8 @@ def test_ambiguous_descriptor_signature_reaches_real_adk_once(
     )
 
     assert stub_binds == [
-        (stub_original, type(stub_original))
+        (stub_original, type(stub_original)),
+        (stub_original, type(stub_original)),
     ]
     assert stub_invocations == []
     assert stub_payload["tool_error"] is True
@@ -4725,8 +4982,11 @@ def test_adaptive_callable_invokes_once_and_awaits_once(
         assert original.await_count == 1
         assert descriptor_binds == []
     else:
-        assert len(descriptor_binds) == 1
-        assert descriptor_binds[0][0] is original
+        assert len(descriptor_binds) == 2
+        assert all(
+            instance is original
+            for instance, _owner in descriptor_binds
+        )
     assert invocations == ["called"]
     assert not inspect.isawaitable(outcome)
     if raises:

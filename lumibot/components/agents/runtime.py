@@ -22,9 +22,12 @@ from importlib.metadata import version
 from types import (
     BuiltinFunctionType,
     BuiltinMethodType,
+    ClassMethodDescriptorType,
     FunctionType,
+    MethodDescriptorType,
     MethodType,
     SimpleNamespace,
+    WrapperDescriptorType,
 )
 from typing import Any, Callable, Literal
 from unittest.mock import AsyncMock
@@ -203,7 +206,16 @@ _SAFE_CALLABLE_INSPECTION_TYPES = {
     BuiltinFunctionType,
     BuiltinMethodType,
 }
-_UNRESOLVED_CALL_TARGET = object()
+_SAFE_DESCRIPTOR_BINDER_TYPES = {
+    FunctionType,
+    MethodType,
+    BuiltinFunctionType,
+    BuiltinMethodType,
+    MethodDescriptorType,
+    WrapperDescriptorType,
+    ClassMethodDescriptorType,
+}
+_UNRESOLVED_SIGNATURE_TARGET = object()
 
 
 def _classify_async_callable(
@@ -263,7 +275,7 @@ def _classify_async_callable(
         return "ambiguous"
 
 
-def _bind_ambiguous_call_descriptor(original: Any) -> Any:
+def _probe_ambiguous_call_descriptor(original: Any) -> Any:
     try:
         owner = type(original)
         raw_call = inspect.getattr_static(owner, "__call__")
@@ -271,18 +283,20 @@ def _bind_ambiguous_call_descriptor(original: Any) -> Any:
             type(raw_call),
             "__get__",
         )
-        if type(descriptor_get) is not FunctionType:
-            return _UNRESOLVED_CALL_TARGET
+        # Probe only exact Python/C descriptor binders. The bound value is
+        # schema-only; execution still invokes the original inside tool context.
+        if type(descriptor_get) not in _SAFE_DESCRIPTOR_BINDER_TYPES:
+            return _UNRESOLVED_SIGNATURE_TARGET
         bound_target = descriptor_get(
             raw_call,
             original,
             owner,
         )
         if not callable(bound_target):
-            return _UNRESOLVED_CALL_TARGET
+            return _UNRESOLVED_SIGNATURE_TARGET
         return bound_target
     except Exception:
-        return _UNRESOLVED_CALL_TARGET
+        return _UNRESOLVED_SIGNATURE_TARGET
 
 
 def _add_trace_diagnostic(
@@ -349,18 +363,18 @@ def _wrap_tool_callable(
     original = tool.function
     callable_metadata = _safe_callable_metadata(original)
     async_classification = _classify_async_callable(original)
-    invocation_target = original
     if async_classification == "ambiguous":
-        bound_target = _bind_ambiguous_call_descriptor(original)
-        if bound_target is _UNRESOLVED_CALL_TARGET:
+        signature_target = _probe_ambiguous_call_descriptor(
+            original
+        )
+        if signature_target is _UNRESOLVED_SIGNATURE_TARGET:
             callable_signature = _fallback_callable_signature(
                 original
             )
         else:
-            invocation_target = bound_target
             try:
                 callable_signature = inspect.signature(
-                    bound_target
+                    signature_target
                 )
             except Exception:
                 callable_signature = _fallback_callable_signature(
@@ -558,7 +572,7 @@ def _wrap_tool_callable(
                 tool_started_at = _utc_iso_timestamp()
                 tool_started_perf = time.perf_counter()
                 try:
-                    raw_result = invocation_target(*args, **kwargs)
+                    raw_result = original(*args, **kwargs)
                 finally:
                     tool_ended_perf = time.perf_counter()
                     tool_ended_at = _utc_iso_timestamp()
@@ -594,7 +608,7 @@ def _wrap_tool_callable(
                 tool_started_at = _utc_iso_timestamp()
                 tool_started_perf = time.perf_counter()
                 try:
-                    pending_result = invocation_target(
+                    pending_result = original(
                         *args,
                         **kwargs,
                     )
