@@ -106,7 +106,12 @@ class StockPlanRuntime:
         else:
             summary = "Held the current stock position."
         events.append(_event("text", text=summary))
-        return AgentRunResult(summary=summary, model=request.model, events=events)
+        return AgentRunResult(
+            summary=summary,
+            model=request.model,
+            events=events,
+            boundary_trace=request.boundary_collector.export(),
+        )
 
 
 class OptionPlanRuntime:
@@ -367,6 +372,7 @@ class AgentStockBacktestStrategy(Strategy):
     def initialize(self):
         self.sleeptime = "1M"
         self.asset = Asset("AGST", Asset.AssetType.STOCK)
+        self.last_agent_result = None
         self.agents.create(
             name="research",
             system_prompt="Use DuckDB and buy once if no position exists.",
@@ -413,7 +419,7 @@ class AgentStockBacktestStrategy(Strategy):
         return BuiltinTools.orders.submit()
 
     def on_trading_iteration(self):
-        self.agents["research"].run(
+        self.last_agent_result = self.agents["research"].run(
             context={
                 "symbol": self.asset.symbol,
                 "length": 3,
@@ -1140,6 +1146,14 @@ def test_agent_runtime_stock_backtest_replays_from_cache(monkeypatch, tmp_path):
     assert strategy_second.get_position(Asset("AGST", Asset.AssetType.STOCK)) is not None
     second_state = strategy_second.vars.get("_agent_runtime_state", {})
     assert second_state["research"]["runs"][-1]["cache_hit"] is True
+    second_result = strategy_second.last_agent_result
+    assert second_result is not None
+    # Cache replay provenance is explicit while legacy entries remain valid.
+    assert second_result.boundary_trace["execution_source"] == "replay_cache"
+    assert second_result.boundary_trace["status"] in {
+        "available_original_trace",
+        "unavailable_legacy_cache",
+    }
 
 
 @pytest.mark.usefixtures("disable_datasource_override")
