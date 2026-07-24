@@ -1148,12 +1148,9 @@ def test_agent_runtime_stock_backtest_replays_from_cache(monkeypatch, tmp_path):
     assert second_state["research"]["runs"][-1]["cache_hit"] is True
     second_result = strategy_second.last_agent_result
     assert second_result is not None
-    # Cache replay provenance is explicit while legacy entries remain valid.
+    # A fresh cache entry retains the original boundary trace reference.
     assert second_result.boundary_trace["execution_source"] == "replay_cache"
-    assert second_result.boundary_trace["status"] in {
-        "available_original_trace",
-        "unavailable_legacy_cache",
-    }
+    assert second_result.boundary_trace["status"] == "available_original_trace"
 
 
 @pytest.mark.usefixtures("disable_datasource_override")

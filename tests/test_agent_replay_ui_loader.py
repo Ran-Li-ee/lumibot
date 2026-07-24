@@ -107,42 +107,47 @@ def test_load_agent_trace_extracts_inputs_and_batches(tmp_path):
 
 
 def test_loader_accepts_trace_with_boundary_trace_without_changing_legacy_tool_batches(tmp_path):
-    trace_path = tmp_path / "traces" / "growth_agent" / "trace.json"
+    legacy_trace_path = tmp_path / "traces" / "growth_agent" / "legacy.json"
+    boundary_trace_path = tmp_path / "traces" / "growth_agent" / "boundary.json"
+    legacy_payload = {
+        "agent": "growth_agent",
+        "model": "openai/test",
+        "request": {"context": {}, "runtime_context": {}},
+        "events": [
+            {
+                "kind": "tool_call",
+                "tool_name": "market_last_price",
+                "call_id": "call_A",
+                "payload": {"symbol": "QQQ"},
+            },
+            {
+                "kind": "tool_result",
+                "tool_name": "market_last_price",
+                "call_id": "call_A",
+                "payload": {"price": 1},
+            },
+        ],
+        "summary": "done",
+    }
+    _write_trace(legacy_trace_path, legacy_payload)
     _write_trace(
-        trace_path,
+        boundary_trace_path,
         {
-            "agent": "growth_agent",
-            "model": "openai/test",
-            "request": {"context": {}, "runtime_context": {}},
-            "events": [
-                {
-                    "kind": "tool_call",
-                    "tool_name": "market_last_price",
-                    "call_id": "call_A",
-                    "payload": {"symbol": "QQQ"},
-                },
-                {
-                    "kind": "tool_result",
-                    "tool_name": "market_last_price",
-                    "call_id": "call_A",
-                    "payload": {"price": 1},
-                },
-            ],
+            **legacy_payload,
             "boundary_trace": {
                 "schema_version": 1,
                 "agent_run_id": "run-1",
                 "events": [{"transition": "B03_ADK_TO_FUNCTION_TOOL", "call_id": "call_A"}],
                 "diagnostics": [],
             },
-            "summary": "done",
         },
     )
 
-    agent = load_agent_trace(trace_path)
+    legacy_agent = load_agent_trace(legacy_trace_path)
+    boundary_agent = load_agent_trace(boundary_trace_path)
 
-    # Boundary metadata must not replace the legacy event source used by the replay UI.
-    assert agent.tool_batches[0].calls[0].tool_name == "market_last_price"
-    assert agent.tool_batches[0].calls[0].raw_result == {"price": 1}
+    # Compare every batch and call so boundary metadata cannot duplicate legacy events.
+    assert boundary_agent.tool_batches == legacy_agent.tool_batches
 
 
 def test_build_replay_dataset_surfaces_backtest_artifact_links(tmp_path):
