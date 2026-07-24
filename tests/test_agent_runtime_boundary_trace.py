@@ -3888,7 +3888,6 @@ def test_wrapper_uses_explicit_instance_signature_defaults_for_b05(tmp_path):
         "venue": "lit",
     }
 
-
 def test_wrapper_falls_back_when_explicit_signature_hook_raises(tmp_path):
     class ThrowingSignatureTool:
         def __init__(self):
@@ -4491,6 +4490,167 @@ def _make_adaptive_callable(callable_kind, raises):
     return DescriptorTool(), descriptor_binds, invocations
 
 
+def _make_signature_descriptor_async_tool():
+    descriptor_binds = []
+    invocations = []
+
+    class SignatureDescriptor:
+        def __get__(self, instance, owner):
+            descriptor_binds.append((instance, owner))
+
+            async def bound(
+                symbol: str,
+                venue: str = "lit",
+            ):
+                invocations.append((symbol, venue))
+                await asyncio.sleep(0)
+                return {"symbol": symbol, "venue": venue}
+
+            return bound
+
+    class SignatureDescriptorTool:
+        __call__ = SignatureDescriptor()
+
+    return SignatureDescriptorTool(), descriptor_binds, invocations
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+@pytest.mark.filterwarnings(
+    "error::pytest.PytestUnraisableExceptionWarning"
+)
+def test_ambiguous_descriptor_signature_reaches_real_adk_once(
+    tmp_path,
+):
+    def exercise(collector):
+        original, descriptor_binds, invocations = (
+            _make_signature_descriptor_async_tool()
+        )
+        if collector is not None:
+            turn_id = collector.start_model_turn()
+            collector.set_active_model_turn(turn_id)
+            collector.register_tool_batch(turn_id, ["call_A"])
+        observed = _build_observed_function_tool(
+            FunctionTool,
+            BoundTool(
+                name="descriptor_price",
+                description="descriptor price",
+                function=original,
+                source="local",
+            ),
+            collector=collector,
+            shared_tool_context={"marker": "descriptor-signature"},
+        )
+
+        signature = inspect.signature(observed.func)
+        assert list(signature.parameters) == ["symbol", "venue"]
+        assert signature.parameters["symbol"].default is inspect.Parameter.empty
+        assert signature.parameters["symbol"].annotation is str
+        assert signature.parameters["venue"].default == "lit"
+        assert descriptor_binds == [
+            (original, type(original))
+        ]
+
+        result = asyncio.run(
+            observed.run_async(
+                args={"symbol": "QQQ"},
+                tool_context=FakeToolContext(),
+            )
+        )
+        gc.collect()
+
+        assert descriptor_binds == [
+            (original, type(original))
+        ]
+        assert invocations == [("QQQ", "lit")]
+        return result
+
+    untraced = exercise(None)
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-descriptor-signature",
+        artifact_root=tmp_path,
+    )
+    traced = exercise(collector)
+
+    assert traced == untraced == {
+        "symbol": "QQQ",
+        "venue": "lit",
+    }
+    events = collector.export()["events"]
+    assert [
+        event["transition"]
+        for event in events
+        if event["call_id"] == "call_A"
+        and event["transition"]
+        in {
+            "B04_FUNCTION_TOOL_TO_WRAPPER",
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+            "B06_PYTHON_TOOL_TO_WRAPPER",
+            "B07_WRAPPER_TO_FUNCTION_TOOL",
+        }
+    ] == [
+        "B04_FUNCTION_TOOL_TO_WRAPPER",
+        "B05_WRAPPER_TO_PYTHON_TOOL",
+        "B06_PYTHON_TOOL_TO_WRAPPER",
+        "B07_WRAPPER_TO_FUNCTION_TOOL",
+    ]
+    b05 = _trace_events(
+        collector.export(),
+        "B05_WRAPPER_TO_PYTHON_TOOL",
+    )[0]
+    assert b05["payload"]["callable_qualname"].endswith(
+        "SignatureDescriptorTool"
+    )
+    assert b05["payload"]["callable_module"] == __name__
+    assert b05["payload"]["source"] == "local"
+    assert b05["payload"]["effective_arguments"] == {
+        "symbol": "QQQ",
+        "venue": "lit",
+    }
+
+    stub_original, stub_binds, stub_invocations = (
+        _make_signature_descriptor_async_tool()
+    )
+    stub_collector = BoundaryTraceCollector(
+        agent_run_id="run-stub-descriptor-signature",
+        artifact_root=tmp_path,
+    )
+    stub_result = StubAgentRuntime().run(
+        make_runtime_request(
+            stub_collector,
+            tools=[
+                BoundTool(
+                    name="descriptor_price",
+                    description="descriptor price",
+                    function=stub_original,
+                    source="local",
+                )
+            ],
+        )
+    )
+    stub_payload = next(
+        event.payload
+        for event in stub_result.events
+        if event.kind == "tool_result"
+    )
+
+    assert stub_binds == [
+        (stub_original, type(stub_original))
+    ]
+    assert stub_invocations == []
+    assert stub_payload["tool_error"] is True
+    assert stub_payload["error"]["type"] == "TypeError"
+    assert "symbol" in stub_payload["error"]["message"]
+    assert stub_result.boundary_trace == stub_collector.export()
+    assert [
+        event["transition"]
+        for event in stub_result.boundary_trace["events"]
+    ] == [
+        "B05_WRAPPER_TO_PYTHON_TOOL",
+        "B06_PYTHON_TOOL_TO_WRAPPER",
+        "B07_WRAPPER_TO_FUNCTION_TOOL",
+    ]
+
+
 @pytest.mark.filterwarnings("error::RuntimeWarning")
 @pytest.mark.filterwarnings(
     "error::pytest.PytestUnraisableExceptionWarning"
@@ -4540,7 +4700,9 @@ def test_adaptive_callable_invokes_once_and_awaits_once(
             {"marker": "adaptive"},
             collector=collector,
         )
-        assert descriptor_binds == []
+        assert len(descriptor_binds) == (
+            0 if callable_kind == "async_mock" else 1
+        )
         assert inspect.iscoroutinefunction(wrapped)
         outcome = asyncio.run(wrapped())
         trace = collector.export() if collector is not None else None

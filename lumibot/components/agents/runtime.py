@@ -197,17 +197,18 @@ _AsyncCallableClassification = Literal[
     "definite_sync",
     "ambiguous",
 ]
+_SAFE_CALLABLE_INSPECTION_TYPES = {
+    FunctionType,
+    MethodType,
+    BuiltinFunctionType,
+    BuiltinMethodType,
+}
+_UNRESOLVED_CALL_TARGET = object()
 
 
 def _classify_async_callable(
     original: Any,
 ) -> _AsyncCallableClassification:
-    safe_coroutine_types = {
-        FunctionType,
-        MethodType,
-        BuiltinFunctionType,
-        BuiltinMethodType,
-    }
     seen: set[int] = set()
 
     def classify(
@@ -226,7 +227,7 @@ def _classify_async_callable(
                 return "definite_async"
         except Exception:
             return "ambiguous"
-        if value_type in safe_coroutine_types:
+        if value_type in _SAFE_CALLABLE_INSPECTION_TYPES:
             return (
                 "definite_async"
                 if inspect.iscoroutinefunction(value)
@@ -260,6 +261,28 @@ def _classify_async_callable(
         return classify(original, inspect_instance_call=True)
     except Exception:
         return "ambiguous"
+
+
+def _bind_ambiguous_call_descriptor(original: Any) -> Any:
+    try:
+        owner = type(original)
+        raw_call = inspect.getattr_static(owner, "__call__")
+        descriptor_get = inspect.getattr_static(
+            type(raw_call),
+            "__get__",
+        )
+        if type(descriptor_get) is not FunctionType:
+            return _UNRESOLVED_CALL_TARGET
+        bound_target = descriptor_get(
+            raw_call,
+            original,
+            owner,
+        )
+        if not callable(bound_target):
+            return _UNRESOLVED_CALL_TARGET
+        return bound_target
+    except Exception:
+        return _UNRESOLVED_CALL_TARGET
 
 
 def _add_trace_diagnostic(
@@ -326,8 +349,23 @@ def _wrap_tool_callable(
     original = tool.function
     callable_metadata = _safe_callable_metadata(original)
     async_classification = _classify_async_callable(original)
+    invocation_target = original
     if async_classification == "ambiguous":
-        callable_signature = _fallback_callable_signature(original)
+        bound_target = _bind_ambiguous_call_descriptor(original)
+        if bound_target is _UNRESOLVED_CALL_TARGET:
+            callable_signature = _fallback_callable_signature(
+                original
+            )
+        else:
+            invocation_target = bound_target
+            try:
+                callable_signature = inspect.signature(
+                    bound_target
+                )
+            except Exception:
+                callable_signature = _fallback_callable_signature(
+                    original
+                )
     else:
         try:
             callable_signature = inspect.signature(original)
@@ -520,7 +558,7 @@ def _wrap_tool_callable(
                 tool_started_at = _utc_iso_timestamp()
                 tool_started_perf = time.perf_counter()
                 try:
-                    raw_result = original(*args, **kwargs)
+                    raw_result = invocation_target(*args, **kwargs)
                 finally:
                     tool_ended_perf = time.perf_counter()
                     tool_ended_at = _utc_iso_timestamp()
@@ -556,7 +594,7 @@ def _wrap_tool_callable(
                 tool_started_at = _utc_iso_timestamp()
                 tool_started_perf = time.perf_counter()
                 try:
-                    pending_result = original(
+                    pending_result = invocation_target(
                         *args,
                         **kwargs,
                     )
