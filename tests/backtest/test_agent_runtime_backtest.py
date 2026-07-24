@@ -924,6 +924,34 @@ def test_non_os_trace_write_failure_does_not_change_successful_agent_result(
     assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
 
 
+def test_trace_build_failure_does_not_change_successful_agent_result(monkeypatch, tmp_path):
+    secret = "sk-proj-synthetic-trace-build-secret"
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+    )
+
+    def fail_trace_build(**_kwargs):
+        raise ValueError(f"trace build failed for {secret}")
+
+    monkeypatch.setattr(handle, "_build_trace_payload", fail_trace_build)
+
+    result = handle.run(task_prompt="test")
+
+    assert result.summary == "RESULT: done"
+    assert result.events[0].text == "RESULT: done"
+    assert result.events[0].call_id == "call-1"
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    diagnostic = result.boundary_trace["diagnostics"][-1]
+    assert diagnostic["kind"] == "trace_write_failed"
+    assert diagnostic["message"] == "trace build failed for [REDACTED]"
+    assert secret not in json.dumps(result.boundary_trace)
+    assert list((tmp_path / "agent_runtime" / "traces").rglob("*.json")) == []
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
 def test_handled_failure_survives_non_os_trace_write_failure(monkeypatch, tmp_path):
     handle, _ = _build_boundary_trace_handle(
         monkeypatch,
@@ -947,6 +975,36 @@ def test_handled_failure_survives_non_os_trace_write_failure(monkeypatch, tmp_pa
     diagnostic = result.boundary_trace["diagnostics"][-1]
     assert diagnostic["kind"] == "trace_write_failed"
     assert diagnostic["message"] == "trace payload is not serializable"
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_handled_failure_survives_trace_build_failure(monkeypatch, tmp_path):
+    secret = "synthetic-trace-build-bearer-secret"
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(TimeoutError("provider timeout")),
+    )
+
+    def fail_trace_build(**_kwargs):
+        raise TypeError(f"trace build failed; Authorization: Bearer {secret}")
+
+    monkeypatch.setattr(handle, "_build_trace_payload", fail_trace_build)
+
+    result = handle.run(task_prompt="test")
+
+    assert "Skipped this iteration" in result.summary
+    assert "no trades placed" in result.summary
+    assert result.cache_key is None
+    assert result.payload["runtime_error"] is True
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    diagnostic = result.boundary_trace["diagnostics"][-1]
+    assert diagnostic["kind"] == "trace_write_failed"
+    assert diagnostic["message"] == "trace build failed; Authorization: [REDACTED]"
+    assert secret not in json.dumps(result.boundary_trace)
+    assert list((tmp_path / "agent_runtime" / "traces").rglob("*.json")) == []
     assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
 
 
@@ -1002,6 +1060,36 @@ def test_agent_trace_atomic_replace_uses_same_directory(monkeypatch, tmp_path):
     assert replace_calls[0][1] == trace_path
     assert trace_path.is_file()
     assert list(trace_path.parent.glob("*.tmp")) == []
+
+
+def test_agent_trace_redaction_preserves_numeric_token_usage(monkeypatch, tmp_path):
+    api_token = "sk-proj-synthetic-persisted-usage-secret"
+    bearer_token = "synthetic-persisted-usage-bearer-secret"
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+    usage = {
+        "prompt_tokens": 101,
+        "completion_tokens": 23,
+        "total_tokens": 124,
+        "prompt_tokens_details": {"cached_tokens": 80},
+        "completion_tokens_details": {"reasoning_tokens": 9},
+    }
+
+    trace_path = handle._write_trace(
+        AgentRunResult(summary="done", model="test-model", events=[]),
+        {
+            "usage": usage,
+            "api_key": api_token,
+            "header": f"Authorization: Bearer {bearer_token}",
+        },
+    )
+
+    trace_text = trace_path.read_text(encoding="utf-8")
+    trace = json.loads(trace_text)
+    assert trace["usage"] == usage
+    assert trace["api_key"] == "[REDACTED]"
+    assert trace["header"] == "Authorization: [REDACTED]"
+    assert api_token not in trace_text
+    assert bearer_token not in trace_text
 
 
 def test_agent_trace_replace_failure_cleans_temp_without_partial_target(monkeypatch, tmp_path):

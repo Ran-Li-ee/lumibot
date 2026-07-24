@@ -1813,12 +1813,12 @@ class AgentHandle:
             )
             boundary_collector.add_diagnostic("agent_runtime_failed", exc)
             result.boundary_trace = boundary_collector.export()
-            trace_payload = self._build_trace_payload(
-                result=result,
-                model_name=model_name,
-                cache_payload=cache_payload,
-            )
             try:
+                trace_payload = self._build_trace_payload(
+                    result=result,
+                    model_name=model_name,
+                    cache_payload=cache_payload,
+                )
                 trace_path = self._write_trace(result, trace_payload)
             except Exception as trace_exc:
                 boundary_collector.add_diagnostic("trace_write_failed", trace_exc)
@@ -1848,12 +1848,12 @@ class AgentHandle:
         )
         result.cache_key = cache_key
         result.warnings = self._derive_warnings(result, runtime_context, bound_tools)
-        trace_payload = self._build_trace_payload(
-            result=result,
-            model_name=model_name,
-            cache_payload=cache_payload,
-        )
         try:
+            trace_payload = self._build_trace_payload(
+                result=result,
+                model_name=model_name,
+                cache_payload=cache_payload,
+            )
             trace_path = self._write_trace(result, trace_payload)
         except Exception as exc:
             boundary_collector.add_diagnostic("trace_write_failed", exc)

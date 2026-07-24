@@ -27,12 +27,47 @@ _SENSITIVE_COLON_RE = re.compile(
 )
 _BEARER_TOKEN_RE = re.compile(r"\b(Bearer\s+)([^\s,;&\"'}\]\)]+)([\"'}\]\)]?)", re.IGNORECASE)
 _SK_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]+")
+_SAFE_TOKEN_COUNT_KEYS = frozenset(
+    {
+        "budget_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "cached_content_token_count",
+        "cached_input_tokens",
+        "cached_prompt_tokens",
+        "cached_tokens",
+        "candidates_token_count",
+        "completion_tokens",
+        "input_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "max_tokens",
+        "output_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+        "prompt_token_count",
+        "prompt_tokens",
+        "reasoning_tokens",
+        "thoughts_token_count",
+        "tool_use_prompt_token_count",
+        "total_token_count",
+        "total_tokens",
+    }
+)
+_TOKEN_COUNT_DETAIL_KEYS = frozenset(
+    {
+        "completion_tokens_details",
+        "input_tokens_details",
+        "output_tokens_details",
+        "prompt_tokens_details",
+    }
+)
 
 
 def redact_sensitive(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: REDACTED if _SENSITIVE_KEY_RE.search(str(key)) else redact_sensitive(item)
+            key: _redact_mapping_value(key, item)
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -42,6 +77,32 @@ def redact_sensitive(value: Any) -> Any:
     if isinstance(value, str):
         return _redact_string(value)
     return value
+
+
+def _redact_mapping_value(key: Any, value: Any) -> Any:
+    key_text = str(key)
+    if not _SENSITIVE_KEY_RE.search(key_text):
+        return redact_sensitive(value)
+
+    normalized_key = key_text.lower()
+    if normalized_key in _SAFE_TOKEN_COUNT_KEYS and (
+        value is None or type(value) in (bool, int, float)
+    ):
+        return value
+    if normalized_key in _TOKEN_COUNT_DETAIL_KEYS and isinstance(value, dict):
+        return {
+            nested_key: (
+                nested_value
+                if str(nested_key).lower() in _SAFE_TOKEN_COUNT_KEYS
+                and (
+                    nested_value is None
+                    or type(nested_value) in (bool, int, float)
+                )
+                else REDACTED
+            )
+            for nested_key, nested_value in value.items()
+        }
+    return REDACTED
 
 
 def redact_public_preview(

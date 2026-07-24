@@ -31,6 +31,51 @@ def test_redact_sensitive_masks_secret_shaped_keys_and_values():
     assert redacted["items"][1] == "OPENAI_API_KEY=[REDACTED]"
 
 
+def test_redact_sensitive_preserves_safe_token_counts_only():
+    api_token = "sk-proj-synthetic-usage-secret"
+    bearer_token = "synthetic-usage-bearer-secret"
+    payload = {
+        "usage": {
+            "prompt_tokens": 101,
+            "completion_tokens": 23.5,
+            "total_tokens": None,
+            "cached_tokens": False,
+            "prompt_tokens_details": {
+                "cached_tokens": 80,
+                "note": f"credential={api_token}",
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 9,
+                "api_key": api_token,
+            },
+            "reasoning_tokens": api_token,
+            "input_tokens": b"structured-secret",
+        },
+        "token": 123456,
+        "api_key": b"binary-secret",
+        "Authorization": {"header": f"Bearer {bearer_token}"},
+    }
+
+    redacted = redact_sensitive(payload)
+    rendered = repr(redacted)
+
+    assert redacted["usage"]["prompt_tokens"] == 101
+    assert redacted["usage"]["completion_tokens"] == 23.5
+    assert redacted["usage"]["total_tokens"] is None
+    assert redacted["usage"]["cached_tokens"] is False
+    assert redacted["usage"]["prompt_tokens_details"]["cached_tokens"] == 80
+    assert redacted["usage"]["completion_tokens_details"]["reasoning_tokens"] == 9
+    assert redacted["usage"]["prompt_tokens_details"]["note"] == "[REDACTED]"
+    assert redacted["usage"]["completion_tokens_details"]["api_key"] == "[REDACTED]"
+    assert redacted["usage"]["reasoning_tokens"] == "[REDACTED]"
+    assert redacted["usage"]["input_tokens"] == "[REDACTED]"
+    assert redacted["token"] == "[REDACTED]"
+    assert redacted["api_key"] == "[REDACTED]"
+    assert redacted["Authorization"] == "[REDACTED]"
+    assert api_token not in rendered
+    assert bearer_token not in rendered
+
+
 def test_redact_sensitive_masks_bearer_tokens_and_colon_labels():
     payload = {
         "header": "Bearer abc123",
