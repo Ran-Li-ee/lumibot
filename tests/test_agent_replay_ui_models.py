@@ -45,6 +45,7 @@ def test_redact_sensitive_preserves_safe_token_counts_only():
             "completion_tokens": 23.5,
             "total_tokens": None,
             "cached_tokens": False,
+            "cache_write_input_tokens": 7,
             "prompt_tokens_details": {
                 "cached_tokens": 80,
                 "note": f"credential={api_token}",
@@ -68,6 +69,7 @@ def test_redact_sensitive_preserves_safe_token_counts_only():
     assert redacted["usage"]["completion_tokens"] == 23.5
     assert redacted["usage"]["total_tokens"] is None
     assert redacted["usage"]["cached_tokens"] is False
+    assert redacted["usage"]["cache_write_input_tokens"] == 7
     assert redacted["usage"]["prompt_tokens_details"]["cached_tokens"] == 80
     assert redacted["usage"]["completion_tokens_details"]["reasoning_tokens"] == 9
     assert redacted["usage"]["prompt_tokens_details"]["note"] == "[REDACTED]"
@@ -87,6 +89,7 @@ def test_redact_public_preview_preserves_safe_token_counts_only():
         "usage": {
             "Prompt_Tokens": 101,
             "TOTAL_TOKENS": None,
+            "CACHE_WRITE_INPUT_TOKENS": 7,
             "completion_tokens_details": {
                 "Reasoning_Tokens": 9,
                 "note": secret,
@@ -101,6 +104,7 @@ def test_redact_public_preview_preserves_safe_token_counts_only():
 
     assert preview["usage"]["Prompt_Tokens"] == 101
     assert preview["usage"]["TOTAL_TOKENS"] is None
+    assert preview["usage"]["CACHE_WRITE_INPUT_TOKENS"] == 7
     assert preview["usage"]["completion_tokens_details"]["Reasoning_Tokens"] == 9
     assert preview["usage"]["completion_tokens_details"]["note"] == "[REDACTED]"
     assert preview["usage"]["output_tokens"] == "[REDACTED]"

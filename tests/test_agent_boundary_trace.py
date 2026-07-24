@@ -210,6 +210,19 @@ def test_record_includes_adk_invocation_id(tmp_path):
     assert collector.export()["events"][0]["adk_invocation_id"] == "adk-invocation-1"
 
 
+def test_boundary_trace_preserves_cache_write_input_tokens(tmp_path):
+    collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
+
+    event = collector.record(
+        transition="B03_ADK_TO_FUNCTION_TOOL",
+        from_module="google_adk",
+        to_module="function_tool",
+        payload={"usage": {"CACHE_WRITE_INPUT_TOKENS": 7}},
+    )
+
+    assert event["payload"]["usage"]["CACHE_WRITE_INPUT_TOKENS"] == 7
+
+
 def test_redaction_failure_is_fail_open_even_for_diagnostics(monkeypatch, tmp_path):
     collector = BoundaryTraceCollector(agent_run_id="run-1", artifact_root=tmp_path)
 

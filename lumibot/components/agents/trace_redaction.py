@@ -32,6 +32,7 @@ SAFE_NUMERIC_TOKEN_USAGE_FIELDS = frozenset(
         "budget_tokens",
         "cache_creation_input_tokens",
         "cache_read_input_tokens",
+        "cache_write_input_tokens",
         "cached_content_token_count",
         "cached_input_tokens",
         "cached_prompt_tokens",

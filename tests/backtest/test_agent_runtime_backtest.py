@@ -320,6 +320,7 @@ class SensitiveReplayRuntime:
                 "prompt_tokens": 101,
                 "completion_tokens": 23,
                 "total_tokens": 124,
+                "cache_write_input_tokens": 7,
                 "prompt_tokens_details": {"cached_tokens": 80},
                 "completion_tokens_details": {"reasoning_tokens": 9},
             },
@@ -1245,6 +1246,7 @@ def test_agent_trace_redaction_preserves_numeric_token_usage(monkeypatch, tmp_pa
         "prompt_tokens": 101,
         "completion_tokens": 23,
         "total_tokens": 124,
+        "cache_write_input_tokens": 7,
         "prompt_tokens_details": {"cached_tokens": 80},
         "completion_tokens_details": {"reasoning_tokens": 9},
     }
@@ -1287,6 +1289,7 @@ def test_agent_run_artifact_summary_redacts_complete_jsonl_record(monkeypatch, t
             "prompt_tokens": 101,
             "completion_tokens": 23,
             "total_tokens": 124,
+            "cache_creation_input_tokens": 7,
             "completion_tokens_details": {"reasoning_tokens": 9},
         },
         warnings=[
@@ -1313,6 +1316,7 @@ def test_agent_run_artifact_summary_redacts_complete_jsonl_record(monkeypatch, t
     assert summary_record["usage"]["output_tokens"] == 23
     assert summary_record["usage"]["total_tokens"] == 124
     assert summary_record["usage"]["thinking_tokens"] == 9
+    assert summary_record["usage"]["cache_write_input_tokens"] == 7
     assert "[REDACTED]" in summary_record["summary"]
     assert "[REDACTED]" in summary_record["warning_messages"][0]
     assert "[REDACTED]" in summary_record["tool_calls"][0]
@@ -1437,6 +1441,7 @@ def test_agent_replay_cache_uses_authoritative_redacted_trace_payload(monkeypatc
         "prompt_tokens": 101,
         "completion_tokens": 23,
         "total_tokens": 124,
+        "cache_write_input_tokens": 7,
         "prompt_tokens_details": {"cached_tokens": 80},
         "completion_tokens_details": {"reasoning_tokens": 9},
     }
