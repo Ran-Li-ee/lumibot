@@ -465,6 +465,43 @@ def test_litellm_clipped_response_marks_b01_projection_truncated(tmp_path):
     assert b01["payload_meta"]["semantic_completeness"] == "partial"
 
 
+def test_litellm_unsupported_response_marks_b01_payload_partial(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-unsupported-response",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    logger = LiteLLMBoundaryLogger(collector)
+    kwargs = {
+        "model": "provider-model",
+        "messages": [],
+        "metadata": {"lumibot_model_turn_id": turn_id},
+    }
+    token = _begin(logger, kwargs)
+
+    logger.complete_success(token, object(), kwargs=kwargs)
+
+    b01 = _events(collector, "B01_PROVIDER_TO_LITELLM")[0]
+    assert b01["payload"]["response"] == {
+        "capture": "omitted_unsupported",
+        "type": "object",
+    }
+    assert b01["payload"]["projection_truncation"] == {
+        "truncated": True,
+        "omitted_count": 1,
+        "omissions": [
+            {
+                "path": "$.response",
+                "reason": "unsupported",
+                "omitted_count": 1,
+            }
+        ],
+    }
+    assert b01["payload_meta"]["truncated"] is True
+    assert b01["payload_meta"]["semantic_completeness"] == "partial"
+
+
 def test_litellm_unsupported_projection_marks_payload_partial(tmp_path):
     class Unsupported:
         pass

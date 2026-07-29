@@ -723,7 +723,11 @@ def _safe_provider_response(
         )
     if response:
         return response
-    return _omitted_value(response_obj)
+    return _omitted_value(
+        response_obj,
+        tracker=tracker,
+        path=path,
+    )
 
 
 def _retry_count(kwargs: Any) -> int | None:
