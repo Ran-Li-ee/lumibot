@@ -2,8 +2,10 @@ import asyncio
 import copy
 import gc
 import gzip
+import hashlib
 import inspect
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -3528,8 +3530,19 @@ def test_native_gemini_multi_turn_run_has_no_litellm_boundaries_or_pending(
     assert len(result.events) == 0
     assert model_entry_observers == [None]
     assert agent_kwargs["after_model_callback"] is None
-    assert _events(collector, "B09_ADK_TO_LITELLM") == []
-    assert _events(collector, "B02_LITELLM_TO_ADK") == []
+    for transition in (
+        "B01_PROVIDER_TO_LITELLM",
+        "B02_LITELLM_TO_ADK",
+        "B09_ADK_TO_LITELLM",
+        "B10_LITELLM_TO_PROVIDER",
+    ):
+        event = _events(collector, transition)[0]
+        assert event["status"] == "not_applicable"
+        assert event["payload"]["fidelity"] == "not_applicable"
+        assert event["payload"]["reason"] == (
+            "native_model_path_does_not_use_litellm"
+        )
+        assert event["payload_meta"]["fidelity"] == "not_applicable"
     assert collector.pending_model_turn_count() == 0
     assert collector.active_model_turn().endswith(":turn:0003")
 
@@ -3551,8 +3564,10 @@ def test_wrapper_records_raw_and_serialized_results_separately(tmp_path):
 
     with collector.tool_call_context(
         call_id="call_A",
+        call_instance_id="run-1:call:0001",
         model_turn_id="run-1:turn:0001",
         tool_batch_id="run-1:turn:0001:batch:0001",
+        adk_invocation_id="adk-invocation-1",
     ):
         result = wrapped("QQQ")
 
@@ -3582,17 +3597,65 @@ def test_wrapper_records_raw_and_serialized_results_separately(tmp_path):
         "symbol": "QQQ",
         "asset_type": "stock",
     }
+    assert b05["payload"]["tool_context_identifiers"] == {
+        "agent_name": None,
+        "model_call_id": None,
+        "adk_invocation_id": "adk-invocation-1",
+        "model_turn_id": "run-1:turn:0001",
+        "tool_batch_id": "run-1:turn:0001:batch:0001",
+        "call_id": "call_A",
+        "call_instance_id": "run-1:call:0001",
+    }
+    assert b05["payload"]["invocation_started_at"] == b05["started_at"]
+    assert isinstance(
+        b05["payload"]["invocation_started_monotonic"],
+        float,
+    )
+    assert b05["payload"]["invocation_monotonic_clock"] == (
+        "time.monotonic"
+    )
+    assert b05["payload"]["calling_thread"] == {
+        "identifier": threading.get_ident(),
+        "name": threading.current_thread().name,
+    }
+    assert b05["payload"]["asyncio_task"] is None
 
     assert b06["from_module"] == "python_tool"
     assert b06["to_module"] == "lumibot_tool_wrapper"
     assert b06["status"] == "success"
     assert b06["duration_ms"] >= 0
     assert b06["payload"]["raw_result"]["python_type"] == "dict"
+    assert b06["payload"]["raw_result"]["qualified_type"] == "builtins.dict"
     assert b06["payload"]["raw_result"]["fidelity"] == "semantic_copy"
+    assert b06["payload"]["raw_result"]["structural_metadata"] == {
+        "kind": "mapping",
+        "length": 3,
+        "keys": ["symbol", "asset_type", "as_of"],
+    }
     assert b06["payload"]["raw_result"]["semantic_value"]["symbol"] == "QQQ"
+    raw_canonical = json.dumps(
+        b06["payload"]["raw_result"]["semantic_value"],
+        sort_keys=True,
+    ).encode("utf-8")
+    assert b06["payload"]["raw_result"]["content_sha256"] == (
+        hashlib.sha256(raw_canonical).hexdigest()
+    )
     assert b07["from_module"] == "lumibot_tool_wrapper"
     assert b07["to_module"] == "function_tool"
     assert b07["payload"]["serialized_result"]["as_of"].startswith("2024-09-05")
+    assert b07["payload"]["serialization_changed_type"] is True
+    assert b07["payload"]["serialization_changed_shape"] is False
+    assert b07["payload"]["serialization_diagnostics"] == {
+        "reason": "json_safe_conversion",
+        "changed_paths": ["$.as_of"],
+    }
+    assert b07["payload"]["wrapper_error_payload"] is None
+    assert b07["payload"]["redaction_fidelity"] == (
+        "collector_snapshot_applied"
+    )
+    assert b07["payload"]["storage_fidelity"] == "event_payload_meta"
+    assert b07["payload_meta"]["redacted"] is False
+    assert b07["payload_meta"]["fidelity"] == "normalized_copy"
 
 
 def test_wrapper_records_original_exception_and_returns_existing_error_payload(tmp_path):
@@ -3620,13 +3683,157 @@ def test_wrapper_records_original_exception_and_returns_existing_error_payload(t
     assert failure["status"] == "error"
     assert failure["call_id"] == "call_A"
     assert failure["duration_ms"] >= 0
-    assert failure["error"] == {
-        "type": "ValueError",
-        "message": "bad symbol BAD",
-    }
+    assert failure["error"]["type"] == "ValueError"
+    assert failure["error"]["message"] == "bad symbol BAD"
+    assert "ValueError: bad symbol BAD" in failure["error"]["traceback"]
+    assert failure["ended_at"]
     b07 = _events(collector, "B07_WRAPPER_TO_FUNCTION_TOOL")[0]
     assert b07["call_id"] == "call_A"
     assert b07["payload"]["serialized_result"] == result
+    assert b07["payload"]["serialization_changed_type"] is True
+    assert b07["payload"]["serialization_changed_shape"] is True
+    assert b07["payload"]["serialization_diagnostics"]["reason"] == (
+        "wrapper_generated_tool_error_payload"
+    )
+    assert b07["payload"]["wrapper_error_payload"] == result
+
+
+def test_wrapper_redacts_b06_exception_message_and_traceback(tmp_path):
+    secret = "trace-secret-value"
+
+    def broken():
+        raise RuntimeError(f"provider failed api_key={secret}")
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-redacted-error",
+        artifact_root=tmp_path,
+    )
+    wrapped = _wrap_tool_callable(
+        BoundTool(
+            name="broken",
+            description="broken",
+            function=broken,
+        ),
+        collector=collector,
+    )
+
+    result = wrapped()
+
+    assert secret in result["error"]["message"]
+    failure = _events(
+        collector,
+        "B06_PYTHON_TOOL_TO_WRAPPER",
+    )[0]
+    assert failure["error"]["message"] == (
+        "provider failed api_key=[REDACTED]"
+    )
+    assert "RuntimeError: provider failed api_key=[REDACTED]" in (
+        failure["error"]["traceback"]
+    )
+    assert secret not in str(failure)
+
+
+def test_wrapper_records_safe_context_ids_without_arbitrary_context_payload(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-context",
+        artifact_root=tmp_path,
+    )
+    wrapped = _wrap_tool_callable(
+        BoundTool(
+            name="price",
+            description="price",
+            function=lambda symbol="QQQ": {"symbol": symbol},
+        ),
+        {
+            "agent_name": "research-agent",
+            "model_call_id": "model-call-1",
+            "secret_context_payload": "must-not-be-captured",
+        },
+        collector=collector,
+    )
+
+    assert wrapped() == {"symbol": "QQQ"}
+
+    b05 = _events(collector, "B05_WRAPPER_TO_PYTHON_TOOL")[0]
+    identifiers = b05["payload"]["tool_context_identifiers"]
+    assert identifiers["agent_name"] == "research-agent"
+    assert identifiers["model_call_id"] == "model-call-1"
+    assert "secret_context_payload" not in str(b05)
+    assert b05["payload"]["effective_arguments"] == {"symbol": "QQQ"}
+
+
+def test_wrapper_one_shot_result_is_described_without_consumption(tmp_path):
+    consumed = []
+
+    def one_shot():
+        def values():
+            consumed.append("consumed")
+            yield 1
+
+        return values()
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-one-shot",
+        artifact_root=tmp_path,
+    )
+    wrapped = _wrap_tool_callable(
+        BoundTool(
+            name="one_shot",
+            description="one shot",
+            function=one_shot,
+        ),
+        collector=collector,
+    )
+
+    result = wrapped()
+
+    assert consumed == []
+    assert isinstance(result, str)
+    b06 = _events(collector, "B06_PYTHON_TOOL_TO_WRAPPER")[0]
+    assert b06["payload"]["raw_result"]["one_shot"] is True
+    assert "generator instance" in (
+        b06["payload"]["raw_result"]["preview"]
+    )
+    assert "semantic_value" not in b06["payload"]["raw_result"]
+    assert "content_sha256" not in b06["payload"]["raw_result"]
+    b07 = _events(collector, "B07_WRAPPER_TO_FUNCTION_TOOL")[0]
+    assert b07["payload"]["serialization_changed_type"] is True
+    assert b07["payload"]["serialization_diagnostics"]["reason"] == (
+        "json_safe_conversion"
+    )
+
+
+def test_b07_does_not_claim_tool_supplied_error_shape_as_wrapper_error(
+    tmp_path,
+):
+    supplied_result = {
+        "ok": False,
+        "tool_error": True,
+        "source": "tool",
+    }
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-tool-supplied-shape",
+        artifact_root=tmp_path,
+    )
+    wrapped = _wrap_tool_callable(
+        BoundTool(
+            name="status",
+            description="status",
+            function=lambda: supplied_result,
+        ),
+        collector=collector,
+    )
+
+    assert wrapped() == supplied_result
+
+    b07 = _events(collector, "B07_WRAPPER_TO_FUNCTION_TOOL")[0]
+    assert b07["payload"]["wrapper_error_payload"] is None
+    assert b07["payload"]["serialization_diagnostics"] == {
+        "reason": "identity",
+        "changed_paths": [],
+    }
 
 
 def test_b06_success_timing_excludes_trace_overhead(monkeypatch, tmp_path):
@@ -3646,9 +3853,9 @@ def test_b06_success_timing_excludes_trace_overhead(monkeypatch, tmp_path):
         time.sleep(0.08)
         return original_record(**event)
 
-    def delayed_describe(value):
+    def delayed_describe(value, **kwargs):
         time.sleep(0.08)
-        return original_describe(value)
+        return original_describe(value, **kwargs)
 
     monkeypatch.setattr(collector, "record", delayed_record)
     monkeypatch.setattr(collector, "describe_raw_value", delayed_describe)
@@ -4014,8 +4221,16 @@ def test_async_tool_is_awaited_by_adk_with_matching_trace_semantics(
     recwarn,
 ):
     contexts = []
+    task_identity = {}
 
     async def async_tool(symbol: str, venue: str = "lit"):
+        task = asyncio.current_task()
+        task_identity.update(
+            {
+                "identifier": id(task),
+                "name": task.get_name(),
+            }
+        )
         contexts.append(current_agent_tool_context())
         await asyncio.sleep(0)
         contexts.append(current_agent_tool_context())
@@ -4067,6 +4282,15 @@ def test_async_tool_is_awaited_by_adk_with_matching_trace_semantics(
         if "was never awaited" in str(warning.message)
     ]
     if collector is not None:
+        b05 = _events(
+            collector,
+            "B05_WRAPPER_TO_PYTHON_TOOL",
+        )[0]
+        assert b05["payload"]["asyncio_task"] == task_identity
+        assert b05["payload"]["calling_thread"] == {
+            "identifier": threading.get_ident(),
+            "name": threading.current_thread().name,
+        }
         assert [
             event["transition"]
             for event in collector.export()["events"]
@@ -5449,10 +5673,16 @@ def test_full_boundary_loop_preserves_turns_batches_and_reversed_parallel_comple
         )
         assert "contents" in b09["payload"]["llm_request"]
         assert b10["payload"]["capture_type"] == (
-            "provider_adapter_request"
+            "litellm_acompletion_input_snapshot"
         )
         assert b10["payload"]["boundary_distinction"] == (
-            "litellm_provider_adapter_request_not_adk_model_entry"
+            "litellm_input_before_provider_translation_not_raw_http"
+        )
+        assert b10["payload"][
+            "translated_provider_request_status"
+        ] == "not_available"
+        assert b10["payload"]["shown_request_stage"] == (
+            "litellm_acompletion_input_before_provider_translation"
         )
         assert "messages" in b10["payload"]["request"]
         assert b10["payload"]["request"]["messages"] == (

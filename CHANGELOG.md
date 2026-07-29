@@ -3,12 +3,16 @@
 ## Unreleased
 
 ### Added
-- **AI-agent traces now preserve the complete model-to-tool semantic boundary.**
-  Versioned, redacted boundary events correlate LiteLLM provider requests and
-  responses, ADK model turns, parallel FunctionTool calls, validated wrapper
-  arguments, raw local results, serialized FunctionResponses, context pruning,
-  retries when exposed, and replay-cache provenance without capturing secrets
-  or raw HTTP traffic.
+- **AI-agent traces now preserve the observable model-to-tool semantic
+  boundaries.** Versioned, redacted events correlate request-local LiteLLM
+  inputs and provider responses, ADK model turns, parallel FunctionTool calls,
+  validated wrapper arguments, raw local results, serialized
+  FunctionResponses, context pruning, retries when exposed, and replay-cache
+  provenance. A translated provider-adapter request is claimed only when a
+  safe request-local pre-API callback exposes it; otherwise the trace marks that
+  fidelity unavailable and identifies the captured value as pre-translation
+  LiteLLM input. Projection clipping is explicit, native non-LiteLLM paths are
+  marked not applicable, and no secrets or raw HTTP traffic are captured.
 
 ## 4.5.75 - 2026-07-13
 

@@ -1682,13 +1682,29 @@ class BoundaryTraceCollector:
         ended_at: str | None = None,
         duration_ms: float | None = None,
         error: dict[str, Any] | None = None,
+        payload_fidelity: str | None = None,
+        projection_truncation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         sidecar_path: str | None = None
         try:
             normalized_error, _ = self._snapshot_trace_value(error, nested=False)
             safe_error = _redact_trace_value(normalized_error)
             span_id = uuid4().hex
-            safe_payload, payload_meta = self.snapshot(payload, span_id=span_id)
+            snapshot_options: dict[str, Any] = {
+                "span_id": span_id,
+            }
+            if payload_fidelity is not None:
+                snapshot_options["payload_fidelity"] = (
+                    payload_fidelity
+                )
+            if projection_truncation is not None:
+                snapshot_options["projection_truncation"] = (
+                    projection_truncation
+                )
+            safe_payload, payload_meta = self.snapshot(
+                payload,
+                **snapshot_options,
+            )
             sidecar_path = payload_meta.get("sidecar_path")
             with self._lock:
                 event = {
@@ -1776,7 +1792,70 @@ class BoundaryTraceCollector:
             descriptor["preview"] = _type_based_preview(descriptor)
         return descriptor
 
-    def describe_raw_value(self, value: Any) -> dict[str, Any]:
+    def _structural_metadata(self, value: Any) -> dict[str, Any]:
+        actual_type = type(value)
+        if _type_is_subclass(
+            actual_type,
+            collections.abc.Iterator,
+        ):
+            return {"kind": "iterator", "one_shot": True}
+        shape = _safe_shape(value, actual_type)
+        if shape is not None:
+            return {"kind": "array_like", "shape": shape}
+        if _is_mapping_type(actual_type):
+            metadata: dict[str, Any] = {"kind": "mapping"}
+            try:
+                metadata["length"] = _container_length(
+                    value,
+                    actual_type,
+                )
+            except Exception:
+                pass
+            try:
+                metadata["keys"] = [
+                    _safe_mapping_key(key)[0]
+                    for key in itertools.islice(
+                        _mapping_keys(value, actual_type),
+                        100,
+                    )
+                ]
+            except Exception:
+                pass
+            return metadata
+        if any(
+            _type_mro_contains(actual_type, sequence_type)
+            for sequence_type in (list, tuple)
+        ):
+            metadata = {"kind": "sequence"}
+            try:
+                metadata["length"] = _container_length(
+                    value,
+                    actual_type,
+                )
+            except Exception:
+                pass
+            return metadata
+        if any(
+            _type_mro_contains(actual_type, set_type)
+            for set_type in (set, frozenset)
+        ):
+            metadata = {"kind": "set"}
+            try:
+                metadata["length"] = _container_length(
+                    value,
+                    actual_type,
+                )
+            except Exception:
+                pass
+            return metadata
+        return {"kind": "scalar"}
+
+    def describe_raw_value(
+        self,
+        value: Any,
+        *,
+        include_forensics: bool = False,
+    ) -> dict[str, Any]:
         fallback = _descriptor_type(value)
         fallback["preview"] = _type_based_preview(fallback)
         try:
@@ -1798,9 +1877,30 @@ class BoundaryTraceCollector:
                     value,
                     include_safe_preview=True,
                 )
+            if include_forensics:
+                descriptor["structural_metadata"] = (
+                    self._structural_metadata(value)
+                )
+                if (
+                    "semantic_value" not in descriptor
+                    and "preview" not in descriptor
+                ):
+                    descriptor["preview"] = (
+                        _type_based_preview(descriptor)
+                    )
             sanitized = _redact_trace_value(descriptor)
             if sanitized != descriptor:
                 sanitized["redacted"] = True
+            if (
+                include_forensics
+                and "semantic_value" in sanitized
+            ):
+                encoded = _canonical_json_bytes(
+                    sanitized["semantic_value"]
+                )
+                sanitized["content_sha256"] = hashlib.sha256(
+                    encoded
+                ).hexdigest()
             return _bound_descriptor_previews(sanitized)
         except Exception:
             return fallback
@@ -2002,6 +2102,8 @@ class BoundaryTraceCollector:
         payload: Any,
         *,
         span_id: str,
+        payload_fidelity: str | None = None,
+        projection_truncation: dict[str, Any] | None = None,
     ) -> tuple[Any, dict[str, Any]]:
         normalized, descriptor_only = self._snapshot_trace_value(
             payload,
@@ -2014,7 +2116,12 @@ class BoundaryTraceCollector:
         encoded = _canonical_json_bytes(redacted)
         meta = {
             "fidelity": (
-                "descriptor_only" if descriptor_only else "normalized_copy"
+                payload_fidelity
+                or (
+                    "descriptor_only"
+                    if descriptor_only
+                    else "normalized_copy"
+                )
             ),
             "representation": "json",
             "byte_count": len(encoded),
@@ -2024,7 +2131,20 @@ class BoundaryTraceCollector:
             "truncated": False,
             "sidecar_path": None,
             "compression": None,
+            "semantic_completeness": "complete",
         }
+        if projection_truncation:
+            normalized_truncation, _ = self._snapshot_trace_value(
+                projection_truncation,
+                nested=False,
+            )
+            safe_truncation = _redact_trace_value(
+                normalized_truncation
+            )
+            meta["truncation"] = safe_truncation
+            if safe_truncation.get("truncated") is True:
+                meta["truncated"] = True
+                meta["semantic_completeness"] = "partial"
         if len(encoded) <= self.inline_payload_limit:
             return redacted, meta
         preview = {"preview": encoded[:500].decode("utf-8", errors="replace")}
@@ -2038,6 +2158,7 @@ class BoundaryTraceCollector:
         except Exception as exc:
             self.add_diagnostic("sidecar_write_failed", exc)
             meta["truncated"] = True
+            meta["semantic_completeness"] = "partial"
             return preview, meta
 
     def add_diagnostic(self, kind: str, exc: BaseException | str) -> None:

@@ -206,9 +206,19 @@ def test_litellm_success_records_provider_adapter_pair_without_secrets(tmp_path)
     b01 = _events(collector, "B01_PROVIDER_TO_LITELLM")[0]
     assert b10["model_turn_id"] == turn_id
     assert b01["model_turn_id"] == turn_id
+    assert b10["to_module"] == "provider_adapter"
     assert b10["payload"]["capture_type"] == "provider_adapter_request"
     assert b10["payload"]["boundary_distinction"] == (
-        "litellm_provider_adapter_request_not_adk_model_entry"
+        "request_local_litellm_pre_api_semantics_not_raw_http"
+    )
+    assert b10["payload"]["translated_provider_request_status"] == (
+        "available"
+    )
+    assert b10["payload"]["translated_provider_request_fidelity"] == (
+        "normalized_copy"
+    )
+    assert b10["payload"]["shown_request_stage"] == (
+        "litellm_pre_api_callback"
     )
     assert set(b10["payload"]["request"]) == {
         "model",
@@ -233,13 +243,215 @@ def test_litellm_success_records_provider_adapter_pair_without_secrets(tmp_path)
         "pre_api_to_terminal_not_per_attempt"
     )
     assert b10["duration_ms"] == 1000.0
+    assert b10["payload_meta"]["truncated"] is False
+    assert b10["payload_meta"]["semantic_completeness"] == "complete"
     assert b01["payload"]["response"]["id"] == "response-1"
+    assert b01["payload_meta"]["truncated"] is False
     rendered = str((b10, b01))
     assert secret not in rendered
     assert "Authorization" not in rendered
     assert "private-provider.invalid" not in rendered
     assert r"C:\private\secret.txt" not in rendered
     assert "binary-secret" not in rendered
+
+
+def test_litellm_adapter_fallback_does_not_claim_provider_translation(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-fallback",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    logger = LiteLLMBoundaryLogger(collector)
+    kwargs = {
+        "model": "provider-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "litellm_call_id": "litellm-call-fallback",
+        "metadata": {"lumibot_model_turn_id": turn_id},
+    }
+    token = _begin(logger, kwargs)
+
+    logger.complete_success(
+        token,
+        {"id": "response-fallback", "choices": []},
+        kwargs=kwargs,
+    )
+
+    b10 = _events(collector, "B10_LITELLM_TO_PROVIDER")[0]
+    assert b10["to_module"] == "provider_boundary_not_observed"
+    assert b10["payload"]["capture_type"] == (
+        "litellm_acompletion_input_snapshot"
+    )
+    assert b10["payload"]["boundary_distinction"] == (
+        "litellm_input_before_provider_translation_not_raw_http"
+    )
+    assert b10["payload"]["translated_provider_request_status"] == (
+        "not_available"
+    )
+    assert b10["payload"]["translated_provider_request_fidelity"] == (
+        "not_available"
+    )
+    assert b10["payload"]["translated_provider_request_reason"] == (
+        "installed_litellm_does_not_expose_request_local_pre_api_callback"
+    )
+    assert b10["payload"]["shown_request_stage"] == (
+        "litellm_acompletion_input_before_provider_translation"
+    )
+    assert b10["payload"]["provider_routing"]["litellm_call_id"] == (
+        "litellm-call-fallback"
+    )
+
+
+def test_litellm_pre_api_request_remains_authoritative_at_completion(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-pre-api-authoritative",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    logger = LiteLLMBoundaryLogger(collector)
+    adapter_kwargs = {
+        "model": "provider-model",
+        "messages": [{"role": "user", "content": "adapter input"}],
+        "litellm_call_id": "litellm-call-authoritative",
+        "metadata": {"lumibot_model_turn_id": turn_id},
+    }
+    token = _begin(logger, adapter_kwargs)
+    logger.log_pre_api_call(
+        "translated-provider-model",
+        [{"role": "user", "content": "translated request"}],
+        {
+            **adapter_kwargs,
+            "model": "translated-provider-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "translated request",
+                }
+            ],
+        },
+    )
+
+    logger.complete_success(
+        token,
+        {"id": "response-authoritative", "choices": []},
+        kwargs=adapter_kwargs,
+    )
+
+    b10 = _events(collector, "B10_LITELLM_TO_PROVIDER")[0]
+    assert b10["payload"]["translated_provider_request_status"] == (
+        "available"
+    )
+    assert b10["payload"]["request"]["model"] == (
+        "translated-provider-model"
+    )
+    assert b10["payload"]["request"]["messages"] == [
+        {"role": "user", "content": "translated request"}
+    ]
+
+
+def test_litellm_clipped_messages_mark_projection_and_collector_truncated(
+    tmp_path,
+):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-clipped",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    logger = LiteLLMBoundaryLogger(collector)
+    kwargs = {
+        "model": "provider-model",
+        "messages": [
+            {"role": "user", "content": f"message-{index}"}
+            for index in range(205)
+        ],
+        "litellm_call_id": "litellm-call-clipped",
+        "metadata": {"lumibot_model_turn_id": turn_id},
+    }
+    token = _begin(logger, kwargs)
+
+    logger.complete_success(
+        token,
+        {"id": "response-clipped", "choices": []},
+        kwargs=kwargs,
+    )
+
+    b10 = _events(collector, "B10_LITELLM_TO_PROVIDER")[0]
+    assert len(b10["payload"]["request"]["messages"]) == 201
+    assert b10["payload"]["request"]["messages"][-1] == {
+        "capture": "omitted_item_limit",
+        "remaining_count": 5,
+    }
+    assert b10["payload"]["projection_truncation"] == {
+        "truncated": True,
+        "omitted_count": 5,
+        "omissions": [
+            {
+                "path": "$.messages",
+                "reason": "item_limit",
+                "omitted_count": 5,
+            }
+        ],
+    }
+    assert b10["payload_meta"]["truncated"] is True
+    assert b10["payload_meta"]["semantic_completeness"] == "partial"
+    assert b10["payload_meta"]["truncation"] == (
+        b10["payload"]["projection_truncation"]
+    )
+    assert b10["payload_meta"]["fidelity"] != "framework_exact"
+
+
+def test_litellm_clipped_response_marks_b01_projection_truncated(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-clipped-response",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    logger = LiteLLMBoundaryLogger(collector)
+    kwargs = {
+        "model": "provider-model",
+        "messages": [],
+        "metadata": {"lumibot_model_turn_id": turn_id},
+    }
+    token = _begin(logger, kwargs)
+    response = {
+        "id": "response-clipped",
+        "choices": [
+            {
+                "index": index,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": f"choice-{index}",
+                },
+            }
+            for index in range(205)
+        ],
+    }
+
+    logger.complete_success(token, response, kwargs=kwargs)
+
+    b01 = _events(collector, "B01_PROVIDER_TO_LITELLM")[0]
+    assert len(b01["payload"]["response"]["choices"]) == 200
+    assert b01["payload"]["projection_truncation"] == {
+        "truncated": True,
+        "omitted_count": 5,
+        "omissions": [
+            {
+                "path": "$.response.choices",
+                "reason": "item_limit",
+                "omitted_count": 5,
+            }
+        ],
+    }
+    assert b01["payload_meta"]["truncated"] is True
+    assert b01["payload_meta"]["semantic_completeness"] == "partial"
 
 
 def test_litellm_provider_request_allowlist_is_complete_and_deny_by_default(
@@ -3337,13 +3549,18 @@ def test_resolved_litellm_preserves_b09_and_records_distinct_b10(
         event["payload"]["llm_request"]["model"] == "openai/test"
         for event in b09_events
     )
+    assert [
+        event["payload"]["request"]["model"]
+        for event in b10_events
+    ] == ["openai/test", "openai/test"]
     assert all(
-        event["payload"]["request"]["model"] == "test"
+        event["payload"]["boundary_distinction"]
+        == "litellm_input_before_provider_translation_not_raw_http"
         for event in b10_events
     )
     assert all(
-        event["payload"]["boundary_distinction"]
-        == "litellm_provider_adapter_request_not_adk_model_entry"
+        event["payload"]["translated_provider_request_status"]
+        == "not_available"
         for event in b10_events
     )
 

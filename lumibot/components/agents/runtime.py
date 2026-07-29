@@ -12,7 +12,9 @@ import math
 import os
 import re
 import sys
+import threading
 import time
+import traceback
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -96,7 +98,11 @@ def _configure_google_sdk_noise_filters() -> None:
     _GOOGLE_SDK_NOISE_FILTERS_CONFIGURED = True
 
 
-def _safe_exception_details(exc: Exception) -> dict[str, str]:
+def _safe_exception_details(
+    exc: Exception,
+    *,
+    include_traceback: bool = False,
+) -> dict[str, str]:
     try:
         type_name = type.__getattribute__(type(exc), "__name__")
     except Exception:
@@ -105,10 +111,23 @@ def _safe_exception_details(exc: Exception) -> dict[str, str]:
         message = str(exc)
     except Exception:
         message = "[exception message unavailable]"
-    return {
+    details = {
         "type": type_name if isinstance(type_name, str) else "Exception",
         "message": message,
     }
+    if include_traceback:
+        try:
+            rendered_traceback = "".join(
+                traceback.format_exception(
+                    type(exc),
+                    exc,
+                    exc.__traceback__,
+                )
+            )
+        except Exception:
+            rendered_traceback = "[traceback unavailable]"
+        details["traceback"] = rendered_traceback
+    return details
 
 
 def _tool_error_payload(tool_name: str, args: dict[str, Any], exc: Exception) -> dict[str, Any]:
@@ -399,8 +418,6 @@ def _wrap_tool_callable(
             else:
                 if isinstance(current_context, dict):
                     call_context = current_context
-        wrapper_started_at = _utc_iso_timestamp()
-        started_perf = time.perf_counter()
         wrapper_received_arguments = dict(kwargs)
         effective_arguments = dict(kwargs)
         if callable_signature is not None:
@@ -413,6 +430,9 @@ def _wrap_tool_callable(
                 pass
 
         trace_ids = {
+            "adk_invocation_id": call_context.get(
+                "adk_invocation_id"
+            ),
             "model_turn_id": call_context.get("model_turn_id"),
             "tool_batch_id": call_context.get("tool_batch_id"),
             "call_id": call_context.get("call_id"),
@@ -435,13 +455,42 @@ def _wrap_tool_callable(
                     "pre_invoke_observation_failed",
                     exc,
                 )
+        invocation_started_at = _utc_iso_timestamp()
+        invocation_started_monotonic = time.monotonic()
+        started_perf = time.perf_counter()
+        calling_thread = threading.current_thread()
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
         observation_id = call_context.get("observation_id")
+        tool_context_identifiers = {
+            "agent_name": (
+                tool_context.get("agent_name")
+                if isinstance(tool_context, dict)
+                else None
+            ),
+            "model_call_id": (
+                tool_context.get("model_call_id")
+                if isinstance(tool_context, dict)
+                else None
+            ),
+            "adk_invocation_id": call_context.get(
+                "adk_invocation_id"
+            ),
+            "model_turn_id": call_context.get("model_turn_id"),
+            "tool_batch_id": call_context.get("tool_batch_id"),
+            "call_id": call_context.get("call_id"),
+            "call_instance_id": call_context.get(
+                "call_instance_id"
+            ),
+        }
         _record_tool_boundary(
             collector,
             transition="B05_WRAPPER_TO_PYTHON_TOOL",
             from_module="lumibot_tool_wrapper",
             to_module="python_tool",
-            started_at=_utc_iso_timestamp(),
+            started_at=invocation_started_at,
             payload={
                 "tool_name": tool.name,
                 "source": tool.source,
@@ -450,12 +499,32 @@ def _wrap_tool_callable(
                 "positional_arguments": list(args),
                 "keyword_arguments": dict(kwargs),
                 "effective_arguments": effective_arguments,
+                "tool_context_identifiers": (
+                    tool_context_identifiers
+                ),
+                "invocation_started_at": invocation_started_at,
+                "invocation_started_monotonic": (
+                    invocation_started_monotonic
+                ),
+                "invocation_monotonic_clock": "time.monotonic",
+                "calling_thread": {
+                    "identifier": calling_thread.ident,
+                    "name": calling_thread.name,
+                },
+                "asyncio_task": (
+                    {
+                        "identifier": id(current_task),
+                        "name": current_task.get_name(),
+                    }
+                    if current_task is not None
+                    else None
+                ),
                 "observation_id": observation_id,
             },
             **trace_ids,
         )
         return {
-            "wrapper_started_at": wrapper_started_at,
+            "wrapper_started_at": invocation_started_at,
             "started_perf": started_perf,
             "trace_ids": trace_ids,
             "observation_id": observation_id,
@@ -473,6 +542,7 @@ def _wrap_tool_callable(
     ) -> Any:
         observation_id = state["observation_id"]
         trace_ids = state["trace_ids"]
+        serialization_error: Exception | None = None
         if error is not None:
             if tool_started_at is None:
                 tool_started_at = _utc_iso_timestamp()
@@ -490,7 +560,10 @@ def _wrap_tool_callable(
                     "tool_name": tool.name,
                     "observation_id": observation_id,
                 },
-                error=_safe_exception_details(error),
+                error=_safe_exception_details(
+                    error,
+                    include_traceback=True,
+                ),
                 **trace_ids,
             )
             result = _tool_error_payload(
@@ -501,7 +574,10 @@ def _wrap_tool_callable(
         else:
             if collector is not None:
                 try:
-                    raw_description = collector.describe_raw_value(raw_result)
+                    raw_description = collector.describe_raw_value(
+                        raw_result,
+                        include_forensics=True,
+                    )
                 except Exception as exc:
                     _add_trace_diagnostic(collector, "describe_raw_value_failed", exc)
                 else:
@@ -522,11 +598,12 @@ def _wrap_tool_callable(
                     )
             try:
                 result = _json_safe_value(raw_result)
-            except Exception as serialization_error:
+            except Exception as caught_serialization_error:
+                serialization_error = caught_serialization_error
                 result = _tool_error_payload(
                     tool.name,
                     kwargs,
-                    serialization_error,
+                    caught_serialization_error,
                 )
         if isinstance(tool_context, dict):
             calls = tool_context.setdefault("tool_calls", [])
@@ -538,6 +615,42 @@ def _wrap_tool_callable(
                         "ok": not (isinstance(result, dict) and result.get("tool_error") is True),
                     }
                 )
+        wrapper_error_payload = (
+            result
+            if error is not None or serialization_error is not None
+            else None
+        )
+        if error is not None:
+            serialization_changed_type = True
+            serialization_changed_shape = True
+            serialization_diagnostics = {
+                "reason": "wrapper_generated_tool_error_payload",
+                "changed_paths": ["$"],
+            }
+        elif serialization_error is not None:
+            serialization_changed_type = True
+            serialization_changed_shape = True
+            serialization_diagnostics = {
+                "reason": "serialization_failed_wrapper_error_payload",
+                "changed_paths": ["$"],
+                "error": _safe_exception_details(
+                    serialization_error
+                ),
+            }
+        else:
+            (
+                serialization_changed_type,
+                serialization_changed_shape,
+                changed_paths,
+            ) = _serialization_changes(raw_result, result)
+            serialization_diagnostics = {
+                "reason": (
+                    "json_safe_conversion"
+                    if changed_paths
+                    else "identity"
+                ),
+                "changed_paths": changed_paths,
+            }
         _record_tool_boundary(
             collector,
             transition="B07_WRAPPER_TO_FUNCTION_TOOL",
@@ -554,6 +667,20 @@ def _wrap_tool_callable(
             ),
             payload={
                 "serialized_result": result,
+                "serialization_changed_type": (
+                    serialization_changed_type
+                ),
+                "serialization_changed_shape": (
+                    serialization_changed_shape
+                ),
+                "serialization_diagnostics": (
+                    serialization_diagnostics
+                ),
+                "wrapper_error_payload": wrapper_error_payload,
+                "redaction_fidelity": (
+                    "collector_snapshot_applied"
+                ),
+                "storage_fidelity": "event_payload_meta",
                 "observation_id": observation_id,
             },
             **trace_ids,
@@ -654,6 +781,89 @@ def _wrap_tool_callable(
     if annotations is not None:
         wrapper.__annotations__ = annotations
     return wrapper
+
+
+def _serialization_changes(
+    original: Any,
+    serialized: Any,
+) -> tuple[bool, bool, list[str]]:
+    changed_type = False
+    changed_shape = False
+    changed_paths: list[str] = []
+
+    def kind(value: Any) -> str:
+        value_type = type(value)
+        if value_type is dict:
+            return "mapping"
+        if value_type in (list, tuple):
+            return "sequence"
+        if value_type in (
+            type(None),
+            bool,
+            str,
+            int,
+            float,
+            datetime,
+            date,
+            UUID,
+        ) or isinstance(value, Enum):
+            return "scalar"
+        return "opaque"
+
+    def note(path: str) -> None:
+        if path not in changed_paths:
+            changed_paths.append(path)
+
+    def compare(left: Any, right: Any, path: str) -> None:
+        nonlocal changed_type, changed_shape
+        left_type = type(left)
+        right_type = type(right)
+        left_kind = kind(left)
+        right_kind = kind(right)
+        if left_type is not right_type:
+            changed_type = True
+            note(path)
+        if left_kind != right_kind:
+            changed_shape = True
+            note(path)
+            return
+        if left_kind == "mapping":
+            left_keys = [str(key) for key in dict.keys(left)]
+            right_keys = list(dict.keys(right))
+            if left_keys != right_keys:
+                changed_shape = True
+                note(path)
+            for key in dict.keys(left):
+                safe_key = str(key)
+                if safe_key in right:
+                    compare(
+                        dict.__getitem__(left, key),
+                        dict.__getitem__(right, safe_key),
+                        f"{path}.{safe_key}",
+                    )
+            return
+        if left_kind == "sequence":
+            if len(left) != len(right):
+                changed_shape = True
+                note(path)
+            for index, (left_item, right_item) in enumerate(
+                zip(left, right)
+            ):
+                compare(
+                    left_item,
+                    right_item,
+                    f"{path}[{index}]",
+                )
+
+    try:
+        compare(original, serialized, "$")
+    except Exception:
+        return (
+            type(original) is not type(serialized),
+            kind(original) != kind(serialized),
+            ["$"],
+        )
+    return changed_type, changed_shape, changed_paths
 
 
 def _build_observed_function_tool(
@@ -1174,6 +1384,12 @@ def _build_observed_function_tool(
                     ),
                     model_turn_id=ids.get("model_turn_id"),
                     tool_batch_id=ids.get("tool_batch_id"),
+                    adk_invocation_id=_safe_optional_string(
+                        _safe_attribute(
+                            tool_context,
+                            "invocation_id",
+                        )
+                    ),
                     model_arguments=args,
                     provider_call_id=ids.get("provider_call_id"),
                     provider_runtime_call_id=(
@@ -1641,7 +1857,12 @@ def _to_serializable_dict(value: Any) -> dict[str, Any] | None:
 
 def _extract_structured_content(result: Any) -> dict[str, Any]:
     if isinstance(result, dict):
-        structured = result.get("structuredContent") or result.get("structured_content") or result.get("output") or result.get("result")
+        structured = (
+            result.get("structuredContent")
+            or result.get("structured_content")
+            or result.get("output")
+            or result.get("result")
+        )
         if isinstance(structured, dict):
             return structured
         content = result.get("content")
@@ -2521,7 +2742,12 @@ def _replace_function_response_payload(part: Any, message: str) -> bool:
         return False
 
 
-def _prune_tool_response_for_context_window(tool_response: Any, *, tool_name: str | None, max_chars: int = 4_000) -> Any | None:
+def _prune_tool_response_for_context_window(
+    tool_response: Any,
+    *,
+    tool_name: str | None,
+    max_chars: int = 4_000,
+) -> Any | None:
     response_chars = _serialized_content_length(tool_response)
     if response_chars <= max_chars:
         return None
@@ -2571,7 +2797,10 @@ def _prune_request_contents_for_context_window(
                 tool_response_parts.append(part)
 
     should_prune_for_size = before_chars > max_chars
-    should_prune_for_history = always_prune_older_tool_results and len(tool_response_parts) > preserve_recent_tool_results
+    should_prune_for_history = (
+        always_prune_older_tool_results
+        and len(tool_response_parts) > preserve_recent_tool_results
+    )
     if not should_prune_for_size and not should_prune_for_history:
         return None
 
@@ -2722,6 +2951,31 @@ def _is_native_gemini_model(model: Any) -> bool:
         return False
     lower = model.strip().lower()
     return lower.startswith("gemini-") or lower.startswith("models/gemini")
+
+
+def _record_native_litellm_boundaries_not_applicable(
+    collector: BoundaryTraceCollector | None,
+) -> None:
+    payload = {
+        "fidelity": "not_applicable",
+        "reason": "native_model_path_does_not_use_litellm",
+        "runtime_path": "native_google_adk_gemini",
+    }
+    for transition, from_module, to_module in (
+        ("B01_PROVIDER_TO_LITELLM", "provider", "litellm"),
+        ("B02_LITELLM_TO_ADK", "litellm", "google_adk"),
+        ("B09_ADK_TO_LITELLM", "google_adk", "litellm"),
+        ("B10_LITELLM_TO_PROVIDER", "litellm", "provider"),
+    ):
+        _record_tool_boundary(
+            collector,
+            transition=transition,
+            from_module=from_module,
+            to_module=to_module,
+            status="not_applicable",
+            payload=payload,
+            payload_fidelity="not_applicable",
+        )
 
 
 def _build_observed_litellm_type(
@@ -3267,7 +3521,7 @@ class GoogleADKRuntime:
 
         self._llm_agent_type = llm_agent_module.LlmAgent
         self._runner_type = runners_module.InMemoryRunner
-        self._function_tool_type = getattr(function_tool_module, "FunctionTool")
+        self._function_tool_type = function_tool_module.FunctionTool
         self._genai_types = google_genai_types
         self._google_genai_types = google_genai_types
         return self._llm_agent_type, self._runner_type, self._genai_types, self._function_tool_type
@@ -4451,8 +4705,13 @@ class GoogleADKRuntime:
         sections: list[str] = []
         tool_names = {tool.name for tool in request.bound_tools}
         if request.runtime_context:
+            runtime_context = json.dumps(
+                _json_safe_value(request.runtime_context),
+                sort_keys=True,
+                default=str,
+            )
             sections.append(
-                f"Runtime Context JSON:\n{json.dumps(_json_safe_value(request.runtime_context), sort_keys=True, default=str)}"
+                f"Runtime Context JSON:\n{runtime_context}"
             )
         if request.bound_tools:
             sections.append(
@@ -4490,7 +4749,12 @@ class GoogleADKRuntime:
             ]
             if "alpaca_news" in tool_names:
                 required_categories.append("alpaca_news")
-            fred_tools = sorted(name for name in tool_names if name.startswith("get_fred_") or name == "list_fred_series")
+            fred_tools = sorted(
+                name
+                for name in tool_names
+                if name.startswith("get_fred_")
+                or name == "list_fred_series"
+            )
             if fred_tools:
                 required_categories.append(" or ".join(fred_tools))
             required_categories.extend(
@@ -4566,6 +4830,10 @@ class GoogleADKRuntime:
         uses_litellm_boundaries = not _is_native_gemini_model(
             request.model
         )
+        if not uses_litellm_boundaries:
+            _record_native_litellm_boundaries_not_applicable(
+                request.boundary_collector
+            )
         before_model_callbacks = [
             callback
             for callback in (

@@ -133,8 +133,64 @@ class _PendingProviderRequest:
     cache_hit: bool
     started_at: datetime
     visibility: str
+    projection_truncation: dict[str, Any]
     pre_api_seen: bool = False
     proxy_owned: bool = False
+
+
+@dataclass
+class _ProjectionTracker:
+    omissions: list[dict[str, Any]]
+
+    def note(
+        self,
+        *,
+        path: str,
+        reason: str,
+        omitted_count: int,
+    ) -> None:
+        if omitted_count <= 0:
+            return
+        omission = {
+            "path": path,
+            "reason": reason,
+            "omitted_count": omitted_count,
+        }
+        if omission not in self.omissions:
+            self.omissions.append(omission)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "truncated": bool(self.omissions),
+            "omitted_count": sum(
+                omission["omitted_count"]
+                for omission in self.omissions
+            ),
+            "omissions": list(self.omissions),
+        }
+
+
+def _merge_projection_truncation(
+    *values: dict[str, Any],
+) -> dict[str, Any]:
+    tracker = _ProjectionTracker([])
+    for value in values:
+        omissions = (
+            value.get("omissions", [])
+            if type(value) is dict
+            else []
+        )
+        for omission in omissions:
+            if type(omission) is not dict:
+                continue
+            tracker.note(
+                path=str(omission.get("path", "$")),
+                reason=str(omission.get("reason", "unknown")),
+                omitted_count=int(
+                    omission.get("omitted_count", 0)
+                ),
+            )
+    return tracker.summary()
 
 
 def supports_dynamic_input_callback() -> bool:
@@ -218,11 +274,23 @@ def _omitted_value(value: Any, reason: str = "unsupported") -> dict[str, str]:
     }
 
 
-def _safe_value(value: Any, *, depth: int = 0) -> Any:
+def _safe_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$",
+) -> Any:
     scalar = _safe_scalar(value)
     if scalar is not _MISSING:
         return scalar
     if depth >= _MAX_CAPTURE_DEPTH:
+        if tracker is not None:
+            tracker.note(
+                path=path,
+                reason="depth_limit",
+                omitted_count=1,
+            )
         return _omitted_value(value, "depth_limit")
     value_type = type(value)
     if value_type in (bytes, bytearray, memoryview):
@@ -236,14 +304,28 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
         captured = []
         for index, item in enumerate(iterator):
             if index >= _MAX_CAPTURE_ITEMS:
+                remaining_count = max(len(value) - index, 0)
                 captured.append(
                     {
                         "capture": "omitted_item_limit",
-                        "remaining_count": max(len(value) - index, 0),
+                        "remaining_count": remaining_count,
                     }
                 )
+                if tracker is not None:
+                    tracker.note(
+                        path=path,
+                        reason="item_limit",
+                        omitted_count=remaining_count,
+                    )
                 break
-            captured.append(_safe_value(item, depth=depth + 1))
+            captured.append(
+                _safe_value(
+                    item,
+                    depth=depth + 1,
+                    tracker=tracker,
+                    path=f"{path}[{index}]",
+                )
+            )
         return captured
     storage = _object_storage(value)
     if storage is not None and any(
@@ -256,6 +338,15 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
             for index, (key, item) in enumerate(iterator):
                 if index >= _MAX_CAPTURE_ITEMS:
                     captured_mapping["capture"] = "omitted_item_limit"
+                    if tracker is not None:
+                        tracker.note(
+                            path=path,
+                            reason="item_limit",
+                            omitted_count=max(
+                                len(storage) - index,
+                                0,
+                            ),
+                        )
                     break
                 safe_key = _safe_scalar(key)
                 if type(safe_key) not in (str, int):
@@ -263,6 +354,8 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
                 captured_mapping[str(safe_key)] = _safe_value(
                     item,
                     depth=depth + 1,
+                    tracker=tracker,
+                    path=f"{path}.{safe_key}",
                 )
         except BaseException:
             return _omitted_value(value)
@@ -298,7 +391,11 @@ def _request_value(kwargs: Any, key: str) -> Any:
     return _MISSING
 
 
-def _safe_provider_request(kwargs: Any) -> dict[str, Any]:
+def _safe_provider_request(
+    kwargs: Any,
+    *,
+    tracker: _ProjectionTracker | None = None,
+) -> dict[str, Any]:
     request: dict[str, Any] = {}
     for key in _ALLOWED_REQUEST_FIELDS:
         value = _request_value(kwargs, key)
@@ -307,7 +404,11 @@ def _safe_provider_request(kwargs: Any) -> dict[str, Any]:
         request[key] = (
             _safe_metadata(value)
             if key == "metadata"
-            else _safe_value(value)
+            else _safe_value(
+                value,
+                tracker=tracker,
+                path=f"$.{key}",
+            )
         )
     return request
 
@@ -325,21 +426,51 @@ def _safe_routing(kwargs: Any) -> dict[str, Any]:
     return routing
 
 
-def _safe_usage(value: Any, *, depth: int = 0) -> dict[str, Any]:
+def _safe_usage(
+    value: Any,
+    *,
+    depth: int = 0,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$.response.usage",
+) -> dict[str, Any]:
     storage = _object_storage(value)
-    if storage is None or depth >= _MAX_CAPTURE_DEPTH:
+    if storage is None:
+        return {}
+    if depth >= _MAX_CAPTURE_DEPTH:
+        if tracker is not None:
+            tracker.note(
+                path=path,
+                reason="depth_limit",
+                omitted_count=1,
+            )
         return {}
     usage: dict[str, Any] = {}
     try:
         items = dict.items(storage)
         for index, (key, item) in enumerate(items):
-            if index >= _MAX_CAPTURE_ITEMS or type(key) is not str:
+            if index >= _MAX_CAPTURE_ITEMS:
+                if tracker is not None:
+                    tracker.note(
+                        path=path,
+                        reason="item_limit",
+                        omitted_count=max(
+                            len(storage) - index,
+                            0,
+                        ),
+                    )
+                break
+            if type(key) is not str:
                 break
             scalar = _safe_scalar(item)
             if type(scalar) in (int, float) and type(scalar) is not bool:
                 usage[key] = scalar
                 continue
-            nested = _safe_usage(item, depth=depth + 1)
+            nested = _safe_usage(
+                item,
+                depth=depth + 1,
+                tracker=tracker,
+                path=f"{path}.{key}",
+            )
             if nested:
                 usage[key] = nested
     except BaseException:
@@ -347,28 +478,55 @@ def _safe_usage(value: Any, *, depth: int = 0) -> dict[str, Any]:
     return usage
 
 
-def _safe_function(value: Any) -> dict[str, Any]:
+def _safe_function(
+    value: Any,
+    *,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$",
+) -> dict[str, Any]:
     function: dict[str, Any] = {}
     for key in _FUNCTION_FIELDS:
         item = _field(value, key)
         if item is not _MISSING:
-            function[key] = _safe_value(item)
+            function[key] = _safe_value(
+                item,
+                tracker=tracker,
+                path=f"{path}.{key}",
+            )
     return function
 
 
-def _safe_tool_call(value: Any) -> dict[str, Any]:
+def _safe_tool_call(
+    value: Any,
+    *,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$",
+) -> dict[str, Any]:
     tool_call: dict[str, Any] = {}
     for key in _TOOL_CALL_FIELDS:
         item = _field(value, key)
         if item is not _MISSING:
-            tool_call[key] = _safe_value(item)
+            tool_call[key] = _safe_value(
+                item,
+                tracker=tracker,
+                path=f"{path}.{key}",
+            )
     function = _field(value, "function")
     if function is not _MISSING:
-        tool_call["function"] = _safe_function(function)
+        tool_call["function"] = _safe_function(
+            function,
+            tracker=tracker,
+            path=f"{path}.function",
+        )
     return tool_call
 
 
-def _safe_tool_calls(value: Any) -> list[dict[str, Any]]:
+def _safe_tool_calls(
+    value: Any,
+    *,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$",
+) -> list[dict[str, Any]]:
     if type(value) not in (list, tuple):
         return []
     iterator = (
@@ -376,45 +534,93 @@ def _safe_tool_calls(value: Any) -> list[dict[str, Any]]:
         if type(value) is list
         else tuple.__iter__(value)
     )
-    return [
-        _safe_tool_call(item)
-        for index, item in enumerate(iterator)
-        if index < _MAX_CAPTURE_ITEMS
-    ]
+    captured = []
+    for index, item in enumerate(iterator):
+        if index >= _MAX_CAPTURE_ITEMS:
+            if tracker is not None:
+                tracker.note(
+                    path=path,
+                    reason="item_limit",
+                    omitted_count=max(len(value) - index, 0),
+                )
+            break
+        captured.append(
+            _safe_tool_call(
+                item,
+                tracker=tracker,
+                path=f"{path}[{index}]",
+            )
+        )
+    return captured
 
 
-def _safe_message(value: Any) -> dict[str, Any]:
+def _safe_message(
+    value: Any,
+    *,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$",
+) -> dict[str, Any]:
     message: dict[str, Any] = {}
     for key in _MESSAGE_FIELDS:
         item = _field(value, key)
         if item is not _MISSING:
-            message[key] = _safe_value(item)
+            message[key] = _safe_value(
+                item,
+                tracker=tracker,
+                path=f"{path}.{key}",
+            )
     for key in ("tool_calls", "function_call"):
         item = _field(value, key)
         if item is _MISSING:
             continue
         message[key] = (
-            _safe_tool_calls(item)
+            _safe_tool_calls(
+                item,
+                tracker=tracker,
+                path=f"{path}.{key}",
+            )
             if key == "tool_calls"
-            else _safe_function(item)
+            else _safe_function(
+                item,
+                tracker=tracker,
+                path=f"{path}.{key}",
+            )
         )
     return message
 
 
-def _safe_choice(value: Any) -> dict[str, Any]:
+def _safe_choice(
+    value: Any,
+    *,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$",
+) -> dict[str, Any]:
     choice: dict[str, Any] = {}
     for key in _CHOICE_FIELDS:
         item = _field(value, key)
         if item is not _MISSING:
-            choice[key] = _safe_value(item)
+            choice[key] = _safe_value(
+                item,
+                tracker=tracker,
+                path=f"{path}.{key}",
+            )
     for key in ("message", "delta"):
         item = _field(value, key)
         if item is not _MISSING:
-            choice[key] = _safe_message(item)
+            choice[key] = _safe_message(
+                item,
+                tracker=tracker,
+                path=f"{path}.{key}",
+            )
     return choice
 
 
-def _safe_choices(value: Any) -> list[dict[str, Any]]:
+def _safe_choices(
+    value: Any,
+    *,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$",
+) -> list[dict[str, Any]]:
     if type(value) not in (list, tuple):
         return []
     iterator = (
@@ -422,14 +628,32 @@ def _safe_choices(value: Any) -> list[dict[str, Any]]:
         if type(value) is list
         else tuple.__iter__(value)
     )
-    return [
-        _safe_choice(item)
-        for index, item in enumerate(iterator)
-        if index < _MAX_CAPTURE_ITEMS
-    ]
+    captured = []
+    for index, item in enumerate(iterator):
+        if index >= _MAX_CAPTURE_ITEMS:
+            if tracker is not None:
+                tracker.note(
+                    path=path,
+                    reason="item_limit",
+                    omitted_count=max(len(value) - index, 0),
+                )
+            break
+        captured.append(
+            _safe_choice(
+                item,
+                tracker=tracker,
+                path=f"{path}[{index}]",
+            )
+        )
+    return captured
 
 
-def _safe_provider_response(response_obj: Any) -> dict[str, Any]:
+def _safe_provider_response(
+    response_obj: Any,
+    *,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$.response",
+) -> dict[str, Any]:
     if type(response_obj) is LiteLLMStreamAggregate:
         return {
             "object": "lumibot.stream_aggregate",
@@ -439,9 +663,16 @@ def _safe_provider_response(response_obj: Any) -> dict[str, Any]:
                     response_obj.fidelity
                 ),
                 "chunks": [
-                    _safe_provider_response(chunk)
-                    for chunk in tuple.__iter__(
-                        response_obj.chunks
+                    _safe_provider_response(
+                        chunk,
+                        tracker=tracker,
+                        path=(
+                            f"{path}.stream_aggregate.chunks"
+                            f"[{index}]"
+                        ),
+                    )
+                    for index, chunk in enumerate(
+                        tuple.__iter__(response_obj.chunks)
                     )
                 ],
             },
@@ -450,13 +681,25 @@ def _safe_provider_response(response_obj: Any) -> dict[str, Any]:
     for key in _RESPONSE_FIELDS:
         value = _field(response_obj, key)
         if value is not _MISSING:
-            response[key] = _safe_value(value)
+            response[key] = _safe_value(
+                value,
+                tracker=tracker,
+                path=f"{path}.{key}",
+            )
     choices = _field(response_obj, "choices")
     if choices is not _MISSING:
-        response["choices"] = _safe_choices(choices)
+        response["choices"] = _safe_choices(
+            choices,
+            tracker=tracker,
+            path=f"{path}.choices",
+        )
     usage = _field(response_obj, "usage")
     if usage is not _MISSING:
-        response["usage"] = _safe_usage(usage)
+        response["usage"] = _safe_usage(
+            usage,
+            tracker=tracker,
+            path=f"{path}.usage",
+        )
     if response:
         return response
     return _omitted_value(response_obj)
@@ -655,6 +898,11 @@ class LiteLLMBoundaryLogger(CustomLogger):
         started_at = _field(captured_kwargs, "api_call_start_time")
         if type(started_at) is not datetime:
             started_at = datetime.now()
+        projection_tracker = _ProjectionTracker([])
+        request = _safe_provider_request(
+            captured_kwargs,
+            tracker=projection_tracker,
+        )
         with self._state_lock:
             self._attempt_sequence += 1
             token = LiteLLMAttemptToken(
@@ -665,11 +913,14 @@ class LiteLLMBoundaryLogger(CustomLogger):
             )
             self._pending_requests[token] = _PendingProviderRequest(
                 token=token,
-                request=_safe_provider_request(captured_kwargs),
+                request=request,
                 routing=_safe_routing(captured_kwargs),
                 cache_hit=_cache_hit(captured_kwargs),
                 started_at=started_at,
                 visibility=visibility,
+                projection_truncation=(
+                    projection_tracker.summary()
+                ),
                 pre_api_seen=pre_api_seen,
                 proxy_owned=proxy_owned,
             )
@@ -729,6 +980,11 @@ class LiteLLMBoundaryLogger(CustomLogger):
             captured_kwargs["messages"] = messages
         turn_id = self._turn_id(captured_kwargs)
         retry_count = _retry_count(captured_kwargs)
+        projection_tracker = _ProjectionTracker([])
+        projected_request = _safe_provider_request(
+            captured_kwargs,
+            tracker=projection_tracker,
+        )
         with self._state_lock:
             for token, pending in reversed(
                 self._pending_requests.items()
@@ -740,8 +996,14 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 ):
                     pending.request = {
                         **pending.request,
-                        **_safe_provider_request(captured_kwargs),
+                        **projected_request,
                     }
+                    pending.projection_truncation = (
+                        _merge_projection_truncation(
+                            pending.projection_truncation,
+                            projection_tracker.summary(),
+                        )
+                    )
                     pending.routing = {
                         **pending.routing,
                         **_safe_routing(captured_kwargs),
@@ -959,39 +1221,90 @@ class LiteLLMBoundaryLogger(CustomLogger):
             retry_count=pending.token.retry_count,
         )
         routing = {**pending.routing, **_safe_routing(kwargs)}
-        request = {
-            **pending.request,
-            **_safe_provider_request(kwargs),
-        }
+        request_tracker = _ProjectionTracker([])
+        terminal_request = _safe_provider_request(
+            kwargs,
+            tracker=request_tracker,
+        )
+        request = (
+            {**terminal_request, **pending.request}
+            if pending.pre_api_seen
+            else {**pending.request, **terminal_request}
+        )
+        request_truncation = _merge_projection_truncation(
+            pending.projection_truncation,
+            request_tracker.summary(),
+        )
         response_model = _safe_scalar(_field(response_obj, "model"))
         if (
             accepted_response
             and response_model is not _MISSING
             and response_model is not None
         ):
-            request["model"] = response_model
             routing["model"] = response_model
         status = "success" if accepted_response else "error"
+        translated_request_available = pending.pre_api_seen
+        if translated_request_available:
+            capture_type = "provider_adapter_request"
+            boundary_distinction = (
+                "request_local_litellm_pre_api_semantics_not_raw_http"
+            )
+            shown_request_stage = "litellm_pre_api_callback"
+            translated_request_reason = None
+            to_module = "provider_adapter"
+        else:
+            capture_type = "litellm_acompletion_input_snapshot"
+            boundary_distinction = (
+                "litellm_input_before_provider_translation_not_raw_http"
+            )
+            shown_request_stage = (
+                "litellm_acompletion_input_before_provider_translation"
+            )
+            translated_request_reason = (
+                "request_local_pre_api_callback_did_not_fire"
+                if supports_dynamic_input_callback()
+                else (
+                    "installed_litellm_does_not_expose_"
+                    "request_local_pre_api_callback"
+                )
+            )
+            to_module = "provider_boundary_not_observed"
         self._try_record(
             transition="B10_LITELLM_TO_PROVIDER",
             from_module="litellm",
-            to_module="provider",
+            to_module=to_module,
             model_turn_id=pending.token.model_turn_id,
             status=status,
             **timing,
             payload={
-                "capture_type": "provider_adapter_request",
-                "boundary_distinction": (
-                    "litellm_provider_adapter_request_not_adk_model_entry"
+                "capture_type": capture_type,
+                "boundary_distinction": boundary_distinction,
+                "translated_provider_request_status": (
+                    "available"
+                    if translated_request_available
+                    else "not_available"
                 ),
+                "translated_provider_request_fidelity": (
+                    "normalized_copy"
+                    if translated_request_available
+                    else "not_available"
+                ),
+                "translated_provider_request_reason": (
+                    translated_request_reason
+                ),
+                "shown_request_stage": shown_request_stage,
                 "provider_request_visibility": (
                     pending.visibility
                 ),
                 "request": request,
                 "provider_routing": routing,
+                "projection_truncation": request_truncation,
                 **attempt,
             },
+            projection_truncation=request_truncation,
         )
+        response_tracker = _ProjectionTracker([])
+        response_truncation = response_tracker.summary()
         response_event: dict[str, Any] = {
             "transition": "B01_PROVIDER_TO_LITELLM",
             "from_module": "provider",
@@ -1002,12 +1315,17 @@ class LiteLLMBoundaryLogger(CustomLogger):
             "payload": {
                 "capture_type": "provider_adapter_response",
                 "provider_routing": routing,
+                "projection_truncation": response_truncation,
                 **attempt,
             },
+            "projection_truncation": response_truncation,
         }
         if accepted_response:
             response_event["payload"]["response"] = (
-                _safe_provider_response(response_obj)
+                _safe_provider_response(
+                    response_obj,
+                    tracker=response_tracker,
+                )
             )
         else:
             response_event["error"] = _safe_error(
@@ -1017,9 +1335,18 @@ class LiteLLMBoundaryLogger(CustomLogger):
                 response_event["payload"]["partial_stream"] = {
                     "complete": False,
                     "response": _safe_provider_response(
-                        partial_response_obj
+                        partial_response_obj,
+                        tracker=response_tracker,
+                        path="$.partial_stream.response",
                     ),
                 }
+        response_truncation = response_tracker.summary()
+        response_event["payload"]["projection_truncation"] = (
+            response_truncation
+        )
+        response_event["projection_truncation"] = (
+            response_truncation
+        )
         self._try_record(**response_event)
         return True
 
