@@ -243,8 +243,19 @@ def test_litellm_success_records_provider_adapter_pair_without_secrets(tmp_path)
         "pre_api_to_terminal_not_per_attempt"
     )
     assert b10["duration_ms"] == 1000.0
-    assert b10["payload_meta"]["truncated"] is False
-    assert b10["payload_meta"]["semantic_completeness"] == "complete"
+    assert b10["payload"]["projection_truncation"] == {
+        "truncated": True,
+        "omitted_count": 1,
+        "omissions": [
+            {
+                "path": "$.messages[0].content.binary",
+                "reason": "binary",
+                "omitted_count": 1,
+            }
+        ],
+    }
+    assert b10["payload_meta"]["truncated"] is True
+    assert b10["payload_meta"]["semantic_completeness"] == "partial"
     assert b01["payload"]["response"]["id"] == "response-1"
     assert b01["payload_meta"]["truncated"] is False
     rendered = str((b10, b01))
@@ -452,6 +463,46 @@ def test_litellm_clipped_response_marks_b01_projection_truncated(tmp_path):
     }
     assert b01["payload_meta"]["truncated"] is True
     assert b01["payload_meta"]["semantic_completeness"] == "partial"
+
+
+def test_litellm_unsupported_projection_marks_payload_partial(tmp_path):
+    class Unsupported:
+        pass
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-unsupported",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    logger = LiteLLMBoundaryLogger(collector)
+    kwargs = {
+        "model": "provider-model",
+        "messages": [{"role": "user", "content": Unsupported()}],
+        "metadata": {"lumibot_model_turn_id": turn_id},
+    }
+    token = _begin(logger, kwargs)
+
+    logger.complete_success(
+        token,
+        {"id": "response-unsupported", "choices": []},
+        kwargs=kwargs,
+    )
+
+    b10 = _events(collector, "B10_LITELLM_TO_PROVIDER")[0]
+    assert b10["payload"]["projection_truncation"] == {
+        "truncated": True,
+        "omitted_count": 1,
+        "omissions": [
+            {
+                "path": "$.messages[0].content",
+                "reason": "unsupported",
+                "omitted_count": 1,
+            }
+        ],
+    }
+    assert b10["payload_meta"]["truncated"] is True
+    assert b10["payload_meta"]["semantic_completeness"] == "partial"
 
 
 def test_litellm_provider_request_allowlist_is_complete_and_deny_by_default(
@@ -3257,6 +3308,66 @@ def test_observed_pre_provider_failure_reraises_same_exception_without_events(
 
     assert raised.value is expected
     assert collector.export()["events"] == []
+
+
+def test_litellm_callback_composition_failure_records_unavailable_boundaries(
+    tmp_path,
+):
+    observed_requests = []
+
+    class CopyFailingLiteLlm:
+        def __init__(self, **kwargs):
+            self._additional_args = dict(kwargs)
+
+        def model_copy(self, *, deep=False):
+            assert deep is False
+            raise RuntimeError("copy failed")
+
+        async def generate_content_async(
+            self,
+            llm_request,
+            stream=False,
+        ):
+            assert stream is False
+            observed_requests.append(llm_request)
+            yield "response"
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-copy-failed",
+        artifact_root=tmp_path,
+    )
+    turn_id = collector.start_model_turn()
+    collector.set_active_model_turn(turn_id)
+    observed_type = agent_runtime._build_observed_litellm_type(
+        CopyFailingLiteLlm,
+        on_model_entry=lambda _request: None,
+        boundary_collector=collector,
+    )
+    model = observed_type(model="provider-model")
+
+    responses = _run(
+        _collect_async(model.generate_content_async("request"))
+    )
+
+    assert responses == ["response"]
+    assert observed_requests == ["request"]
+    events = collector.export()["events"]
+    assert [event["transition"] for event in events] == [
+        "B10_LITELLM_TO_PROVIDER",
+        "B01_PROVIDER_TO_LITELLM",
+    ]
+    assert all(event["status"] == "not_available" for event in events)
+    assert all(
+        event["payload"]["reason"]
+        == "litellm_callback_composition_failed"
+        for event in events
+    )
+    assert all(
+        event["payload_meta"]["fidelity"] == "not_available"
+        for event in events
+    )
+    assert events[0]["to_module"] == "provider_boundary_not_observed"
+    assert events[1]["from_module"] == "provider_boundary_not_observed"
 
 
 def test_litellm_mock_stream_records_one_provider_pair(tmp_path):

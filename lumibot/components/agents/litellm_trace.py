@@ -267,7 +267,19 @@ def _safe_scalar(value: Any) -> Any:
     return _MISSING
 
 
-def _omitted_value(value: Any, reason: str = "unsupported") -> dict[str, str]:
+def _omitted_value(
+    value: Any,
+    reason: str = "unsupported",
+    *,
+    tracker: _ProjectionTracker | None = None,
+    path: str = "$",
+) -> dict[str, str]:
+    if tracker is not None:
+        tracker.note(
+            path=path,
+            reason=reason,
+            omitted_count=1,
+        )
     return {
         "capture": f"omitted_{reason}",
         "type": _type_name(value),
@@ -294,7 +306,12 @@ def _safe_value(
         return _omitted_value(value, "depth_limit")
     value_type = type(value)
     if value_type in (bytes, bytearray, memoryview):
-        return _omitted_value(value, "binary")
+        return _omitted_value(
+            value,
+            "binary",
+            tracker=tracker,
+            path=path,
+        )
     if value_type in (list, tuple):
         iterator = (
             list.__iter__(value)
@@ -358,9 +375,13 @@ def _safe_value(
                     path=f"{path}.{safe_key}",
                 )
         except BaseException:
-            return _omitted_value(value)
+            return _omitted_value(
+                value,
+                tracker=tracker,
+                path=path,
+            )
         return captured_mapping
-    return _omitted_value(value)
+    return _omitted_value(value, tracker=tracker, path=path)
 
 
 def _safe_metadata(value: Any) -> dict[str, Any]:

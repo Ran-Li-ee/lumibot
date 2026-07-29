@@ -1891,17 +1891,22 @@ class BoundaryTraceCollector:
             sanitized = _redact_trace_value(descriptor)
             if sanitized != descriptor:
                 sanitized["redacted"] = True
-            if (
-                include_forensics
-                and "semantic_value" in sanitized
-            ):
-                encoded = _canonical_json_bytes(
-                    sanitized["semantic_value"]
+            bounded = _bound_descriptor_previews(sanitized)
+            if include_forensics:
+                hash_input = (
+                    bounded["semantic_value"]
+                    if "semantic_value" in bounded
+                    else {
+                        key: value
+                        for key, value in bounded.items()
+                        if key != "content_sha256"
+                    }
                 )
-                sanitized["content_sha256"] = hashlib.sha256(
+                encoded = _canonical_json_bytes(hash_input)
+                bounded["content_sha256"] = hashlib.sha256(
                     encoded
                 ).hexdigest()
-            return _bound_descriptor_previews(sanitized)
+            return bounded
         except Exception:
             return fallback
 

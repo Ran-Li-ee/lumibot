@@ -830,11 +830,17 @@ def _serialization_changes(
         if left_kind == "mapping":
             left_keys = [str(key) for key in dict.keys(left)]
             right_keys = list(dict.keys(right))
-            if left_keys != right_keys:
+            if (
+                left_keys != right_keys
+                or len(set(left_keys)) != len(left_keys)
+            ):
                 changed_shape = True
                 note(path)
             for key in dict.keys(left):
                 safe_key = str(key)
+                if type(key) is not str:
+                    changed_type = True
+                    note(f"{path}.{safe_key}")
                 if safe_key in right:
                     compare(
                         dict.__getitem__(left, key),
@@ -2978,6 +2984,41 @@ def _record_native_litellm_boundaries_not_applicable(
         )
 
 
+def _record_litellm_boundaries_not_available(
+    collector: BoundaryTraceCollector | None,
+    *,
+    model_turn_id: str | None,
+    reason: str,
+) -> None:
+    payload = {
+        "fidelity": "not_available",
+        "reason": reason,
+        "runtime_path": "litellm_observation_unavailable",
+    }
+    for transition, from_module, to_module in (
+        (
+            "B10_LITELLM_TO_PROVIDER",
+            "litellm",
+            "provider_boundary_not_observed",
+        ),
+        (
+            "B01_PROVIDER_TO_LITELLM",
+            "provider_boundary_not_observed",
+            "litellm",
+        ),
+    ):
+        _record_tool_boundary(
+            collector,
+            transition=transition,
+            from_module=from_module,
+            to_module=to_module,
+            status="not_available",
+            model_turn_id=model_turn_id,
+            payload=payload,
+            payload_fidelity="not_available",
+        )
+
+
 def _build_observed_litellm_type(
     base_type: type[Any],
     *,
@@ -3364,6 +3405,11 @@ def _build_observed_litellm_type(
                         boundary_collector,
                         "litellm_callback_composition_failed",
                         exc,
+                    )
+                    _record_litellm_boundaries_not_available(
+                        boundary_collector,
+                        model_turn_id=invocation_turn_id,
+                        reason="litellm_callback_composition_failed",
                     )
                     invocation_model = self
             terminal_error: BaseException | None = None

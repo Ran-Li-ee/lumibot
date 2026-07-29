@@ -3797,12 +3797,37 @@ def test_wrapper_one_shot_result_is_described_without_consumption(tmp_path):
         b06["payload"]["raw_result"]["preview"]
     )
     assert "semantic_value" not in b06["payload"]["raw_result"]
-    assert "content_sha256" not in b06["payload"]["raw_result"]
+    assert "content_sha256" in b06["payload"]["raw_result"]
     b07 = _events(collector, "B07_WRAPPER_TO_FUNCTION_TOOL")[0]
     assert b07["payload"]["serialization_changed_type"] is True
     assert b07["payload"]["serialization_diagnostics"]["reason"] == (
         "json_safe_conversion"
     )
+
+
+def test_b07_records_dict_key_type_conversion(tmp_path):
+    collector = BoundaryTraceCollector(
+        agent_run_id="run-key-type-conversion",
+        artifact_root=tmp_path,
+    )
+    wrapped = _wrap_tool_callable(
+        BoundTool(
+            name="numeric_key",
+            description="numeric key",
+            function=lambda: {1: "one"},
+        ),
+        collector=collector,
+    )
+
+    assert wrapped() == {"1": "one"}
+
+    b07 = _events(collector, "B07_WRAPPER_TO_FUNCTION_TOOL")[0]
+    assert b07["payload"]["serialization_changed_type"] is True
+    assert b07["payload"]["serialization_changed_shape"] is False
+    assert b07["payload"]["serialization_diagnostics"] == {
+        "reason": "json_safe_conversion",
+        "changed_paths": ["$.1"],
+    }
 
 
 def test_b07_does_not_claim_tool_supplied_error_shape_as_wrapper_error(
