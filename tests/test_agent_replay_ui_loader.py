@@ -150,6 +150,142 @@ def test_loader_accepts_trace_with_boundary_trace_without_changing_legacy_tool_b
     assert boundary_agent.tool_batches == legacy_agent.tool_batches
 
 
+def test_loader_groups_boundary_trace_by_turn_batch_and_call_id(tmp_path):
+    trace_path = tmp_path / "traces" / "growth_agent" / "trace.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "growth_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [],
+            "boundary_trace": {
+                "schema_version": 1,
+                "diagnostics": [],
+                "events": [
+                    {
+                        "transition": "B09_ADK_TO_LITELLM",
+                        "model_turn_id": "turn-1",
+                        "status": "success",
+                        "payload": {"messages": ["request"]},
+                        "payload_meta": {"semantic_completeness": "complete"},
+                    },
+                    {
+                        "transition": "B02_LITELLM_TO_ADK",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "status": "success",
+                        "payload": {"function_calls": [{"id": "call-A"}, {"id": "call-B"}]},
+                    },
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "call_id": "call-A",
+                        "status": "success",
+                        "payload": {"tool_name": "market_last_price", "args": {"symbol": "SPY"}},
+                    },
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "call_id": "call-B",
+                        "status": "success",
+                        "payload": {"tool_name": "market_last_price", "args": {"symbol": "QQQ"}},
+                    },
+                    {
+                        "transition": "B08_FUNCTION_TOOL_TO_ADK",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "call_id": "call-A",
+                        "status": "success",
+                        "payload": {"tool_name": "market_last_price", "result": {"symbol": "SPY"}},
+                    },
+                    {
+                        "transition": "B08_FUNCTION_TOOL_TO_ADK",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "call_id": "call-B",
+                        "status": "success",
+                        "payload": {"tool_name": "market_last_price", "result": {"symbol": "QQQ"}},
+                    },
+                ],
+            },
+        },
+    )
+
+    agent = load_agent_trace(trace_path)
+    public = agent.to_public_dict()["boundary_trace"]
+
+    assert public["available"] is True
+    assert public["schema_version"] == 1
+    assert len(public["events"]) == 6
+    assert public["model_turns"][0]["model_turn_id"] == "turn-1"
+    assert public["model_turns"][0]["request_response_events"]
+    batch = public["model_turns"][0]["tool_batches"][0]
+    assert batch["tool_batch_id"] == "turn-1:batch:0001"
+    assert [call["call_id"] for call in batch["tool_calls"]] == ["call-A", "call-B"]
+
+    events_by_id = {event["id"]: event for event in public["events"]}
+    calls_by_id = {call["call_id"]: call for call in batch["tool_calls"]}
+    for call_id, symbol in (("call-A", "SPY"), ("call-B", "QQQ")):
+        call_events = [events_by_id[event_id] for event_id in calls_by_id[call_id]["events"]]
+        assert [event["call_id"] for event in call_events] == [call_id, call_id]
+        assert {event["payload"]["result"]["symbol"] for event in call_events if "result" in event["payload"]} == {
+            symbol
+        }
+        assert all(event["summary"] == {} for event in call_events)
+
+
+def test_loader_marks_sidecar_backed_boundary_event_without_inlining_payload(tmp_path):
+    trace_path = tmp_path / "traces" / "growth_agent" / "trace.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "growth_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [],
+            "boundary_trace": {
+                "schema_version": 1,
+                "events": [
+                    {
+                        "transition": "B10_LITELLM_TO_PROVIDER",
+                        "model_turn_id": "turn-1",
+                        "payload": {"preview": "small preview only"},
+                        "payload_meta": {
+                            "sidecar_path": "boundary_payloads/event.json.gz",
+                            "semantic_completeness": "complete",
+                            "byte_count": 123,
+                            "compression": "gzip",
+                            "sha256": "abc123",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    public = load_agent_trace(trace_path).to_public_dict()["boundary_trace"]
+    event = public["events"][0]
+
+    assert event["payload"] == {"preview": "small preview only"}
+    assert event["payload_meta"] == {
+        "semantic_completeness": "complete",
+        "byte_count": 123,
+        "compression": "gzip",
+        "sha256": "abc123",
+    }
+    assert event["sidecar"] == {
+        "available": True,
+        "event_id": event["id"],
+        "byte_count": 123,
+        "compression": "gzip",
+        "sha256": "abc123",
+    }
+    assert "boundary_payloads/event.json.gz" not in str(public)
+
+
 def test_build_replay_dataset_surfaces_backtest_artifact_links(tmp_path):
     backtest_root = tmp_path / "artifacts" / "20260718_101010_000000" / "growth-execution-test"
     runtime_root = backtest_root / "cache" / "agent_runtime"

@@ -8,7 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from .formatters import explain_tool_result
-from .models import AgentDependency, AgentReplay, ReplayDataset, ReplayRun, SystemRun, ToolBatch, ToolCallReplay
+from .models import (
+    AgentDependency,
+    AgentReplay,
+    BoundaryEventReplay,
+    BoundaryTraceReplay,
+    ReplayDataset,
+    ReplayRun,
+    SystemRun,
+    ToolBatch,
+    ToolCallReplay,
+)
 
 MISSING_TOOL_RESULT = "Tool result unavailable in trace."
 CONTEXT_METADATA_KEYS = {
@@ -26,6 +36,20 @@ CONTEXT_METADATA_KEYS = {
     "time",
     "timestep",
     "universe",
+}
+REQUEST_RESPONSE_TRANSITIONS = {
+    "B01_PROVIDER_TO_LITELLM",
+    "B02_LITELLM_TO_ADK",
+    "B09_ADK_TO_LITELLM",
+    "B10_LITELLM_TO_PROVIDER",
+}
+LOCAL_TOOL_TRANSITIONS = {
+    "B03_ADK_TO_FUNCTION_TOOL",
+    "B04_FUNCTION_TOOL_TO_WRAPPER",
+    "B05_WRAPPER_TO_PYTHON_TOOL",
+    "B06_PYTHON_TOOL_TO_WRAPPER",
+    "B07_WRAPPER_TO_FUNCTION_TOOL",
+    "B08_FUNCTION_TOOL_TO_ADK",
 }
 
 
@@ -178,6 +202,7 @@ def load_agent_trace(path: str | Path) -> AgentReplay:
     tool_batches = _tool_batches_from_events(trace.get("events"))
     if not tool_batches:
         tool_batches = _tool_batches_from_flat_lists(trace.get("tool_calls"), trace.get("tool_results"))
+    boundary_trace = _load_boundary_trace(trace, trace_path)
 
     return AgentReplay(
         id=_agent_id(name, trace_path),
@@ -189,7 +214,152 @@ def load_agent_trace(path: str | Path) -> AgentReplay:
         summary=trace.get("summary"),
         warnings=_warnings(trace.get("warnings")),
         raw_trace=raw_trace,
+        boundary_trace=boundary_trace,
     )
+
+
+def _load_boundary_trace(trace: dict[str, Any], trace_path: Path) -> BoundaryTraceReplay:
+    boundary = trace.get("boundary_trace")
+    if not isinstance(boundary, dict):
+        return BoundaryTraceReplay()
+
+    raw_events = boundary.get("events")
+    if not isinstance(raw_events, list):
+        raw_events = []
+
+    events: list[BoundaryEventReplay] = []
+    for index, raw_event in enumerate(raw_events):
+        if not isinstance(raw_event, dict):
+            continue
+        events.append(_boundary_event_from_raw(trace_path, index, raw_event))
+
+    return BoundaryTraceReplay(
+        available=True,
+        schema_version=boundary.get("schema_version") if isinstance(boundary.get("schema_version"), int) else None,
+        events=events,
+        model_turns=_group_boundary_events(events),
+        diagnostics=boundary.get("diagnostics") if isinstance(boundary.get("diagnostics"), list) else [],
+        message="Boundary trace data is available for this agent run.",
+    )
+
+
+def _boundary_event_from_raw(trace_path: Path, index: int, raw_event: dict[str, Any]) -> BoundaryEventReplay:
+    transition = _first_text(raw_event.get("transition"), "UNKNOWN_BOUNDARY")
+    event_id = _boundary_event_id(trace_path, index, raw_event)
+    payload_meta = raw_event.get("payload_meta") if isinstance(raw_event.get("payload_meta"), dict) else {}
+    sidecar = None
+    if isinstance(payload_meta.get("sidecar_path"), str) and payload_meta.get("sidecar_path"):
+        sidecar = {
+            "available": True,
+            "event_id": event_id,
+            "byte_count": payload_meta.get("byte_count"),
+            "compression": payload_meta.get("compression"),
+            "sha256": payload_meta.get("sha256"),
+        }
+
+    return BoundaryEventReplay(
+        id=event_id,
+        transition=transition,
+        model_turn_id=_optional_text(raw_event.get("model_turn_id")),
+        tool_batch_id=_optional_text(raw_event.get("tool_batch_id")),
+        call_id=_optional_text(raw_event.get("call_id")),
+        status=_optional_text(raw_event.get("status")),
+        timestamp=_optional_text(raw_event.get("timestamp")),
+        payload=raw_event.get("payload"),
+        payload_meta=payload_meta,
+        summary={},
+        sidecar=sidecar,
+    )
+
+
+def _boundary_event_id(trace_path: Path, index: int, raw_event: dict[str, Any]) -> str:
+    basis = "|".join(
+        [
+            str(trace_path.resolve()),
+            str(index),
+            str(raw_event.get("transition") or ""),
+            str(raw_event.get("model_turn_id") or ""),
+            str(raw_event.get("tool_batch_id") or ""),
+            str(raw_event.get("call_id") or ""),
+        ]
+    )
+    return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:24]
+
+
+def _group_boundary_events(events: list[BoundaryEventReplay]) -> list[dict[str, Any]]:
+    turns: dict[str, list[BoundaryEventReplay]] = {}
+    for event in events:
+        turn_id = event.model_turn_id or "unknown-model-turn"
+        turns.setdefault(turn_id, []).append(event)
+
+    grouped_turns = []
+    for turn_id, turn_events in turns.items():
+        grouped_turns.append(
+            {
+                "model_turn_id": turn_id,
+                "request_response_events": [
+                    event.id for event in turn_events if event.transition in REQUEST_RESPONSE_TRANSITIONS
+                ],
+                "tool_batches": _group_boundary_tool_batches(turn_events),
+            }
+        )
+    return grouped_turns
+
+
+def _group_boundary_tool_batches(events: list[BoundaryEventReplay]) -> list[dict[str, Any]]:
+    batches: dict[str, list[BoundaryEventReplay]] = {}
+    for event in events:
+        if event.transition not in LOCAL_TOOL_TRANSITIONS and not event.call_id:
+            continue
+        batch_id = event.tool_batch_id or "unknown-tool-batch"
+        batches.setdefault(batch_id, []).append(event)
+
+    return [
+        {
+            "tool_batch_id": batch_id,
+            "tool_calls": _group_boundary_tool_calls(batch_events),
+        }
+        for batch_id, batch_events in batches.items()
+    ]
+
+
+def _group_boundary_tool_calls(events: list[BoundaryEventReplay]) -> list[dict[str, Any]]:
+    calls: dict[str, list[BoundaryEventReplay]] = {}
+    for event in events:
+        call_id = event.call_id or "unknown-call"
+        calls.setdefault(call_id, []).append(event)
+
+    grouped_calls = []
+    for call_id, call_events in calls.items():
+        grouped_calls.append(
+            {
+                "call_id": call_id,
+                "tool_name": _boundary_tool_name(call_events),
+                "events": [event.id for event in call_events],
+            }
+        )
+    return grouped_calls
+
+
+def _boundary_tool_name(events: list[BoundaryEventReplay]) -> str | None:
+    for event in events:
+        payload = event.payload
+        if not isinstance(payload, dict):
+            continue
+        for key in ("tool_name", "name", "function_name"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+        function = payload.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            if isinstance(name, str) and name:
+                return name
+    return None
+
+
+def _optional_text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _agent_id(name: str, trace_path: Path) -> str:
