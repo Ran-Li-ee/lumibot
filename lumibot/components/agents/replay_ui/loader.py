@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .boundary_formatters import summarize_boundary_event
 from .formatters import explain_tool_result
 from .models import (
     AgentDependency,
@@ -267,7 +268,7 @@ def _boundary_event_from_raw(trace_path: Path, index: int, raw_event: dict[str, 
         timestamp=_optional_text(raw_event.get("timestamp")),
         payload=raw_event.get("payload"),
         payload_meta=payload_meta,
-        summary={},
+        summary=summarize_boundary_event(raw_event),
         sidecar=sidecar,
     )
 

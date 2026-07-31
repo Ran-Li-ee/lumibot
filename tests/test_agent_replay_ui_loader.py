@@ -235,7 +235,12 @@ def test_loader_groups_boundary_trace_by_turn_batch_and_call_id(tmp_path):
         assert {event["payload"]["result"]["symbol"] for event in call_events if "result" in event["payload"]} == {
             symbol
         }
-        assert all(event["summary"] == {} for event in call_events)
+        for event in call_events:
+            assert event["summary"]["label"]
+            assert event["summary"]["source"]
+            assert event["summary"]["target"]
+            assert event["summary"]["badges"]
+            assert event["summary"]["preview"]
 
 
 def test_loader_boundary_event_ids_are_deterministic_across_repeated_loads(tmp_path):
