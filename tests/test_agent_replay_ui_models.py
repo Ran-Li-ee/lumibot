@@ -274,6 +274,101 @@ def test_agent_public_dict_includes_boundary_trace():
     assert public["boundary_trace"]["model_turns"][0]["model_turn_id"] == "turn-1"
 
 
+def test_boundary_event_public_dict_exposes_only_safe_sidecar_metadata():
+    secret = "sk-test-sidecar-secret"
+    event = BoundaryEventReplay(
+        id="event-sidecar",
+        transition="B10_LITELLM_TO_PROVIDER",
+        payload={"preview": "small"},
+        payload_meta={
+            "sidecar_path": "boundary_payloads/private-event.json.gz",
+            "byte_count": 123456,
+            "compression": "gzip",
+            "sha256": "abc123",
+            "semantic_completeness": "complete",
+        },
+        sidecar={
+            "available": True,
+            "event_id": "event-sidecar",
+            "byte_count": 123456,
+            "compression": "gzip",
+            "sha256": "abc123",
+            "sidecar_path": "boundary_payloads/private-event.json.gz",
+            "payload": {"document": "A" * 6000, "api_key": secret},
+        },
+    )
+
+    public = event.to_public_dict()
+    rendered = repr(public)
+
+    assert public["sidecar"] == {
+        "available": True,
+        "event_id": "event-sidecar",
+        "byte_count": 123456,
+        "compression": "gzip",
+        "sha256": "abc123",
+    }
+    assert "sidecar_path" not in public["payload_meta"]
+    assert "boundary_payloads/private-event.json.gz" not in rendered
+    assert secret not in rendered
+    assert "A" * 1000 not in rendered
+
+
+def test_boundary_trace_public_dict_keeps_model_turns_metadata_only():
+    secret = "sk-test-model-turn-secret"
+    trace = BoundaryTraceReplay(
+        available=True,
+        schema_version=1,
+        model_turns=[
+            {
+                "model_turn_id": "turn-1",
+                "request_response_events": ["event-1"],
+                "tool_batches": [
+                    {
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "tool_calls": [
+                            {
+                                "call_id": "call-1",
+                                "events": ["event-2", "event-3"],
+                                "payload": "B" * 6000,
+                                "password": "hunter2",
+                            }
+                        ],
+                        "raw_result": {"api_key": secret},
+                    }
+                ],
+                "raw_prompt": "C" * 6000,
+                "authorization": f"Bearer {secret}",
+            }
+        ],
+    )
+
+    public = trace.to_public_dict()
+    rendered = repr(public)
+
+    assert public["model_turns"] == [
+        {
+            "model_turn_id": "turn-1",
+            "request_response_events": ["event-1"],
+            "tool_batches": [
+                {
+                    "tool_batch_id": "turn-1:batch:0001",
+                    "tool_calls": [
+                        {
+                            "call_id": "call-1",
+                            "events": ["event-2", "event-3"],
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    assert secret not in rendered
+    assert "hunter2" not in rendered
+    assert "B" * 1000 not in rendered
+    assert "C" * 1000 not in rendered
+
+
 def test_agent_public_dict_uses_empty_boundary_trace_by_default():
     agent = AgentReplay(
         id="agent-1",
