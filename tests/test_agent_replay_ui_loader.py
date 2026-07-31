@@ -1,6 +1,11 @@
 import json
+import os
+import subprocess
+
+import pytest
 
 from lumibot.components.agents.replay_ui.loader import (
+    boundary_sidecar_index_for_roots,
     build_replay_dataset,
     build_replay_dataset_from_roots,
     discover_trace_files,
@@ -30,6 +35,22 @@ def _write_minimal_system_trace(root, *, strategy_name="DemoStrategy", current_d
             "summary": "RESULT: done.",
         },
     )
+
+
+def _symlink_dir_or_skip(link_path, target_path):
+    try:
+        link_path.symlink_to(target_path, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link_path), str(target_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                return
+        pytest.skip(f"directory symlink support unavailable: {exc}")
 
 
 def test_load_agent_trace_extracts_inputs_and_batches(tmp_path):
@@ -489,6 +510,44 @@ def test_discover_trace_files_only_reads_trace_json_files(tmp_path):
     files = discover_trace_files(root)
 
     assert files == [root / "traces" / "growth_agent" / "growth.json"]
+
+
+def test_discover_trace_files_rejects_symlinked_trace_paths_outside_root(tmp_path):
+    root = tmp_path / "agent_runtime"
+    traces_dir = root / "traces"
+    traces_dir.mkdir(parents=True)
+    outside_agent_dir = tmp_path / "outside_agent"
+    _write_trace(
+        outside_agent_dir / "trace.json",
+        {
+            "agent": "escaped_agent",
+            "model": "openai/test",
+            "request": {
+                "runtime_context": {
+                    "mode": "backtesting",
+                    "current_datetime": "2026-04-07T09:30:00-04:00",
+                    "strategy_name": "EscapedStrategy",
+                }
+            },
+            "events": [],
+            "boundary_trace": {
+                "schema_version": 1,
+                "events": [
+                    {
+                        "transition": "B09_ADK_TO_LITELLM",
+                        "model_turn_id": "turn-escaped",
+                        "payload_meta": {"sidecar_path": "boundary_payloads/escaped.json"},
+                    }
+                ],
+            },
+        },
+    )
+    _write_trace(outside_agent_dir / "boundary_payloads" / "escaped.json", {"leaked": True})
+    _symlink_dir_or_skip(traces_dir / "agent", outside_agent_dir)
+
+    assert discover_trace_files(root) == []
+    assert build_replay_dataset(root).to_public_dict()["runs"] == []
+    assert boundary_sidecar_index_for_roots([root]) == {}
 
 
 def test_build_replay_dataset_groups_agents_by_system_run_and_context_dependencies(tmp_path):

@@ -58,10 +58,17 @@ LOCAL_TOOL_TRANSITIONS = {
 def discover_trace_files(trace_root: str | Path) -> list[Path]:
     """Discover agent trace JSON files without touching unrelated runtime files."""
 
-    traces_dir = Path(trace_root) / "traces"
+    root = Path(trace_root).resolve()
+    traces_dir = root / "traces"
     if not traces_dir.exists():
         return []
-    return sorted(traces_dir.glob("*/*.json"))
+
+    trace_files = []
+    for trace_path in traces_dir.glob("*/*.json"):
+        resolved_trace_path = trace_path.resolve()
+        if _is_relative_to(resolved_trace_path, root):
+            trace_files.append(resolved_trace_path)
+    return sorted(trace_files)
 
 
 def build_replay_dataset(trace_root: str | Path) -> ReplayDataset:
