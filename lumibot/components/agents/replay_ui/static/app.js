@@ -1093,7 +1093,7 @@
 
     const events = Array.isArray(trace.events) ? trace.events : [];
     const eventsById = boundaryEventsById(events);
-    const turns = Array.isArray(trace.model_turns) ? trace.model_turns : [];
+    const turns = Array.isArray(trace.model_turns) ? trace.model_turns.map(boundaryItemOrEmpty) : [];
     const body = `
       <div class="boundary-trace">
         ${turns.length ? turns.map((turn, index) => renderBoundaryModelTurn(turn, eventsById, index === 0)).join("") : '<div class="empty-state">Boundary trace contains no model turns.</div>'}
@@ -1118,8 +1118,9 @@
   }
 
   function renderBoundaryModelTurn(turn, eventsById, isOpen) {
+    turn = boundaryItemOrEmpty(turn);
     const requestEvents = eventIdsToEvents(turn.request_response_events, eventsById);
-    const batches = Array.isArray(turn.tool_batches) ? turn.tool_batches : [];
+    const batches = Array.isArray(turn.tool_batches) ? turn.tool_batches.map(boundaryItemOrEmpty) : [];
     const body = `
       <div class="boundary-event-group">
         <h4>Model Request / Response</h4>
@@ -1141,7 +1142,8 @@
   }
 
   function renderBoundaryToolBatch(batch, eventsById, isOpen) {
-    const calls = Array.isArray(batch.tool_calls) ? batch.tool_calls : [];
+    batch = boundaryItemOrEmpty(batch);
+    const calls = Array.isArray(batch.tool_calls) ? batch.tool_calls.map(boundaryItemOrEmpty) : [];
     const body = calls.length
       ? calls.map((call) => renderBoundaryToolCall(call, eventsById)).join("")
       : '<div class="empty-state">No tool calls recorded in this boundary batch.</div>';
@@ -1154,6 +1156,7 @@
   }
 
   function renderBoundaryToolCall(call, eventsById) {
+    call = boundaryItemOrEmpty(call);
     const events = eventIdsToEvents(call.events, eventsById);
     return `
       <div class="boundary-call-span">
@@ -1173,7 +1176,8 @@
   }
 
   function renderBoundaryEventRow(event) {
-    const summary = event.summary || {};
+    event = boundaryItemOrEmpty(event);
+    const summary = boundaryItemOrEmpty(event.summary);
     return `
       <details class="boundary-event">
         <summary>
@@ -1201,6 +1205,8 @@
   }
 
   function boundaryBadgesForEvent(event, summary) {
+    event = boundaryItemOrEmpty(event);
+    summary = boundaryItemOrEmpty(summary);
     const badges = [];
     if (event.status) {
       badges.push(event.status);
@@ -1223,10 +1229,15 @@
   }
 
   function renderBoundarySidecarButton(event) {
+    event = boundaryItemOrEmpty(event);
     if (!event.sidecar || !event.sidecar.available) {
       return "";
     }
-    return `<button class="secondary-button boundary-sidecar-button" type="button" data-boundary-event-id="${escapeHtml(event.sidecar.event_id || event.id)}">Load full sidecar payload</button><pre class="boundary-sidecar-output" hidden></pre>`;
+    return `<div class="boundary-sidecar-unavailable" role="status">Full sidecar payload unavailable: Phase 4 pending.</div>`;
+  }
+
+  function boundaryItemOrEmpty(item) {
+    return item && typeof item === "object" && !Array.isArray(item) ? item : {};
   }
 
   function renderCollapsibleSection(title, meta, body, isOpen) {

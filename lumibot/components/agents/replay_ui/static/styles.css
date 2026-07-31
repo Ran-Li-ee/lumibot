@@ -651,6 +651,16 @@ pre,
   width: fit-content;
 }
 
+.boundary-sidecar-unavailable {
+  width: fit-content;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  background: #f5f7f6;
+  font-size: 12px;
+}
+
 .warnings {
   margin-top: 12px;
   padding-top: 12px;

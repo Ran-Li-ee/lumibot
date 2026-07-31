@@ -47,6 +47,9 @@ def test_static_javascript_renders_boundary_trace_inspector():
     assert "renderBoundaryEventRow" in javascript
     assert "renderBoundarySidecarButton" in javascript
     assert "This trace does not contain 10-step boundary trace data" in javascript
+    assert "Phase 4 pending" in javascript
+    assert "Load full sidecar payload" not in javascript
+    assert "boundaryItemOrEmpty" in javascript
 
 
 def test_static_javascript_renders_backtest_artifact_links():

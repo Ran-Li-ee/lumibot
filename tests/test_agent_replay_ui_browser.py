@@ -617,7 +617,62 @@ def test_browser_renders_boundary_trace_for_selected_agent(page, replay_url):
     expect(page.get_by_text("B03_ADK_TO_FUNCTION_TOOL")).to_be_visible()
     expect(page.get_by_text("Google ADK -> LiteLLM")).to_be_visible()
     expect(page.locator(".boundary-call-heading").get_by_text("market_last_price")).to_be_visible()
-    expect(page.locator(".boundary-sidecar-button")).to_have_count(1)
+    sidecar_status = page.locator(".boundary-sidecar-unavailable")
+    expect(sidecar_status).to_have_count(1)
+    expect(sidecar_status).to_contain_text("Phase 4 pending")
+    expect(page.locator(".boundary-sidecar-button")).to_have_count(0)
+    expect(page.get_by_role("button", name="Load full sidecar payload")).to_have_count(0)
+
+
+def test_browser_boundary_trace_handles_malformed_nested_items(page, replay_url):
+    agent = _public_agent(
+        "malformed_agent",
+        boundary_trace={
+            "available": True,
+            "events": [
+                None,
+                {
+                    "id": "event-b09",
+                    "transition": "B09_ADK_TO_LITELLM",
+                    "status": "success",
+                    "summary": None,
+                    "sidecar": {"available": True},
+                },
+            ],
+            "model_turns": [
+                None,
+                {
+                    "model_turn_id": "turn-2",
+                    "request_response_events": ["event-b09"],
+                    "tool_batches": [
+                        None,
+                        {
+                            "tool_batch_id": "turn-2:batch:0001",
+                            "tool_calls": [
+                                None,
+                                {
+                                    "events": ["event-b09"],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+    dataset = _public_dataset([agent], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("malformed_agent")).click()
+
+    expect(page.get_by_text("LLM <-> Tool Boundary Trace")).to_be_visible()
+    expect(page.get_by_text("Model Turn unknown")).to_be_visible()
+    page.get_by_text("Model Turn 2").click()
+    expect(page.get_by_text("Tool Batch unknown")).to_be_visible()
+    page.get_by_text("Tool Batch turn-2:batch:0001").click()
+    expect(page.locator(".boundary-call-heading").get_by_text("Unknown tool").first).to_be_visible()
+    expect(page.locator(".boundary-call-heading").get_by_text("unknown call").first).to_be_visible()
 
 
 def test_browser_renders_boundary_trace_legacy_fallback(page, replay_url):
