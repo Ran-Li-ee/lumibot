@@ -352,7 +352,6 @@ Expected: new boundary grouping assertions fail.
 In `lumibot/components/agents/replay_ui/loader.py`, update imports:
 
 ```python
-from .boundary_formatters import summarize_boundary_event
 from .models import (
     AgentDependency,
     AgentReplay,
@@ -435,7 +434,7 @@ def _boundary_event_from_raw(trace_path: Path, index: int, raw_event: dict[str, 
         timestamp=_optional_text(raw_event.get("timestamp")),
         payload=raw_event.get("payload"),
         payload_meta=payload_meta,
-        summary=summarize_boundary_event(raw_event),
+        summary={},
         sidecar=sidecar,
     )
 
@@ -1819,4 +1818,5 @@ python -m ruff check lumibot/components/agents/replay_ui/models.py lumibot/compo
 - [ ] Confirm `git status --short` is clean.
 - [ ] Confirm every phase has its own passing test gate before the next phase commit.
 - [ ] Confirm the validation note names a real trace root.
+
 
