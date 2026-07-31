@@ -225,6 +225,7 @@ def test_loader_groups_boundary_trace_by_turn_batch_and_call_id(tmp_path):
     batch = public["model_turns"][0]["tool_batches"][0]
     assert batch["tool_batch_id"] == "turn-1:batch:0001"
     assert [call["call_id"] for call in batch["tool_calls"]] == ["call-A", "call-B"]
+    assert [call["tool_name"] for call in batch["tool_calls"]] == ["market_last_price", "market_last_price"]
 
     events_by_id = {event["id"]: event for event in public["events"]}
     calls_by_id = {call["call_id"]: call for call in batch["tool_calls"]}
@@ -235,6 +236,82 @@ def test_loader_groups_boundary_trace_by_turn_batch_and_call_id(tmp_path):
             symbol
         }
         assert all(event["summary"] == {} for event in call_events)
+
+
+def test_loader_boundary_event_ids_are_deterministic_across_repeated_loads(tmp_path):
+    trace_path = tmp_path / "traces" / "growth_agent" / "trace.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "growth_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [],
+            "boundary_trace": {
+                "schema_version": 1,
+                "events": [
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "payload": {"tool_name": "market_last_price", "args": {"symbol": "SPY"}},
+                    },
+                    {
+                        "transition": "B08_FUNCTION_TOOL_TO_ADK",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "payload": {"tool_name": "market_last_price", "result": {"symbol": "SPY"}},
+                    },
+                ],
+            },
+        },
+    )
+
+    first = load_agent_trace(trace_path).to_public_dict()["boundary_trace"]
+    second = load_agent_trace(trace_path).to_public_dict()["boundary_trace"]
+
+    assert [event["id"] for event in first["events"]] == [event["id"] for event in second["events"]]
+    assert first["model_turns"] == second["model_turns"]
+
+
+def test_loader_missing_call_id_local_tool_events_do_not_collapse_into_one_call(tmp_path):
+    trace_path = tmp_path / "traces" / "growth_agent" / "trace.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "growth_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [],
+            "boundary_trace": {
+                "schema_version": 1,
+                "events": [
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "payload": {"tool_name": "market_last_price", "args": {"symbol": "SPY"}},
+                    },
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "payload": {"tool_name": "market_last_price", "args": {"symbol": "QQQ"}},
+                    },
+                ],
+            },
+        },
+    )
+
+    public = load_agent_trace(trace_path).to_public_dict()["boundary_trace"]
+    calls = public["model_turns"][0]["tool_batches"][0]["tool_calls"]
+
+    assert len(calls) == 2
+    assert [call["call_id"] for call in calls] == [
+        f"unknown-call:{public['events'][0]['id']}",
+        f"unknown-call:{public['events'][1]['id']}",
+    ]
+    assert [call["tool_name"] for call in calls] == ["market_last_price", "market_last_price"]
 
 
 def test_loader_marks_sidecar_backed_boundary_event_without_inlining_payload(tmp_path):

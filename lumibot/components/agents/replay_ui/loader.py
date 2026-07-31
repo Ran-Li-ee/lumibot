@@ -326,7 +326,7 @@ def _group_boundary_tool_batches(events: list[BoundaryEventReplay]) -> list[dict
 def _group_boundary_tool_calls(events: list[BoundaryEventReplay]) -> list[dict[str, Any]]:
     calls: dict[str, list[BoundaryEventReplay]] = {}
     for event in events:
-        call_id = event.call_id or "unknown-call"
+        call_id = event.call_id or f"unknown-call:{event.id}"
         calls.setdefault(call_id, []).append(event)
 
     grouped_calls = []

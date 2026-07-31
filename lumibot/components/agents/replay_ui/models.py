@@ -57,6 +57,9 @@ def _public_boundary_tool_call(call: Any) -> dict[str, Any]:
     call_id = call.get("call_id")
     if isinstance(call_id, str) and call_id:
         public["call_id"] = redact_sensitive(call_id)
+    tool_name = call.get("tool_name")
+    if isinstance(tool_name, str) and tool_name:
+        public["tool_name"] = redact_sensitive(tool_name)
     events = _string_list_metadata(call.get("events"))
     if events:
         public["events"] = events

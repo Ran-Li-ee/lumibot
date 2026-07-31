@@ -329,6 +329,7 @@ def test_boundary_trace_public_dict_keeps_model_turns_metadata_only():
                         "tool_calls": [
                             {
                                 "call_id": "call-1",
+                                "tool_name": "market_last_price",
                                 "events": ["event-2", "event-3"],
                                 "payload": "B" * 6000,
                                 "password": "hunter2",
@@ -356,6 +357,7 @@ def test_boundary_trace_public_dict_keeps_model_turns_metadata_only():
                     "tool_calls": [
                         {
                             "call_id": "call-1",
+                            "tool_name": "market_last_price",
                             "events": ["event-2", "event-3"],
                         }
                     ],
