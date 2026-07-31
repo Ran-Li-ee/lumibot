@@ -2,6 +2,8 @@ import pytest
 
 from lumibot.components.agents.replay_ui.boundary_formatters import (
     BOUNDARY_TRANSITION_ORDER,
+    BOUNDARY_TRANSITIONS,
+    MAX_PREVIEW_CHARS,
     summarize_boundary_event,
 )
 
@@ -81,3 +83,56 @@ def test_formatter_does_not_fabricate_missing_payload():
 
     assert "not available" in summary["preview"].lower()
 
+
+def test_formatter_bounds_long_error_preview():
+    summary = summarize_boundary_event(
+        {
+            "transition": "B06_PYTHON_TOOL_TO_WRAPPER",
+            "status": "error",
+            "payload": {"error": "x" * (MAX_PREVIEW_CHARS * 2)},
+            "payload_meta": {},
+        }
+    )
+
+    assert len(summary["preview"]) <= MAX_PREVIEW_CHARS
+    assert summary["preview"].endswith("...")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"tool_name": "tool_" + ("x" * (MAX_PREVIEW_CHARS * 2))},
+        {"name": "name_" + ("x" * (MAX_PREVIEW_CHARS * 2))},
+        {"function": {"name": "function_" + ("x" * (MAX_PREVIEW_CHARS * 2))}},
+    ],
+)
+def test_formatter_bounds_long_name_previews(payload):
+    summary = summarize_boundary_event(
+        {
+            "transition": "B03_ADK_TO_FUNCTION_TOOL",
+            "status": "success",
+            "payload": payload,
+            "payload_meta": {},
+        }
+    )
+
+    assert len(summary["preview"]) <= MAX_PREVIEW_CHARS
+    assert summary["preview"].endswith("...")
+
+
+def test_provider_boundaries_describe_provider_litellm_snapshots_not_http_internals():
+    for transition in ("B01_PROVIDER_TO_LITELLM", "B10_LITELLM_TO_PROVIDER"):
+        definition = BOUNDARY_TRANSITIONS[transition]
+        text = " ".join(
+            [
+                definition["label"],
+                definition["source"],
+                definition["target"],
+                definition["explanation"],
+            ]
+        ).lower()
+
+        assert "provider" in text
+        assert "litellm" in text
+        assert "http" not in text
+        assert "openai server" not in text

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+MAX_PREVIEW_CHARS = 240
+
 BOUNDARY_TRANSITIONS: dict[str, dict[str, str]] = {
     "B01_PROVIDER_TO_LITELLM": {
         "label": "Provider response",
@@ -116,34 +118,41 @@ def _badges(status: str, payload_meta: dict[str, Any]) -> list[str]:
 
 def _preview(status: str, payload: Any) -> str:
     if status in {"not_available", "not_applicable"}:
-        return status.replace("_", " ")
+        return _bounded_preview_text(status.replace("_", " "))
     if payload is None:
-        return "Payload not available."
+        return _bounded_preview_text("Payload not available.")
     if isinstance(payload, dict):
         return _preview_dict(payload)
     if isinstance(payload, list):
-        return f"{len(payload)} item(s)"
+        return _bounded_preview_text(f"{len(payload)} item(s)")
     text = str(payload)
-    return text[:240] + ("..." if len(text) > 240 else "")
+    return _bounded_preview_text(text)
 
 
 def _preview_dict(payload: dict[str, Any]) -> str:
     for key in ("tool_name", "name", "function_name"):
         value = payload.get(key)
         if isinstance(value, str) and value:
-            return value
+            return _bounded_preview_text(value)
     function = payload.get("function")
     if isinstance(function, dict) and isinstance(function.get("name"), str):
-        return function["name"]
+        return _bounded_preview_text(function["name"])
     if isinstance(payload.get("messages"), list):
-        return f"{len(payload['messages'])} model message(s)"
+        return _bounded_preview_text(f"{len(payload['messages'])} model message(s)")
     if isinstance(payload.get("tool_calls"), list):
-        return f"{len(payload['tool_calls'])} provider tool call(s)"
+        return _bounded_preview_text(f"{len(payload['tool_calls'])} provider tool call(s)")
     if isinstance(payload.get("function_calls"), list):
-        return f"{len(payload['function_calls'])} ADK function call(s)"
+        return _bounded_preview_text(f"{len(payload['function_calls'])} ADK function call(s)")
     if "result" in payload:
-        return "Tool result payload"
+        return _bounded_preview_text("Tool result payload")
     if "error" in payload:
-        return f"Error payload: {payload.get('error')}"
+        return _bounded_preview_text(f"Error payload: {payload.get('error')}")
     keys = ", ".join(str(key) for key in list(payload.keys())[:5])
-    return f"Payload keys: {keys}" if keys else "Empty object payload"
+    return _bounded_preview_text(f"Payload keys: {keys}" if keys else "Empty object payload")
+
+
+def _bounded_preview_text(value: Any) -> str:
+    text = str(value)
+    if len(text) <= MAX_PREVIEW_CHARS:
+        return text
+    return text[: MAX_PREVIEW_CHARS - 3] + "..."
