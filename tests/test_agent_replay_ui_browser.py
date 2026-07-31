@@ -617,11 +617,57 @@ def test_browser_renders_boundary_trace_for_selected_agent(page, replay_url):
     expect(page.get_by_text("B03_ADK_TO_FUNCTION_TOOL")).to_be_visible()
     expect(page.get_by_text("Google ADK -> LiteLLM")).to_be_visible()
     expect(page.locator(".boundary-call-heading").get_by_text("market_last_price")).to_be_visible()
-    sidecar_status = page.locator(".boundary-sidecar-unavailable")
-    expect(sidecar_status).to_have_count(1)
-    expect(sidecar_status).to_contain_text("Phase 4 pending")
-    expect(page.locator(".boundary-sidecar-button")).to_have_count(0)
-    expect(page.get_by_role("button", name="Load full sidecar payload")).to_have_count(0)
+    expect(page.locator(".boundary-sidecar-unavailable")).to_have_count(0)
+    expect(page.locator(".boundary-sidecar-button")).to_have_count(1)
+    page.get_by_text("B10_LITELLM_TO_PROVIDER").click()
+    expect(page.get_by_role("button", name="Load full sidecar payload")).to_be_visible()
+
+
+def test_browser_loads_boundary_sidecar_payload(page, replay_url):
+    agent = _public_agent(
+        "growth_agent",
+        boundary_trace={
+            "available": True,
+            "events": [
+                {
+                    "id": "event-sidecar",
+                    "transition": "B09_ADK_TO_LITELLM",
+                    "status": "success",
+                    "summary": {
+                        "label": "ADK builds model request",
+                        "source": "Google ADK",
+                        "target": "LiteLLM",
+                        "badges": ["success", "sidecar"],
+                        "preview": "sidecar preview",
+                    },
+                    "payload": {"preview": "small"},
+                    "payload_meta": {"semantic_completeness": "partial"},
+                    "sidecar": {"available": True, "event_id": "event-sidecar"},
+                }
+            ],
+            "model_turns": [
+                {
+                    "model_turn_id": "turn-1",
+                    "request_response_events": ["event-sidecar"],
+                    "tool_batches": [],
+                }
+            ],
+        },
+    )
+    dataset = _public_dataset([agent], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+    page.route(
+        "**/api/boundary-payload/event-sidecar",
+        lambda route: route.fulfill(json={"event_id": "event-sidecar", "payload": {"full": "payload"}}),
+    )
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("growth_agent")).click()
+    page.get_by_text("B09_ADK_TO_LITELLM").click()
+    page.get_by_role("button", name="Load full sidecar payload").click()
+
+    expect(page.get_by_text('"full": "payload"')).to_be_visible()
+    expect(page.get_by_role("button", name="Full sidecar payload loaded")).to_be_visible()
 
 
 def test_browser_boundary_trace_handles_malformed_nested_items(page, replay_url):

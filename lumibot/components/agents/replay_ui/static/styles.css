@@ -647,8 +647,27 @@ pre,
   overflow-wrap: anywhere;
 }
 
+.boundary-sidecar-controls {
+  display: grid;
+  gap: 8px;
+}
+
 .boundary-sidecar-button {
   width: fit-content;
+}
+
+.boundary-sidecar-button:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.boundary-sidecar-output {
+  max-height: 360px;
+  overflow: auto;
+}
+
+.boundary-sidecar-output.error {
+  color: var(--danger);
 }
 
 .boundary-sidecar-unavailable {

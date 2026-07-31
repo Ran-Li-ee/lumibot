@@ -46,9 +46,11 @@ def test_static_javascript_renders_boundary_trace_inspector():
     assert "renderBoundaryToolCall" in javascript
     assert "renderBoundaryEventRow" in javascript
     assert "renderBoundarySidecarButton" in javascript
+    assert "loadBoundarySidecar" in javascript
+    assert "/api/boundary-payload/" in javascript
     assert "This trace does not contain 10-step boundary trace data" in javascript
-    assert "Phase 4 pending" in javascript
-    assert "Load full sidecar payload" not in javascript
+    assert "Phase 4 pending" not in javascript
+    assert "Load full sidecar payload" in javascript
     assert "boundaryItemOrEmpty" in javascript
 
 

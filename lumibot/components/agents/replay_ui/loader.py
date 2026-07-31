@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -84,6 +85,69 @@ def build_replay_dataset_from_roots(trace_roots: list[str | Path]) -> ReplayData
 
     runs.sort(key=lambda run: (run.strategy_name, run.label, run.id))
     return ReplayDataset(runs=runs, source_path="; ".join(source_paths), warnings=warnings)
+
+
+def boundary_sidecar_index_for_roots(trace_roots: list[str | Path]) -> dict[str, dict[str, Any]]:
+    """Build an event-id keyed index for boundary sidecars under configured trace roots."""
+
+    index: dict[str, dict[str, Any]] = {}
+    for trace_root in trace_roots:
+        root = Path(trace_root)
+        for trace_path in discover_trace_files(root):
+            try:
+                with trace_path.open("r", encoding="utf-8-sig") as trace_file:
+                    trace = json.load(trace_file)
+            except Exception:
+                continue
+
+            boundary = trace.get("boundary_trace") if isinstance(trace, dict) else None
+            raw_events = boundary.get("events") if isinstance(boundary, dict) else None
+            if not isinstance(raw_events, list):
+                continue
+
+            for event_index, raw_event in enumerate(raw_events):
+                if not isinstance(raw_event, dict):
+                    continue
+                payload_meta = raw_event.get("payload_meta")
+                if not isinstance(payload_meta, dict):
+                    continue
+                sidecar_path = payload_meta.get("sidecar_path")
+                if not isinstance(sidecar_path, str) or not sidecar_path:
+                    continue
+
+                event_id = _boundary_event_id(trace_path, event_index, raw_event)
+                index[event_id] = {
+                    "trace_root": root.resolve(),
+                    "sidecar_path": sidecar_path,
+                    "compression": payload_meta.get("compression"),
+                }
+    return index
+
+
+def load_boundary_sidecar_payload(entry: dict[str, Any]) -> Any:
+    """Load a JSON sidecar after enforcing trace-root-relative path boundaries."""
+
+    trace_root = Path(entry["trace_root"]).resolve()
+    relative = Path(str(entry["sidecar_path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise FileNotFoundError("invalid sidecar path")
+
+    target = (trace_root / relative).resolve()
+    if not _is_relative_to(target, trace_root):
+        raise FileNotFoundError("sidecar path escapes trace root")
+
+    data = target.read_bytes()
+    if entry.get("compression") == "gzip" or target.suffix == ".gz":
+        data = gzip.decompress(data)
+    return json.loads(data.decode("utf-8"))
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _build_replay_dataset_for_root(root: Path) -> ReplayDataset:

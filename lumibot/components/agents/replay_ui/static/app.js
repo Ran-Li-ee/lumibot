@@ -71,6 +71,14 @@
       render();
     });
 
+    document.addEventListener("click", (event) => {
+      const button = event.target.closest(".boundary-sidecar-button");
+      if (!button) {
+        return;
+      }
+      loadBoundarySidecar(button);
+    });
+
     window.addEventListener("resize", () => {
       if (state.dataset) {
         scheduleWorkflowRelayout();
@@ -1233,7 +1241,50 @@
     if (!event.sidecar || !event.sidecar.available) {
       return "";
     }
-    return `<div class="boundary-sidecar-unavailable" role="status">Full sidecar payload unavailable: Phase 4 pending.</div>`;
+    const eventId = event.sidecar.event_id || event.id;
+    if (!eventId) {
+      return `<div class="boundary-sidecar-unavailable" role="status">Full sidecar payload unavailable: missing event id.</div>`;
+    }
+    return `
+      <div class="boundary-sidecar-controls">
+        <button class="secondary-button boundary-sidecar-button" type="button" data-boundary-event-id="${escapeHtml(eventId)}">Load full sidecar payload</button>
+        <pre class="boundary-sidecar-output" hidden></pre>
+      </div>
+    `;
+  }
+
+  async function loadBoundarySidecar(button) {
+    const eventId = button.getAttribute("data-boundary-event-id");
+    const controls = button.closest(".boundary-sidecar-controls");
+    const output = controls ? controls.querySelector(".boundary-sidecar-output") : null;
+    if (!eventId || !output) {
+      return;
+    }
+
+    button.disabled = true;
+    button.textContent = "Loading full sidecar payload...";
+    output.hidden = true;
+    output.textContent = "";
+    output.classList.remove("error");
+
+    try {
+      const response = await fetch(`/api/boundary-payload/${encodeURIComponent(eventId)}`, {
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const payload = await response.json();
+      output.hidden = false;
+      output.textContent = formatPlainValue(payload.payload);
+      button.textContent = "Full sidecar payload loaded";
+    } catch (error) {
+      output.hidden = false;
+      output.textContent = `Unable to load sidecar payload: ${error.message}`;
+      output.classList.add("error");
+      button.textContent = "Load full sidecar payload";
+      button.disabled = false;
+    }
   }
 
   function boundaryItemOrEmpty(item) {
@@ -1484,6 +1535,20 @@
       return escapeHtml(JSON.stringify(value, null, 2));
     } catch (error) {
       return escapeHtml(String(value));
+    }
+  }
+
+  function formatPlainValue(value) {
+    if (value === null || value === undefined || value === "") {
+      return "Unavailable";
+    }
+    if (typeof value === "string") {
+      return value;
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (error) {
+      return String(value);
     }
   }
 

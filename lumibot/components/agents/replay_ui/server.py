@@ -10,10 +10,13 @@ from flask import Flask, Response, abort, jsonify
 from .loader import (
     artifact_token_for_root,
     backtest_artifact_root,
+    boundary_sidecar_index_for_roots,
     build_replay_dataset_from_roots,
     find_account_curve_report,
     find_performance_report,
+    load_boundary_sidecar_payload,
 )
+from .redaction import redact_public_preview
 
 STATIC_ALLOWLIST = {
     "app.js",
@@ -29,11 +32,24 @@ def create_app(trace_root: str | Path | list[str | Path]) -> Flask:
     trace_roots = trace_root if isinstance(trace_root, list) else [trace_root]
     app.config["TRACE_ROOTS"] = [Path(root) for root in trace_roots]
     app.config["ARTIFACT_ROOTS_BY_TOKEN"] = _artifact_roots_by_token(app.config["TRACE_ROOTS"])
+    app.config["BOUNDARY_SIDECARS_BY_EVENT_ID"] = boundary_sidecar_index_for_roots(app.config["TRACE_ROOTS"])
 
     @app.get("/api/dataset")
     def dataset() -> Response:
         replay_dataset = build_replay_dataset_from_roots(app.config["TRACE_ROOTS"])
         return jsonify(replay_dataset.to_public_dict())
+
+    @app.get("/api/boundary-payload/<event_id>")
+    def boundary_payload(event_id: str) -> Response:
+        index = app.config.get("BOUNDARY_SIDECARS_BY_EVENT_ID") or {}
+        entry = index.get(event_id)
+        if entry is None:
+            abort(404)
+        try:
+            payload = load_boundary_sidecar_payload(entry)
+        except Exception:
+            abort(404)
+        return jsonify({"event_id": event_id, "payload": redact_public_preview(payload)})
 
     @app.get("/healthz")
     def healthz() -> Response:
