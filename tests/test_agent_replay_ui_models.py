@@ -1,6 +1,8 @@
 from lumibot.components.agents.replay_ui.models import (
     AgentDependency,
     AgentReplay,
+    BoundaryEventReplay,
+    BoundaryTraceReplay,
     ReplayDataset,
     ReplayRun,
     SystemRun,
@@ -224,6 +226,67 @@ def test_agent_replay_public_dict_contains_three_detail_areas():
     assert public["tool_batches"][0]["calls"][0]["raw_result"] == {"price": 110.71}
     assert public["summary"] == "RESULT: QQQ is strongest."
     assert "raw_trace" not in public
+
+
+def test_agent_public_dict_includes_boundary_trace():
+    event = BoundaryEventReplay(
+        id="event-1",
+        transition="B03_ADK_TO_FUNCTION_TOOL",
+        model_turn_id="turn-1",
+        tool_batch_id="turn-1:batch:0001",
+        call_id="call-1",
+        status="success",
+        payload={"tool_name": "market_last_price"},
+        payload_meta={"semantic_completeness": "complete"},
+        summary={
+            "label": "ADK dispatches FunctionTool",
+            "source": "Google ADK",
+            "target": "ADK FunctionTool",
+            "badges": ["complete"],
+            "preview": "market_last_price",
+        },
+    )
+    agent = AgentReplay(
+        id="agent-1",
+        name="growth_agent",
+        model="openai/test",
+        trace_path="trace.json",
+        boundary_trace=BoundaryTraceReplay(
+            available=True,
+            schema_version=1,
+            events=[event],
+            model_turns=[
+                {
+                    "model_turn_id": "turn-1",
+                    "request_response_events": ["event-1"],
+                    "tool_batches": [],
+                }
+            ],
+        ),
+    )
+
+    public = agent.to_public_dict()
+
+    assert public["boundary_trace"]["available"] is True
+    assert public["boundary_trace"]["schema_version"] == 1
+    assert public["boundary_trace"]["events"][0]["id"] == "event-1"
+    assert public["boundary_trace"]["events"][0]["payload"]["tool_name"] == "market_last_price"
+    assert public["boundary_trace"]["model_turns"][0]["model_turn_id"] == "turn-1"
+
+
+def test_agent_public_dict_uses_empty_boundary_trace_by_default():
+    agent = AgentReplay(
+        id="agent-1",
+        name="legacy_agent",
+        model="openai/test",
+        trace_path="trace.json",
+    )
+
+    public = agent.to_public_dict()
+
+    assert public["boundary_trace"]["available"] is False
+    assert public["boundary_trace"]["events"] == []
+    assert "does not contain" in public["boundary_trace"]["message"]
 
 
 def test_agent_replay_input_material_redacts_runtime_context_fields():

@@ -71,6 +71,61 @@ class AgentDependency:
 
 
 @dataclass
+class BoundaryEventReplay:
+    id: str
+    transition: str
+    model_turn_id: str | None = None
+    tool_batch_id: str | None = None
+    call_id: str | None = None
+    status: str | None = None
+    timestamp: str | None = None
+    payload: Any = None
+    payload_meta: dict[str, Any] = field(default_factory=dict)
+    summary: dict[str, Any] = field(default_factory=dict)
+    sidecar: dict[str, Any] | None = None
+
+    def to_public_dict(self) -> dict[str, Any]:
+        public = {
+            "id": redact_sensitive(self.id),
+            "transition": redact_sensitive(self.transition),
+            "model_turn_id": redact_sensitive(self.model_turn_id),
+            "tool_batch_id": redact_sensitive(self.tool_batch_id),
+            "call_id": redact_sensitive(self.call_id),
+            "status": redact_sensitive(self.status),
+            "timestamp": redact_sensitive(self.timestamp),
+            "payload": redact_public_preview(self.payload),
+            "payload_meta": redact_sensitive(self.payload_meta),
+            "summary": redact_sensitive(self.summary),
+        }
+        if self.sidecar is not None:
+            public["sidecar"] = redact_sensitive(self.sidecar)
+        return public
+
+
+@dataclass
+class BoundaryTraceReplay:
+    available: bool = False
+    schema_version: int | None = None
+    events: list[BoundaryEventReplay] = field(default_factory=list)
+    model_turns: list[dict[str, Any]] = field(default_factory=list)
+    diagnostics: list[Any] = field(default_factory=list)
+    message: str = (
+        "This trace does not contain 10-step boundary trace data. "
+        "It may have been created before boundary tracing was added."
+    )
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "schema_version": self.schema_version,
+            "events": [event.to_public_dict() for event in self.events],
+            "model_turns": redact_sensitive(self.model_turns),
+            "diagnostics": redact_sensitive(self.diagnostics),
+            "message": redact_sensitive(self.message),
+        }
+
+
+@dataclass
 class AgentReplay:
     id: str
     name: str
@@ -82,6 +137,7 @@ class AgentReplay:
     warnings: list[Any] = field(default_factory=list)
     raw_trace: Any = None
     dependencies: list[AgentDependency] = field(default_factory=list)
+    boundary_trace: BoundaryTraceReplay = field(default_factory=BoundaryTraceReplay)
 
     def input_material(self) -> dict[str, Any]:
         context = self.request.get("context") or {}
@@ -118,6 +174,7 @@ class AgentReplay:
             "summary": redact_sensitive(self.summary),
             "warnings": redact_sensitive(self.warnings),
             "dependencies": [dependency.to_public_dict() for dependency in self.dependencies],
+            "boundary_trace": self.boundary_trace.to_public_dict(),
         }
 
 
