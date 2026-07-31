@@ -555,6 +555,102 @@ pre,
   background: #ffffff;
 }
 
+.boundary-trace {
+  display: grid;
+  gap: 12px;
+}
+
+.boundary-event-group {
+  display: grid;
+  gap: 8px;
+}
+
+.boundary-event-group h4 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.boundary-call-span {
+  margin: 8px 0;
+  padding: 10px;
+  border: 1px solid #cbd5d1;
+  border-radius: 6px;
+  background: #fbfcfb;
+}
+
+.boundary-call-heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.boundary-call-heading span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.boundary-event {
+  padding: 8px;
+  border: 1px solid #d6ddd9;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.boundary-event + .boundary-event {
+  margin-top: 8px;
+}
+
+.boundary-event summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.boundary-code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-weight: 700;
+}
+
+.boundary-label {
+  font-weight: 600;
+}
+
+.boundary-route {
+  color: #52615a;
+}
+
+.boundary-badge {
+  padding: 2px 7px;
+  border: 1px solid #b8c4be;
+  border-radius: 999px;
+  background: #eef4f1;
+  font-size: 12px;
+}
+
+.boundary-event-body {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.boundary-preview {
+  padding-left: 8px;
+  border-left: 3px solid #78958a;
+  color: #26312c;
+  overflow-wrap: anywhere;
+}
+
+.boundary-sidecar-button {
+  width: fit-content;
+}
+
 .warnings {
   margin-top: 12px;
   padding-top: 12px;

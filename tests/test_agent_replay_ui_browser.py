@@ -57,7 +57,7 @@ def _agent_trace(agent_name: str, context: dict, summary: str) -> dict:
     }
 
 
-def _public_agent(agent_id: str) -> dict:
+def _public_agent(agent_id: str, boundary_trace: dict | None = None) -> dict:
     return {
         "id": agent_id,
         "name": agent_id,
@@ -76,6 +76,14 @@ def _public_agent(agent_id: str) -> dict:
         "summary": f"{agent_id} summary",
         "warnings": [],
         "dependencies": [],
+        "boundary_trace": boundary_trace
+        if boundary_trace is not None
+        else {
+            "available": False,
+            "events": [],
+            "model_turns": [],
+            "message": "This trace does not contain 10-step boundary trace data.",
+        },
     }
 
 
@@ -521,6 +529,105 @@ def test_agent_detail_cards_and_subcards_are_collapsible(page, replay_url):
 
     tool_card.locator("summary").first.click()
     expect(page.locator("#toolArea pre").filter(has_text="Looked up SPY price.")).to_be_hidden()
+
+
+def test_browser_renders_boundary_trace_for_selected_agent(page, replay_url):
+    agent = _public_agent(
+        "growth_agent",
+        boundary_trace={
+            "available": True,
+            "schema_version": 1,
+            "message": "Boundary trace data is available for this agent run.",
+            "events": [
+                {
+                    "id": "event-b09",
+                    "transition": "B09_ADK_TO_LITELLM",
+                    "status": "success",
+                    "summary": {
+                        "label": "ADK builds model request",
+                        "source": "Google ADK",
+                        "target": "LiteLLM",
+                        "badges": ["success", "complete"],
+                        "preview": "1 model message(s)",
+                    },
+                    "payload": {"messages": [{"role": "user", "content": "hello"}]},
+                    "payload_meta": {"semantic_completeness": "complete"},
+                },
+                {
+                    "id": "event-b03",
+                    "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                    "status": "success",
+                    "summary": {
+                        "label": "ADK dispatches FunctionTool",
+                        "source": "Google ADK",
+                        "target": "ADK FunctionTool",
+                        "badges": ["success", "complete"],
+                        "preview": "market_last_price",
+                    },
+                    "payload": {"tool_name": "market_last_price", "args": {"symbol": "SPY"}},
+                    "payload_meta": {"semantic_completeness": "complete"},
+                },
+                {
+                    "id": "event-sidecar",
+                    "transition": "B10_LITELLM_TO_PROVIDER",
+                    "status": "success",
+                    "summary": {
+                        "label": "LiteLLM sends provider request",
+                        "source": "LiteLLM",
+                        "target": "Model provider",
+                        "badges": ["success", "sidecar"],
+                        "preview": "sidecar preview only",
+                    },
+                    "payload": {"preview": "small"},
+                    "payload_meta": {"semantic_completeness": "partial"},
+                    "sidecar": {"available": True, "event_id": "event-sidecar"},
+                },
+            ],
+            "model_turns": [
+                {
+                    "model_turn_id": "turn-1",
+                    "request_response_events": ["event-b09", "event-sidecar"],
+                    "tool_batches": [
+                        {
+                            "tool_batch_id": "turn-1:batch:0001",
+                            "tool_calls": [
+                                {
+                                    "call_id": "call-1",
+                                    "tool_name": "market_last_price",
+                                    "events": ["event-b03"],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    dataset = _public_dataset([agent], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("growth_agent")).click()
+
+    expect(page.get_by_text("LLM <-> Tool Boundary Trace")).to_be_visible()
+    expect(page.get_by_text("Model Turn 1")).to_be_visible()
+    expect(page.get_by_text("Model Request / Response")).to_be_visible()
+    expect(page.get_by_text("B09_ADK_TO_LITELLM")).to_be_visible()
+    expect(page.get_by_text("B10_LITELLM_TO_PROVIDER")).to_be_visible()
+    expect(page.get_by_text("B03_ADK_TO_FUNCTION_TOOL")).to_be_visible()
+    expect(page.get_by_text("Google ADK -> LiteLLM")).to_be_visible()
+    expect(page.locator(".boundary-call-heading").get_by_text("market_last_price")).to_be_visible()
+    expect(page.locator(".boundary-sidecar-button")).to_have_count(1)
+
+
+def test_browser_renders_boundary_trace_legacy_fallback(page, replay_url):
+    dataset = _public_dataset([_public_agent("legacy_agent")], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("legacy_agent")).click()
+
+    expect(page.get_by_text("This trace does not contain 10-step boundary trace data")).to_be_visible()
 
 
 def test_clicking_agent_still_shows_detail_without_dependency_panel(page, replay_url):

@@ -20,6 +20,7 @@ def test_static_ui_contains_required_detail_regions():
     assert 'id="overviewArea"' in html
     assert 'id="inputArea"' in html
     assert 'id="toolArea"' in html
+    assert 'id="boundaryTraceArea"' in html
     assert 'id="summaryArea"' in html
 
 
@@ -28,10 +29,24 @@ def test_static_javascript_renders_agent_sections():
 
     assert "renderInputArea" in javascript
     assert "renderToolArea" in javascript
+    assert "renderBoundaryTraceArea" in javascript
     assert "renderSummaryArea" in javascript
     assert "Human Explanation" in javascript
     assert "USER SYSTEM PROMPT:" in javascript
     assert "Effective System Prompt" in javascript
+
+
+def test_static_javascript_renders_boundary_trace_inspector():
+    javascript = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "renderBoundaryTraceArea" in javascript
+    assert "LLM <-> Tool Boundary Trace" in javascript
+    assert "renderBoundaryModelTurn" in javascript
+    assert "renderBoundaryToolBatch" in javascript
+    assert "renderBoundaryToolCall" in javascript
+    assert "renderBoundaryEventRow" in javascript
+    assert "renderBoundarySidecarButton" in javascript
+    assert "This trace does not contain 10-step boundary trace data" in javascript
 
 
 def test_static_javascript_renders_backtest_artifact_links():
@@ -123,6 +138,7 @@ def test_static_ui_contains_workflow_graph_and_overview_regions():
     assert 'id="overviewArea"' in html
     assert 'id="inputArea"' in html
     assert 'id="toolArea"' in html
+    assert 'id="boundaryTraceArea"' in html
     assert 'id="summaryArea"' in html
 
 
@@ -211,3 +227,12 @@ def test_static_css_defines_detail_modes():
     assert ".graph-node.active" in css
     assert ".overview-card" in css
     assert "[hidden]" in css
+
+
+def test_static_css_defines_boundary_trace_styles():
+    css = (STATIC_ROOT / "styles.css").read_text(encoding="utf-8")
+
+    assert ".boundary-trace" in css
+    assert ".boundary-event" in css
+    assert ".boundary-badge" in css
+    assert ".boundary-call-span" in css

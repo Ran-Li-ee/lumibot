@@ -29,6 +29,7 @@
     elements.overviewArea = document.getElementById("overviewArea");
     elements.inputArea = document.getElementById("inputArea");
     elements.toolArea = document.getElementById("toolArea");
+    elements.boundaryTraceArea = document.getElementById("boundaryTraceArea");
     elements.summaryArea = document.getElementById("summaryArea");
 
     elements.overviewButton.addEventListener("click", () => {
@@ -141,6 +142,7 @@
     elements.overviewArea.innerHTML = sectionShell("System Overview", "Loading selected system run...");
     elements.inputArea.innerHTML = "";
     elements.toolArea.innerHTML = "";
+    elements.boundaryTraceArea.innerHTML = "";
     elements.summaryArea.innerHTML = "";
   }
 
@@ -155,6 +157,7 @@
     elements.overviewArea.innerHTML = sectionShell("System Overview", `Dataset error: ${message}`);
     elements.inputArea.innerHTML = "";
     elements.toolArea.innerHTML = "";
+    elements.boundaryTraceArea.innerHTML = "";
     elements.summaryArea.innerHTML = "";
   }
 
@@ -173,6 +176,7 @@
     elements.overviewArea.innerHTML = `${sectionShell("System Overview", "No replay runs are available.")}${renderVisibleWarnings(warnings)}`;
     elements.inputArea.innerHTML = "";
     elements.toolArea.innerHTML = "";
+    elements.boundaryTraceArea.innerHTML = "";
     elements.summaryArea.innerHTML = "";
   }
 
@@ -904,6 +908,7 @@
     `;
     elements.inputArea.innerHTML = "";
     elements.toolArea.innerHTML = "";
+    elements.boundaryTraceArea.innerHTML = "";
     elements.summaryArea.innerHTML = "";
   }
 
@@ -920,6 +925,7 @@
     setDetailMode("agent");
     renderInputArea(agent);
     renderToolArea(agent);
+    renderBoundaryTraceArea(agent);
     renderSummaryArea(agent, systemRun);
   }
 
@@ -928,6 +934,7 @@
     elements.overviewArea.hidden = !showOverview;
     elements.inputArea.hidden = showOverview;
     elements.toolArea.hidden = showOverview;
+    elements.boundaryTraceArea.hidden = showOverview;
     elements.summaryArea.hidden = showOverview;
   }
 
@@ -1070,6 +1077,156 @@
       body,
       true,
     );
+  }
+
+  function renderBoundaryTraceArea(agent) {
+    const trace = agent.boundary_trace || {};
+    if (!trace.available) {
+      elements.boundaryTraceArea.innerHTML = renderCollapsibleSection(
+        "LLM <-> Tool Boundary Trace",
+        "not available",
+        `<div class="empty-state">${escapeHtml(trace.message || "This trace does not contain 10-step boundary trace data. It may have been created before boundary tracing was added.")}</div>`,
+        true,
+      );
+      return;
+    }
+
+    const events = Array.isArray(trace.events) ? trace.events : [];
+    const eventsById = boundaryEventsById(events);
+    const turns = Array.isArray(trace.model_turns) ? trace.model_turns : [];
+    const body = `
+      <div class="boundary-trace">
+        ${turns.length ? turns.map((turn, index) => renderBoundaryModelTurn(turn, eventsById, index === 0)).join("") : '<div class="empty-state">Boundary trace contains no model turns.</div>'}
+      </div>
+    `;
+    elements.boundaryTraceArea.innerHTML = renderCollapsibleSection(
+      "LLM <-> Tool Boundary Trace",
+      `${turns.length} model turn${turns.length === 1 ? "" : "s"} | ${events.length} event${events.length === 1 ? "" : "s"}`,
+      body,
+      true,
+    );
+  }
+
+  function boundaryEventsById(events) {
+    const map = new Map();
+    (Array.isArray(events) ? events : []).forEach((event) => {
+      if (event && event.id) {
+        map.set(event.id, event);
+      }
+    });
+    return map;
+  }
+
+  function renderBoundaryModelTurn(turn, eventsById, isOpen) {
+    const requestEvents = eventIdsToEvents(turn.request_response_events, eventsById);
+    const batches = Array.isArray(turn.tool_batches) ? turn.tool_batches : [];
+    const body = `
+      <div class="boundary-event-group">
+        <h4>Model Request / Response</h4>
+        ${requestEvents.length ? requestEvents.map(renderBoundaryEventRow).join("") : '<div class="empty-state">No model request/response boundary events recorded.</div>'}
+      </div>
+      ${batches.map((batch, index) => renderBoundaryToolBatch(batch, eventsById, index === 0)).join("")}
+    `;
+    return renderCollapsibleSubsection(
+      `Model Turn ${modelTurnLabel(turn.model_turn_id)}`,
+      turn.model_turn_id || "unknown turn",
+      body,
+      isOpen,
+    );
+  }
+
+  function modelTurnLabel(modelTurnId) {
+    const match = String(modelTurnId || "").match(/turn[:_-]?(\d+)$/i);
+    return match ? String(Number(match[1])) : String(modelTurnId || "unknown");
+  }
+
+  function renderBoundaryToolBatch(batch, eventsById, isOpen) {
+    const calls = Array.isArray(batch.tool_calls) ? batch.tool_calls : [];
+    const body = calls.length
+      ? calls.map((call) => renderBoundaryToolCall(call, eventsById)).join("")
+      : '<div class="empty-state">No tool calls recorded in this boundary batch.</div>';
+    return renderCollapsibleSubsection(
+      `Tool Batch ${batch.tool_batch_id || "unknown"}`,
+      `${calls.length} call${calls.length === 1 ? "" : "s"}`,
+      body,
+      isOpen,
+    );
+  }
+
+  function renderBoundaryToolCall(call, eventsById) {
+    const events = eventIdsToEvents(call.events, eventsById);
+    return `
+      <div class="boundary-call-span">
+        <div class="boundary-call-heading">
+          <strong>${escapeHtml(call.tool_name || "Unknown tool")}</strong>
+          <span>${escapeHtml(call.call_id || "unknown call")}</span>
+        </div>
+        ${events.length ? events.map(renderBoundaryEventRow).join("") : '<div class="empty-state">No boundary events recorded for this tool call.</div>'}
+      </div>
+    `;
+  }
+
+  function eventIdsToEvents(ids, eventsById) {
+    return (Array.isArray(ids) ? ids : [])
+      .map((id) => eventsById.get(id))
+      .filter(Boolean);
+  }
+
+  function renderBoundaryEventRow(event) {
+    const summary = event.summary || {};
+    return `
+      <details class="boundary-event">
+        <summary>
+          <span class="boundary-code">${escapeHtml(event.transition || "UNKNOWN")}</span>
+          <span class="boundary-label">${escapeHtml(summary.label || "")}</span>
+          <span class="boundary-route">${escapeHtml(summary.source || "?")} -> ${escapeHtml(summary.target || "?")}</span>
+          ${renderBoundaryBadges(boundaryBadgesForEvent(event, summary))}
+        </summary>
+        <div class="boundary-event-body">
+          ${summary.explanation ? `<div class="notice">${escapeHtml(summary.explanation)}</div>` : ""}
+          <div class="boundary-preview">${escapeHtml(summary.preview || "No preview available.")}</div>
+          <pre>${formatValue({
+            id: event.id,
+            status: event.status,
+            model_turn_id: event.model_turn_id,
+            tool_batch_id: event.tool_batch_id,
+            call_id: event.call_id,
+            payload_meta: event.payload_meta,
+            payload: event.payload,
+          })}</pre>
+          ${renderBoundarySidecarButton(event)}
+        </div>
+      </details>
+    `;
+  }
+
+  function boundaryBadgesForEvent(event, summary) {
+    const badges = [];
+    if (event.status) {
+      badges.push(event.status);
+    }
+    (Array.isArray(summary.badges) ? summary.badges : []).forEach((badge) => {
+      if (!badges.includes(badge)) {
+        badges.push(badge);
+      }
+    });
+    if (event.sidecar && event.sidecar.available && !badges.includes("sidecar")) {
+      badges.push("sidecar");
+    }
+    return badges;
+  }
+
+  function renderBoundaryBadges(badges) {
+    return (Array.isArray(badges) ? badges : [])
+      .map((badge) => `<span class="boundary-badge">${escapeHtml(badge)}</span>`)
+      .join("");
+  }
+
+  function renderBoundarySidecarButton(event) {
+    if (!event.sidecar || !event.sidecar.available) {
+      return "";
+    }
+    return `<button class="secondary-button boundary-sidecar-button" type="button" data-boundary-event-id="${escapeHtml(event.sidecar.event_id || event.id)}">Load full sidecar payload</button><pre class="boundary-sidecar-output" hidden></pre>`;
   }
 
   function renderCollapsibleSection(title, meta, body, isOpen) {
