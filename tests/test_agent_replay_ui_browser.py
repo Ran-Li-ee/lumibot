@@ -623,6 +623,155 @@ def test_browser_renders_boundary_trace_for_selected_agent(page, replay_url):
     expect(page.get_by_role("button", name="Load full sidecar payload")).to_be_visible()
 
 
+def _boundary_trace_for_model_turn_replay() -> dict:
+    return {
+        "available": True,
+        "schema_version": 1,
+        "events": [
+            {
+                "id": "event-b09",
+                "transition": "B09_ADK_TO_LITELLM",
+                "model_turn_id": "turn-1",
+                "status": "success",
+                "payload": {"preview": "ADK request"},
+                "payload_meta": {"semantic_completeness": "complete"},
+                "summary": {
+                    "label": "ADK request",
+                    "source": "Google ADK",
+                    "target": "LiteLLM",
+                    "explanation": "Request sent.",
+                },
+            },
+            {
+                "id": "event-b01",
+                "transition": "B01_PROVIDER_TO_LITELLM",
+                "model_turn_id": "turn-1",
+                "status": "success",
+                "payload": {"response": {"tool_calls": [{"name": "orders_submit_order"}]}},
+                "payload_meta": {"semantic_completeness": "complete"},
+                "summary": {
+                    "label": "Model tool call",
+                    "source": "OpenAI LLM",
+                    "target": "LiteLLM",
+                    "explanation": "Model requested tool.",
+                },
+            },
+            {
+                "id": "event-b03",
+                "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                "model_turn_id": "turn-1",
+                "tool_batch_id": "batch-1",
+                "call_id": "call-1",
+                "status": "success",
+                "payload": {"tool_name": "orders_submit_order", "model_arguments": {"symbol": "QQQ"}},
+                "payload_meta": {"semantic_completeness": "complete"},
+                "summary": {
+                    "label": "Dispatch tool",
+                    "source": "Google ADK",
+                    "target": "ADK FunctionTool",
+                    "explanation": "Dispatch.",
+                },
+            },
+        ],
+        "model_turns": [],
+        "model_turn_replay": [
+            {
+                "model_turn_id": "turn-1",
+                "turn_index": 1,
+                "kind": "tool_calling",
+                "model_steps": [
+                    {
+                        "ui_step": "1",
+                        "transition": "B09_ADK_TO_LITELLM",
+                        "event": {
+                            "id": "event-b09",
+                            "transition": "B09_ADK_TO_LITELLM",
+                            "status": "success",
+                            "payload": {"preview": "ADK request"},
+                            "payload_meta": {"semantic_completeness": "complete"},
+                            "summary": {
+                                "label": "ADK request",
+                                "source": "Google ADK",
+                                "target": "LiteLLM",
+                                "explanation": "Request sent.",
+                            },
+                        },
+                    },
+                    {
+                        "ui_step": "3",
+                        "transition": "B01_PROVIDER_TO_LITELLM",
+                        "event": {
+                            "id": "event-b01",
+                            "transition": "B01_PROVIDER_TO_LITELLM",
+                            "status": "success",
+                            "payload": {"response": {"tool_calls": [{"name": "orders_submit_order"}]}},
+                            "payload_meta": {"semantic_completeness": "complete"},
+                            "summary": {
+                                "label": "Model tool call",
+                                "source": "OpenAI LLM",
+                                "target": "LiteLLM",
+                                "explanation": "Model requested tool.",
+                            },
+                        },
+                    },
+                ],
+                "tool_calls": [
+                    {
+                        "call_key": "call-1",
+                        "call_index": 1,
+                        "call_id": "call-1",
+                        "call_instance_id": "instance-1",
+                        "tool_batch_id": "batch-1",
+                        "tool_name": "orders_submit_order",
+                        "steps": [
+                            {
+                                "ui_step": "5.1",
+                                "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                                "event": {
+                                    "id": "event-b03",
+                                    "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                                    "status": "success",
+                                    "payload": {
+                                        "tool_name": "orders_submit_order",
+                                        "model_arguments": {"symbol": "QQQ"},
+                                    },
+                                    "payload_meta": {"semantic_completeness": "complete"},
+                                    "summary": {
+                                        "label": "Dispatch tool",
+                                        "source": "Google ADK",
+                                        "target": "ADK FunctionTool",
+                                        "explanation": "Dispatch.",
+                                    },
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        "diagnostics": [],
+        "message": "Boundary trace data is available.",
+    }
+
+
+def test_browser_shows_model_turn_replay_for_boundary_trace(page, replay_url):
+    agent = _public_agent("execution_agent", boundary_trace=_boundary_trace_for_model_turn_replay())
+    dataset = _public_dataset([agent], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("execution_agent")).click()
+
+    expect(page.get_by_text("Model Turn Replay")).to_be_visible()
+    expect(page.locator(".model-turn-select")).to_be_visible()
+    expect(page.get_by_text("Tool Call 1: orders_submit_order")).to_be_visible()
+    expect(page.get_by_text("B03_ADK_TO_FUNCTION_TOOL")).to_be_visible()
+
+    page.get_by_role("button", name=re.compile(r"5\.1")).click()
+    expect(page.get_by_text("Selected Step Detail")).to_be_visible()
+    expect(page.get_by_text("QQQ")).to_be_visible()
+
+
 def test_browser_loads_boundary_sidecar_payload(page, replay_url):
     agent = _public_agent(
         "growth_agent",
