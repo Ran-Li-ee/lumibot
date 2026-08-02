@@ -15,7 +15,7 @@
 - Modify `lumibot/components/agents/replay_ui/loader.py`
   - Add deterministic model-turn replay grouping helpers.
   - Map trace transitions to UI step numbers.
-  - Group tool events by `call_instance_id`, falling back to `call_id`, `tool_batch_id`, then event id.
+  - Group tool events by `call_instance_id`, falling back to `call_id`, then event id. Keep `tool_batch_id` as metadata, but do not use it as the final grouping key because that can merge multiple same-batch calls.
 - Modify `lumibot/components/agents/replay_ui/models.py`
   - Expose the new model-turn replay data through public JSON with existing redaction helpers.
 - Modify `lumibot/components/agents/replay_ui/static/app.js`
@@ -331,7 +331,6 @@ def _model_turn_tool_calls(events: list[BoundaryEventReplay]) -> list[dict[str, 
         group_key = (
             _call_instance_id(event)
             or event.call_id
-            or event.tool_batch_id
             or f"event:{event.id}"
         )
         grouped.setdefault(group_key, []).append(event)
