@@ -53,6 +53,26 @@ LOCAL_TOOL_TRANSITIONS = {
     "B07_WRAPPER_TO_FUNCTION_TOOL",
     "B08_FUNCTION_TOOL_TO_ADK",
 }
+MODEL_STEP_BY_TRANSITION = {
+    "B09_ADK_TO_LITELLM": "1",
+    "B10_LITELLM_TO_PROVIDER": "2",
+    "B01_PROVIDER_TO_LITELLM": "3",
+    "B02_LITELLM_TO_ADK": "4",
+}
+FINAL_STEP_BY_TRANSITION = {
+    "B09_ADK_TO_LITELLM": "11",
+    "B10_LITELLM_TO_PROVIDER": "12",
+    "B01_PROVIDER_TO_LITELLM": "13",
+    "B02_LITELLM_TO_ADK": "14",
+}
+LOCAL_TOOL_STEP_BASE_BY_TRANSITION = {
+    "B03_ADK_TO_FUNCTION_TOOL": "5",
+    "B04_FUNCTION_TOOL_TO_WRAPPER": "6",
+    "B05_WRAPPER_TO_PYTHON_TOOL": "7",
+    "B06_PYTHON_TOOL_TO_WRAPPER": "8",
+    "B07_WRAPPER_TO_FUNCTION_TOOL": "9",
+    "B08_FUNCTION_TOOL_TO_ADK": "10",
+}
 
 
 def discover_trace_files(trace_root: str | Path) -> list[Path]:
@@ -310,6 +330,7 @@ def _load_boundary_trace(trace: dict[str, Any], trace_path: Path) -> BoundaryTra
         schema_version=boundary.get("schema_version") if isinstance(boundary.get("schema_version"), int) else None,
         events=events,
         model_turns=_group_boundary_events(events),
+        model_turn_replay=_build_model_turn_replay(events),
         diagnostics=boundary.get("diagnostics") if isinstance(boundary.get("diagnostics"), list) else [],
         message="Boundary trace data is available for this agent run.",
     )
@@ -335,6 +356,7 @@ def _boundary_event_from_raw(trace_path: Path, index: int, raw_event: dict[str, 
         model_turn_id=_optional_text(raw_event.get("model_turn_id")),
         tool_batch_id=_optional_text(raw_event.get("tool_batch_id")),
         call_id=_optional_text(raw_event.get("call_id")),
+        call_instance_id=_optional_text(raw_event.get("call_instance_id")),
         status=_optional_text(raw_event.get("status")),
         timestamp=_optional_text(raw_event.get("timestamp")),
         payload=raw_event.get("payload"),
@@ -428,6 +450,164 @@ def _boundary_tool_name(events: list[BoundaryEventReplay]) -> str | None:
             if isinstance(name, str) and name:
                 return name
     return None
+
+
+def _build_model_turn_replay(events: list[BoundaryEventReplay]) -> list[dict[str, Any]]:
+    turns: dict[str, list[BoundaryEventReplay]] = {}
+    for event in events:
+        turn_id = event.model_turn_id or "unknown-model-turn"
+        turns.setdefault(turn_id, []).append(event)
+
+    replay = []
+    for turn_index, (turn_id, turn_events) in enumerate(turns.items(), start=1):
+        request_events = [event for event in turn_events if event.transition in REQUEST_RESPONSE_TRANSITIONS]
+        tool_events = [event for event in turn_events if event.transition in LOCAL_TOOL_TRANSITIONS]
+        is_final_turn = not tool_events and _turn_has_final_text(request_events)
+        replay.append(
+            {
+                "model_turn_id": turn_id,
+                "turn_index": turn_index,
+                "kind": "final_answer" if is_final_turn else "tool_calling",
+                "model_steps": [_model_step(event, is_final_turn=is_final_turn) for event in request_events],
+                "tool_calls": _model_turn_tool_calls(tool_events, request_events),
+            }
+        )
+    return replay
+
+
+def _model_step(event: BoundaryEventReplay, *, is_final_turn: bool) -> dict[str, Any]:
+    step_map = FINAL_STEP_BY_TRANSITION if is_final_turn else MODEL_STEP_BY_TRANSITION
+    ui_step = step_map.get(event.transition, "?")
+    return {
+        "ui_step": ui_step,
+        "transition": event.transition,
+        "label": _step_label(ui_step, event.transition),
+        "completeness": _payload_completeness(event),
+        "truncated": _payload_truncated(event),
+        "event": event.to_public_dict(),
+    }
+
+
+def _model_turn_tool_calls(
+    events: list[BoundaryEventReplay],
+    request_events: list[BoundaryEventReplay],
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[BoundaryEventReplay]] = {}
+    for event in events:
+        group_key = _call_instance_id(event) or event.call_id or f"event:{event.id}"
+        grouped.setdefault(group_key, []).append(event)
+
+    tool_names_by_key = _model_tool_names_by_key(request_events)
+    calls = []
+    for call_index, (group_key, call_events) in enumerate(grouped.items(), start=1):
+        calls.append(
+            {
+                "call_key": group_key,
+                "call_index": call_index,
+                "call_id": _first_non_empty([event.call_id for event in call_events]),
+                "call_instance_id": _first_non_empty([_call_instance_id(event) for event in call_events]),
+                "tool_batch_id": _first_non_empty([event.tool_batch_id for event in call_events]),
+                "tool_name": _boundary_tool_name(call_events)
+                or _request_tool_name(group_key, call_events, tool_names_by_key)
+                or "Unknown tool",
+                "steps": [
+                    _tool_step(event, call_index)
+                    for event in call_events
+                    if event.transition in LOCAL_TOOL_STEP_BASE_BY_TRANSITION
+                ],
+            }
+        )
+    return calls
+
+
+def _model_tool_names_by_key(events: list[BoundaryEventReplay]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for event in events:
+        if event.transition != "B02_LITELLM_TO_ADK":
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        for tool_call in payload.get("tool_calls", []):
+            if not isinstance(tool_call, dict):
+                continue
+            name = tool_call.get("name") or tool_call.get("tool_name")
+            if not isinstance(name, str) or not name:
+                continue
+            for key in _tool_call_lookup_keys(tool_call):
+                names.setdefault(key, name)
+    return names
+
+
+def _tool_call_lookup_keys(tool_call: dict[str, Any]) -> list[str]:
+    keys = []
+    for raw_key in (tool_call.get("call_instance_id"), tool_call.get("call_id"), tool_call.get("id")):
+        if isinstance(raw_key, str) and raw_key:
+            keys.append(raw_key)
+    return keys
+
+
+def _request_tool_name(
+    group_key: str,
+    events: list[BoundaryEventReplay],
+    tool_names_by_key: dict[str, str],
+) -> str | None:
+    keys = [group_key]
+    keys.extend(_call_instance_id(event) for event in events)
+    keys.extend(event.call_id for event in events)
+    for key in keys:
+        if isinstance(key, str) and key in tool_names_by_key:
+            return tool_names_by_key[key]
+    return None
+
+
+def _tool_step(event: BoundaryEventReplay, call_index: int) -> dict[str, Any]:
+    base = LOCAL_TOOL_STEP_BASE_BY_TRANSITION.get(event.transition, "?")
+    ui_step = f"{base}.{call_index}" if base != "?" else "?"
+    return {
+        "ui_step": ui_step,
+        "transition": event.transition,
+        "label": _step_label(ui_step, event.transition),
+        "completeness": _payload_completeness(event),
+        "truncated": _payload_truncated(event),
+        "event": event.to_public_dict(),
+    }
+
+
+def _payload_completeness(event: BoundaryEventReplay) -> Any:
+    return event.payload_meta.get("semantic_completeness") if isinstance(event.payload_meta, dict) else None
+
+
+def _payload_truncated(event: BoundaryEventReplay) -> bool:
+    return bool(event.payload_meta.get("truncated")) if isinstance(event.payload_meta, dict) else False
+
+
+def _call_instance_id(event: BoundaryEventReplay) -> str | None:
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    value = payload.get("call_instance_id")
+    if isinstance(value, str) and value:
+        return value
+    return event.call_instance_id
+
+
+def _first_non_empty(values: list[str | None]) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _turn_has_final_text(events: list[BoundaryEventReplay]) -> bool:
+    for event in events:
+        if event.transition not in {"B01_PROVIDER_TO_LITELLM", "B02_LITELLM_TO_ADK"}:
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        serialized = json.dumps(payload, ensure_ascii=False)
+        if '"text"' in serialized or "RESULT:" in serialized:
+            return True
+    return False
+
+
+def _step_label(ui_step: str, transition: str) -> str:
+    return f"{ui_step} {transition.replace('_', ' -> ', 1)}"
 
 
 def _optional_text(value: Any) -> str | None:

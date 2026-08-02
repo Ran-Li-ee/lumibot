@@ -340,6 +340,234 @@ def test_loader_missing_call_id_local_tool_events_do_not_collapse_into_one_call(
     assert [call["tool_name"] for call in calls] == ["market_last_price", "market_last_price"]
 
 
+def test_loader_builds_model_turn_replay_steps(tmp_path):
+    trace_path = tmp_path / "traces" / "execution_agent" / "trace.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "execution_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [],
+            "boundary_trace": {
+                "schema_version": 1,
+                "diagnostics": [],
+                "events": [
+                    {
+                        "transition": "B09_ADK_TO_LITELLM",
+                        "model_turn_id": "turn-1",
+                        "status": "success",
+                        "payload": {"preview": "ADK request"},
+                    },
+                    {
+                        "transition": "B10_LITELLM_TO_PROVIDER",
+                        "model_turn_id": "turn-1",
+                        "status": "success",
+                        "payload_meta": {"semantic_completeness": "partial", "truncated": True},
+                    },
+                    {
+                        "transition": "B01_PROVIDER_TO_LITELLM",
+                        "model_turn_id": "turn-1",
+                        "status": "success",
+                        "payload": {
+                            "response": {
+                                "choices": [
+                                    {
+                                        "message": {
+                                            "tool_calls": [
+                                                {
+                                                    "id": "call-submit",
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": "orders_submit_order",
+                                                        "arguments": "{\"symbol\":\"QQQ\"}",
+                                                    },
+                                                }
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                    },
+                    {
+                        "transition": "B02_LITELLM_TO_ADK",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "status": "success",
+                        "payload": {
+                            "tool_calls": [
+                                {
+                                    "call_id": "call-submit",
+                                    "name": "orders_submit_order",
+                                    "arguments": {"symbol": "QQQ"},
+                                    "call_instance_id": "turn-1:batch:0001:call:0001",
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "call_id": "call-submit",
+                        "call_instance_id": "turn-1:batch:0001:call:0001",
+                        "status": "success",
+                        "payload": {"tool_name": "orders_submit_order", "model_arguments": {"symbol": "QQQ"}},
+                    },
+                    {
+                        "transition": "B08_FUNCTION_TOOL_TO_ADK",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "call_id": "call-submit",
+                        "call_instance_id": "turn-1:batch:0001:call:0001",
+                        "status": "success",
+                        "payload": {"function_name": "orders_submit_order", "model_facing_response": {"ok": True}},
+                    },
+                ],
+            },
+        },
+    )
+
+    public = load_agent_trace(trace_path).to_public_dict()
+    replay = public["boundary_trace"]["model_turn_replay"]
+
+    assert len(replay) == 1
+    turn = replay[0]
+    assert turn["model_turn_id"] == "turn-1"
+    assert [step["ui_step"] for step in turn["model_steps"]] == ["1", "2", "3", "4"]
+    assert turn["model_steps"][0]["transition"] == "B09_ADK_TO_LITELLM"
+    assert turn["model_steps"][1]["completeness"] == "partial"
+    assert len(turn["tool_calls"]) == 1
+    call = turn["tool_calls"][0]
+    assert call["tool_name"] == "orders_submit_order"
+    assert call["call_instance_id"] == "turn-1:batch:0001:call:0001"
+    assert [step["ui_step"] for step in call["steps"]] == ["5.1", "10.1"]
+    assert call["steps"][0]["event"]["payload"]["model_arguments"]["symbol"] == "QQQ"
+
+
+def test_loader_groups_tool_calls_by_call_instance_before_call_id(tmp_path):
+    trace_path = tmp_path / "traces" / "execution_agent" / "trace.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "execution_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [],
+            "boundary_trace": {
+                "schema_version": 1,
+                "events": [
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "batch-1",
+                        "call_id": "provider-call",
+                        "call_instance_id": "instance-A",
+                        "payload": {"tool_name": "account_positions"},
+                    },
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "batch-1",
+                        "call_id": "provider-call",
+                        "call_instance_id": "instance-B",
+                        "payload": {"tool_name": "account_portfolio"},
+                    },
+                ],
+            },
+        },
+    )
+
+    public = load_agent_trace(trace_path).to_public_dict()
+    calls = public["boundary_trace"]["model_turn_replay"][0]["tool_calls"]
+
+    assert [call["call_instance_id"] for call in calls] == ["instance-A", "instance-B"]
+    assert [call["tool_name"] for call in calls] == ["account_positions", "account_portfolio"]
+
+
+def test_loader_uses_b02_tool_call_name_when_local_tool_event_omits_name(tmp_path):
+    trace_path = tmp_path / "traces" / "execution_agent" / "trace.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "execution_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [],
+            "boundary_trace": {
+                "schema_version": 1,
+                "events": [
+                    {
+                        "transition": "B02_LITELLM_TO_ADK",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "batch-1",
+                        "payload": {
+                            "tool_calls": [
+                                {
+                                    "call_id": "call-submit",
+                                    "name": "orders_submit_order",
+                                    "call_instance_id": "instance-submit",
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "batch-1",
+                        "call_id": "call-submit",
+                        "call_instance_id": "instance-submit",
+                        "payload": {"model_arguments": {"symbol": "QQQ"}},
+                    },
+                ],
+            },
+        },
+    )
+
+    public = load_agent_trace(trace_path).to_public_dict()
+    calls = public["boundary_trace"]["model_turn_replay"][0]["tool_calls"]
+
+    assert calls[0]["tool_name"] == "orders_submit_order"
+
+
+def test_loader_model_turn_replay_does_not_group_missing_call_ids_by_tool_batch(tmp_path):
+    trace_path = tmp_path / "traces" / "execution_agent" / "trace.json"
+    _write_trace(
+        trace_path,
+        {
+            "agent": "execution_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [],
+            "boundary_trace": {
+                "schema_version": 1,
+                "events": [
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "batch-1",
+                        "payload": {"tool_name": "account_positions"},
+                    },
+                    {
+                        "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "batch-1",
+                        "payload": {"tool_name": "account_portfolio"},
+                    },
+                ],
+            },
+        },
+    )
+
+    public = load_agent_trace(trace_path).to_public_dict()
+    calls = public["boundary_trace"]["model_turn_replay"][0]["tool_calls"]
+
+    assert len(calls) == 2
+    assert [call["tool_batch_id"] for call in calls] == ["batch-1", "batch-1"]
+    assert [call["tool_name"] for call in calls] == ["account_positions", "account_portfolio"]
+
+
 def test_loader_marks_sidecar_backed_boundary_event_without_inlining_payload(tmp_path):
     trace_path = tmp_path / "traces" / "growth_agent" / "trace.json"
     _write_trace(

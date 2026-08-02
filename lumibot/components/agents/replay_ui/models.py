@@ -163,6 +163,7 @@ class BoundaryEventReplay:
     model_turn_id: str | None = None
     tool_batch_id: str | None = None
     call_id: str | None = None
+    call_instance_id: str | None = None
     status: str | None = None
     timestamp: str | None = None
     payload: Any = None
@@ -177,6 +178,7 @@ class BoundaryEventReplay:
             "model_turn_id": redact_sensitive(self.model_turn_id),
             "tool_batch_id": redact_sensitive(self.tool_batch_id),
             "call_id": redact_sensitive(self.call_id),
+            "call_instance_id": redact_sensitive(self.call_instance_id),
             "status": redact_sensitive(self.status),
             "timestamp": redact_sensitive(self.timestamp),
             "payload": redact_public_preview(self.payload),
@@ -194,6 +196,7 @@ class BoundaryTraceReplay:
     schema_version: int | None = None
     events: list[BoundaryEventReplay] = field(default_factory=list)
     model_turns: list[dict[str, Any]] = field(default_factory=list)
+    model_turn_replay: list[dict[str, Any]] = field(default_factory=list)
     diagnostics: list[Any] = field(default_factory=list)
     message: str = (
         "This trace does not contain 10-step boundary trace data. "
@@ -210,6 +213,7 @@ class BoundaryTraceReplay:
                 for turn in self.model_turns
                 if (public_turn := _public_boundary_model_turn(turn))
             ],
+            "model_turn_replay": redact_sensitive(self.model_turn_replay),
             "diagnostics": redact_sensitive(self.diagnostics),
             "message": redact_sensitive(self.message),
         }
