@@ -7,6 +7,8 @@
     selectedBacktestRunId: null,
     selectedSystemRunId: null,
     selectedAgentId: null,
+    selectedModelTurnIdByAgentId: {},
+    selectedBoundaryStepIdByAgentId: {},
     workflowGraphHidden: false,
     workflowLayoutRequestId: 0,
     workflowRelayoutFrame: null,
@@ -73,10 +75,34 @@
 
     document.addEventListener("click", (event) => {
       const button = event.target.closest(".boundary-sidecar-button");
-      if (!button) {
+      if (button) {
+        loadBoundarySidecar(button);
         return;
       }
-      loadBoundarySidecar(button);
+
+      const stepButton = event.target.closest(".boundary-flow-step");
+      if (stepButton) {
+        const agentId = stepButton.getAttribute("data-agent-id");
+        const eventId = stepButton.getAttribute("data-boundary-event-id");
+        if (agentId && eventId) {
+          state.selectedBoundaryStepIdByAgentId[agentId] = eventId;
+          render();
+        }
+      }
+    });
+
+    document.addEventListener("change", (event) => {
+      const select = event.target.closest(".model-turn-select");
+      if (!select) {
+        return;
+      }
+
+      const agentId = select.getAttribute("data-agent-id");
+      if (agentId) {
+        state.selectedModelTurnIdByAgentId[agentId] = select.value;
+        delete state.selectedBoundaryStepIdByAgentId[agentId];
+        render();
+      }
     });
 
     window.addEventListener("resize", () => {
@@ -1104,6 +1130,7 @@
     const turns = Array.isArray(trace.model_turns) ? trace.model_turns.map(boundaryItemOrEmpty) : [];
     const body = `
       <div class="boundary-trace">
+        ${renderModelTurnReplayArea(agent, trace, eventsById, turns)}
         ${turns.length ? turns.map((turn, index) => renderBoundaryModelTurn(turn, eventsById, index === 0)).join("") : '<div class="empty-state">Boundary trace contains no model turns.</div>'}
       </div>
     `;
@@ -1123,6 +1150,190 @@
       }
     });
     return map;
+  }
+
+  function renderModelTurnReplayArea(agent, trace, eventsById, legacyTurns) {
+    const replayTurns = Array.isArray(trace.model_turn_replay)
+      ? trace.model_turn_replay.map(boundaryItemOrEmpty)
+      : [];
+    if (!replayTurns.length) {
+      return `
+        <section class="model-turn-replay">
+          <h4>Model Turn Replay</h4>
+          <div class="empty-state">No model turn replay data is available for this trace.</div>
+        </section>
+      `;
+    }
+
+    const selectedTurn = selectedModelTurnReplay(agent, replayTurns);
+    const replaySteps = modelTurnReplayStepEvents(selectedTurn, eventsById);
+    const selectedEventId = selectedBoundaryStepId(agent, replaySteps);
+    const selectedStep = replaySteps.find((step) => replayStepEvent(step, eventsById).id === selectedEventId) || replaySteps[0] || null;
+
+    return `
+      <section class="model-turn-replay">
+        <div class="model-turn-replay-header">
+          <h4>Model Turn Replay</h4>
+          ${renderModelTurnSelector(agent, replayTurns, selectedTurn)}
+        </div>
+        <div class="model-turn-replay-grid">
+          ${renderModelTurnFlow(agent, selectedTurn, selectedEventId)}
+          ${renderSelectedBoundaryStepDetail(selectedStep)}
+        </div>
+      </section>
+    `;
+  }
+
+  function selectedModelTurnReplay(agent, replayTurns) {
+    const agentId = agent && agent.id ? agent.id : "";
+    const selectedId = state.selectedModelTurnIdByAgentId[agentId];
+    return replayTurns.find((turn) => turn.model_turn_id === selectedId) || replayTurns[0] || {};
+  }
+
+  function modelTurnReplayStepEvents(turn, eventsById) {
+    const steps = [];
+    (Array.isArray(turn.model_steps) ? turn.model_steps : []).forEach((step) => {
+      if (replayStepEvent(step, eventsById).id) {
+        steps.push(step);
+      }
+    });
+    (Array.isArray(turn.tool_calls) ? turn.tool_calls : []).forEach((call) => {
+      (Array.isArray(call.steps) ? call.steps : []).forEach((step) => {
+        if (replayStepEvent(step, eventsById).id) {
+          steps.push(step);
+        }
+      });
+    });
+    return steps;
+  }
+
+  function replayStepEvent(step, eventsById) {
+    step = boundaryItemOrEmpty(step);
+    const event = boundaryItemOrEmpty(step.event);
+    if (event.id && eventsById && eventsById.has(event.id)) {
+      return eventsById.get(event.id);
+    }
+    return event.id ? event : {};
+  }
+
+  function selectedBoundaryStepId(agent, steps) {
+    const agentId = agent && agent.id ? agent.id : "";
+    const selectedId = state.selectedBoundaryStepIdByAgentId[agentId];
+    return steps.some((step) => replayStepEvent(step).id === selectedId)
+      ? selectedId
+      : (steps[0] && replayStepEvent(steps[0]).id);
+  }
+
+  function renderModelTurnSelector(agent, replayTurns, selectedTurn) {
+    const agentId = agent && agent.id ? agent.id : "";
+    const options = replayTurns.map((turn) => {
+      const selected = turn.model_turn_id === selectedTurn.model_turn_id ? "selected" : "";
+      return `<option value="${escapeHtml(turn.model_turn_id || "")}" ${selected}>Model Turn ${escapeHtml(String(turn.turn_index || modelTurnLabel(turn.model_turn_id)))}</option>`;
+    }).join("");
+    return `
+      <label class="model-turn-selector">
+        <span>Model Turn</span>
+        <select class="model-turn-select" data-agent-id="${escapeHtml(agentId)}">
+          ${options}
+        </select>
+      </label>
+    `;
+  }
+
+  function renderModelTurnFlow(agent, turn, selectedEventId) {
+    const agentId = agent && agent.id ? agent.id : "";
+    const modelSteps = Array.isArray(turn.model_steps) ? turn.model_steps : [];
+    const toolCalls = Array.isArray(turn.tool_calls) ? turn.tool_calls : [];
+    return `
+      <div class="model-turn-flow" aria-label="Model turn boundary flow">
+        <div class="boundary-flow-lane">
+          ${modelSteps.map((step) => renderBoundaryStepButton(agentId, step, selectedEventId)).join("")}
+        </div>
+        <div class="tool-call-flow-list">
+          ${toolCalls.length ? toolCalls.map((call) => renderToolCallFlow(agentId, call, selectedEventId)).join("") : '<div class="empty-state">This model turn did not call tools.</div>'}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderToolCallFlow(agentId, call, selectedEventId) {
+    const steps = Array.isArray(call.steps) ? call.steps : [];
+    return `
+      <div class="tool-call-flow">
+        <div class="tool-call-flow-title">
+          <strong>Tool Call ${escapeHtml(String(call.call_index || ""))}: ${escapeHtml(call.tool_name || "Unknown tool")}</strong>
+          <span>${escapeHtml(call.call_id || call.call_instance_id || "")}</span>
+        </div>
+        <div class="boundary-flow-lane tool-boundary-flow-lane">
+          ${steps.map((step) => renderBoundaryStepButton(agentId, step, selectedEventId)).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderBoundaryStepButton(agentId, step, selectedEventId) {
+    step = boundaryItemOrEmpty(step);
+    const event = boundaryItemOrEmpty(step.event);
+    const isSelected = event.id && event.id === selectedEventId;
+    const classes = ["boundary-flow-step"];
+    if (isSelected) {
+      classes.push("selected");
+    }
+    if (step.truncated || (event.payload_meta && event.payload_meta.truncated)) {
+      classes.push("partial");
+    }
+    return `
+      <button type="button" class="${classes.join(" ")}" data-agent-id="${escapeHtml(agentId)}" data-boundary-event-id="${escapeHtml(event.id || "")}">
+        <span class="boundary-flow-step-number">${escapeHtml(step.ui_step || "?")}</span>
+        <span class="boundary-flow-step-label">${escapeHtml(step.transition || event.transition || "UNKNOWN")}</span>
+      </button>
+    `;
+  }
+
+  function renderSelectedBoundaryStepDetail(step) {
+    if (!step) {
+      return `<div class="boundary-step-detail"><div class="empty-state">Select a boundary step to inspect details.</div></div>`;
+    }
+    step = boundaryItemOrEmpty(step);
+    const event = replayStepEvent(step);
+    const summary = boundaryItemOrEmpty(event.summary);
+    const payload = boundaryItemOrEmpty(event.payload);
+    const callInstanceId = step.call_instance_id || event.call_instance_id || payload.call_instance_id;
+    const toolName = step.tool_name || event.tool_name || payload.tool_name || payload.function_name;
+    const error = step.error || event.error || payload.error;
+    return `
+      <aside class="boundary-step-detail">
+        <h4>Selected Step Detail</h4>
+        <div class="boundary-step-detail-meta">
+          <div><strong>UI Step</strong><span>${escapeHtml(step.ui_step || "?")}</span></div>
+          <div><strong>Transition</strong><span>${escapeHtml(event.transition || "UNKNOWN")}</span></div>
+          <div><strong>Status</strong><span>${escapeHtml(event.status || "unknown")}</span></div>
+          <div><strong>Route</strong><span>${escapeHtml(summary.source || "?")} -> ${escapeHtml(summary.target || "?")}</span></div>
+          <div><strong>Model turn ID</strong><span>${escapeHtml(event.model_turn_id || "unknown")}</span></div>
+          <div><strong>Tool batch ID</strong><span>${escapeHtml(event.tool_batch_id || "none")}</span></div>
+          <div><strong>Call ID</strong><span>${escapeHtml(event.call_id || "none")}</span></div>
+          <div><strong>Call Instance ID</strong><span>${escapeHtml(callInstanceId || "none")}</span></div>
+          <div><strong>Tool Name</strong><span>${escapeHtml(toolName || "none")}</span></div>
+          <div><strong>Error</strong><span>${escapeHtml(error ? formatPlainValue(error) : "none")}</span></div>
+        </div>
+        ${summary.explanation ? `<div class="notice">${escapeHtml(summary.explanation)}</div>` : ""}
+        <pre>${formatValue({
+          ui_step: step.ui_step,
+          id: event.id,
+          transition: event.transition,
+          status: event.status,
+          model_turn_id: event.model_turn_id,
+          tool_batch_id: event.tool_batch_id,
+          call_id: event.call_id,
+          call_instance_id: callInstanceId,
+          tool_name: toolName,
+          error,
+          payload_meta: event.payload_meta,
+          payload: event.payload,
+        })}</pre>
+        ${renderBoundarySidecarButton(event)}
+      </aside>
+    `;
   }
 
   function renderBoundaryModelTurn(turn, eventsById, isOpen) {

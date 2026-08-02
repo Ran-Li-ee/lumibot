@@ -680,6 +680,145 @@ pre,
   font-size: 12px;
 }
 
+.model-turn-replay {
+  border: 1px solid var(--border);
+  padding: 12px;
+  margin-bottom: 16px;
+  background: var(--panel);
+}
+
+.model-turn-replay h4 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.model-turn-replay-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.model-turn-selector {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.model-turn-select {
+  min-width: 150px;
+}
+
+.model-turn-replay-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(320px, 1.1fr);
+  gap: 12px;
+}
+
+.model-turn-flow,
+.boundary-step-detail {
+  border: 1px solid var(--border);
+  background: var(--panel-muted);
+  padding: 10px;
+  min-width: 0;
+}
+
+.boundary-flow-lane {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.boundary-flow-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 32px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.boundary-flow-step:hover,
+.boundary-flow-step:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.boundary-flow-step.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-muted);
+}
+
+.boundary-flow-step.partial {
+  border-style: dashed;
+}
+
+.boundary-flow-step-number {
+  font-weight: 700;
+}
+
+.boundary-flow-step-label {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.tool-call-flow {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  margin-top: 10px;
+}
+
+.tool-call-flow-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.tool-call-flow-title strong,
+.tool-call-flow-title span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.boundary-step-detail {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.boundary-step-detail-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.boundary-step-detail-meta div {
+  border: 1px solid var(--border);
+  padding: 6px;
+  background: var(--panel);
+}
+
+.boundary-step-detail-meta strong,
+.boundary-step-detail-meta span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.boundary-step-detail-meta strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
 .warnings {
   margin-top: 12px;
   padding-top: 12px;
@@ -710,5 +849,18 @@ pre,
 
   .workflow-diagram {
     gap: 22px;
+  }
+
+  .model-turn-replay-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .model-turn-replay-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .boundary-step-detail-meta {
+    grid-template-columns: 1fr;
   }
 }

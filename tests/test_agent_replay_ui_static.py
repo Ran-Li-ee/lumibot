@@ -54,6 +54,25 @@ def test_static_javascript_renders_boundary_trace_inspector():
     assert "boundaryItemOrEmpty" in javascript
 
 
+def test_static_javascript_renders_model_turn_replay():
+    javascript = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    css = (STATIC_ROOT / "styles.css").read_text(encoding="utf-8")
+
+    assert "Model Turn Replay" in javascript
+    assert "renderModelTurnReplayArea" in javascript
+    assert "renderModelTurnSelector" in javascript
+    assert "renderModelTurnFlow" in javascript
+    assert "renderBoundaryStepButton" in javascript
+    assert "renderSelectedBoundaryStepDetail" in javascript
+    assert "UI Step" in javascript
+    assert "Call Instance ID" in javascript
+    assert "Tool Name" in javascript
+    assert "Error" in javascript
+    assert "model-turn-replay" in css
+    assert "boundary-flow-step" in css
+    assert "boundary-step-detail" in css
+
+
 def test_static_javascript_renders_backtest_artifact_links():
     javascript = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
