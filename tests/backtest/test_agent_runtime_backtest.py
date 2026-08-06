@@ -2036,6 +2036,11 @@ def test_duckdb_table_inventory_tracks_fresh_and_cached_history_tables(monkeypat
     first_columns = first["columns"]
     second_columns = second["columns"]
     assert first_columns != second_columns
+    assert first["computed_summary"]["symbol"] == "AGST"
+    assert first["computed_summary"]["timestep"] == "minute"
+    assert first["computed_summary"]["data_window"]["row_count"] == first["row_count"]
+    assert first["computed_summary"]["price"]["latest_close"] is not None
+    assert cached_first["computed_summary"] == first["computed_summary"]
     assert first["available_tables"] == [
         {"table_name": "z_history", "columns": first_columns},
     ]

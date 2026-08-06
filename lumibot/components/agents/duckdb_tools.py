@@ -10,7 +10,7 @@ from typing import Any
 from lumibot.tools.helpers import parse_timestep_qty_and_unit
 
 from .asset_resolution import resolve_asset_and_quote
-
+from .history_summary import compute_history_summary
 
 _READ_ONLY_SQL_RE = re.compile(r"^\s*(select|with|show|describe|pragma|explain)\b", re.IGNORECASE)
 
@@ -121,7 +121,13 @@ class DuckDBQueryLayer:
         broker = getattr(self.strategy, "broker", None)
         return getattr(broker, "data_source", None)
 
-    def _lookup_source_frame(self, *, asset: Any, quote: Any, timestep: str) -> tuple[tuple[Any, ...], Any, pd.DataFrame] | None:
+    def _lookup_source_frame(
+        self,
+        *,
+        asset: Any,
+        quote: Any,
+        timestep: str,
+    ) -> tuple[tuple[Any, ...], Any, pd.DataFrame] | None:
         data_source = self._data_source()
         store = getattr(data_source, "_data_store", None)
         finder = getattr(data_source, "find_asset_in_data_store", None)
@@ -169,6 +175,10 @@ class DuckDBQueryLayer:
             if meta.get("kind") != "source_frame"
         ]
 
+    def _read_registered_table(self, table_name: str) -> pd.DataFrame:
+        safe_name = self._safe_identifier(table_name)
+        return self.connection.execute(f"SELECT * FROM {self._quote_identifier(safe_name)}").fetch_df()
+
     def _ensure_source_table(
         self,
         *,
@@ -184,11 +194,19 @@ class DuckDBQueryLayer:
             self.metrics["history_bind_cache_hits"] += 1.0
             return cached
         normalized = self._normalize_index(frame)
-        datetime_column = next((col for col in normalized.columns if "date" in str(col).lower() or "time" in str(col).lower()), None)
+        datetime_column = next(
+            (col for col in normalized.columns if "date" in str(col).lower() or "time" in str(col).lower()),
+            None,
+        )
         if datetime_column is None:
             datetime_column = normalized.columns[0]
         normalized[datetime_column] = pd.to_datetime(normalized[datetime_column])
-        table_name = self._source_table_name(symbol=symbol, asset_type=asset_type, timestep=timestep, store_key=store_key)
+        table_name = self._source_table_name(
+            symbol=symbol,
+            asset_type=asset_type,
+            timestep=timestep,
+            store_key=store_key,
+        )
         info = self._register_frame(
             table_name,
             normalized,
@@ -303,6 +321,7 @@ class DuckDBQueryLayer:
         )
         source_entry = self._lookup_source_frame(asset=asset, quote=quote, timestep=timestep)
         info: dict[str, Any]
+        summary_frame: pd.DataFrame
         if source_entry is not None:
             store_key, _data, frame = source_entry
             source_info = self._ensure_source_table(
@@ -320,6 +339,7 @@ class DuckDBQueryLayer:
                 asset_type=asset_type,
                 timestep=timestep,
             )
+            summary_frame = self._read_registered_table(str(info["table_name"]))
         else:
             bars = None
             frame = None
@@ -340,6 +360,7 @@ class DuckDBQueryLayer:
             if frame is None:
                 frame = pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
             normalized = self._normalize_index(frame)
+            summary_frame = normalized
             if table_name is None:
                 base = self._slugify(f"{symbol}_{asset_type}_{timestep}")
                 self._name_counters[base] += 1
@@ -351,13 +372,21 @@ class DuckDBQueryLayer:
                     "symbol": symbol,
                     "asset_type": asset_type,
                     "timestep": timestep,
-                    "loaded_at": self.strategy.get_datetime().isoformat() if hasattr(self.strategy, "get_datetime") else None,
+                    "loaded_at": (
+                        self.strategy.get_datetime().isoformat() if hasattr(self.strategy, "get_datetime") else None
+                    ),
                     "kind": "slice_frame",
                 },
             )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.metrics["history_load_ms"] += float(elapsed_ms)
         info["load_ms"] = round(elapsed_ms, 3)
+        info["computed_summary"] = compute_history_summary(
+            summary_frame,
+            symbol=symbol,
+            timestep=timestep,
+            as_of=info.get("loaded_at"),
+        )
         self._history_cache[cache_key] = dict(info)
         result = dict(info)
         result["available_tables"] = self._available_table_schemas()
