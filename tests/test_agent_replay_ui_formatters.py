@@ -29,6 +29,35 @@ def test_duckdb_query_formatter_summarizes_rows():
     assert "avg_close" in text
 
 
+def test_market_load_history_table_formatter_includes_computed_summary():
+    text = explain_tool_result(
+        "market_load_history_table",
+        {"symbol": "QQQ"},
+        {
+            "symbol": "QQQ",
+            "table_name": "qqq_hist",
+            "row_count": 252,
+            "computed_summary": {
+                "price": {"latest_close": 458.67},
+                "momentum": {"return_20": 0.034, "return_60": -0.021, "return_120": None},
+                "trend": {"sma_20": 450.12, "sma_50": 440.5, "price_vs_sma_20": 0.019},
+                "range": {"distance_to_high_252": -0.044, "distance_to_low_252": 0.21},
+                "risk": {"max_drawdown_60": -0.083, "volatility_20": 0.011},
+            },
+        },
+        None,
+    )
+
+    assert "252 rows" in text
+    assert "latest close 458.67" in text
+    assert "20-bar return 3.40%" in text
+    assert "60-bar return -2.10%" in text
+    assert "SMA20 450.12" in text
+    assert "vs SMA20 1.90%" in text
+    assert "from 252-bar high -4.40%" in text
+    assert "max drawdown 60 -8.30%" in text
+
+
 def test_tool_error_formatter_is_visible():
     text = explain_tool_result(
         "market_last_price",

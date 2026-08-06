@@ -88,6 +88,22 @@ def _text(value: Any, fallback: str = "unknown") -> str:
     return str(value)
 
 
+def _number(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int | float):
+        return f"{float(value):.2f}"
+    return None
+
+
+def _percent(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int | float):
+        return f"{float(value) * 100:.2f}%"
+    return None
+
+
 def _short_list(values: list[Any], label: str) -> str:
     clean_values = [str(value) for value in values if value is not None]
     if not clean_values:
@@ -164,10 +180,59 @@ def _market_load_history_table(args: dict[str, Any], raw_result: Any) -> str:
     symbol = _first_present(result, "symbol", "ticker") or _first_present(args, "symbol", "ticker")
     table = _first_present(result, "table", "table_name") or _first_present(args, "table", "table_name")
     count = _row_count(raw_result, "rows", "data")
-    return (
+    text = (
         f"Loaded market history for {_text(symbol)} into table {_text(table)} "
         f"with {_rows_label(count)}."
     )
+    summary_text = _computed_history_summary(result.get("computed_summary"))
+    if summary_text:
+        text += f" {summary_text}"
+    return text
+
+
+def _computed_history_summary(raw_summary: Any) -> str:
+    summary = _as_dict(raw_summary)
+    if not summary:
+        return ""
+    price = _as_dict(summary.get("price"))
+    momentum = _as_dict(summary.get("momentum"))
+    trend = _as_dict(summary.get("trend"))
+    range_summary = _as_dict(summary.get("range"))
+    risk = _as_dict(summary.get("risk"))
+    parts = []
+    latest_close = _number(price.get("latest_close"))
+    if latest_close is not None:
+        parts.append(f"latest close {latest_close}")
+    for label, key in (
+        ("20-bar return", "return_20"),
+        ("60-bar return", "return_60"),
+        ("120-bar return", "return_120"),
+    ):
+        value = _percent(momentum.get(key))
+        if value is not None:
+            parts.append(f"{label} {value}")
+    for label, key in (("SMA20", "sma_20"), ("SMA50", "sma_50"), ("SMA200", "sma_200")):
+        value = _number(trend.get(key))
+        if value is not None:
+            parts.append(f"{label} {value}")
+    value = _percent(trend.get("price_vs_sma_20"))
+    if value is not None:
+        parts.append(f"vs SMA20 {value}")
+    value = _percent(range_summary.get("distance_to_high_252"))
+    if value is not None:
+        parts.append(f"from 252-bar high {value}")
+    value = _percent(range_summary.get("distance_to_low_252"))
+    if value is not None:
+        parts.append(f"from 252-bar low {value}")
+    value = _percent(risk.get("max_drawdown_60"))
+    if value is not None:
+        parts.append(f"max drawdown 60 {value}")
+    value = _percent(risk.get("volatility_20"))
+    if value is not None:
+        parts.append(f"20-bar volatility {value}")
+    if not parts:
+        return ""
+    return "Computed summary: " + "; ".join(parts) + "."
 
 
 def _duckdb_query(args: dict[str, Any], raw_result: Any) -> str:
