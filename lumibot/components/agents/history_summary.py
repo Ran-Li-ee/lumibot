@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+from numbers import Real
 from typing import Any
 
 import pandas as pd
@@ -119,6 +121,104 @@ def compute_history_summary(
     }
 
 
+def build_universe_history_summary(
+    history_summaries: dict[str, dict[str, Any]],
+    *,
+    symbols: list[str],
+    timestep: str | None,
+    length: int | None,
+    as_of: str | None,
+    loaded_tables: dict[str, Any] | None,
+    warnings: list[str] | None,
+) -> dict[str, Any]:
+    """Return a compact, model-facing batch summary for a symbol universe."""
+    universe_summary = [
+        _summary_to_universe_row(history_summaries[symbol])
+        for symbol in symbols
+        if symbol in history_summaries
+    ]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "symbols": symbols,
+        "timestep": timestep,
+        "length": length,
+        "as_of": as_of,
+        "loaded_tables": loaded_tables or {},
+        "universe_summary": universe_summary,
+        "rankings": _rankings(universe_summary),
+        "warnings": warnings or [],
+    }
+
+
+def _summary_to_universe_row(summary: dict[str, Any]) -> dict[str, Any]:
+    price = _dict(summary.get("price"))
+    momentum = _dict(summary.get("momentum"))
+    trend = _dict(summary.get("trend"))
+    scores = _dict(summary.get("scores"))
+    range_metrics = _dict(summary.get("range"))
+    risk = _dict(summary.get("risk"))
+
+    return {
+        "symbol": summary.get("symbol"),
+        "latest_close": _finite_or_none(price.get("latest_close")),
+        "return_21": _finite_or_none(momentum.get("return_21")),
+        "return_63": _finite_or_none(momentum.get("return_63")),
+        "return_126": _finite_or_none(momentum.get("return_126")),
+        "return_252": _finite_or_none(momentum.get("return_252")),
+        "momentum_composite": _finite_or_none(scores.get("momentum_composite")),
+        "sma_20": _finite_or_none(trend.get("sma_20")),
+        "sma_50": _finite_or_none(trend.get("sma_50")),
+        "sma_200": _finite_or_none(trend.get("sma_200")),
+        "price_vs_sma_20": _finite_or_none(trend.get("price_vs_sma_20")),
+        "price_vs_sma_50": _finite_or_none(trend.get("price_vs_sma_50")),
+        "price_vs_sma_200": _finite_or_none(trend.get("price_vs_sma_200")),
+        "trend_alignment": _finite_or_none(scores.get("trend_alignment")),
+        "max_drawdown_60": _finite_or_none(risk.get("max_drawdown_60")),
+        "volatility_20": _finite_or_none(risk.get("volatility_20")),
+        "distance_to_high_252": _finite_or_none(range_metrics.get("distance_to_high_252")),
+        "distance_to_low_252": _finite_or_none(range_metrics.get("distance_to_low_252")),
+    }
+
+
+def _rankings(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    return {
+        "by_return_21": _rank_symbols(rows, "return_21"),
+        "by_return_63": _rank_symbols(rows, "return_63"),
+        "by_return_126": _rank_symbols(rows, "return_126"),
+        "by_momentum_composite": _rank_symbols(rows, "momentum_composite"),
+        "by_trend_alignment": _rank_symbols(rows, "trend_alignment"),
+    }
+
+
+def _rank_symbols(rows: list[dict[str, Any]], key: str) -> list[str]:
+    rankable = [
+        (str(row["symbol"]), float(row[key]))
+        for row in rows
+        if row.get("symbol") and _is_rankable(row.get(key))
+    ]
+    return [symbol for symbol, _ in sorted(rankable, key=lambda item: item[1], reverse=True)]
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _is_rankable(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return False
+    return math.isfinite(float(value))
+
+
+def _finite_or_none(value: Any) -> Any:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return value
+    if math.isfinite(float(value)):
+        return value
+    return None
+
+
 def _sort_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame.copy()
@@ -196,7 +296,7 @@ def _mean_available(values: list[float | None]) -> float | None:
 
 
 def _trend_alignment(values: list[float | None]) -> int | None:
-    available = [value for value in values if value is not None]
+    available = [float(value) for value in values if _is_rankable(value)]
     if not available:
         return None
     return sum(1 for value in available if value > 0)

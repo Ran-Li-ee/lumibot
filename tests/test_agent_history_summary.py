@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 
-from lumibot.components.agents.history_summary import compute_history_summary
+from lumibot.components.agents.history_summary import build_universe_history_summary, compute_history_summary
 
 
 def _frame(length: int = 260) -> pd.DataFrame:
@@ -169,3 +171,203 @@ def test_compute_history_summary_non_daily_volatility_adds_note():
 
     assert summary["risk"]["volatility_20"] is not None
     assert any("daily" in note.lower() for note in summary["notes"])
+
+
+def test_build_universe_history_summary_flattens_rows_and_rankings():
+    qqq = compute_history_summary(_frame(260), symbol="QQQ", timestep="day", as_of="2024-09-05")
+    spy = compute_history_summary(_frame(260), symbol="SPY", timestep="day", as_of="2024-09-05")
+    spy["momentum"]["return_21"] = qqq["momentum"]["return_21"] + 0.10
+    spy["momentum"]["return_63"] = qqq["momentum"]["return_63"] + 0.20
+    spy["momentum"]["return_126"] = qqq["momentum"]["return_126"] + 0.30
+    spy["scores"]["momentum_composite"] = qqq["scores"]["momentum_composite"] + 0.40
+    spy["scores"]["trend_alignment"] = qqq["scores"]["trend_alignment"] - 1
+
+    summary = build_universe_history_summary(
+        {"QQQ": qqq, "SPY": spy},
+        symbols=["QQQ", "SPY"],
+        timestep="day",
+        length=260,
+        as_of="2024-09-05",
+        loaded_tables={"QQQ": "history_QQQ", "SPY": "history_SPY"},
+        warnings=["kept"],
+    )
+
+    assert summary["schema_version"] == "1.0"
+    assert summary["symbols"] == ["QQQ", "SPY"]
+    assert summary["timestep"] == "day"
+    assert summary["length"] == 260
+    assert summary["as_of"] == "2024-09-05"
+    assert summary["loaded_tables"] == {"QQQ": "history_QQQ", "SPY": "history_SPY"}
+    assert summary["warnings"] == ["kept"]
+
+    assert summary["universe_summary"] == [
+        {
+            "symbol": "QQQ",
+            "latest_close": qqq["price"]["latest_close"],
+            "return_21": qqq["momentum"]["return_21"],
+            "return_63": qqq["momentum"]["return_63"],
+            "return_126": qqq["momentum"]["return_126"],
+            "return_252": qqq["momentum"]["return_252"],
+            "momentum_composite": qqq["scores"]["momentum_composite"],
+            "sma_20": qqq["trend"]["sma_20"],
+            "sma_50": qqq["trend"]["sma_50"],
+            "sma_200": qqq["trend"]["sma_200"],
+            "price_vs_sma_20": qqq["trend"]["price_vs_sma_20"],
+            "price_vs_sma_50": qqq["trend"]["price_vs_sma_50"],
+            "price_vs_sma_200": qqq["trend"]["price_vs_sma_200"],
+            "trend_alignment": qqq["scores"]["trend_alignment"],
+            "max_drawdown_60": qqq["risk"]["max_drawdown_60"],
+            "volatility_20": qqq["risk"]["volatility_20"],
+            "distance_to_high_252": qqq["range"]["distance_to_high_252"],
+            "distance_to_low_252": qqq["range"]["distance_to_low_252"],
+        },
+        {
+            "symbol": "SPY",
+            "latest_close": spy["price"]["latest_close"],
+            "return_21": spy["momentum"]["return_21"],
+            "return_63": spy["momentum"]["return_63"],
+            "return_126": spy["momentum"]["return_126"],
+            "return_252": spy["momentum"]["return_252"],
+            "momentum_composite": spy["scores"]["momentum_composite"],
+            "sma_20": spy["trend"]["sma_20"],
+            "sma_50": spy["trend"]["sma_50"],
+            "sma_200": spy["trend"]["sma_200"],
+            "price_vs_sma_20": spy["trend"]["price_vs_sma_20"],
+            "price_vs_sma_50": spy["trend"]["price_vs_sma_50"],
+            "price_vs_sma_200": spy["trend"]["price_vs_sma_200"],
+            "trend_alignment": spy["scores"]["trend_alignment"],
+            "max_drawdown_60": spy["risk"]["max_drawdown_60"],
+            "volatility_20": spy["risk"]["volatility_20"],
+            "distance_to_high_252": spy["range"]["distance_to_high_252"],
+            "distance_to_low_252": spy["range"]["distance_to_low_252"],
+        },
+    ]
+    assert summary["rankings"]["by_return_21"] == ["SPY", "QQQ"]
+    assert summary["rankings"]["by_return_63"] == ["SPY", "QQQ"]
+    assert summary["rankings"]["by_return_126"] == ["SPY", "QQQ"]
+    assert summary["rankings"]["by_momentum_composite"] == ["SPY", "QQQ"]
+    assert summary["rankings"]["by_trend_alignment"] == ["QQQ", "SPY"]
+
+
+def test_build_universe_history_summary_skips_unavailable_ranking_values():
+    qqq = compute_history_summary(_frame(260), symbol="QQQ", timestep="day", as_of=None)
+    short = compute_history_summary(_frame(10), symbol="SHORT", timestep="day", as_of=None)
+    bad = compute_history_summary(_frame(260), symbol="BAD", timestep="day", as_of=None)
+    bad["momentum"]["return_21"] = True
+    bad["scores"]["trend_alignment"] = "high"
+    missing_symbol = compute_history_summary(_frame(260), symbol="", timestep="day", as_of=None)
+
+    summary = build_universe_history_summary(
+        {"QQQ": qqq, "SHORT": short, "BAD": bad, "MISSING": missing_symbol},
+        symbols=["QQQ", "SHORT", "BAD", "MISSING"],
+        timestep="day",
+        length=260,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+    )
+
+    assert summary["rankings"]["by_return_21"] == ["QQQ"]
+    assert summary["rankings"]["by_return_63"] == ["QQQ", "BAD"]
+    assert summary["rankings"]["by_return_126"] == ["QQQ", "BAD"]
+    assert summary["rankings"]["by_momentum_composite"] == ["QQQ", "BAD"]
+    assert summary["rankings"]["by_trend_alignment"] == ["QQQ"]
+
+
+def test_build_universe_history_summary_sanitizes_non_finite_row_values():
+    bad = {
+        "symbol": "BAD",
+        "price": {"latest_close": float("inf")},
+        "momentum": {
+            "return_21": float("nan"),
+            "return_63": float("-inf"),
+            "return_126": 0.12,
+            "return_252": float("inf"),
+        },
+        "scores": {
+            "momentum_composite": float("nan"),
+            "trend_alignment": float("inf"),
+        },
+        "trend": {
+            "sma_20": float("inf"),
+            "sma_50": float("nan"),
+            "sma_200": 200.0,
+            "price_vs_sma_20": float("-inf"),
+            "price_vs_sma_50": 0.03,
+            "price_vs_sma_200": float("nan"),
+        },
+        "risk": {
+            "max_drawdown_60": float("-inf"),
+            "volatility_20": float("nan"),
+        },
+        "range": {
+            "distance_to_high_252": float("inf"),
+            "distance_to_low_252": float("nan"),
+        },
+    }
+
+    summary = build_universe_history_summary(
+        {"BAD": bad},
+        symbols=["BAD"],
+        timestep="day",
+        length=260,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+    )
+
+    row = summary["universe_summary"][0]
+    assert row == {
+        "symbol": "BAD",
+        "latest_close": None,
+        "return_21": None,
+        "return_63": None,
+        "return_126": 0.12,
+        "return_252": None,
+        "momentum_composite": None,
+        "sma_20": None,
+        "sma_50": None,
+        "sma_200": 200.0,
+        "price_vs_sma_20": None,
+        "price_vs_sma_50": 0.03,
+        "price_vs_sma_200": None,
+        "trend_alignment": None,
+        "max_drawdown_60": None,
+        "volatility_20": None,
+        "distance_to_high_252": None,
+        "distance_to_low_252": None,
+    }
+    assert summary["rankings"] == {
+        "by_return_21": [],
+        "by_return_63": [],
+        "by_return_126": ["BAD"],
+        "by_momentum_composite": [],
+        "by_trend_alignment": [],
+    }
+    json.dumps(summary, allow_nan=False)
+
+
+def test_compute_history_summary_excludes_non_finite_trend_alignment_from_rankings():
+    frame = pd.DataFrame(
+        {
+            "Date": pd.date_range("2024-01-01", periods=260, freq="D"),
+            "close": [float("inf")] * 260,
+        }
+    )
+    history_summary = compute_history_summary(frame, symbol="BAD", timestep="day", as_of=None)
+
+    summary = build_universe_history_summary(
+        {"BAD": history_summary},
+        symbols=["BAD"],
+        timestep="day",
+        length=260,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+    )
+
+    assert history_summary["scores"]["trend_alignment"] is None
+    assert history_summary["availability"]["trend_alignment"] is False
+    assert summary["universe_summary"][0]["trend_alignment"] is None
+    assert summary["rankings"]["by_trend_alignment"] == []
+    json.dumps(summary, allow_nan=False)
