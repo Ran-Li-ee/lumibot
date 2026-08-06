@@ -499,6 +499,47 @@ def _bind_load_history(strategy: Any, manager: Any) -> BoundTool:
     )
 
 
+def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
+    def load_history_tables_summary(
+        *,
+        symbols: list[str],
+        length: int = 252,
+        timestep: str = "day",
+        asset_type: AssetTypeArg = "stock",
+        table_prefix: str | None = None,
+        include_after_hours: bool = True,
+    ) -> dict[str, Any]:
+        if not isinstance(symbols, list) or not symbols:
+            raise ValueError("symbols must be a non-empty list.")
+        symbols = [_require_single_symbol_text("symbols", symbol) for symbol in symbols]
+        length = _require_positive_int("length", length)
+        timestep = _require_non_empty_text("timestep", timestep)
+        return manager.duckdb.load_history_tables_summary(
+            symbols=symbols,
+            length=length,
+            timestep=timestep,
+            asset_type=asset_type,
+            table_prefix=table_prefix,
+            include_after_hours=include_after_hours,
+        )
+
+    return BoundTool(
+        name="market_load_history_tables_summary",
+        description=(
+            "Load visible historical bars for multiple symbols into DuckDB and return a cross-symbol summary. "
+            "Arguments: symbols, optional length, timestep, asset_type, table_prefix, include_after_hours. "
+            "This tool returns factual rankings plus recent returns, moving averages, trend alignment, drawdown, "
+            "volatility, and range position for the requested universe. "
+            "Prefer this tool before writing DuckDB SQL for common universe ranking. "
+            "Caveat: this only loads bars visible at the current LumiBot runtime datetime. "
+            "Example: market_load_history_tables_summary("
+            "symbols=['QQQ', 'SPY'], length=252, timestep='day', table_prefix='cmp')."
+        ),
+        function=load_history_tables_summary,
+        metadata={"kind": "builtin", "replay_on_cache": True},
+    )
+
+
 def _bind_duckdb_query(strategy: Any, manager: Any) -> BoundTool:
     def duckdb_query(*, sql: str, limit: int = 200) -> dict[str, Any]:
         sql = _require_non_empty_text("sql", sql)
@@ -1598,6 +1639,13 @@ class _MarketTools:
             binder=_bind_load_history,
         )
 
+    def load_history_tables_summary(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="market_load_history_tables_summary",
+            description="Load visible historical bars for multiple symbols and summarize the universe.",
+            binder=_bind_load_history_tables_summary,
+        )
+
 
 class _DuckDBTools:
     def query(self) -> ToolDefinition:
@@ -1768,6 +1816,7 @@ class _BuiltinTools:
             self.account.portfolio(),
             self.market.last_price(),
             self.market.load_history_table(),
+            self.market.load_history_tables_summary(),
             self.duckdb.query(),
             self.docs.search(),
             self.news.alpaca_news(),

@@ -1992,6 +1992,86 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
 
 
 @pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_history_tables_summary_returns_rankings_and_queryable_tables(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    pandas_data = _build_stock_pandas_data()
+    first_asset = next(iter(pandas_data.keys()))
+    first_data = pandas_data[first_asset]
+    base_frame = first_data.df.copy()
+    first_frame = pd.concat([base_frame] * 5, ignore_index=True).iloc[:30].copy()
+    first_frame.index = pd.date_range("2025-01-06 09:30", periods=30, freq="min", tz="America/New_York")
+    first_frame[["open", "high", "low", "close"]] = first_frame[["open", "high", "low", "close"]].add(
+        range(30),
+        axis=0,
+    )
+    pandas_data[first_asset] = Data(first_asset, first_frame, timestep="minute")
+    second_asset = Asset("AGST2", Asset.AssetType.STOCK)
+    second_frame = first_frame.copy()
+    second_frame[["open", "high", "low", "close"]] = second_frame[["open", "high", "low", "close"]] * 1.1
+    pandas_data[second_asset] = Data(second_asset, second_frame, timestep="minute")
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=pandas_data,
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    summary = strategy.agents.duckdb.load_history_tables_summary(
+        symbols=["AGST", "AGST2"],
+        length=30,
+        timestep="minute",
+        table_prefix="cmp",
+    )
+
+    assert summary["schema_version"] == "1.0"
+    assert summary["symbols"] == ["AGST", "AGST2"]
+    assert len(summary["loaded_tables"]) == 2
+    assert len(summary["universe_summary"]) == 2
+    assert "by_return_21" in summary["rankings"]
+    assert "by_return_63" in summary["rankings"]
+    assert "by_momentum_composite" in summary["rankings"]
+    assert all(table["table_name"].startswith("cmp_") for table in summary["loaded_tables"].values())
+    assert {"cmp_agst", "cmp_agst2"}.issubset({table["table_name"] for table in summary["available_tables"]})
+    row_count = strategy.agents.duckdb.query(sql="SELECT COUNT(*) AS count_rows FROM cmp_agst")
+    assert row_count["rows"] == [{"count_rows": 30}]
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
+def test_builtin_market_history_tables_summary_rejects_empty_symbols(monkeypatch, tmp_path):
+    from lumibot.components.agents import BuiltinTools
+
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=_build_stock_pandas_data(),
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+    tool = BuiltinTools.market.load_history_tables_summary().binder(strategy, strategy.agents)
+
+    with pytest.raises(ValueError, match="symbols"):
+        tool.function(symbols=[])
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
 def test_duckdb_table_inventory_tracks_fresh_and_cached_history_tables(monkeypatch, tmp_path):
     monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
     pandas_data = _build_stock_pandas_data()

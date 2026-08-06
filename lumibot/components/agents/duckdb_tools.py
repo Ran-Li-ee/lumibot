@@ -10,7 +10,7 @@ from typing import Any
 from lumibot.tools.helpers import parse_timestep_qty_and_unit
 
 from .asset_resolution import resolve_asset_and_quote
-from .history_summary import compute_history_summary
+from .history_summary import build_universe_history_summary, compute_history_summary
 
 _READ_ONLY_SQL_RE = re.compile(r"^\s*(select|with|show|describe|pragma|explain)\b", re.IGNORECASE)
 
@@ -389,6 +389,70 @@ class DuckDBQueryLayer:
         )
         self._history_cache[cache_key] = dict(info)
         result = dict(info)
+        result["available_tables"] = self._available_table_schemas()
+        return result
+
+    def load_history_tables_summary(
+        self,
+        *,
+        symbols: list[str],
+        length: int,
+        timestep: str = "day",
+        asset_type: str = "stock",
+        table_prefix: str | None = None,
+        include_after_hours: bool = True,
+    ) -> dict[str, Any]:
+        if not isinstance(symbols, list) or not symbols:
+            raise ValueError("symbols must be a non-empty list.")
+        normalized_symbols = [str(symbol).strip() for symbol in symbols]
+        if any(not symbol for symbol in normalized_symbols):
+            raise ValueError("symbols must contain non-empty symbol values.")
+        current_dt = self._current_datetime()
+        as_of = current_dt.isoformat() if hasattr(current_dt, "isoformat") else None
+        summaries: dict[str, dict[str, Any]] = {}
+        loaded_tables: dict[str, dict[str, Any]] = {}
+        warnings: list[str] = []
+
+        prefix = self._slugify(table_prefix) if table_prefix else None
+        for symbol in normalized_symbols:
+            table_name = f"{prefix}_{self._slugify(symbol)}" if prefix else None
+            try:
+                table_info = self.load_history_table(
+                    symbol=symbol,
+                    length=length,
+                    timestep=timestep,
+                    table_name=table_name,
+                    asset_type=asset_type,
+                    include_after_hours=include_after_hours,
+                )
+            except Exception as exc:
+                warnings.append(f"{symbol}: failed to load history table: {exc}")
+                continue
+
+            summary = table_info.get("computed_summary")
+            if not isinstance(summary, dict):
+                warnings.append(f"{symbol}: loaded history table did not include computed_summary.")
+            else:
+                summaries[symbol] = summary
+            loaded_tables[symbol] = {
+                "table_name": table_info.get("table_name"),
+                "row_count": table_info.get("row_count"),
+                "columns": table_info.get("columns", []),
+                "symbol": table_info.get("symbol"),
+                "asset_type": table_info.get("asset_type"),
+                "timestep": table_info.get("timestep"),
+                "loaded_at": table_info.get("loaded_at"),
+            }
+
+        result = build_universe_history_summary(
+            summaries,
+            symbols=normalized_symbols,
+            timestep=timestep,
+            length=int(length),
+            as_of=as_of,
+            loaded_tables=loaded_tables,
+            warnings=warnings,
+        )
         result["available_tables"] = self._available_table_schemas()
         return result
 
