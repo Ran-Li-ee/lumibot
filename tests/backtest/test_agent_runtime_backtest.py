@@ -1973,6 +1973,8 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
     assert "close" in history_tool.description
     assert "available_tables" in history_tool.description
     assert "currently queryable tables" in history_tool.description
+    assert "computed_summary" in history_tool.description
+    assert "read it first before writing SQL" in history_tool.description
     assert "exact column names" in query_tool.description
     assert "market_load_history_table" in query_tool.description
     assert "pragma_table_info" in query_tool.description
