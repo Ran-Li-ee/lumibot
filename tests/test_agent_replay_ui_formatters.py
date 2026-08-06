@@ -39,10 +39,19 @@ def test_market_load_history_table_formatter_includes_computed_summary():
             "row_count": 252,
             "computed_summary": {
                 "price": {"latest_close": 458.67},
-                "momentum": {"return_20": 0.034, "return_60": -0.021, "return_120": None},
+                "momentum": {
+                    "return_20": 0.034,
+                    "return_21": 0.032,
+                    "return_60": -0.021,
+                    "return_63": -0.019,
+                    "return_120": None,
+                    "return_126": 0.052,
+                    "return_252": 0.103,
+                },
                 "trend": {"sma_20": 450.12, "sma_50": 440.5, "price_vs_sma_20": 0.019},
                 "range": {"distance_to_high_252": -0.044, "distance_to_low_252": 0.21},
                 "risk": {"max_drawdown_60": -0.083, "volatility_20": 0.011},
+                "scores": {"momentum_composite": 0.0217, "trend_alignment": 2},
             },
         },
         None,
@@ -51,11 +60,59 @@ def test_market_load_history_table_formatter_includes_computed_summary():
     assert "252 rows" in text
     assert "latest close 458.67" in text
     assert "20-bar return 3.40%" in text
+    assert "21-bar return 3.20%" in text
     assert "60-bar return -2.10%" in text
+    assert "63-bar return -1.90%" in text
+    assert "126-bar return 5.20%" in text
+    assert "252-bar return 10.30%" in text
+    assert "momentum composite 2.17%" in text
+    assert "trend alignment 2" in text
     assert "SMA20 450.12" in text
     assert "vs SMA20 1.90%" in text
     assert "from 252-bar high -4.40%" in text
     assert "max drawdown 60 -8.30%" in text
+
+
+def test_market_load_history_tables_summary_formatter_shows_rankings_and_warnings():
+    text = explain_tool_result(
+        "market_load_history_tables_summary",
+        {"symbols": ["SPY", "QQQ", "VNQ"]},
+        {
+            "universe_summary": [
+                {"symbol": "SPY"},
+                {"symbol": "QQQ"},
+                {"symbol": "VNQ"},
+            ],
+            "rankings": {
+                "by_return_63": ["VNQ", "SPY", "QQQ"],
+                "by_momentum_composite": ["VNQ", "QQQ", "SPY"],
+            },
+            "warnings": ["QQQ had a partial history window"],
+        },
+        None,
+    )
+
+    assert "3 symbols" in text
+    assert "return_63: VNQ, SPY, QQQ" in text
+    assert "momentum_composite: VNQ, QQQ, SPY" in text
+    assert "1 warning" in text
+
+
+def test_market_load_history_tables_summary_formatter_counts_empty_summary_rows():
+    text = explain_tool_result(
+        "market_load_history_tables_summary",
+        {"symbols": ["SPY", "QQQ"]},
+        {
+            "universe_summary": [],
+            "rankings": {},
+            "warnings": ["No history rows were loaded"],
+        },
+        None,
+    )
+
+    assert "2 symbols" not in text
+    assert "0 symbols" in text
+    assert "1 warning" in text
 
 
 def test_tool_error_formatter_is_visible():

@@ -113,6 +113,18 @@ def _short_list(values: list[Any], label: str) -> str:
     return f" {label}: {shown}{suffix}."
 
 
+def _symbol_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    symbols = []
+    for value in values:
+        if isinstance(value, dict):
+            value = _first_present(value, "symbol", "ticker")
+        if value is not None:
+            symbols.append(str(value))
+    return symbols
+
+
 def _collection(raw_result: Any, *keys: str) -> list[Any]:
     result = _as_dict(raw_result)
     for key in keys:
@@ -199,18 +211,29 @@ def _computed_history_summary(raw_summary: Any) -> str:
     trend = _as_dict(summary.get("trend"))
     range_summary = _as_dict(summary.get("range"))
     risk = _as_dict(summary.get("risk"))
+    scores = _as_dict(summary.get("scores"))
     parts = []
     latest_close = _number(price.get("latest_close"))
     if latest_close is not None:
         parts.append(f"latest close {latest_close}")
     for label, key in (
         ("20-bar return", "return_20"),
+        ("21-bar return", "return_21"),
         ("60-bar return", "return_60"),
+        ("63-bar return", "return_63"),
         ("120-bar return", "return_120"),
+        ("126-bar return", "return_126"),
+        ("252-bar return", "return_252"),
     ):
         value = _percent(momentum.get(key))
         if value is not None:
             parts.append(f"{label} {value}")
+    value = _percent(scores.get("momentum_composite"))
+    if value is not None:
+        parts.append(f"momentum composite {value}")
+    trend_alignment = scores.get("trend_alignment")
+    if isinstance(trend_alignment, int | float) and not isinstance(trend_alignment, bool):
+        parts.append(f"trend alignment {_text(trend_alignment)}")
     for label, key in (("SMA20", "sma_20"), ("SMA50", "sma_50"), ("SMA200", "sma_200")):
         value = _number(trend.get(key))
         if value is not None:
@@ -233,6 +256,30 @@ def _computed_history_summary(raw_summary: Any) -> str:
     if not parts:
         return ""
     return "Computed summary: " + "; ".join(parts) + "."
+
+
+def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -> str:
+    result = _as_dict(raw_result)
+    count = len(_collection(raw_result, "universe_summary"))
+    parts = [f"Loaded market history summaries for {_rows_label(count, 'symbol')}"]
+    requested_symbols = args.get("symbols")
+    if isinstance(requested_symbols, list):
+        parts.append(f"{_rows_label(len(requested_symbols), 'requested symbol')}")
+
+    rankings = _as_dict(result.get("rankings"))
+    for label, key in (
+        ("return_63", "by_return_63"),
+        ("momentum_composite", "by_momentum_composite"),
+    ):
+        symbols = _symbol_list(rankings.get(key))
+        if symbols:
+            parts.append(f"{label}: {', '.join(symbols[:3])}")
+
+    warnings = result.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        parts.append(_rows_label(len(warnings), "warning"))
+
+    return "; ".join(parts) + "."
 
 
 def _duckdb_query(args: dict[str, Any], raw_result: Any) -> str:
@@ -329,6 +376,7 @@ _FORMATTERS = {
     "orders_open_orders": _orders_open_orders,
     "market_last_price": _market_last_price,
     "market_load_history_table": _market_load_history_table,
+    "market_load_history_tables_summary": _market_load_history_tables_summary,
     "duckdb_query": _duckdb_query,
     "get_indicator": _get_indicator,
     "get_indicators": _get_indicators,
