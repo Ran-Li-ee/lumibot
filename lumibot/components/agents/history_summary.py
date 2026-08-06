@@ -30,8 +30,12 @@ def compute_history_summary(
     latest_close = _last_value(close)
     momentum = {
         "return_20": _period_return(close, 20),
+        "return_21": _period_return(close, 21),
         "return_60": _period_return(close, 60),
+        "return_63": _period_return(close, 63),
         "return_120": _period_return(close, 120),
+        "return_126": _period_return(close, 126),
+        "return_252": _period_return(close, 252),
     }
     trend = {
         "sma_20": _sma(close, 20),
@@ -45,6 +49,22 @@ def compute_history_summary(
             "price_vs_sma_200": _relative_to(latest_close, trend["sma_200"]),
         }
     )
+    scores = {
+        "momentum_composite": _mean_available(
+            [
+                momentum["return_21"],
+                momentum["return_63"],
+                momentum["return_126"],
+            ]
+        ),
+        "trend_alignment": _trend_alignment(
+            [
+                trend["price_vs_sma_20"],
+                trend["price_vs_sma_50"],
+                trend["price_vs_sma_200"],
+            ]
+        ),
+    }
     high_252 = _window_extreme(high if high is not None else close, 252, "max")
     low_252 = _window_extreme(low if low is not None else close, 252, "min")
     volatility_20 = _volatility(close, 20)
@@ -54,8 +74,14 @@ def compute_history_summary(
     availability = {
         "latest_close": latest_close is not None,
         "return_20": momentum["return_20"] is not None,
+        "return_21": momentum["return_21"] is not None,
         "return_60": momentum["return_60"] is not None,
+        "return_63": momentum["return_63"] is not None,
         "return_120": momentum["return_120"] is not None,
+        "return_126": momentum["return_126"] is not None,
+        "return_252": momentum["return_252"] is not None,
+        "momentum_composite": scores["momentum_composite"] is not None,
+        "trend_alignment": scores["trend_alignment"] is not None,
         "sma_20": trend["sma_20"] is not None,
         "sma_50": trend["sma_50"] is not None,
         "sma_200": trend["sma_200"] is not None,
@@ -76,6 +102,7 @@ def compute_history_summary(
         },
         "momentum": momentum,
         "trend": trend,
+        "scores": scores,
         "range": {
             "high_252": high_252,
             "low_252": low_252,
@@ -159,6 +186,20 @@ def _relative_to(numerator: float | None, denominator: float | None) -> float | 
     if numerator is None or denominator in (None, 0):
         return None
     return numerator / denominator - 1.0
+
+
+def _mean_available(values: list[float | None]) -> float | None:
+    available = [float(value) for value in values if value is not None]
+    if not available:
+        return None
+    return sum(available) / len(available)
+
+
+def _trend_alignment(values: list[float | None]) -> int | None:
+    available = [value for value in values if value is not None]
+    if not available:
+        return None
+    return sum(1 for value in available if value > 0)
 
 
 def _window_extreme(series: pd.Series | None, window: int, method: str) -> float | None:

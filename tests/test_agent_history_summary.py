@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
+
 from lumibot.components.agents.history_summary import compute_history_summary
 
 
@@ -62,6 +63,33 @@ def test_compute_history_summary_calculates_momentum_and_trend():
     assert summary["trend"]["price_vs_sma_20"] == pytest.approx(latest / summary["trend"]["sma_20"] - 1.0)
 
 
+def test_compute_history_summary_adds_ranking_windows_and_scores():
+    frame = _frame(260)
+    latest = 359.0
+
+    summary = compute_history_summary(frame, symbol="QQQ", timestep="day", as_of=None)
+
+    assert summary["momentum"]["return_21"] == pytest.approx(latest / 338.0 - 1.0)
+    assert summary["momentum"]["return_63"] == pytest.approx(latest / 296.0 - 1.0)
+    assert summary["momentum"]["return_126"] == pytest.approx(latest / 233.0 - 1.0)
+    assert summary["momentum"]["return_252"] == pytest.approx(latest / 107.0 - 1.0)
+    assert summary["scores"]["momentum_composite"] == pytest.approx(
+        (
+            summary["momentum"]["return_21"]
+            + summary["momentum"]["return_63"]
+            + summary["momentum"]["return_126"]
+        )
+        / 3
+    )
+    assert summary["scores"]["trend_alignment"] == 3
+    assert summary["availability"]["return_21"] is True
+    assert summary["availability"]["return_63"] is True
+    assert summary["availability"]["return_126"] is True
+    assert summary["availability"]["return_252"] is True
+    assert summary["availability"]["momentum_composite"] is True
+    assert summary["availability"]["trend_alignment"] is True
+
+
 def test_compute_history_summary_calculates_range_and_drawdown():
     frame = _frame(260)
 
@@ -97,6 +125,20 @@ def test_compute_history_summary_short_data_marks_unavailable_metrics():
     assert summary["availability"]["sma_20"] is False
     assert summary["range"]["high_252"] == 110.0
     assert summary["range"]["low_252"] == 99.0
+
+
+def test_compute_history_summary_new_windows_are_unavailable_when_data_is_short():
+    summary = compute_history_summary(_frame(30), symbol="SHORT", timestep="day", as_of=None)
+
+    assert summary["momentum"]["return_21"] is not None
+    assert summary["momentum"]["return_63"] is None
+    assert summary["momentum"]["return_126"] is None
+    assert summary["momentum"]["return_252"] is None
+    assert summary["scores"]["momentum_composite"] == summary["momentum"]["return_21"]
+    assert summary["availability"]["return_63"] is False
+    assert summary["availability"]["return_126"] is False
+    assert summary["availability"]["return_252"] is False
+    assert summary["availability"]["momentum_composite"] is True
 
 
 def test_compute_history_summary_missing_close_returns_warnings():
