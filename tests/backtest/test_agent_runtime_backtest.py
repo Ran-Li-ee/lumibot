@@ -2046,6 +2046,80 @@ def test_duckdb_history_tables_summary_returns_rankings_and_queryable_tables(mon
 
 
 @pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_history_tables_summary_disambiguates_table_prefix_collisions(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    base_data = next(iter(_build_stock_pandas_data().values()))
+    pandas_data = {}
+    for symbol, multiplier in (("BRK.B", 1.0), ("BRK/B", 1.2)):
+        asset = Asset(symbol, Asset.AssetType.STOCK)
+        frame = base_data.df.copy()
+        frame[["open", "high", "low", "close"]] = frame[["open", "high", "low", "close"]] * multiplier
+        pandas_data[asset] = Data(asset, frame, timestep="minute")
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=pandas_data,
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    summary = strategy.agents.duckdb.load_history_tables_summary(
+        symbols=["BRK.B", "BRK/B"],
+        length=3,
+        timestep="minute",
+        table_prefix="cmp",
+    )
+
+    table_names = [table["table_name"] for table in summary["loaded_tables"].values()]
+    assert table_names == ["cmp_brk_b", "cmp_brk_b_2"]
+    assert len(table_names) == len(set(table_names))
+    for table_name in table_names:
+        result = strategy.agents.duckdb.query(sql=f"SELECT COUNT(*) AS count_rows FROM {table_name}")
+        assert result["rows"] == [{"count_rows": 3}]
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_history_tables_summary_raises_when_all_symbols_fail(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=_build_stock_pandas_data(),
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    def fail_load_history_table(**kwargs):
+        raise RuntimeError(f"forced failure for {kwargs['symbol']}")
+
+    monkeypatch.setattr(strategy.agents.duckdb, "load_history_table", fail_load_history_table)
+
+    with pytest.raises(ValueError, match="no history tables.*symbols"):
+        strategy.agents.duckdb.load_history_tables_summary(
+            symbols=["AGST", "AGST2"],
+            length=3,
+            timestep="minute",
+            table_prefix="cmp",
+        )
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
 def test_builtin_market_history_tables_summary_rejects_empty_symbols(monkeypatch, tmp_path):
     from lumibot.components.agents import BuiltinTools
 

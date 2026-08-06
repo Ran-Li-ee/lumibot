@@ -414,8 +414,15 @@ class DuckDBQueryLayer:
         warnings: list[str] = []
 
         prefix = self._slugify(table_prefix) if table_prefix else None
+        table_name_counts: defaultdict[str, int] = defaultdict(int)
         for symbol in normalized_symbols:
-            table_name = f"{prefix}_{self._slugify(symbol)}" if prefix else None
+            table_name = None
+            if prefix:
+                table_base = f"{prefix}_{self._slugify(symbol)}"
+                table_name_counts[table_base] += 1
+                table_name = table_base
+                if table_name_counts[table_base] > 1:
+                    table_name = f"{table_base}_{table_name_counts[table_base]}"
             try:
                 table_info = self.load_history_table(
                     symbol=symbol,
@@ -443,6 +450,10 @@ class DuckDBQueryLayer:
                 "timestep": table_info.get("timestep"),
                 "loaded_at": table_info.get("loaded_at"),
             }
+
+        if not loaded_tables:
+            warning_text = "; ".join(warnings) if warnings else "no successful symbol loads"
+            raise ValueError(f"no history tables could be loaded for symbols {normalized_symbols}: {warning_text}")
 
         result = build_universe_history_summary(
             summaries,
