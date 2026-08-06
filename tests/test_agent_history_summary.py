@@ -223,6 +223,22 @@ def test_compute_history_summary_invalid_trend_comparisons_are_unavailable():
     json.dumps(summary, allow_nan=False)
 
 
+def test_compute_history_summary_sanitizes_overflowed_derived_ratios():
+    frame = _frame(260)
+    frame["close"] = 1e-308
+    frame.loc[8:259, "close"] = 1e308
+    frame["high"] = 1e308
+    frame["low"] = 1e-308
+
+    summary = compute_history_summary(frame, symbol="WIDE", timestep="day", as_of=None)
+
+    json.dumps(summary, allow_nan=False)
+    assert summary["momentum"]["return_252"] is None
+    assert summary["range"]["distance_to_low_252"] is None
+    assert summary["availability"]["return_252"] is False
+    assert summary["range"]["distance_to_high_252"] == 0.0
+
+
 def test_compute_history_summary_empty_frame_does_not_raise():
     summary = compute_history_summary(pd.DataFrame(), symbol="EMPTY", timestep="day", as_of=None)
 

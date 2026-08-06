@@ -283,7 +283,7 @@ def _period_return(series: pd.Series | None, window: int) -> float | None:
     latest = _finite_float(series.iloc[-1])
     if previous in (None, 0) or latest is None:
         return None
-    return latest / previous - 1.0
+    return _finite_float(latest / previous - 1.0)
 
 
 def _sma(series: pd.Series | None, window: int) -> float | None:
@@ -297,7 +297,7 @@ def _relative_to(numerator: float | None, denominator: float | None) -> float | 
     denominator = _finite_float(denominator)
     if numerator is None or denominator in (None, 0):
         return None
-    return numerator / denominator - 1.0
+    return _finite_float(numerator / denominator - 1.0)
 
 
 def _mean_available(values: list[float | None]) -> float | None:
@@ -305,7 +305,7 @@ def _mean_available(values: list[float | None]) -> float | None:
     available = [value for value in available if value is not None]
     if not available:
         return None
-    return sum(available) / len(available)
+    return _finite_float(sum(available) / len(available))
 
 
 def _trend_alignment(values: list[float | None]) -> int | None:
