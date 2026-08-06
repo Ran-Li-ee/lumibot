@@ -512,6 +512,9 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
         if not isinstance(symbols, list) or not symbols:
             raise ValueError("symbols must be a non-empty list.")
         symbols = [_require_single_symbol_text("symbols", symbol) for symbol in symbols]
+        normalized_symbol_keys = [symbol.upper() for symbol in symbols]
+        if len(normalized_symbol_keys) != len(set(normalized_symbol_keys)):
+            raise ValueError("duplicate symbols are not allowed.")
         length = _require_positive_int("length", length)
         timestep = _require_non_empty_text("timestep", timestep)
         return manager.duckdb.load_history_tables_summary(

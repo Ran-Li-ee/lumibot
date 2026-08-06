@@ -2120,6 +2120,34 @@ def test_duckdb_history_tables_summary_raises_when_all_symbols_fail(monkeypatch,
 
 
 @pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_history_tables_summary_rejects_duplicate_symbols(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=_build_stock_pandas_data(),
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    with pytest.raises(ValueError, match="duplicate symbols"):
+        strategy.agents.duckdb.load_history_tables_summary(
+            symbols=["AGST", "AGST"],
+            length=3,
+            timestep="minute",
+            table_prefix="cmp",
+        )
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
 def test_builtin_market_history_tables_summary_rejects_empty_symbols(monkeypatch, tmp_path):
     from lumibot.components.agents import BuiltinTools
 

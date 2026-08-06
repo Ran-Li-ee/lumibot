@@ -407,6 +407,11 @@ class DuckDBQueryLayer:
         normalized_symbols = [str(symbol).strip() for symbol in symbols]
         if any(not symbol for symbol in normalized_symbols):
             raise ValueError("symbols must contain non-empty symbol values.")
+        symbol_keys = [symbol.upper() for symbol in normalized_symbols]
+        duplicate_keys = [symbol for symbol in dict.fromkeys(symbol_keys) if symbol_keys.count(symbol) > 1]
+        if duplicate_keys:
+            duplicates = ", ".join(duplicate_keys)
+            raise ValueError(f"duplicate symbols are not allowed: {duplicates}")
         current_dt = self._current_datetime()
         as_of = current_dt.isoformat() if hasattr(current_dt, "isoformat") else None
         summaries: dict[str, dict[str, Any]] = {}
