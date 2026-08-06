@@ -1794,12 +1794,13 @@ def test_agent_runtime_injects_base_prompt_runtime_context_and_default_summary_l
     assert "Do not trade for the sake of activity." in request.system_prompt
     assert "Do not resist intentional concentration" in request.system_prompt
     assert "Avoid leaving raw cash idle unless there is a specific reason" in request.system_prompt
+    assert "DUCKDB SQL GUIDANCE" not in request.system_prompt
     assert (
         "use the exact column names returned by market_load_history_table or pragma_table_info"
-        in request.system_prompt
+        not in request.system_prompt
     )
-    assert "often named Date, not datetime" in request.system_prompt
-    assert "Do not assume datetime exists" in request.system_prompt
+    assert "often named Date, not datetime" not in request.system_prompt
+    assert "Do not assume datetime exists" not in request.system_prompt
     assert "use datetime for timestamp columns" not in request.system_prompt
     tool_names = [tool.name for tool in request.bound_tools]
     assert len(tool_names) == len(set(tool_names))
@@ -1965,7 +1966,9 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
         quiet_logs=True,
     )
     history_tool = BuiltinTools.market.load_history_table().binder(strategy, strategy.agents)
+    batch_tool = BuiltinTools.market.load_history_tables_summary().binder(strategy, strategy.agents)
     query_tool = BuiltinTools.duckdb.query().binder(strategy, strategy.agents)
+    tool_names = [tool.name for tool in BuiltinTools.all()]
 
     assert "exact column names" in history_tool.description
     assert "Date" in history_tool.description
@@ -1975,6 +1978,13 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
     assert "currently queryable tables" in history_tool.description
     assert "computed_summary" in history_tool.description
     assert "read it first before writing SQL" in history_tool.description
+    assert (
+        "Use duckdb_query only when the needed comparison or statistic is not already available"
+        in history_tool.description
+    )
+    assert "market_load_history_tables_summary" in tool_names
+    assert "cross-symbol summary" in batch_tool.description
+    assert "Prefer this tool before writing DuckDB SQL" in batch_tool.description
     assert "exact column names" in query_tool.description
     assert "market_load_history_table" in query_tool.description
     assert "pragma_table_info" in query_tool.description

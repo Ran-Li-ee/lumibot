@@ -14,7 +14,6 @@ from uuid import uuid4
 from lumibot import LUMIBOT_CACHE_FOLDER
 
 from .boundary_trace import BoundaryTraceCollector
-from .duckdb_prompt import DUCKDB_SQL_GUIDANCE_PROMPT
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer, ToolDefinition
 from .tool_context import agent_tool_context
 from .tools import bind_callable_tool
@@ -851,8 +850,6 @@ class AgentHandle:
             "For ETFs, indexes, or broad-market trades, use SEC financial/filing tools on the most relevant single-stock candidates, holdings, or alternatives you are considering; do not skip the category just because the final instrument is an ETF.",
             "Do not repeat identical read-only evidence calls if the current task context already includes fresh results from another agent; reference those results and call again only when they are missing, stale, or conflicting.",
             "If the user asks for an aggressive or concentrated strategy, let that user strategy prompt override the default investor style, but still ground the decision in tool evidence, position sizing, broker constraints, and backtesting look-ahead safety.",
-            "When querying DuckDB tables, use the exact column names returned by market_load_history_table or pragma_table_info.",
-            "For history tables loaded by market_load_history_table, the timestamp column is often named Date, not datetime. Do not assume datetime exists unless returned columns explicitly include it.",
             "Use close for price columns when the returned columns include close.",
             "When you have access to external MCP tools, explore what they offer and use them. You do not need to be told which specific tool to call.",
             "Finish every run with a short summary sentence starting with RESULT: that explains what you did and why.",
@@ -942,7 +939,6 @@ class AgentHandle:
         runtime_context: dict[str, Any],
         bound_tools: list[BoundTool] | None = None,
     ) -> str:
-        available_tools = bound_tools if bound_tools is not None else self._ensure_bound_tools()
         prompt_parts = [
             self._base_system_prompt(runtime_context),
             "USER SYSTEM PROMPT:",
@@ -950,9 +946,24 @@ class AgentHandle:
             "but not hard safety, broker, or look-ahead-bias rules.",
             self.system_prompt.strip(),
         ]
-        tool_names = {tool.name for tool in available_tools}
-        if tool_names.intersection({"market_load_history_table", "duckdb_query"}):
-            prompt_parts.append(DUCKDB_SQL_GUIDANCE_PROMPT.strip())
+        if bound_tools:
+            tool_names = {tool.name for tool in bound_tools}
+            has_history_summary = bool(
+                tool_names
+                & {
+                    "market_load_history_table",
+                    "market_load_history_tables_summary",
+                }
+            )
+            if has_history_summary and "duckdb_query" in tool_names:
+                prompt_parts.extend(
+                    [
+                        "HISTORICAL DATA TOOL PRIORITY:",
+                        "Use computed summaries from market_load_history_table or "
+                        "market_load_history_tables_summary first. "
+                        "Use duckdb_query only when the needed comparison or statistic is not already available.",
+                    ]
+                )
         return "\n\n".join(prompt_parts).strip()
 
     def _append_memory(self, result: AgentRunResult) -> None:

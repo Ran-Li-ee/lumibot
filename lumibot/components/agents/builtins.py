@@ -488,6 +488,8 @@ def _bind_load_history(strategy: Any, manager: Any) -> BoundTool:
             "The computed_summary result field already includes common price, momentum, trend, "
             "range, and risk statistics; "
             "read it first before writing SQL for common history analysis. "
+            "For cross-symbol comparisons, prefer market_load_history_tables_summary. "
+            "Use duckdb_query only when the needed comparison or statistic is not already available in tool results. "
             "History tables loaded by this tool often expose Date as the timestamp column, not datetime; "
             "Do not assume datetime exists unless it is explicitly listed in columns. "
             "Use close for the traded price when that column is listed. "

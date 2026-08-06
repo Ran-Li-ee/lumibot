@@ -1,7 +1,7 @@
 import pytest
 
-from lumibot.components.agents.duckdb_prompt import DUCKDB_SQL_GUIDANCE_PROMPT
 from lumibot.components.agents.manager import AgentHandle, AgentManager
+from lumibot.components.agents.runtime import GoogleADKRuntime, RuntimeRequest
 from lumibot.components.agents.schemas import (
     AgentRunResult,
     AgentTraceEvent,
@@ -43,25 +43,25 @@ class DummyManager:
         return tool
 
 
-def test_duckdb_sql_guidance_content_covers_general_query_rules():
-    prompt = DUCKDB_SQL_GUIDANCE_PROMPT
-    normalized = " ".join(prompt.split())
-
-    assert "authoritative database schema" in normalized
-    assert "Each SELECT or CTE creates a new table" in normalized
-    assert "window values in an inner CTE" in normalized
-    assert "exactly one row and one column" in normalized
-    assert "qualify all referenced columns with their aliases" in normalized
-    assert "Specify ORDER BY" in normalized
-    assert "First run the logic successfully against one loaded table" in normalized
-    assert "Identify the failing stage" in normalized
-
-
 def _bound_tool(name):
     return BoundTool(
         name=name,
         description=f"{name} description",
         function=lambda: None,
+    )
+
+
+def _runtime_request(bound_tools):
+    return RuntimeRequest(
+        agent_name="research_agent",
+        model="test-model",
+        system_prompt="Agent-specific objective.",
+        task_prompt=None,
+        context=None,
+        runtime_context=None,
+        memory_state=None,
+        memory_notes=[],
+        bound_tools=bound_tools,
     )
 
 
@@ -71,9 +71,11 @@ def _bound_tool(name):
         ["market_load_history_table"],
         ["duckdb_query"],
         ["market_load_history_table", "duckdb_query"],
+        [],
+        ["account_positions"],
     ],
 )
-def test_duckdb_sql_guidance_is_appended_for_trigger_tools(tool_names):
+def test_duckdb_sql_guidance_is_not_appended_to_system_prompt(tool_names):
     handle = AgentHandle(
         manager=DummyManager(),
         name="research_agent",
@@ -85,27 +87,12 @@ def test_duckdb_sql_guidance_is_appended_for_trigger_tools(tool_names):
 
     prompt = handle._compose_system_prompt({"mode": "backtesting"}, bound_tools)
 
-    assert prompt.count("DUCKDB SQL GUIDANCE") == 1
-    assert prompt.index("Agent-specific objective.") < prompt.index("DUCKDB SQL GUIDANCE")
-
-
-@pytest.mark.parametrize("tool_names", [[], ["account_positions"]])
-def test_duckdb_sql_guidance_is_omitted_without_trigger_tools(tool_names):
-    handle = AgentHandle(
-        manager=DummyManager(),
-        name="execution_agent",
-        system_prompt="Agent-specific objective.",
-        default_model="test-model",
-        runtime=object(),
-    )
-    bound_tools = [_bound_tool(name) for name in tool_names]
-
-    prompt = handle._compose_system_prompt({"mode": "backtesting"}, bound_tools)
-
     assert "DUCKDB SQL GUIDANCE" not in prompt
+    assert "When querying DuckDB tables" not in prompt
+    assert "Date, not datetime" not in prompt
 
 
-def test_duckdb_sql_guidance_uses_actual_bound_tools_by_default():
+def test_duckdb_sql_guidance_is_not_appended_with_actual_bound_tools_by_default():
     handle = AgentHandle(
         manager=DummyManager(),
         name="research_agent",
@@ -119,7 +106,73 @@ def test_duckdb_sql_guidance_uses_actual_bound_tools_by_default():
 
     prompt = handle._compose_system_prompt({"mode": "backtesting"})
 
-    assert prompt.count("DUCKDB SQL GUIDANCE") == 1
+    assert "DUCKDB SQL GUIDANCE" not in prompt
+
+
+def test_system_prompt_prefers_computed_summaries_before_duckdb_query():
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="research_agent",
+        system_prompt="Agent-specific objective.",
+        default_model="test-model",
+        runtime=object(),
+    )
+    bound_tools = [
+        _bound_tool("market_load_history_table"),
+        _bound_tool("market_load_history_tables_summary"),
+        _bound_tool("duckdb_query"),
+    ]
+
+    prompt = handle._compose_system_prompt({"mode": "backtesting"}, bound_tools)
+
+    assert "Use DuckDB for time-series analysis when historical tables are available" not in prompt
+    assert (
+        "Use computed summaries from market_load_history_table or "
+        "market_load_history_tables_summary first"
+    ) in prompt
+    assert (
+        "Use duckdb_query only when the needed comparison or statistic is not already available"
+        in prompt
+    )
+
+
+def test_runtime_instruction_prefers_computed_summaries_before_duckdb_query():
+    request = _runtime_request(
+        [
+            _bound_tool("market_load_history_table"),
+            _bound_tool("market_load_history_tables_summary"),
+            _bound_tool("duckdb_query"),
+        ]
+    )
+
+    instruction = GoogleADKRuntime()._instruction_for(request)
+
+    assert "Use DuckDB for time-series analysis when historical tables are available" not in instruction
+    assert (
+        "Use computed summaries from market_load_history_table or "
+        "market_load_history_tables_summary first"
+    ) in instruction
+    assert (
+        "Use duckdb_query only when the needed comparison or statistic is not already available"
+        in instruction
+    )
+
+
+@pytest.mark.parametrize(
+    "bound_tools",
+    [
+        [],
+        [_bound_tool("account_positions")],
+        [_bound_tool("market_load_history_table")],
+        [_bound_tool("duckdb_query")],
+    ],
+)
+def test_runtime_instruction_omits_computed_summary_guidance_without_matching_tools(bound_tools):
+    instruction = GoogleADKRuntime()._instruction_for(_runtime_request(bound_tools))
+
+    assert "Use DuckDB for time-series analysis when historical tables are available" not in instruction
+    assert "Use computed summaries from market_load_history_table" not in instruction
+    assert "Use duckdb_query only when the needed comparison or statistic is not already available" not in instruction
 
 
 def test_disabled_duckdb_tool_does_not_trigger_guidance():
@@ -167,16 +220,15 @@ class CaptureRuntime:
 
 
 @pytest.mark.parametrize(
-    ("tool_name", "expects_guidance"),
+    "tool_name",
     [
-        ("duckdb_query", True),
-        ("account_positions", False),
+        "duckdb_query",
+        "account_positions",
     ],
 )
 def test_agent_run_reuses_bound_tools_for_prompt_runtime_and_cache(
     monkeypatch,
     tool_name,
-    expects_guidance,
 ):
     strategy = DummyStrategy()
     manager = AgentManager(strategy)
@@ -220,7 +272,7 @@ def test_agent_run_reuses_bound_tools_for_prompt_runtime_and_cache(
     assert len(captured_cache_payloads) == 1
     effective_prompt = captured_cache_payloads[0]["effective_system_prompt"]
     assert runtime.request.system_prompt == effective_prompt
-    assert effective_prompt.count("DUCKDB SQL GUIDANCE") == int(expects_guidance)
+    assert "DUCKDB SQL GUIDANCE" not in effective_prompt
 
 
 def test_agent_run_reuses_bound_tools_when_replay_cache_hits(monkeypatch):

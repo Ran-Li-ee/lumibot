@@ -3610,10 +3610,23 @@ class GoogleADKRuntime:
         lines.append("General rules:")
         lines.append("- Use tools for structured data and trading actions.")
         if request.bound_tools:
-            tool_names = ", ".join(sorted(tool.name for tool in request.bound_tools))
+            available_tool_names = {tool.name for tool in request.bound_tools}
+            tool_names = ", ".join(sorted(available_tool_names))
             lines.append(f"- Available tool names for this run: {tool_names}.")
             lines.append("- Only call tool names that appear in the available tool list for this run.")
-        lines.append("- Use DuckDB for time-series analysis when historical tables are available.")
+            has_history_summary = bool(
+                available_tool_names
+                & {
+                    "market_load_history_table",
+                    "market_load_history_tables_summary",
+                }
+            )
+            if has_history_summary and "duckdb_query" in available_tool_names:
+                lines.append(
+                    "- Use computed summaries from market_load_history_table or "
+                    "market_load_history_tables_summary first. Use duckdb_query only when the needed "
+                    "comparison or statistic is not already available."
+                )
         lines.append("- Return a short final summary after you finish using tools.")
         return "\n".join(lines).strip()
 
