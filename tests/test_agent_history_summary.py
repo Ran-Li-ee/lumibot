@@ -155,6 +155,74 @@ def test_compute_history_summary_missing_close_returns_warnings():
     assert any("close" in warning.lower() for warning in summary["warnings"])
 
 
+def test_compute_history_summary_sanitizes_non_finite_source_values():
+    frame = pd.DataFrame(
+        {
+            "Date": pd.date_range("2024-01-01", periods=3, freq="D"),
+            "high": [float("inf"), float("-inf"), float("nan")],
+            "low": [float("-inf"), float("nan"), float("inf")],
+            "close": [float("inf"), float("-inf"), float("nan")],
+        }
+    )
+
+    summary = compute_history_summary(frame, symbol="BAD", timestep="day", as_of=None)
+
+    json.dumps(summary, allow_nan=False)
+    assert summary["price"]["latest_close"] is None
+    assert summary["momentum"] == {
+        "return_20": None,
+        "return_21": None,
+        "return_60": None,
+        "return_63": None,
+        "return_120": None,
+        "return_126": None,
+        "return_252": None,
+    }
+    assert summary["trend"] == {
+        "sma_20": None,
+        "sma_50": None,
+        "sma_200": None,
+        "price_vs_sma_20": None,
+        "price_vs_sma_50": None,
+        "price_vs_sma_200": None,
+    }
+    assert summary["range"] == {
+        "high_252": None,
+        "low_252": None,
+        "distance_to_high_252": None,
+        "distance_to_low_252": None,
+    }
+    assert summary["risk"] == {
+        "max_drawdown_60": None,
+        "volatility_20": None,
+    }
+    assert summary["scores"] == {
+        "momentum_composite": None,
+        "trend_alignment": None,
+    }
+    assert summary["availability"]["latest_close"] is False
+    assert summary["availability"]["momentum_composite"] is False
+    assert summary["availability"]["trend_alignment"] is False
+    assert summary["availability"]["high_252"] is False
+    assert summary["availability"]["low_252"] is False
+    assert summary["availability"]["max_drawdown_60"] is False
+    assert summary["availability"]["volatility_20"] is False
+
+
+def test_compute_history_summary_invalid_trend_comparisons_are_unavailable():
+    frame = _frame(260)
+    frame.loc[60:258, "close"] = float("inf")
+
+    summary = compute_history_summary(frame, symbol="BAD", timestep="day", as_of=None)
+
+    assert summary["trend"]["price_vs_sma_20"] is None
+    assert summary["trend"]["price_vs_sma_50"] is None
+    assert summary["trend"]["price_vs_sma_200"] is None
+    assert summary["scores"]["trend_alignment"] is None
+    assert summary["availability"]["trend_alignment"] is False
+    json.dumps(summary, allow_nan=False)
+
+
 def test_compute_history_summary_empty_frame_does_not_raise():
     summary = compute_history_summary(pd.DataFrame(), symbol="EMPTY", timestep="day", as_of=None)
 

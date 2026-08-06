@@ -69,6 +69,7 @@ def compute_history_summary(
     }
     high_252 = _window_extreme(high if high is not None else close, 252, "max")
     low_252 = _window_extreme(low if low is not None else close, 252, "min")
+    max_drawdown_60 = _max_drawdown(close, 60)
     volatility_20 = _volatility(close, 20)
     if volatility_20 is not None and timestep != "day":
         notes.append("volatility_20 is calculated from the last 20 bars and is not annualized as daily volatility.")
@@ -89,7 +90,7 @@ def compute_history_summary(
         "sma_200": trend["sma_200"] is not None,
         "high_252": high_252 is not None,
         "low_252": low_252 is not None,
-        "max_drawdown_60": close is not None and len(close.dropna()) > 0,
+        "max_drawdown_60": max_drawdown_60 is not None,
         "volatility_20": volatility_20 is not None,
     }
 
@@ -112,7 +113,7 @@ def compute_history_summary(
             "distance_to_low_252": _relative_to(latest_close, low_252),
         },
         "risk": {
-            "max_drawdown_60": _max_drawdown(close, 60),
+            "max_drawdown_60": max_drawdown_60,
             "volatility_20": volatility_20,
         },
         "availability": availability,
@@ -219,6 +220,15 @@ def _finite_or_none(value: Any) -> Any:
     return None
 
 
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    numeric = float(value)
+    if math.isfinite(numeric):
+        return numeric
+    return None
+
+
 def _sort_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame.copy()
@@ -263,15 +273,15 @@ def _numeric_series(frame: pd.DataFrame, column: str) -> pd.Series | None:
 def _last_value(series: pd.Series | None) -> float | None:
     if series is None or series.empty:
         return None
-    return float(series.iloc[-1])
+    return _finite_float(series.iloc[-1])
 
 
 def _period_return(series: pd.Series | None, window: int) -> float | None:
     if series is None or len(series) <= window:
         return None
-    previous = float(series.iloc[-window - 1])
-    latest = float(series.iloc[-1])
-    if previous == 0:
+    previous = _finite_float(series.iloc[-window - 1])
+    latest = _finite_float(series.iloc[-1])
+    if previous in (None, 0) or latest is None:
         return None
     return latest / previous - 1.0
 
@@ -279,17 +289,20 @@ def _period_return(series: pd.Series | None, window: int) -> float | None:
 def _sma(series: pd.Series | None, window: int) -> float | None:
     if series is None or len(series) < window:
         return None
-    return float(series.tail(window).mean())
+    return _finite_float(series.tail(window).mean())
 
 
 def _relative_to(numerator: float | None, denominator: float | None) -> float | None:
+    numerator = _finite_float(numerator)
+    denominator = _finite_float(denominator)
     if numerator is None or denominator in (None, 0):
         return None
     return numerator / denominator - 1.0
 
 
 def _mean_available(values: list[float | None]) -> float | None:
-    available = [float(value) for value in values if value is not None]
+    available = [_finite_float(value) for value in values]
+    available = [value for value in available if value is not None]
     if not available:
         return None
     return sum(available) / len(available)
@@ -305,7 +318,10 @@ def _trend_alignment(values: list[float | None]) -> int | None:
 def _window_extreme(series: pd.Series | None, window: int, method: str) -> float | None:
     if series is None or series.empty:
         return None
-    values = series.tail(min(window, len(series)))
+    values = series.tail(min(window, len(series))).dropna()
+    values = values[values.map(lambda value: _finite_float(value) is not None)]
+    if values.empty:
+        return None
     if method == "max":
         return float(values.max())
     if method == "min":
@@ -316,16 +332,20 @@ def _window_extreme(series: pd.Series | None, window: int, method: str) -> float
 def _max_drawdown(series: pd.Series | None, window: int) -> float | None:
     if series is None or series.empty:
         return None
-    values = series.tail(min(window, len(series))).astype("float64")
+    values = series.tail(min(window, len(series))).astype("float64").dropna()
+    values = values[values.map(lambda value: _finite_float(value) is not None)]
+    if values.empty:
+        return None
     running_peak = values.cummax()
     drawdowns = values / running_peak - 1.0
-    return float(drawdowns.min())
+    return _finite_float(drawdowns.min())
 
 
 def _volatility(series: pd.Series | None, window: int) -> float | None:
     if series is None or len(series) <= 1:
         return None
-    returns = series.pct_change().dropna().tail(window)
+    returns = series.pct_change().dropna()
+    returns = returns[returns.map(lambda value: _finite_float(value) is not None)].tail(window)
     if len(returns) < 2:
         return None
-    return float(returns.std())
+    return _finite_float(returns.std())
