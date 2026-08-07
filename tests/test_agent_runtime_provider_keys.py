@@ -10,6 +10,7 @@ from lumibot.components.agents.runtime import (
     GoogleADKRuntime,
     RuntimeRequest,
     _aggregate_usage_metadata,
+    _sanitize_litellm_completion_args_for_model,
     _resolve_model_for_adk,
     _strip_thought_parts_from_litellm_request,
     _supports_explicit_temperature_for_adk_model,
@@ -230,6 +231,47 @@ def test_litellm_model_forwards_model_request_timeout(monkeypatch):
     assert created["prompt_cache_key"] == "stable-prefix-key"
 
 
+def test_openai_luna_tool_calls_force_reasoning_effort_none():
+    kwargs = {"reasoning_effort": "medium", "stream": False}
+
+    sanitized = _sanitize_litellm_completion_args_for_model(
+        model="openai/gpt-5.6-luna",
+        tools=[{"type": "function"}],
+        kwargs=kwargs,
+    )
+
+    assert sanitized is not kwargs
+    assert sanitized["reasoning_effort"] == "none"
+    assert sanitized["stream"] is False
+    assert kwargs["reasoning_effort"] == "medium"
+
+
+def test_openai_luna_without_tools_omits_reasoning_effort_for_chat_completions():
+    kwargs = {"reasoning_effort": "medium"}
+
+    sanitized = _sanitize_litellm_completion_args_for_model(
+        model="openai/gpt-5.6-luna",
+        tools=[],
+        kwargs=kwargs,
+    )
+
+    assert sanitized is not kwargs
+    assert "reasoning_effort" not in sanitized
+
+
+def test_openai_non_luna_tool_calls_preserve_reasoning_effort():
+    kwargs = {"reasoning_effort": "medium"}
+
+    sanitized = _sanitize_litellm_completion_args_for_model(
+        model="openai/gpt-5.4-mini",
+        tools=[{"type": "function"}],
+        kwargs=kwargs,
+    )
+
+    assert sanitized is kwargs
+    assert sanitized["reasoning_effort"] == "medium"
+
+
 def test_xai_model_forwards_grok_conversation_cache_header(monkeypatch):
     created: dict[str, object] = {}
 
@@ -356,6 +398,50 @@ def test_runtime_prompt_only_names_available_tools():
     assert "Momentum holds." in user_text
     assert "list_fred_series" not in user_text
     assert "alpaca_news" not in user_text
+
+
+def test_runtime_instruction_does_not_repeat_history_tool_policy():
+    runtime = GoogleADKRuntime()
+    bound_tools = [
+        BoundTool(
+            name="market_load_history_table",
+            description="History table",
+            function=lambda: {},
+        ),
+        BoundTool(
+            name="market_load_history_tables_summary",
+            description="History summaries",
+            function=lambda: {},
+        ),
+        BoundTool(
+            name="duckdb_query",
+            description="DuckDB query",
+            function=lambda: {},
+        ),
+    ]
+    request = RuntimeRequest(
+        agent_name="growth_agent",
+        model="openai/gpt-5.4-mini",
+        system_prompt="System prompt with manager-owned tool policy.",
+        task_prompt=None,
+        context=None,
+        runtime_context=None,
+        memory_state=None,
+        memory_notes=[],
+        bound_tools=bound_tools,
+    )
+
+    instruction = runtime._instruction_for(request)
+
+    for tool_name in (
+        "duckdb_query",
+        "market_load_history_table",
+        "market_load_history_tables_summary",
+    ):
+        assert tool_name in instruction
+    assert "Use computed summaries" not in instruction
+    assert "primary evidence for price history" not in instruction
+    assert "Use duckdb_query only" not in instruction
 
 
 def test_runtime_enforces_agent_run_timeout(monkeypatch):

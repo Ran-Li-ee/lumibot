@@ -2754,6 +2754,8 @@ def _prune_tool_response_for_context_window(
     tool_name: str | None,
     max_chars: int = 4_000,
 ) -> Any | None:
+    if tool_name == "market_load_history_tables_summary":
+        max_chars = max(max_chars, 6_000)
     response_chars = _serialized_content_length(tool_response)
     if response_chars <= max_chars:
         return None
@@ -3281,6 +3283,11 @@ def _build_observed_litellm_type(
             tools: Any,
             **kwargs: Any,
         ) -> Any:
+            kwargs = _sanitize_litellm_completion_args_for_model(
+                model=model,
+                tools=tools,
+                kwargs=kwargs,
+            )
             capture_kwargs = {
                 "model": model,
                 "messages": messages,
@@ -3541,6 +3548,26 @@ def _supports_explicit_temperature_for_adk_model(model: Any) -> bool:
     return _is_native_gemini_model(model)
 
 
+def _sanitize_litellm_completion_args_for_model(
+    *,
+    model: Any,
+    tools: Any,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Return provider-compatible LiteLLM completion kwargs for known model quirks."""
+
+    if not isinstance(model, str):
+        return kwargs
+    if model.strip().lower() != "openai/gpt-5.6-luna":
+        return kwargs
+    sanitized = dict(kwargs)
+    if tools:
+        sanitized["reasoning_effort"] = "none"
+    else:
+        sanitized.pop("reasoning_effort", None)
+    return sanitized
+
+
 class GoogleADKRuntime:
     def __init__(self, mcp_servers: list[MCPServer] | None = None) -> None:
         self.mcp_servers = mcp_servers or []
@@ -3614,19 +3641,6 @@ class GoogleADKRuntime:
             tool_names = ", ".join(sorted(available_tool_names))
             lines.append(f"- Available tool names for this run: {tool_names}.")
             lines.append("- Only call tool names that appear in the available tool list for this run.")
-            has_history_summary = bool(
-                available_tool_names
-                & {
-                    "market_load_history_table",
-                    "market_load_history_tables_summary",
-                }
-            )
-            if has_history_summary and "duckdb_query" in available_tool_names:
-                lines.append(
-                    "- Use computed summaries from market_load_history_table or "
-                    "market_load_history_tables_summary first. Use duckdb_query only when the needed "
-                    "comparison or statistic is not already available."
-                )
         lines.append("- Return a short final summary after you finish using tools.")
         return "\n".join(lines).strip()
 

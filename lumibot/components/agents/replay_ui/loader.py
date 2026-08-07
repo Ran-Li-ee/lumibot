@@ -675,11 +675,15 @@ def _system_run_backtest_key(root: Path, system_run: SystemRun) -> tuple[str, st
 
 def _trace_root_label(root: Path) -> str:
     parts = root.parts
-    marker = "ai_trading_team_example_benchmarks"
-    if marker in parts:
-        index = parts.index(marker)
-        if len(parts) > index + 2:
-            return f"{parts[index + 1]} / {parts[index + 2]}"
+    benchmark_markers = (
+        "ai_trading_team_example_benchmarks",
+        "ai_trading_team_provider_benchmarks",
+    )
+    for marker in benchmark_markers:
+        if marker in parts:
+            index = parts.index(marker)
+            if len(parts) > index + 2:
+                return f"{parts[index + 1]} / {parts[index + 2]}"
     return root.name or "agent_runtime"
 
 

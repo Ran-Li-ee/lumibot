@@ -89,6 +89,10 @@ def assert_sequence_side_relationship(prompt_text, sequence, side):
     )
 
 
+def created_tool_names(created_agent):
+    return {getattr(tool, "name", "") for tool in created_agent.get("tools", [])}
+
+
 def test_parse_execution_plan_extracts_clean_plan_from_result_text():
     strategy_module, _strategy_class = load_strategy_module()
     raw_summary = (
@@ -744,9 +748,9 @@ def test_strategy_prompts_do_not_reference_removed_workflow_concepts(monkeypatch
     strategy.on_trading_iteration()
 
     prompt_text = inspect.getsource(strategy_module)
-    prompt_text += json.dumps(agent_manager.created)
+    prompt_text += json.dumps(agent_manager.created, default=str)
     for agent in agent_manager._agents.values():
-        prompt_text += json.dumps(agent.calls)
+        prompt_text += json.dumps(agent.calls, default=str)
 
     assert_removed_concepts_absent(prompt_text)
 
@@ -884,7 +888,7 @@ def test_decision_buy_sizing_accepts_inclusive_tolerance_boundaries(quantity):
         (966.0, 0.034),
     ],
 )
-def test_decision_buy_sizing_raises_typed_diagnostics_outside_tolerance(
+def test_decision_buy_sizing_allows_quantities_outside_former_cash_buffer_tolerance(
     quantity,
     expected_ratio,
 ):
@@ -908,21 +912,10 @@ def test_decision_buy_sizing_raises_typed_diagnostics_outside_tolerance(
         "constraints": {"allow_negative_cash": False},
     }
 
-    with pytest.raises(strategy_module.DecisionCashBufferToleranceError) as error_info:
-        strategy_module.validate_decision_buy_sizing(strategy, plan)
+    strategy_module.validate_decision_buy_sizing(strategy, plan)
 
-    error = error_info.value
-    assert isinstance(error, ValueError)
-    assert error.sequence == 1
-    assert error.symbol == "SPY"
-    assert error.quantity == quantity
-    assert error.sizing_price == 0.1
-    assert error.simulated_cash_before_buy == 100.0
-    assert error.projected_cash == pytest.approx(100.0 - quantity * 0.1)
-    assert error.portfolio_value == 100.0
-    assert error.projected_ratio == pytest.approx(expected_ratio)
-    assert error.minimum_ratio == 0.01
-    assert error.maximum_ratio == 0.03
+    projected_ratio = (100.0 - quantity * 0.1) / 100.0
+    assert projected_ratio == pytest.approx(expected_ratio)
 
 
 @pytest.mark.parametrize("quantity", [425.0, 426.0, 427.0])
@@ -1184,11 +1177,8 @@ def test_decision_sizing_preserves_decimal_price_precision_at_lower_boundary():
         "constraints": {"allow_negative_cash": False},
     }
 
-    with pytest.raises(strategy_module.DecisionCashBufferToleranceError) as error_info:
-        strategy_module.validate_decision_buy_sizing(strategy, plan)
-
     assert strategy_module._decision_order_price(strategy, plan["orders"][0]) == precise_price
-    assert "DECISION_CASH_BUFFER_TOLERANCE" in str(error_info.value)
+    strategy_module.validate_decision_buy_sizing(strategy, plan)
 
 
 def _decision_summary(
@@ -1298,7 +1288,7 @@ def test_in_band_initial_decision_runs_once_and_reaches_execution():
     assert len(agent_manager["execution_agent"].calls) == 1
 
 
-def test_out_of_band_decision_retries_once_and_passing_retry_reaches_execution():
+def test_former_out_of_band_decision_reaches_execution_without_retry():
     _strategy_module, strategy_class = load_strategy_module()
     strategy, agent_manager = _workflow_strategy(
         strategy_class,
@@ -1307,127 +1297,8 @@ def test_out_of_band_decision_retries_once_and_passing_retry_reaches_execution()
 
     strategy.on_trading_iteration()
 
-    assert len(agent_manager["decision_agent"].calls) == 2
+    assert len(agent_manager["decision_agent"].calls) == 1
     assert len(agent_manager["execution_agent"].calls) == 1
-    retry_call = agent_manager["decision_agent"].calls[1]
-    assert "correction" in retry_call["task_prompt"].lower()
-    assert "1%" in retry_call["task_prompt"]
-    assert "3%" in retry_call["task_prompt"]
-    diagnostics = retry_call["context"]["decision_sizing_diagnostics"]
-    assert diagnostics["projected_cash"] == 500.0
-    assert diagnostics["projected_ratio"] == 0.005
-    assert diagnostics["minimum_ratio"] == 0.01
-    assert diagnostics["maximum_ratio"] == 0.03
-    assert diagnostics["simulated_cash_before_buy"] == 100000.0
-    assert diagnostics["portfolio_value"] == 100000.0
-    assert diagnostics["sizing_price"] == 100.0
-    assert retry_call["context"]["previous_decision_output"] == _decision_summary(995)
-
-
-def test_out_of_band_retry_failure_stops_without_third_call_or_execution():
-    strategy_module, strategy_class = load_strategy_module()
-    strategy, agent_manager = _workflow_strategy(
-        strategy_class,
-        [_decision_summary(995), _decision_summary(996)],
-    )
-
-    strategy.on_trading_iteration()
-
-    assert len(agent_manager["decision_agent"].calls) == 2
-    assert agent_manager["execution_agent"].calls == []
-    assert isinstance(strategy._last_execution_plan_error, str)
-    assert "DECISION_CASH_BUFFER_TOLERANCE" in strategy._last_execution_plan_error
-    assert strategy_module.DecisionCashBufferToleranceError
-
-
-@pytest.mark.parametrize(
-    "retry_summary",
-    [
-        _decision_summary(980, symbol="SPY"),
-        _decision_summary(980, decision_type="rotate"),
-        _decision_summary(980, side="sell"),
-        _decision_summary(980, order_type="limit"),
-    ],
-    ids=["symbol", "decision-type", "side", "order-type"],
-)
-def test_retry_cannot_change_immutable_decision_or_order_structure(retry_summary):
-    _strategy_module, strategy_class = load_strategy_module()
-    strategy, agent_manager = _workflow_strategy(
-        strategy_class,
-        [_decision_summary(995), retry_summary],
-    )
-    strategy.get_positions = lambda: [
-        SimpleNamespace(asset=SimpleNamespace(symbol="GLD"), quantity=1000.0),
-    ]
-
-    strategy.on_trading_iteration()
-
-    assert len(agent_manager["decision_agent"].calls) == 2
-    assert agent_manager["execution_agent"].calls == []
-    assert "DECISION_RETRY_STRUCTURE_CHANGED" in strategy._last_execution_plan_error
-
-
-def test_retry_cannot_change_sell_quantity_while_correcting_buy_quantity():
-    _strategy_module, strategy_class = load_strategy_module()
-    strategy, agent_manager = _workflow_strategy(
-        strategy_class,
-        [
-            _rotate_decision_summary(100, 1095),
-            _rotate_decision_summary(50, 1030),
-        ],
-    )
-    strategy.get_positions = lambda: [
-        SimpleNamespace(asset=SimpleNamespace(symbol="GLD"), quantity=100.0),
-    ]
-
-    strategy.on_trading_iteration()
-
-    assert len(agent_manager["decision_agent"].calls) == 2
-    assert agent_manager["execution_agent"].calls == []
-    assert "DECISION_RETRY_STRUCTURE_CHANGED" in strategy._last_execution_plan_error
-    assert "execution_plan.orders[0].quantity" in strategy._last_execution_plan_error
-
-
-def test_retry_cannot_change_decision_reason_brief():
-    _strategy_module, strategy_class = load_strategy_module()
-    strategy, agent_manager = _workflow_strategy(
-        strategy_class,
-        [
-            _decision_summary(995, reason_brief="initial reason"),
-            _decision_summary(980, reason_brief="changed reason"),
-        ],
-    )
-
-    strategy.on_trading_iteration()
-
-    assert len(agent_manager["decision_agent"].calls) == 2
-    assert agent_manager["execution_agent"].calls == []
-    assert "DECISION_RETRY_STRUCTURE_CHANGED" in strategy._last_execution_plan_error
-    assert "decision.reason_brief" in strategy._last_execution_plan_error
-
-
-def test_retry_can_change_only_sizing_error_target_buy_quantity():
-    _strategy_module, strategy_class = load_strategy_module()
-    strategy, agent_manager = _workflow_strategy(
-        strategy_class,
-        [
-            _rotate_decision_summary(100, 1095),
-            _rotate_decision_summary(100, 1080),
-        ],
-    )
-    strategy.get_positions = lambda: [
-        SimpleNamespace(asset=SimpleNamespace(symbol="GLD"), quantity=100.0),
-    ]
-
-    strategy.on_trading_iteration()
-
-    assert len(agent_manager["decision_agent"].calls) == 2
-    assert len(agent_manager["execution_agent"].calls) == 1
-    orders = agent_manager["execution_agent"].calls[0]["context"]["execution_plan"]["orders"]
-    assert [(order["side"], order["quantity"]) for order in orders] == [
-        ("sell", 100.0),
-        ("buy", 1080.0),
-    ]
 
 
 def test_structural_decision_error_does_not_retry():
@@ -1443,7 +1314,7 @@ def test_structural_decision_error_does_not_retry():
     assert agent_manager["execution_agent"].calls == []
 
 
-def test_retry_handoff_keeps_execution_agent_free_of_buffer_and_retry_material():
+def test_execution_handoff_keeps_execution_agent_free_of_buffer_and_retry_material():
     _strategy_module, strategy_class = load_strategy_module()
     strategy, agent_manager = _workflow_strategy(
         strategy_class,
@@ -1480,7 +1351,7 @@ def test_retry_handoff_keeps_execution_agent_free_of_buffer_and_retry_material()
                     "symbol": "GLD",
                     "asset_type": "stock",
                     "side": "buy",
-                    "quantity": 980.0,
+                        "quantity": 995.0,
                     "quantity_mode": "shares",
                     "order_type": "market",
                     "limit_price": None,
@@ -1608,10 +1479,17 @@ def test_decision_prompt_requests_structured_execution_plan():
         agent_manager._agents[name] = RecordingAgent(name)
     strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
 
+    strategy.initialize()
     strategy.on_trading_iteration()
 
-    decision_prompt = agent_manager["decision_agent"].calls[0]["task_prompt"]
-    decision_prompt_lower = decision_prompt.lower()
+    decision_agent_created = [
+        created for created in agent_manager.created if created["name"] == "decision_agent"
+    ][0]
+    decision_prompt = json.dumps(decision_agent_created, default=str) + json.dumps(
+        agent_manager["decision_agent"].calls,
+        default=str,
+    )
+    decision_prompt_lower = decision_prompt.lower().replace('\\"', '"')
     for field in (
         "decision.type",
         "decision.from",
@@ -1620,7 +1498,6 @@ def test_decision_prompt_requests_structured_execution_plan():
         "schema_version",
         "intent",
         "execution_plan.orders",
-        "constraints",
         "sequence",
         "quantity_mode",
     ):
@@ -1635,40 +1512,54 @@ def test_decision_prompt_requests_structured_execution_plan():
         assert rotate_plan_fragment in decision_prompt_lower
 
     for prompt_phrase in (
-        "before producing json for a non-hold decision, call account_positions and account_portfolio",
+        "before a non-hold decision, call account_positions and account_portfolio",
         "call market_last_price when sizing buy orders",
-        "final executable orders must use quantity_mode: shares",
-        "final executable orders must include a positive numeric quantity",
+        "use numeric share quantities",
         "do not use full_position, current_position, max_affordable_cash, or max_affordable_after_prior_sells",
         "calculate the share quantity from account tool output",
-        "target a cash reserve of approximately 2% of the current portfolio value",
-        "floor((available cash after prior sell orders - 0.02 * current portfolio value) / latest price)",
-        "largest whole-share quantity",
-        "do not include cash_buffer_pct in the execution order",
+        "choose order_type before calculating quantity",
+        "maximum buy quantity must be no greater than floor(0.98 * available_cash_after_prior_sells / sizing_price)",
+        "output only the final numeric share quantity",
+        "for market buys, use a conservative sizing_price based on available price evidence",
+        "it may be higher than market_last_price in daily backtests",
+        "for limit buys, use limit_price",
+        "for stop_limit buys, use stop_limit_price or the final bounded execution price",
+        "use the 98% cash rule only as an internal sizing rule",
+        "do not output cash_buffer_pct or any buffer field in execution_plan",
         "buy orders must use market, limit, smart_limit, or stop_limit",
         "do not use stop or trailing_stop for a buy order",
+        "compare the holding against the strongest candidate",
+        "choose rotate only when the candidate is clearly stronger",
+        "planned sell and buy quantities can be expressed as executable numeric share orders",
+        'quantity_mode must be exactly "shares"',
     ):
         assert prompt_phrase in decision_prompt_lower
-    assert "exactly 2%" not in decision_prompt_lower
-    assert "unless a larger cash buffer" not in decision_prompt_lower
+    for forbidden_cash_buffer_phrase in (
+        "target a cash reserve",
+        "0.02",
+        "2%",
+        "1%",
+        "3%",
+        "unless a larger cash buffer",
+        "quantity * sizing_price <= 0.98 * available cash after prior sells",
+        "do not assume market_last_price is the actual fill price",
+        "do not include cash_buffer_pct in the execution order",
+    ):
+        assert forbidden_cash_buffer_phrase not in decision_prompt_lower
 
     for strict_phrase in (
         "return only one valid json object",
         "do not include markdown",
-        "do not include result text",
-        "do not include prose after the json",
+        "result text",
+        "prose after the json",
     ):
         assert strict_phrase in decision_prompt_lower
 
     for prompt_phrase in (
-        "required top-level execution_plan fields are schema_version, intent, and orders",
-        "execution_plan.intent must be one of: hold, enter_position, rotate, reduce_position, close_position",
-        "do not write a sentence",
-        "constraints is optional and defaults apply",
-        "optional order fields include action, asset_type, order_type, "
-        "time_in_force, limit_price, stop_price, stop_limit_price, trail_price, and trail_percent",
-        "defaults apply",
-        "legacy aliases are optional",
+        "execution_plan must include schema_version, intent, and orders",
+        "intent must be one of hold, enter_position, rotate, reduce_position, close_position",
+        "each executable order must include sequence, symbol, side, quantity_mode, quantity, asset_type, order_type, and time_in_force",
+        "optional bounded-price fields include limit_price, stop_price, and stop_limit_price",
     ):
         assert prompt_phrase in decision_prompt_lower
 
@@ -1694,6 +1585,82 @@ def test_decision_prompt_requests_structured_execution_plan():
         assert old_field not in decision_prompt
 
 
+def test_growth_prompt_is_research_only_and_summary_first():
+    _strategy_module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    for name in ("growth_agent", "decision_agent", "execution_agent"):
+        agent_manager._agents[name] = RecordingAgent(name)
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+    strategy.on_trading_iteration()
+
+    growth_agent_created = [
+        created for created in agent_manager.created if created["name"] == "growth_agent"
+    ][0]
+    prompt_text = json.dumps(growth_agent_created, default=str) + json.dumps(
+        agent_manager["growth_agent"].calls,
+        default=str,
+    )
+    prompt_lower = prompt_text.lower().replace('\\"', '"')
+
+    for required_phrase in (
+        "rank the etf universe",
+        "use computed summary metrics as default evidence",
+        "identify the strongest candidate",
+        "do not place orders",
+        "do not calculate final executable share quantities",
+        "lack of order permission is not a recommendation to hold cash",
+        "preferred account action",
+        "do not exhaustively load raw history tables",
+    ):
+        assert required_phrase in prompt_lower
+
+    for forbidden_phrase in (
+        "execution_plan",
+        "schema_version",
+        "98% cash rule",
+        "cash_buffer_pct",
+        "orders_submit_order",
+    ):
+        assert forbidden_phrase not in prompt_lower
+
+
+def test_growth_decision_execution_agents_receive_distinct_tool_surfaces():
+    _strategy_module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    created = {agent["name"]: agent for agent in agent_manager.created}
+
+    assert created["growth_agent"]["include_builtin_tools"] is False
+    assert created_tool_names(created["growth_agent"]) == {
+        "account_positions",
+        "account_portfolio",
+        "market_load_history_table",
+        "market_load_history_tables_summary",
+        "duckdb_query",
+    }
+
+    assert created["decision_agent"]["include_builtin_tools"] is False
+    assert created_tool_names(created["decision_agent"]) == {
+        "account_positions",
+        "account_portfolio",
+        "market_last_price",
+    }
+
+    assert created["execution_agent"]["include_builtin_tools"] is False
+    assert created_tool_names(created["execution_agent"]) == {
+        "account_positions",
+        "account_portfolio",
+        "market_last_price",
+        "orders_open_orders",
+        "orders_submit_order",
+    }
+
+
 def test_execution_prompt_treats_execution_plan_as_authoritative():
     _strategy_module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -1709,24 +1676,33 @@ def test_execution_prompt_treats_execution_plan_as_authoritative():
     ]
     assert len(execution_agent_created) == 1
 
-    prompt_text = json.dumps(execution_agent_created[0])
-    prompt_text += json.dumps(agent_manager["execution_agent"].calls)
+    prompt_text = json.dumps(execution_agent_created[0], default=str)
+    prompt_text += json.dumps(agent_manager["execution_agent"].calls, default=str)
     prompt_text = prompt_text.lower().replace('\\"', '"')
 
     for required_phrase in (
         "execution_plan.orders",
-        "decision.reason_brief",
-        "human context",
         "do not re-rank",
         "do not substitute",
         "execution-level blockers",
-        "sequence number",
+        "sequence order",
         "submit the explicit numeric share quantities",
         "do not compute semantic sizing",
     ):
         assert required_phrase in prompt_text
     for forbidden_buffer_reference in ("cash_buffer_pct", "0.02", "2%"):
         assert forbidden_buffer_reference not in prompt_text
+    for forbidden_research_reference in (
+        "decision.reason_brief",
+        "growth_report",
+        "relative-strength account management",
+        "market_load_history_tables_summary",
+        "market_load_history_table",
+        "duckdb_query",
+        "98% cash rule",
+        "rank the etf universe",
+    ):
+        assert forbidden_research_reference not in prompt_text
     for required_pattern in (
         r"(execution_plan(?:\.orders)?.{0,100}(authoritative|source of truth|control|drive)|"
         r"(authoritative|source of truth|control|drive).{0,100}execution_plan(?:\.orders)?)",
@@ -1762,27 +1738,31 @@ def test_prompts_frame_strategy_as_neutral_relative_strength_account_management(
     strategy.initialize()
     strategy.on_trading_iteration()
 
-    prompt_text = json.dumps(agent_manager.created)
+    prompt_text = json.dumps(agent_manager.created, default=str)
     for agent in agent_manager._agents.values():
-        prompt_text += json.dumps(agent.calls)
+        prompt_text += json.dumps(agent.calls, default=str)
     prompt_text = prompt_text.lower().replace('\\"', '"')
 
     for required_phrase in (
         "relative-strength account management",
         "do not assume any etf is the default holding",
         "do not favor the current holding merely because it is already held",
-        "rank the universe from current evidence",
-        "more attractive than the current holding",
-        "you cannot place orders, but you must still make a clear research recommendation",
-        "you cannot place orders, but you must produce an actionable trading plan",
+        "rank the etf universe",
+        "rank the etf universe from current evidence",
+        "compare the holding against the strongest candidate",
+        "candidate is clearly stronger",
+        "do not place orders",
+        "research recommendation",
+        "strict execution_plan",
+        "do not place orders and do not perform broad etf research again",
         "if the account holds only cash or a cash-like position",
-        "do not treat no-trade as the default answer",
-        "trading costs and weak evidence matter, but they should not override",
     ):
         assert required_phrase in prompt_text
 
     assert "do not assume qqq is the default" not in prompt_text
     assert "you are read-only" not in prompt_text
+    assert "do not treat no-trade as the default answer" not in prompt_text
+    assert "trading costs and weak evidence matter, but they should not override" not in prompt_text
     for forbidden_phrase in (
         "rotation test",
         "execution capability test",

@@ -797,84 +797,31 @@ class AgentHandle:
     def _base_system_prompt(self, runtime_context: dict[str, Any]) -> str:
         if self.base_system_prompt_mode == "execution_minimal":
             return self._execution_minimal_base_system_prompt(runtime_context)
+        return self._global_runtime_rules_prompt(runtime_context)
+
+    def _global_runtime_rules_prompt(self, runtime_context: dict[str, Any]) -> str:
         mode = runtime_context.get("mode") or "live"
         lines = [
             "You are operating as a trading agent inside LumiBot.",
-            "Use the provided runtime context and tool outputs as the ground truth for the current state of the strategy.",
-            "Ground claims in tool results or runtime context instead of unsupported prior knowledge or vague market memory.",
-            "If evidence is weak, conflicting, stale, or incomplete, prefer doing nothing and explain why.",
-            "Execution mode, current datetime, current timezone, current positions, cash, equity/portfolio value, recent orders, and recent trades are provided in Runtime Context JSON.",
-            "Review current exposure, available cash, and recent activity before proposing any new trade.",
-            "",
-            "DEFAULT INVESTOR POLICY - FOLLOW THIS UNLESS THE USER'S SYSTEM PROMPT CLEARLY ASKS FOR A DIFFERENT STYLE:",
-            "Your job is to grow the account's value over time, not to maximize trade count.",
-            "Do not trade for the sake of activity. Prefer no trade over a weak trade.",
-            "Require a real thesis and real conviction before entering or rotating a position.",
-            "Do not buy an asset just because it is tradable, mentioned in news, or recently active.",
-            "Ask yourself why this should likely make money from here, why it is better than doing nothing, why it is better than what is already held, and what the downside is if you are wrong.",
-            "Use capital intentionally. Avoid token positions that are too small to matter.",
-            "Diversify when the strategy is broad and multiple opportunities compete for capital.",
-            "Assume this strategy may be one component of a broader portfolio unless the user says otherwise.",
-            "Do not resist intentional concentration when the user's strategy clearly calls for concentrated or single-asset exposure.",
-            "If you are not deploying capital into risk assets, explain why a high-quality short-duration defensive parking choice is preferable right now.",
-            "Avoid leaving raw cash idle unless there is a specific reason the defensive parking asset is unavailable or inappropriate.",
-            "When rotating, compare the new idea against the current holdings or current defensive posture and only switch if the new opportunity is clearly better.",
-            "Be aware that trading has costs. Commissions, spreads, and slippage add up, especially for thinly traded assets.",
-            "Prefer limit orders over market orders when the asset is not highly liquid.",
-            "Do not overtrade. Each round-trip has a cost, so the expected gain from a trade should clearly exceed the expected friction.",
-            "",
-            "RISK AND DRAWDOWN DISCIPLINE:",
-            "Your objective is the best risk-adjusted return over time, not the highest raw return. A smoother equity curve with a lower max drawdown is more valuable than a jagged one with a slightly higher end value, because compounding is damaged by deep drawdowns and because real users abandon strategies that hurt too much.",
-            "Remember the recovery math: a 20% drawdown requires a 25% gain to get back to even, a 50% drawdown requires a 100% gain, and an 80% drawdown requires a 400% gain. Small losses compound gently, large losses compound painfully. Limiting downside is almost always more valuable than squeezing out the last bit of upside.",
-            "Protect the downside as seriously as you pursue the upside. Size positions relative to conviction and expected volatility, not just available cash. A high-conviction low-volatility idea can take a larger share than a speculative high-volatility one.",
-            "Cut losing positions when the thesis is broken. Do not average down into a losing trade just to lower your cost basis. Reassess the thesis first, and exit if the evidence no longer supports the position.",
-            "Do not chase returns after a drawdown by increasing size or taking more aggressive exposure. That is how small drawdowns become large ones.",
-            "Think in terms of return per unit of volatility (Sharpe), return per unit of downside volatility (Sortino), and return relative to max drawdown (Calmar). The goal is compounding you can actually live with, not a headline number.",
-            "",
-            "POSITION SIZING AND ORDER EXECUTION:",
-            "Do not buy token one-share positions. Use account cash, portfolio value, current position size, and last price to calculate a sensible whole-share quantity.",
-            "Round down to whole shares when sizing positions.",
-            "Before every order, check current cash, portfolio value, current positions, and the latest price of the asset you are ordering. Lumibot rejects agent order submissions that skip those checks in the current agent run.",
-            "Estimate the order's cash impact before submitting it. Ask whether the order is likely to create negative cash or additional leverage, and only do that when it is intentional for the strategy and suitable for the asset class.",
-            "Margin and leverage behave differently across stocks, ETFs, options, futures, forex, crypto, brokers, and jurisdictions. Use judgment instead of assuming the same sizing rule works for every asset class.",
-            "When switching from one asset to another, close or reduce the current position first to free up capital before buying the replacement.",
-            "If the strategy holds a defensive parking asset (like SHV, BIL, or SGOV) and a better opportunity appears, sell the parking asset first to free the cash, then buy the new position. Do not assume parked capital is unavailable.",
-            "",
-            "TOOL USAGE:",
-            "Use your available tools to gather evidence before making any trading decision. Do not guess when a tool can give you the answer.",
-            "Before placing any trade, use tools to check current positions, available cash, and portfolio value.",
-            "Load recent price history for any asset you are considering and inspect it before deciding.",
-            "If you already hold a position and are considering adding, reducing, or selling it, call search_memory for the open thesis first and compare the current evidence against that thesis.",
-            "When available, use the built-in evidence stack before making a material equity decision: account/portfolio tools, current market prices, recent price history, DuckDB analysis, technical indicators, relevant news, macro/FRED data, SEC financial statements, SEC company facts, and SEC filings.",
-            "Do not submit a material equity order until you have called account/portfolio tools, market price/history tools, at least one technical indicator tool, a relevant news tool when configured, a macro/FRED tool when configured, and SEC financial/filing tools for relevant single-stock candidates.",
-            "For ETFs, indexes, or broad-market trades, use SEC financial/filing tools on the most relevant single-stock candidates, holdings, or alternatives you are considering; do not skip the category just because the final instrument is an ETF.",
-            "Do not repeat identical read-only evidence calls if the current task context already includes fresh results from another agent; reference those results and call again only when they are missing, stale, or conflicting.",
-            "If the user asks for an aggressive or concentrated strategy, let that user strategy prompt override the default investor style, but still ground the decision in tool evidence, position sizing, broker constraints, and backtesting look-ahead safety.",
-            "Use close for price columns when the returned columns include close.",
-            "When you have access to external MCP tools, explore what they offer and use them. You do not need to be told which specific tool to call.",
-            "Finish every run with a short summary sentence starting with RESULT: that explains what you did and why.",
+            "Runtime context is the ground truth for current account state, mode, datetime, timezone, "
+            "positions, cash, portfolio value, recent orders, and recent trades.",
+            "Tool outputs outrank model memory. Ground claims in tool results or runtime context instead of "
+            "unsupported prior knowledge.",
+            "Do not invent facts that are not present in runtime context or tool output.",
+            "Context pruning is a normal runtime mechanism used to manage context size.",
+            "If older tool outputs are marked as pruned, do not treat pruning itself as evidence failure.",
+            "Base your conclusion on the evidence still visible in context, and call targeted tools again if a pruned result is essential.",
         ]
         if mode == "backtesting":
             lines.extend(
                 [
                     "",
-                    "BACKTESTING SAFETY RULES - READ THIS AS A HARD REQUIREMENT:",
-                    "Look-ahead bias means using information that would not have been available at the current simulated datetime.",
-                    "If you leak future information into a backtest, the backtest becomes invalid, misleading, and useless for decision-making.",
-                    "Treat the current simulated datetime as a hard wall. Do not cross it. Do not infer across it. Do not hint across it.",
+                    "BACKTESTING SAFETY RULES:",
+                    "The current simulated datetime is a hard wall.",
+                    "Do not use future data.",
                     "Only use bars, news, macro data, filings, prices, positions, and events that were available at or before the current simulated datetime.",
-                    "Correct example: if the current simulated time is 2026-03-10 10:15 ET, you may use a news article published at 09:30 ET that same day if it appears in tool output.",
-                    "Incorrect example: using a headline published at 14:00 ET, a later macro revision, a later SEC filing, or knowledge of the close when the simulated time is still the morning.",
-                    "Incorrect example: saying 'the market later sold off' or 'inflation kept rising after this' unless that fact is explicitly visible in current tool output at or before the simulated datetime.",
-                    "Incorrect example: relying on what you remember happened historically when that information is not yet present in the runtime context or tool results.",
-                    "CRITICAL: When calling ANY external tool, if the tool has ANY parameter that controls a time range, date filter, or temporal bound, you MUST set it so that no data after the current simulated datetime can be returned.",
-                    "This applies regardless of what the parameter is named. Common names include: end, end_date, time_to, observation_end, before, until, to, date, timestamp, coed, realtime_end - but ANY parameter that limits the time range must be set.",
-                    "If a tool has a start/end date range and you only set start without setting end, the tool will likely return data up to today, which is in the future. ALWAYS set the end bound.",
-                    "Correct example: if the current simulated date is 2024-01-22 and a tool accepts end, end_date, time_to, or observation_end, pass 2024-01-22 (or the current simulated datetime) in that field.",
-                    "Incorrect example: calling a news, macro, or data tool with only a start parameter and no end parameter, allowing it to return future data by default.",
+                    "If a tool has any parameter that controls a time range, date filter, or temporal bound, set it so no data after the current simulated datetime can be returned.",
                     "If a tool response seems to include future timestamps, treat that as suspicious. Do not rely on those records without calling out the risk in your reasoning.",
-                    "If you are unsure whether information was available yet, say the evidence is insufficient and do nothing.",
-                    "Backtesting accuracy is more important than being clever. A cautious no-trade is better than a future-biased trade.",
                 ]
             )
         else:
@@ -882,8 +829,7 @@ class AgentHandle:
                 [
                     "",
                     "LIVE TRADING RULES:",
-                    "Act on the current visible market state and runtime context.",
-                    "Keep the strategy's positions, cash, and recent activity in mind before taking new actions.",
+                    "Act on the current visible account, broker, order, and market state.",
                 ]
             )
         return "\n".join(lines).strip()
@@ -892,8 +838,9 @@ class AgentHandle:
         mode = runtime_context.get("mode") or "live"
         lines = [
             "You are operating as an order execution agent inside LumiBot.",
-            "Use the provided runtime context and tool outputs as the ground truth for the current state of the "
-            "strategy.",
+            "Runtime context is the ground truth for current account state, mode, datetime, timezone, "
+            "positions, cash, portfolio value, recent orders, and recent trades.",
+            "Tool outputs outrank model memory.",
             "Execute only the provided execution_plan.",
             "Do not perform investment research, do not re-rank candidates, do not substitute symbols, and do not "
             "change the plan.",
@@ -915,9 +862,9 @@ class AgentHandle:
             lines.extend(
                 [
                     "",
-                    "BACKTESTING SAFETY RULES - READ THIS AS A HARD REQUIREMENT:",
-                    "Treat the current simulated datetime as a hard wall. Do not use data that would not have been "
-                    "available at or before that datetime.",
+                    "BACKTESTING SAFETY RULES:",
+                    "The current simulated datetime is a hard wall.",
+                    "Do not use future data.",
                     "If a tool has any parameter that controls a time range, date filter, or temporal bound, set it "
                     "so that no data after the current simulated datetime can be returned.",
                     "If a tool response seems to include future timestamps, treat that as suspicious and do not "
@@ -934,6 +881,67 @@ class AgentHandle:
             )
         return "\n".join(lines).strip()
 
+    def _account_tool_policy_prompt(self, tool_names: set[str]) -> str:
+        lines = ["ACCOUNT TOOL POLICY:"]
+        if "account_positions" in tool_names:
+            lines.append("Use account_positions to inspect current holdings.")
+        if "account_portfolio" in tool_names:
+            lines.append("Use account_portfolio to inspect cash and portfolio value.")
+        if len(lines) == 1:
+            return ""
+        return "\n".join(lines)
+
+    def _history_tool_policy_prompt(self, tool_names: set[str]) -> str:
+        has_summary = "market_load_history_tables_summary" in tool_names
+        has_single = "market_load_history_table" in tool_names
+        has_duckdb = "duckdb_query" in tool_names
+        if not (has_summary or has_single or has_duckdb):
+            return ""
+
+        lines = ["PRICE/HISTORY TOOL POLICY:"]
+        if has_summary:
+            lines.append(
+                "market_load_history_tables_summary is the default tool for multi-symbol price-history comparison."
+            )
+        if has_single:
+            lines.append(
+                "market_load_history_table is targeted single-symbol follow-up when summary evidence is missing, "
+                "contradictory, or insufficient."
+            )
+        if has_summary and has_single:
+            lines.append("Do not load raw history tables for every symbol when summary rankings already answer the task.")
+        if has_duckdb:
+            lines.append(
+                "duckdb_query is targeted follow-up only when computed summaries and rankings do not answer a "
+                "specific question."
+            )
+            lines.append("Do not treat DuckDB as a required step in every research workflow.")
+        return "\n".join(lines)
+
+    def _execution_tool_policy_prompt(self, tool_names: set[str]) -> str:
+        execution_tools = {
+            "orders_submit_order",
+            "orders_cancel_order",
+            "orders_modify_order",
+            "orders_open_orders",
+        }
+        if not (tool_names & execution_tools):
+            return ""
+
+        lines = [
+            "EXECUTION TOOL POLICY:",
+            "Execution tools are not research tools.",
+        ]
+        if "orders_submit_order" in tool_names:
+            lines.append("orders_submit_order executes explicit order fields from execution_plan.orders.")
+        if "orders_open_orders" in tool_names:
+            lines.append("Use orders_open_orders to inspect outstanding orders before submitting new orders.")
+        if "orders_cancel_order" in tool_names:
+            lines.append("Use orders_cancel_order only for explicit execution-level order management.")
+        if "orders_modify_order" in tool_names:
+            lines.append("Use orders_modify_order only for explicit execution-level order management.")
+        return "\n".join(lines)
+
     def _compose_system_prompt(
         self,
         runtime_context: dict[str, Any],
@@ -948,22 +956,16 @@ class AgentHandle:
         ]
         if bound_tools:
             tool_names = {tool.name for tool in bound_tools}
-            has_history_summary = bool(
-                tool_names
-                & {
-                    "market_load_history_table",
-                    "market_load_history_tables_summary",
-                }
-            )
-            if has_history_summary and "duckdb_query" in tool_names:
-                prompt_parts.extend(
-                    [
-                        "HISTORICAL DATA TOOL PRIORITY:",
-                        "Use computed summaries from market_load_history_table or "
-                        "market_load_history_tables_summary first. "
-                        "Use duckdb_query only when the needed comparison or statistic is not already available.",
-                    ]
-                )
+            account_policy = self._account_tool_policy_prompt(tool_names)
+            if account_policy:
+                prompt_parts.append(account_policy)
+            if self.base_system_prompt_mode != "execution_minimal":
+                history_policy = self._history_tool_policy_prompt(tool_names)
+                if history_policy:
+                    prompt_parts.append(history_policy)
+            execution_policy = self._execution_tool_policy_prompt(tool_names)
+            if execution_policy:
+                prompt_parts.append(execution_policy)
         return "\n\n".join(prompt_parts).strip()
 
     def _append_memory(self, result: AgentRunResult) -> None:

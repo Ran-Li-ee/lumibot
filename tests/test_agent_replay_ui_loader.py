@@ -1048,6 +1048,37 @@ def test_benchmark_artifact_trace_root_gets_readable_label(tmp_path):
     assert public["runs"][0]["label"] == "20260717_185016_461584 / growth-execution-test"
 
 
+def test_provider_benchmark_artifact_trace_root_gets_readable_label(tmp_path):
+    root = (
+        tmp_path
+        / "artifacts"
+        / "ai_trading_team_provider_benchmarks"
+        / "20260731_154745_169491_15832"
+        / "openai_gpt-5.4-mini"
+        / "cache"
+        / "agent_runtime"
+    )
+    _write_trace(
+        root / "traces" / "bear" / "trace.json",
+        {
+            "agent": "bear",
+            "request": {
+                "runtime_context": {
+                    "mode": "backtesting",
+                    "current_datetime": "2024-09-05T09:30:00-04:00",
+                    "strategy_name": "AITradingTeamBullBearLeveragedETFStrategy",
+                }
+            },
+            "events": [],
+            "summary": "bear",
+        },
+    )
+
+    public = build_replay_dataset(root).to_public_dict()
+
+    assert public["runs"][0]["label"] == "20260731_154745_169491_15832 / openai_gpt-5.4-mini"
+
+
 def test_build_replay_dataset_marks_ambiguous_summary_sources(tmp_path):
     root = tmp_path / "agent_runtime"
     common_runtime = {

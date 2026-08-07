@@ -33,8 +33,16 @@ def default_trace_roots() -> list[Path]:
         return [Path(explicit_root)]
 
     roots = [REPO_ROOT / ".lumibot" / "agent_runtime"]
-    benchmark_root = REPO_ROOT / "artifacts" / "ai_trading_team_example_benchmarks"
-    roots.extend(sorted(benchmark_root.glob("*/*/cache/agent_runtime")))
+    global_root = global_trace_root()
+    if global_root.exists():
+        roots.append(global_root)
+    artifact_root = REPO_ROOT / "artifacts"
+    benchmark_roots = [
+        artifact_root / "ai_trading_team_example_benchmarks",
+        artifact_root / "ai_trading_team_provider_benchmarks",
+    ]
+    for benchmark_root in benchmark_roots:
+        roots.extend(sorted(benchmark_root.glob("*/*/cache/agent_runtime")))
     return roots
 
 
@@ -59,10 +67,6 @@ def main() -> None:
     print("Trace roots:")
     for trace_root in trace_roots:
         print(f"  - {trace_root}")
-    default_root = default_trace_root()
-    if args.trace_root is None and default_root not in trace_roots and global_trace_root().exists():
-        print(f"Global trace root not used by default: {global_trace_root()}")
-        print("Pass --trace-root explicitly to inspect global or older project traces.")
     print(f"URL: {url}")
 
     if not args.no_browser:

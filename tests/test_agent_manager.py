@@ -109,7 +109,7 @@ def test_duckdb_sql_guidance_is_not_appended_with_actual_bound_tools_by_default(
     assert "DUCKDB SQL GUIDANCE" not in prompt
 
 
-def test_system_prompt_prefers_computed_summaries_before_duckdb_query():
+def test_system_prompt_routes_price_history_policy_before_duckdb_query():
     handle = AgentHandle(
         manager=DummyManager(),
         name="research_agent",
@@ -125,18 +125,18 @@ def test_system_prompt_prefers_computed_summaries_before_duckdb_query():
 
     prompt = handle._compose_system_prompt({"mode": "backtesting"}, bound_tools)
 
+    prompt_lower = prompt.lower()
     assert "Use DuckDB for time-series analysis when historical tables are available" not in prompt
+    assert "price/history tool policy" in prompt_lower
     assert (
-        "Use computed summaries from market_load_history_table or "
-        "market_load_history_tables_summary first"
-    ) in prompt
-    assert (
-        "Use duckdb_query only when the needed comparison or statistic is not already available"
-        in prompt
-    )
+        "market_load_history_tables_summary is the default tool for multi-symbol "
+        "price-history comparison"
+    ) in prompt_lower
+    assert "market_load_history_table is targeted single-symbol follow-up" in prompt_lower
+    assert "duckdb_query is targeted follow-up only" in prompt_lower
 
 
-def test_runtime_instruction_prefers_computed_summaries_before_duckdb_query():
+def test_runtime_instruction_does_not_duplicate_price_history_policy():
     request = _runtime_request(
         [
             _bound_tool("market_load_history_table"),
@@ -148,14 +148,10 @@ def test_runtime_instruction_prefers_computed_summaries_before_duckdb_query():
     instruction = GoogleADKRuntime()._instruction_for(request)
 
     assert "Use DuckDB for time-series analysis when historical tables are available" not in instruction
-    assert (
-        "Use computed summaries from market_load_history_table or "
-        "market_load_history_tables_summary first"
-    ) in instruction
-    assert (
-        "Use duckdb_query only when the needed comparison or statistic is not already available"
-        in instruction
-    )
+    assert "PRICE/HISTORY TOOL POLICY" not in instruction
+    assert "market_load_history_tables_summary is the default tool" not in instruction
+    assert "market_load_history_table is targeted single-symbol follow-up" not in instruction
+    assert "duckdb_query is targeted follow-up only" not in instruction
 
 
 @pytest.mark.parametrize(
@@ -172,7 +168,7 @@ def test_runtime_instruction_omits_computed_summary_guidance_without_matching_to
 
     assert "Use DuckDB for time-series analysis when historical tables are available" not in instruction
     assert "Use computed summaries from market_load_history_table" not in instruction
-    assert "Use duckdb_query only when the needed comparison or statistic is not already available" not in instruction
+    assert "Use duckdb_query only for targeted follow-up analysis" not in instruction
 
 
 def test_disabled_duckdb_tool_does_not_trigger_guidance():
@@ -332,9 +328,44 @@ def test_agent_handle_uses_default_base_prompt_by_default():
 
     prompt = handle._compose_system_prompt({"mode": "backtesting"})
 
-    assert "DEFAULT INVESTOR POLICY" in prompt
-    assert "Prefer no trade over a weak trade" in prompt
+    assert "Runtime context is the ground truth" in prompt
+    assert "Tool outputs outrank model memory" in prompt
     assert "Decision prompt." in prompt
+
+
+def test_default_base_prompt_contains_only_global_runtime_rules():
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="research_agent",
+        system_prompt="Research prompt.",
+        default_model="test-model",
+        runtime=object(),
+    )
+
+    prompt = handle._compose_system_prompt({"mode": "backtesting"})
+    prompt_lower = prompt.lower()
+
+    for required_phrase in (
+        "runtime context is the ground truth",
+        "tool outputs outrank model memory",
+        "context pruning is a normal runtime mechanism",
+        "current simulated datetime",
+        "hard wall",
+        "do not use future data",
+        "Research prompt.",
+    ):
+        assert required_phrase.lower() in prompt_lower
+
+    for forbidden_phrase in (
+        "default investor policy",
+        "prefer no trade over a weak trade",
+        "load recent price history for any asset",
+        "duckdb analysis",
+        "do not submit a material equity order until",
+        "sec financial/filing tools",
+        "position sizing and order execution",
+    ):
+        assert forbidden_phrase not in prompt_lower
 
 
 def test_agent_handle_execution_minimal_base_prompt_omits_decision_policy():
@@ -356,6 +387,114 @@ def test_agent_handle_execution_minimal_base_prompt_omits_decision_policy():
     assert "Require a real thesis" not in prompt
     assert "BACKTESTING SAFETY RULES" in prompt
     assert "Execution prompt." in prompt
+
+
+def test_execution_minimal_base_prompt_contains_no_research_or_history_policy():
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="execution_agent",
+        system_prompt="Execution prompt.",
+        default_model="test-model",
+        runtime=object(),
+        base_system_prompt_mode="execution_minimal",
+    )
+
+    prompt = handle._compose_system_prompt({"mode": "backtesting"})
+    prompt_lower = prompt.lower()
+
+    for required_phrase in (
+        "order execution agent",
+        "execute only the provided execution_plan",
+        "do not perform investment research",
+        "runtime context is the ground truth",
+        "current simulated datetime",
+        "Execution prompt.",
+    ):
+        assert required_phrase.lower() in prompt_lower
+
+    for forbidden_phrase in (
+        "default investor policy",
+        "market_load_history_tables_summary",
+        "market_load_history_table",
+        "duckdb_query",
+        "computed summaries",
+        "98% cash rule",
+        "cash_buffer_pct",
+        "relative-strength",
+    ):
+        assert forbidden_phrase not in prompt_lower
+
+
+def test_research_agent_with_history_tools_receives_summary_first_policy():
+    def market_load_history_table():
+        return None
+
+    def market_load_history_tables_summary():
+        return None
+
+    def duckdb_query():
+        return None
+
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="growth_agent",
+        system_prompt="Growth role.",
+        default_model="test-model",
+        runtime=object(),
+        tools=[market_load_history_table, market_load_history_tables_summary, duckdb_query],
+        include_builtin_tools=False,
+    )
+
+    prompt = handle._compose_system_prompt(
+        {"mode": "backtesting"},
+        bound_tools=handle._ensure_bound_tools(),
+    )
+    prompt_lower = prompt.lower()
+
+    assert "price/history tool policy" in prompt_lower
+    assert (
+        "market_load_history_tables_summary is the default tool for multi-symbol "
+        "price-history comparison"
+    ) in prompt_lower
+    assert "market_load_history_table is targeted single-symbol follow-up" in prompt_lower
+    assert "duckdb_query is targeted follow-up only" in prompt_lower
+    assert "do not load raw history tables for every symbol" in prompt_lower
+
+
+def test_execution_agent_with_order_tools_does_not_receive_history_policy():
+    def orders_submit_order():
+        return None
+
+    def market_last_price():
+        return None
+
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="execution_agent",
+        system_prompt="Execution role.",
+        default_model="test-model",
+        runtime=object(),
+        tools=[orders_submit_order, market_last_price],
+        include_builtin_tools=False,
+        base_system_prompt_mode="execution_minimal",
+    )
+
+    prompt = handle._compose_system_prompt(
+        {"mode": "backtesting"},
+        bound_tools=handle._ensure_bound_tools(),
+    )
+    prompt_lower = prompt.lower()
+
+    assert "execution tool policy" in prompt_lower
+    assert "orders_submit_order executes explicit order fields from execution_plan.orders" in prompt_lower
+    for forbidden_phrase in (
+        "price/history tool policy",
+        "market_load_history_tables_summary",
+        "market_load_history_table",
+        "duckdb_query",
+        "computed summaries",
+    ):
+        assert forbidden_phrase not in prompt_lower
 
 
 def test_agent_manager_create_forwards_base_system_prompt_mode():

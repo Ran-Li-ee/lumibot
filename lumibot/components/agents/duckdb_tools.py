@@ -446,15 +446,7 @@ class DuckDBQueryLayer:
                 warnings.append(f"{symbol}: loaded history table did not include computed_summary.")
             else:
                 summaries[symbol] = summary
-            loaded_tables[symbol] = {
-                "table_name": table_info.get("table_name"),
-                "row_count": table_info.get("row_count"),
-                "columns": table_info.get("columns", []),
-                "symbol": table_info.get("symbol"),
-                "asset_type": table_info.get("asset_type"),
-                "timestep": table_info.get("timestep"),
-                "loaded_at": table_info.get("loaded_at"),
-            }
+            loaded_tables[symbol] = str(table_info.get("table_name") or "")
 
         if not loaded_tables:
             warning_text = "; ".join(warnings) if warnings else "no successful symbol loads"
@@ -469,7 +461,6 @@ class DuckDBQueryLayer:
             loaded_tables=loaded_tables,
             warnings=warnings,
         )
-        result["available_tables"] = self._available_table_schemas()
         return result
 
     def query(self, *, sql: str, limit: int = 200) -> dict[str, Any]:

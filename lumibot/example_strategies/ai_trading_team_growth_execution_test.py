@@ -5,6 +5,7 @@ import math
 import os
 from decimal import Decimal, InvalidOperation
 
+from lumibot.components.agents.builtins import BuiltinTools
 from lumibot.strategies.strategy import Strategy
 
 ALLOWED_INTENTS = {"hold", "enter_position", "rotate", "reduce_position", "close_position"}
@@ -32,59 +33,10 @@ REJECTED_SEMANTIC_QUANTITY_MODES = {
 ALLOWED_ORDER_TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop", "smart_limit"}
 REQUIRED_DECISION_ACCOUNT_TOOLS = {"account_positions", "account_portfolio"}
 REQUIRED_DECISION_BUY_SIZING_TOOLS = {"market_last_price"}
-DEFAULT_BUY_CASH_BUFFER_PCT = 0.02
-MINIMUM_BUY_CASH_BUFFER_PCT = 0.01
-MAXIMUM_BUY_CASH_BUFFER_PCT = 0.03
 SYSTEM_EXECUTION_CONSTRAINTS = {
     "allow_negative_cash": False,
     "if_any_order_blocked": "stop_remaining_orders",
 }
-
-
-class DecisionCashBufferToleranceError(ValueError):
-    def __init__(
-        self,
-        *,
-        sequence,
-        symbol,
-        quantity,
-        sizing_price,
-        simulated_cash_before_buy,
-        projected_cash,
-        portfolio_value,
-        projected_ratio,
-    ):
-        self.sequence = int(sequence)
-        self.symbol = str(symbol)
-        self.quantity = float(quantity)
-        self.sizing_price = float(sizing_price)
-        self.simulated_cash_before_buy = float(simulated_cash_before_buy)
-        self.projected_cash = float(projected_cash)
-        self.portfolio_value = float(portfolio_value)
-        self.projected_ratio = float(projected_ratio)
-        self.minimum_ratio = MINIMUM_BUY_CASH_BUFFER_PCT
-        self.maximum_ratio = MAXIMUM_BUY_CASH_BUFFER_PCT
-        self.execution_plan = None
-        super().__init__(
-            "DECISION_CASH_BUFFER_TOLERANCE: execution_plan buy order "
-            f"sequence {self.sequence} for {self.symbol} would leave cash "
-            f"{self.projected_cash:.2f} ({self.projected_ratio:.4%} of portfolio value); "
-            f"accepted range is {self.minimum_ratio:.0%} to {self.maximum_ratio:.0%}, inclusive."
-        )
-
-    def as_diagnostics(self):
-        return {
-            "sequence": self.sequence,
-            "symbol": self.symbol,
-            "quantity": self.quantity,
-            "sizing_price": self.sizing_price,
-            "simulated_cash_before_buy": self.simulated_cash_before_buy,
-            "projected_cash": self.projected_cash,
-            "portfolio_value": self.portfolio_value,
-            "projected_ratio": self.projected_ratio,
-            "minimum_ratio": self.minimum_ratio,
-            "maximum_ratio": self.maximum_ratio,
-        }
 
 
 def _extract_first_json_object(text):
@@ -352,13 +304,12 @@ def validate_decision_buy_sizing(strategy, execution_plan):
     if execution_plan["intent"] == "hold":
         return
 
-    simulated_cash = _decimal_number(strategy.get_cash(), "current cash")
     portfolio_value = _decimal_number(strategy.get_portfolio_value(), "portfolio value")
     has_buy_order = any(order["side"] == "buy" for order in execution_plan["orders"])
     if has_buy_order and portfolio_value <= 0:
         raise ValueError("portfolio value must be a finite positive number when sizing a buy order.")
 
-    minimum_cash_reserve = portfolio_value * Decimal(str(MINIMUM_BUY_CASH_BUFFER_PCT))
+    simulated_cash = _decimal_number(strategy.get_cash(), "current cash")
     holdings = (
         _current_long_holdings(strategy)
         if any(order["side"] == "sell" for order in execution_plan["orders"])
@@ -393,31 +344,14 @@ def validate_decision_buy_sizing(strategy, execution_plan):
 
         if (
             uncertain_sell_proceeds > 0
-            and simulated_cash - notional < minimum_cash_reserve
-            and simulated_cash + uncertain_sell_proceeds - notional >= minimum_cash_reserve
+            and simulated_cash - notional < 0
+            and simulated_cash + uncertain_sell_proceeds - notional >= 0
         ):
             raise ValueError(
                 "DECISION_BUY_REQUIRES_MARKET_SELL_PROCEEDS: a later buy may use prior sell proceeds "
                 "only when those sells are market orders."
             )
-        projected_cash = simulated_cash - notional
-        projected_ratio = projected_cash / portfolio_value
-        if not (
-            Decimal(str(MINIMUM_BUY_CASH_BUFFER_PCT))
-            <= projected_ratio
-            <= Decimal(str(MAXIMUM_BUY_CASH_BUFFER_PCT))
-        ):
-            raise DecisionCashBufferToleranceError(
-                sequence=order["sequence"],
-                symbol=order["symbol"],
-                quantity=quantity,
-                sizing_price=price,
-                simulated_cash_before_buy=simulated_cash,
-                projected_cash=projected_cash,
-                portfolio_value=portfolio_value,
-                projected_ratio=projected_ratio,
-            )
-        simulated_cash = projected_cash
+        simulated_cash -= notional
 
 
 def validate_execution_plan_cash_safety(strategy, execution_plan):
@@ -474,70 +408,9 @@ def validate_decision_tool_evidence(execution_plan, decision_result):
 def validate_decision_result(strategy, decision_result):
     execution_plan = parse_execution_plan_from_decision_summary(decision_result.summary)
     validate_decision_tool_evidence(execution_plan, decision_result)
-    try:
-        validate_decision_buy_sizing(strategy, execution_plan)
-    except DecisionCashBufferToleranceError as exc:
-        exc.execution_plan = execution_plan
-        raise
+    validate_decision_buy_sizing(strategy, execution_plan)
     validate_execution_plan_cash_safety(strategy, execution_plan)
     return execution_plan
-
-
-def _decision_structure_from_summary(summary):
-    payload = json.loads(_extract_first_json_object(summary))
-    payload = _require_dict(payload, "decision summary")
-    decision = _require_dict(payload.get("decision", {}), "decision")
-    return {
-        "type": str(decision.get("type", "")).strip().lower(),
-        "from": str(decision.get("from", "")).strip().upper(),
-        "to": str(decision.get("to", "")).strip().upper(),
-        "reason_brief": str(decision.get("reason_brief", "")).strip(),
-    }
-
-
-def validate_retry_quantity_only_change(
-    initial_summary,
-    initial_execution_plan,
-    retry_summary,
-    retry_execution_plan,
-    *,
-    allowed_quantity_sequence,
-    allowed_quantity_symbol,
-):
-    changed_fields = []
-    initial_decision = _decision_structure_from_summary(initial_summary)
-    retry_decision = _decision_structure_from_summary(retry_summary)
-    for field in ("type", "from", "to", "reason_brief"):
-        if initial_decision[field] != retry_decision[field]:
-            changed_fields.append(f"decision.{field}")
-
-    for field in ("schema_version", "intent", "constraints"):
-        if initial_execution_plan[field] != retry_execution_plan[field]:
-            changed_fields.append(f"execution_plan.{field}")
-
-    initial_orders = initial_execution_plan["orders"]
-    retry_orders = retry_execution_plan["orders"]
-    if len(initial_orders) != len(retry_orders):
-        changed_fields.append("execution_plan.orders.length")
-    else:
-        for index, (initial_order, retry_order) in enumerate(zip(initial_orders, retry_orders, strict=True)):
-            order_fields = set(initial_order) | set(retry_order)
-            for field in sorted(order_fields):
-                quantity_change_is_allowed = (
-                    field == "quantity"
-                    and initial_order.get("sequence") == allowed_quantity_sequence
-                    and initial_order.get("symbol") == allowed_quantity_symbol
-                )
-                if quantity_change_is_allowed:
-                    continue
-                if initial_order.get(field) != retry_order.get(field):
-                    changed_fields.append(f"execution_plan.orders[{index}].{field}")
-
-    if changed_fields:
-        raise ValueError(
-            "DECISION_RETRY_STRUCTURE_CHANGED: correction retry may change only positive whole-share quantity; "
-            f"changed immutable fields: {', '.join(changed_fields)}."
-        )
 
 
 class AITradingTeamGrowthExecutionTestStrategy(Strategy):
@@ -553,63 +426,66 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
             name="growth_agent",
             model=model,
             allow_trading=False,
+            include_builtin_tools=False,
+            tools=[
+                BuiltinTools.account.positions(),
+                BuiltinTools.account.portfolio(),
+                BuiltinTools.market.load_history_table(),
+                BuiltinTools.market.load_history_tables_summary(),
+                BuiltinTools.duckdb.query(),
+            ],
             system_prompt=(
-                "Analyze the ETF universe for relative-strength account management. Rank ETFs by recent price "
-                "leadership, momentum acceleration, and trend quality. Compare the current holding, if any, against "
-                "the strongest candidate. Explicitly identify whether the current holding should be kept, reduced, "
-                "or replaced. "
-                "Do not assume any ETF is the default holding. Do not favor the current holding merely because it is "
-                "already held. Rank the universe from current evidence in this run. Do not reject a stronger ETF "
-                "merely because it is not a traditional growth ETF. You cannot place orders, but you must still make "
-                "a clear research recommendation, including whether cash should be deployed into the strongest ETF "
-                "candidate."
+                "Growth agent role: rank the ETF universe for relative-strength account management. "
+                "Use computed summary metrics as default evidence. Identify the strongest candidate and compare "
+                "the current ETF holding, if any, against that candidate. State whether the current holding should "
+                "be kept, reduced, or replaced. Do not assume any ETF is the default holding. Do not favor the "
+                "current holding merely because it is already held. Do not place orders. Do not calculate final "
+                "executable share quantities. Your lack of order permission is not a recommendation to hold cash. "
+                "Your research recommendation must name the preferred account action: hold, buy, rotate, reduce, "
+                "or close. Do not exhaustively load raw history tables when summary evidence is "
+                "sufficient. Growth report contract: include a ranked ETF list, strongest candidate, compact "
+                "evidence summary, current holding comparison when relevant, research recommendation, and a short "
+                "RESULT summary."
             ),
         )
         self.agents.create(
             name="decision_agent",
             model=model,
             allow_trading=False,
+            include_builtin_tools=False,
+            tools=[
+                BuiltinTools.account.positions(),
+                BuiltinTools.account.portfolio(),
+                BuiltinTools.market.last_price(),
+            ],
             system_prompt=(
-                "Convert growth research plus current account state into a concrete relative-strength account "
-                "management plan. Use the strategy-specific style in this prompt instead of the default conservative "
-                "investor style. Do not treat no-trade as the default answer. Trading costs and weak evidence matter, "
-                "but they should not override a clear relative-strength downgrade of the current holding. You must "
-                "produce strict JSON with top-level fields decision and execution_plan. Return only one valid JSON "
-                "object. Do not include markdown. Do not include RESULT text. Do not include prose after the JSON. "
-                "Choose exactly one "
-                "decision.type from: hold, buy, rotate, reduce, close. decision must include decision.type, "
-                "decision.from, decision.to, and decision.reason_brief. Required top-level execution_plan fields "
-                "are schema_version, intent, and orders (execution_plan.orders); constraints is optional and "
-                "defaults apply. execution_plan.intent must be one of: hold, enter_position, rotate, "
-                "reduce_position, close_position; do not write a sentence. Each order must include sequence, symbol, "
-                "side, quantity_mode, and quantity. Optional order "
-                "fields include action, "
-                "asset_type, order_type, time_in_force, limit_price, stop_price, stop_limit_price, "
-                "trail_price, and trail_percent. Legacy aliases are optional: mode for intent and "
-                "execution_constraints for constraints. Before producing JSON for a non-hold decision, call "
-                "account_positions and account_portfolio. Call market_last_price when sizing buy orders. Final "
-                "executable orders must use quantity_mode: shares and must include a positive numeric quantity. "
-                "Do not use full_position, current_position, max_affordable_cash, or max_affordable_after_prior_sells "
-                "in final executable orders. For selling all or part of a position, calculate the share quantity from "
-                "account tool output and write the number. For buy orders, calculate the share quantity from cash and "
-                "latest price data and write the number. Target a cash reserve of approximately 2% of the current "
-                "portfolio value. Calculate the largest whole-share quantity as "
-                "floor((available cash after prior sell orders - 0.02 * current portfolio value) / latest price). "
-                "The resulting reserve may be slightly higher because orders use whole shares. The final quantity "
-                "must already account for this reserve. Do not include cash_buffer_pct in the execution order. "
-                "Buy orders must use market, limit, smart_limit, or stop_limit. Do not use stop or trailing_stop "
-                "for a buy order because those order types do not provide a bounded execution price. "
-                "Never produce orders that would make cash negative. "
-                "If the "
-                "account holds an ETF and another ETF is more attractive than the current holding based on current "
-                'evidence, choose decision.type="rotate" unless there is a clear blocking reason. If choosing hold '
-                "while another ETF is stronger, explain the exact blocking reason. If the account holds only cash or a "
-                'cash-like position and the research identifies a strongest ETF candidate, choose decision.type="buy" '
-                "unless there is a clear blocking reason. "
-                'For rotate decisions, set an order with sequence: 1 and side: "sell" for the source holding, then '
-                'an order with sequence: 2 and side: "buy" for the destination holding. '
-                'Use quantity_mode: "shares" and explicit numeric quantity on every executable order. '
-                "You cannot place orders, but you must produce an actionable trading plan for the execution agent."
+                "Decision agent role: convert growth_report and current account state into a concrete account "
+                "management decision and strict execution_plan. Do not place orders and do not perform broad ETF "
+                "research again. Choose exactly one decision.type from hold, buy, rotate, reduce, close. Decision "
+                "JSON contract: return only one valid JSON object with top-level fields decision and execution_plan. "
+                "Do not include markdown, RESULT text, or prose after the JSON. decision must include "
+                "decision.type, decision.from, decision.to, and decision.reason_brief. execution_plan must include "
+                "schema_version, intent, and orders (execution_plan.orders). intent must be one of hold, "
+                "enter_position, rotate, reduce_position, close_position. Each executable order must include "
+                "sequence, symbol, side, quantity_mode, quantity, asset_type, order_type, and time_in_force. "
+                'quantity_mode must be exactly "shares" for every executable order. '
+                "Optional bounded-price fields include limit_price, stop_price, and stop_limit_price. Use numeric "
+                "share quantities; do not use full_position, current_position, max_affordable_cash, or "
+                "max_affordable_after_prior_sells. Before a non-hold decision, call account_positions and "
+                "account_portfolio. Call market_last_price when sizing buy orders. Sizing and order construction "
+                "rules: choose order_type before calculating quantity. For selling all or part of a position, "
+                "calculate the share quantity from account tool output. For buy sizing, choose sizing_price based on "
+                "order_type. For market buys, use a conservative sizing_price based on available price evidence; it "
+                "may be higher than market_last_price in daily backtests. For limit buys, use limit_price. For "
+                "stop_limit buys, use stop_limit_price or the final bounded execution price. Use the 98% cash rule "
+                "only as an internal sizing rule: maximum buy quantity must be no greater than "
+                "floor(0.98 * available_cash_after_prior_sells / sizing_price). Output only the final numeric share "
+                "quantity. Do not output "
+                "cash_buffer_pct or any buffer field in execution_plan. Buy orders must use market, limit, "
+                "smart_limit, or stop_limit. Do not use stop or trailing_stop for a buy order because those order "
+                "types do not provide a bounded execution price. Never produce orders that would make cash negative. "
+                'For rotate decisions, set sequence: 1 with side: "sell" for decision.from, then set sequence: 2 '
+                'with side: "buy" for decision.to.'
             ),
         )
         self.agents.create(
@@ -617,18 +493,23 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
             model=model,
             allow_trading=True,
             base_system_prompt_mode=self._execution_agent_base_system_prompt_mode,
+            include_builtin_tools=False,
+            tools=[
+                BuiltinTools.account.positions(),
+                BuiltinTools.account.portfolio(),
+                BuiltinTools.market.last_price(),
+                BuiltinTools.orders.open_orders(),
+                BuiltinTools.orders.submit(),
+            ],
             system_prompt=(
-                "Execute only the provided execution_plan object using native trading tools, especially "
-                "orders_submit_order. Do not read or infer investment reasons. Do not add, remove, replace, or "
-                "reorder orders. "
-                "Treat execution_plan.orders as the authoritative source of truth that must control and drive "
-                "execution. decision.reason_brief is only human context, not permission to change orders. Do not redo "
-                "investment analysis, do not re-rank candidates, and do not substitute or replace any symbol. Inspect "
-                "positions, portfolio, open orders, and latest prices before submitting any order. Execute "
-                "execution_plan.orders in ascending sequence order and preserve the sequence number in each report. "
-                "Only execution-level blockers may block or pause execution. For each sequence, report whether it was "
-                "submitted or blocked. Submit the explicit numeric share quantities in execution_plan.orders. Do not "
-                "compute semantic sizing. Check affordability before buy orders."
+                "Execution agent role: execute only the provided execution_plan object using native execution tools, "
+                "especially orders_submit_order. Treat execution_plan.orders as authoritative. Do not read or infer "
+                "investment reasons. Do not re-rank candidates, do not substitute symbols, and do not use upstream "
+                "research to override the plan. Do not add, remove, replace, or reorder orders. Inspect positions, "
+                "portfolio, open orders, and latest prices before submitting orders. Execute orders in ascending "
+                "sequence order. Submit the explicit numeric share quantities in execution_plan.orders. Do not "
+                "compute semantic sizing. Block or pause only for execution-level blockers. Execution report "
+                "contract: report each sequence as submitted or blocked, and finish with a short RESULT summary."
             ),
         )
 
@@ -639,87 +520,26 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
         }
         growth = self.agents["growth_agent"].run(
             task_prompt=(
-                "Review the date and universe for relative-strength account management. Rank the strongest ETFs by "
-                "recent leadership and trend quality. Compare any current holding against the strongest candidate "
-                "and say whether the holding should be kept, reduced, or replaced. Do not assume any ETF is the "
-                "default holding. Do not favor the current holding merely because it is already held. Rank the "
-                "universe from current evidence in this run. You cannot place orders, but you must still make a clear "
-                "research recommendation, including whether cash should be deployed into the strongest ETF candidate."
+                "Use the date and universe to rank the ETF universe from current evidence. Prefer compact computed "
+                "summaries and rankings for price-history evidence. Identify the strongest candidate, summarize the "
+                "main evidence, compare any current ETF holding against the strongest candidate, and make a research "
+                "recommendation with a preferred account action. Finish with RESULT."
             ),
             context=context,
         )
         decision = self.agents["decision_agent"].run(
             task_prompt=(
-                "Use growth_report and current account state to produce strict JSON with exactly two top-level "
-                "fields: decision and execution_plan. Return only one valid JSON object. Do not include markdown. "
-                "Do not include RESULT text. Do not include prose after the JSON. decision must include "
-                "decision.type, decision.from, decision.to, and decision.reason_brief. decision.type must be one of: "
-                "hold, buy, rotate, reduce, "
-                "close. Required top-level execution_plan fields are schema_version, intent, and orders "
-                "(execution_plan.orders); constraints is optional and defaults apply. execution_plan.intent must be "
-                "one of: hold, enter_position, rotate, reduce_position, close_position; do not write a sentence. "
-                "Each order must include sequence, symbol, side, quantity_mode, and quantity. Optional order fields "
-                "include action, asset_type, "
-                "order_type, time_in_force, limit_price, stop_price, stop_limit_price, trail_price, and "
-                "trail_percent. Legacy aliases are optional: mode for intent and execution_constraints for "
-                "constraints. Before producing JSON for a non-hold decision, call account_positions and "
-                "account_portfolio. Call market_last_price when sizing buy orders. Final executable orders must use "
-                "quantity_mode: shares and must include a positive numeric quantity. Do not use full_position, "
-                "current_position, max_affordable_cash, or max_affordable_after_prior_sells in final executable "
-                "orders. For selling all or part of a position, calculate the share quantity from account tool "
-                "output and write the number. For buy orders, calculate the share quantity from cash and latest "
-                "price data and write the number. Target a cash reserve of approximately 2% of the current portfolio "
-                "value. Calculate the largest whole-share quantity as "
-                "floor((available cash after prior sell orders - 0.02 * current portfolio value) / latest price). "
-                "The resulting reserve may be slightly higher because orders use whole shares. The final quantity "
-                "must already account for this reserve. Do not include cash_buffer_pct in the execution order. "
-                "Buy orders must use market, limit, smart_limit, or stop_limit. Do not use stop or trailing_stop "
-                "for a buy order because those order types do not provide a bounded execution price. "
-                "Never produce orders that would make cash negative. "
-                "If another ETF is more attractive "
-                'than the current holding based on current evidence, output decision.type="rotate" unless a clear '
-                "blocking reason exists. If the account holds only cash or a cash-like position and growth_report "
-                'identifies a strongest ETF candidate, output decision.type="buy" unless a clear blocking reason '
-                'exists. For rotate decisions, include sequence: 1 with side: "sell" for decision.from and sequence: '
-                '2 with side: "buy" for decision.to. Final executable orders must include a positive numeric '
-                'quantity. Use quantity_mode: "shares" and explicit numeric quantity on both orders.'
+                "Use growth_report and current account state to produce the strict decision JSON. If the account "
+                "holds only cash or a cash-like position and growth_report identifies a strongest ETF candidate, "
+                "choose buy unless a clear blocking reason exists. If the account holds an ETF, compare the holding "
+                "against the strongest candidate and choose rotate only when the candidate is clearly stronger and "
+                "the planned sell and buy quantities can be expressed as executable numeric share orders. Return "
+                "only the JSON object."
             ),
             context={**context, "growth_report": growth.summary},
         )
         try:
             execution_plan = validate_decision_result(self, decision)
-        except DecisionCashBufferToleranceError as initial_sizing_error:
-            initial_decision_summary = decision.summary
-            initial_execution_plan = initial_sizing_error.execution_plan
-            decision = self.agents["decision_agent"].run(
-                task_prompt=(
-                    "Correction only: preserve the prior decision type, symbols, sides, order sequence, and order "
-                    "types. Recalculate only the numeric buy quantity using current account and price evidence. Call "
-                    "account_positions, account_portfolio, and market_last_price again. Target approximately 2% cash; "
-                    "the corrected projected cash ratio must be between 1% and 3%, inclusive. Return the same strict "
-                    "JSON contract only, without markdown, RESULT text, or prose."
-                ),
-                context={
-                    **context,
-                    "growth_report": growth.summary,
-                    "previous_decision_output": decision.summary,
-                    "decision_sizing_diagnostics": initial_sizing_error.as_diagnostics(),
-                },
-            )
-            try:
-                execution_plan = validate_decision_result(self, decision)
-                validate_retry_quantity_only_change(
-                    initial_decision_summary,
-                    initial_execution_plan,
-                    decision.summary,
-                    execution_plan,
-                    allowed_quantity_sequence=initial_sizing_error.sequence,
-                    allowed_quantity_symbol=initial_sizing_error.symbol,
-                )
-            except ValueError as exc:
-                self._last_execution_plan_error = str(exc)
-                print(f"Execution plan blocked: {exc}")
-                return
         except ValueError as exc:
             self._last_execution_plan_error = str(exc)
             print(f"Execution plan blocked: {exc}")
@@ -728,16 +548,9 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
 
         self.agents["execution_agent"].run(
             task_prompt=(
-                "Execute only the provided execution_plan object. Do not read or infer investment reasons. Do not "
-                "add, remove, replace, or reorder orders. Inspect the account, open orders, positions, and latest "
-                "prices, then submit only the orders listed in execution_plan.orders with orders_submit_order. "
-                "execution_plan.orders is the authoritative source of truth for execution; decision.reason_brief is "
-                "human context only. Do not re-rank, do not substitute symbol, and do not use upstream research to "
-                "override the execution_plan. "
-                "Execute in sequence order, preserve each sequence number, and report each sequence as submitted or "
-                "blocked. Block or pause solely for execution-level blockers. Submit the explicit numeric share "
-                "quantities in execution_plan.orders. Do not compute semantic sizing. Check affordability before "
-                "buy orders."
+                "Execute only the provided execution_plan object. Inspect account state, open orders, positions, and "
+                "latest prices, then submit only execution_plan.orders with orders_submit_order. Preserve sequence "
+                "order and report each sequence as submitted or blocked. Block solely for execution-level blockers."
             ),
             context={"date": context["date"], "execution_plan": execution_plan},
         )

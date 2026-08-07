@@ -6,7 +6,6 @@ from lumibot.components.agents.runtime import (
     _prune_tool_response_for_context_window,
     _request_contents_length,
 )
-
 from scripts.run_ai_committee_provider_benchmark import _estimate_cost as estimate_benchmark_cost
 from scripts.summarize_ai_committee_provider_benchmarks import _estimate_cost as estimate_summary_cost
 
@@ -267,3 +266,15 @@ def test_deepseek_tool_response_pruning_returns_excerpt():
     assert result["tool_name"] == "market_load_history_table"
     assert result["original_chars"] > 500
     assert len(result["excerpt"]) <= 500
+
+
+def test_history_tables_summary_tool_response_gets_larger_summary_budget():
+    response = {"summary": "x" * 4_500}
+
+    result = _prune_tool_response_for_context_window(
+        response,
+        tool_name="market_load_history_tables_summary",
+        max_chars=4_000,
+    )
+
+    assert result is None

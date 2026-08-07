@@ -5,6 +5,7 @@ import json
 import pandas as pd
 import pytest
 
+from lumibot.components.agents.builtins import BuiltinTools
 from lumibot.components.agents.history_summary import build_universe_history_summary, compute_history_summary
 
 
@@ -21,6 +22,32 @@ def _frame(length: int = 260) -> pd.DataFrame:
             "volume": range(1000, 1000 + length),
         }
     )
+
+
+def test_history_tool_descriptions_are_summary_first():
+    tool_names = {
+        "market_load_history_table",
+        "market_load_history_tables_summary",
+        "duckdb_query",
+    }
+    tools = {
+        definition.name: definition.binder(object(), object())
+        for definition in BuiltinTools.all()
+        if definition.name in tool_names
+    }
+
+    single = tools["market_load_history_table"].description.lower()
+    multi = tools["market_load_history_tables_summary"].description.lower()
+    duckdb = tools["duckdb_query"].description.lower()
+
+    assert "targeted single-symbol follow-up" in single
+    assert "not the default tool for every symbol" in single
+    assert "summary-first" in single
+    assert "cross-symbol comparison" in multi
+    assert "default tool for multi-symbol" in multi
+    assert "targeted follow-up" in duckdb
+    assert "computed summaries or rankings are insufficient" in duckdb
+    assert "load a table first with market_load_history_table, then analyze it here" not in duckdb
 
 
 def test_compute_history_summary_returns_core_groups():
@@ -169,15 +196,18 @@ def test_compute_history_summary_sanitizes_non_finite_source_values():
 
     json.dumps(summary, allow_nan=False)
     assert summary["price"]["latest_close"] is None
-    assert summary["momentum"] == {
-        "return_20": None,
-        "return_21": None,
-        "return_60": None,
-        "return_63": None,
-        "return_120": None,
-        "return_126": None,
-        "return_252": None,
-    }
+    for key in (
+        "return_5",
+        "return_10",
+        "return_20",
+        "return_21",
+        "return_60",
+        "return_63",
+        "return_120",
+        "return_126",
+        "return_252",
+    ):
+        assert summary["momentum"][key] is None
     assert summary["trend"] == {
         "sma_20": None,
         "sma_50": None,
@@ -191,6 +221,9 @@ def test_compute_history_summary_sanitizes_non_finite_source_values():
         "low_252": None,
         "distance_to_high_252": None,
         "distance_to_low_252": None,
+        "drawdown_from_high_20": None,
+        "drawdown_from_high_60": None,
+        "drawdown_from_high_252": None,
     }
     assert summary["risk"] == {
         "max_drawdown_60": None,
@@ -199,6 +232,14 @@ def test_compute_history_summary_sanitizes_non_finite_source_values():
     assert summary["scores"] == {
         "momentum_composite": None,
         "trend_alignment": None,
+        "return_63_over_volatility_20": None,
+        "return_126_over_volatility_20": None,
+        "composite_score": None,
+    }
+    assert summary["volume"] == {
+        "latest_volume": None,
+        "avg_volume_20": None,
+        "volume_vs_avg_20": None,
     }
     assert summary["availability"]["latest_close"] is False
     assert summary["availability"]["momentum_composite"] is False
@@ -284,52 +325,23 @@ def test_build_universe_history_summary_flattens_rows_and_rankings():
     assert summary["loaded_tables"] == {"QQQ": "history_QQQ", "SPY": "history_SPY"}
     assert summary["warnings"] == ["kept"]
 
-    assert summary["universe_summary"] == [
-        {
-            "symbol": "QQQ",
-            "latest_close": qqq["price"]["latest_close"],
-            "return_21": qqq["momentum"]["return_21"],
-            "return_63": qqq["momentum"]["return_63"],
-            "return_126": qqq["momentum"]["return_126"],
-            "return_252": qqq["momentum"]["return_252"],
-            "momentum_composite": qqq["scores"]["momentum_composite"],
-            "sma_20": qqq["trend"]["sma_20"],
-            "sma_50": qqq["trend"]["sma_50"],
-            "sma_200": qqq["trend"]["sma_200"],
-            "price_vs_sma_20": qqq["trend"]["price_vs_sma_20"],
-            "price_vs_sma_50": qqq["trend"]["price_vs_sma_50"],
-            "price_vs_sma_200": qqq["trend"]["price_vs_sma_200"],
-            "trend_alignment": qqq["scores"]["trend_alignment"],
-            "max_drawdown_60": qqq["risk"]["max_drawdown_60"],
-            "volatility_20": qqq["risk"]["volatility_20"],
-            "distance_to_high_252": qqq["range"]["distance_to_high_252"],
-            "distance_to_low_252": qqq["range"]["distance_to_low_252"],
-        },
-        {
-            "symbol": "SPY",
-            "latest_close": spy["price"]["latest_close"],
-            "return_21": spy["momentum"]["return_21"],
-            "return_63": spy["momentum"]["return_63"],
-            "return_126": spy["momentum"]["return_126"],
-            "return_252": spy["momentum"]["return_252"],
-            "momentum_composite": spy["scores"]["momentum_composite"],
-            "sma_20": spy["trend"]["sma_20"],
-            "sma_50": spy["trend"]["sma_50"],
-            "sma_200": spy["trend"]["sma_200"],
-            "price_vs_sma_20": spy["trend"]["price_vs_sma_20"],
-            "price_vs_sma_50": spy["trend"]["price_vs_sma_50"],
-            "price_vs_sma_200": spy["trend"]["price_vs_sma_200"],
-            "trend_alignment": spy["scores"]["trend_alignment"],
-            "max_drawdown_60": spy["risk"]["max_drawdown_60"],
-            "volatility_20": spy["risk"]["volatility_20"],
-            "distance_to_high_252": spy["range"]["distance_to_high_252"],
-            "distance_to_low_252": spy["range"]["distance_to_low_252"],
-        },
-    ]
+    rows = {row["symbol"]: row for row in summary["universe_summary"]}
+    assert rows["QQQ"]["latest_close"] == pytest.approx(qqq["price"]["latest_close"])
+    assert rows["QQQ"]["return_21"] == pytest.approx(qqq["momentum"]["return_21"], abs=1e-6)
+    assert rows["QQQ"]["return_5"] == pytest.approx(qqq["momentum"]["return_5"], abs=1e-6)
+    assert rows["QQQ"]["composite_score"] == pytest.approx(qqq["scores"]["composite_score"], abs=1e-6)
+    assert rows["QQQ"]["volume_vs_avg_20"] == pytest.approx(qqq["volume"]["volume_vs_avg_20"], abs=1e-6)
+    assert rows["QQQ"]["drawdown_from_high_60"] == pytest.approx(qqq["range"]["drawdown_from_high_60"], abs=1e-6)
+    assert "sma_20" not in rows["QQQ"]
+    assert rows["SPY"]["latest_close"] == pytest.approx(spy["price"]["latest_close"])
+    assert rows["SPY"]["return_63"] == pytest.approx(spy["momentum"]["return_63"], abs=1e-6)
+    assert rows["SPY"]["momentum_composite"] == pytest.approx(spy["scores"]["momentum_composite"], abs=1e-6)
+    assert rows["SPY"]["trend_alignment"] == pytest.approx(spy["scores"]["trend_alignment"])
     assert summary["rankings"]["by_return_21"] == ["SPY", "QQQ"]
     assert summary["rankings"]["by_return_63"] == ["SPY", "QQQ"]
     assert summary["rankings"]["by_return_126"] == ["SPY", "QQQ"]
     assert summary["rankings"]["by_momentum_composite"] == ["SPY", "QQQ"]
+    assert set(summary["rankings"]["by_composite_score"]) == {"QQQ", "SPY"}
     assert summary["rankings"]["by_trend_alignment"] == ["QQQ", "SPY"]
 
 
@@ -401,31 +413,33 @@ def test_build_universe_history_summary_sanitizes_non_finite_row_values():
     )
 
     row = summary["universe_summary"][0]
-    assert row == {
-        "symbol": "BAD",
-        "latest_close": None,
-        "return_21": None,
-        "return_63": None,
-        "return_126": 0.12,
-        "return_252": None,
-        "momentum_composite": None,
-        "sma_20": None,
-        "sma_50": None,
-        "sma_200": 200.0,
-        "price_vs_sma_20": None,
-        "price_vs_sma_50": 0.03,
-        "price_vs_sma_200": None,
-        "trend_alignment": None,
-        "max_drawdown_60": None,
-        "volatility_20": None,
-        "distance_to_high_252": None,
-        "distance_to_low_252": None,
-    }
+    assert row["symbol"] == "BAD"
+    assert row["latest_close"] is None
+    assert row["return_21"] is None
+    assert row["return_63"] is None
+    assert row["return_126"] == 0.12
+    assert "return_252" not in row
+    assert row["momentum_composite"] is None
+    assert row["composite_score"] is None
+    assert "sma_20" not in row
+    assert "sma_50" not in row
+    assert "sma_200" not in row
+    assert "price_vs_sma_20" not in row
+    assert "price_vs_sma_50" not in row
+    assert "price_vs_sma_200" not in row
+    assert row["trend_alignment"] is None
+    assert "max_drawdown_60" not in row
+    assert row["volatility_20"] is None
+    assert "distance_to_high_252" not in row
+    assert "distance_to_low_252" not in row
+    assert row["volume_vs_avg_20"] is None
+    assert row["drawdown_from_high_60"] is None
     assert summary["rankings"] == {
         "by_return_21": [],
         "by_return_63": [],
         "by_return_126": ["BAD"],
         "by_momentum_composite": [],
+        "by_composite_score": [],
         "by_trend_alignment": [],
     }
     json.dumps(summary, allow_nan=False)

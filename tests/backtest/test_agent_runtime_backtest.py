@@ -1978,12 +1978,12 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
     assert "currently queryable tables" in history_tool.description
     assert "computed_summary" in history_tool.description
     assert "read it first before writing SQL" in history_tool.description
-    assert (
-        "Use duckdb_query only when the needed comparison or statistic is not already available"
-        in history_tool.description
-    )
+    assert "summary-first" in history_tool.description.lower()
+    assert "does not return full raw historical rows" in history_tool.description.lower()
+    assert "Raw rows remain queryable in DuckDB" in history_tool.description
     assert "market_load_history_tables_summary" in tool_names
     assert "cross-symbol summary" in batch_tool.description
+    assert "by_composite_score" in batch_tool.description
     assert "Prefer this tool before writing DuckDB SQL" in batch_tool.description
     assert "exact column names" in query_tool.description
     assert "market_load_history_table" in query_tool.description
@@ -1999,6 +1999,79 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
         "SELECT q.Date, q.close AS qqq_close, s.close AS spy_close FROM qqq_hist AS q "
         "JOIN spy_hist AS s ON q.Date = s.Date ORDER BY q.Date"
     ) in query_tool.description
+
+
+def test_compute_history_summary_includes_extended_summary_metrics():
+    from lumibot.components.agents.history_summary import compute_history_summary
+
+    index = pd.date_range("2024-01-01", periods=260, freq="D", tz="America/New_York")
+    close = pd.Series([100 + i * 0.5 for i in range(260)], index=index)
+    frame = pd.DataFrame(
+        {
+            "Date": index,
+            "open": close - 0.2,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": [1_000_000 + i * 1_000 for i in range(260)],
+        }
+    )
+
+    summary = compute_history_summary(
+        frame,
+        symbol="SPY",
+        timestep="day",
+        as_of="2024-09-16T16:00:00-04:00",
+    )
+
+    assert summary["momentum"]["return_5"] is not None
+    assert summary["momentum"]["return_10"] is not None
+    assert summary["volume"]["latest_volume"] == 1_259_000.0
+    assert summary["volume"]["avg_volume_20"] is not None
+    assert summary["volume"]["volume_vs_avg_20"] is not None
+    assert summary["range"]["drawdown_from_high_20"] is not None
+    assert summary["range"]["drawdown_from_high_60"] is not None
+    assert summary["range"]["drawdown_from_high_252"] is not None
+    assert summary["scores"]["return_63_over_volatility_20"] is not None
+    assert summary["scores"]["return_126_over_volatility_20"] is not None
+    assert summary["scores"]["composite_score"] is not None
+    assert summary["availability"]["return_5"] is True
+    assert summary["availability"]["latest_volume"] is True
+    assert summary["availability"]["drawdown_from_high_20"] is True
+    assert summary["availability"]["composite_score"] is True
+
+
+def test_compute_history_summary_marks_extended_metrics_unavailable_when_data_is_short():
+    from lumibot.components.agents.history_summary import compute_history_summary
+
+    frame = pd.DataFrame(
+        {
+            "Date": pd.date_range("2024-01-01", periods=4, freq="D", tz="America/New_York"),
+            "open": [100.0, 101.0, 102.0, 103.0],
+            "high": [101.0, 102.0, 103.0, 104.0],
+            "low": [99.0, 100.0, 101.0, 102.0],
+            "close": [100.0, 101.0, 102.0, 103.0],
+            "volume": [1000, 1100, 1200, 1300],
+        }
+    )
+
+    summary = compute_history_summary(
+        frame,
+        symbol="SPY",
+        timestep="day",
+        as_of="2024-01-04T16:00:00-04:00",
+    )
+
+    assert summary["momentum"]["return_5"] is None
+    assert summary["momentum"]["return_10"] is None
+    assert summary["volume"]["avg_volume_20"] is None
+    assert summary["volume"]["volume_vs_avg_20"] is None
+    assert summary["scores"]["return_63_over_volatility_20"] is None
+    assert summary["scores"]["return_126_over_volatility_20"] is None
+    assert summary["scores"]["composite_score"] is None
+    assert summary["availability"]["return_5"] is False
+    assert summary["availability"]["avg_volume_20"] is False
+    assert summary["availability"]["composite_score"] is False
 
 
 @pytest.mark.usefixtures("disable_datasource_override")
@@ -2049,8 +2122,15 @@ def test_duckdb_history_tables_summary_returns_rankings_and_queryable_tables(mon
     assert "by_return_21" in summary["rankings"]
     assert "by_return_63" in summary["rankings"]
     assert "by_momentum_composite" in summary["rankings"]
-    assert all(table["table_name"].startswith("cmp_") for table in summary["loaded_tables"].values())
-    assert {"cmp_agst", "cmp_agst2"}.issubset({table["table_name"] for table in summary["available_tables"]})
+    assert "by_composite_score" in summary["rankings"]
+    assert summary["rankings"]["by_composite_score"]
+    for row in summary["universe_summary"]:
+        assert "composite_score" in row
+        assert "return_5" in row
+        assert "volume_vs_avg_20" in row
+        assert "drawdown_from_high_60" in row
+    assert all(table_name.startswith("cmp_") for table_name in summary["loaded_tables"].values())
+    assert {"cmp_agst", "cmp_agst2"}.issubset(set(summary["loaded_tables"].values()))
     row_count = strategy.agents.duckdb.query(sql="SELECT COUNT(*) AS count_rows FROM cmp_agst")
     assert row_count["rows"] == [{"count_rows": 30}]
 
@@ -2088,7 +2168,7 @@ def test_duckdb_history_tables_summary_disambiguates_table_prefix_collisions(mon
         table_prefix="cmp",
     )
 
-    table_names = [table["table_name"] for table in summary["loaded_tables"].values()]
+    table_names = list(summary["loaded_tables"].values())
     assert table_names == ["cmp_brk_b", "cmp_brk_b_2"]
     assert len(table_names) == len(set(table_names))
     for table_name in table_names:
@@ -2234,6 +2314,9 @@ def test_duckdb_table_inventory_tracks_fresh_and_cached_history_tables(monkeypat
     assert first["computed_summary"]["timestep"] == "minute"
     assert first["computed_summary"]["data_window"]["row_count"] == first["row_count"]
     assert first["computed_summary"]["price"]["latest_close"] is not None
+    assert "rows" not in first
+    assert "data" not in first
+    assert "records" not in first
     assert cached_first["computed_summary"] == first["computed_summary"]
     assert first["available_tables"] == [
         {"table_name": "z_history", "columns": first_columns},
@@ -2246,6 +2329,11 @@ def test_duckdb_table_inventory_tracks_fresh_and_cached_history_tables(monkeypat
         {"table_name": "a_history", "columns": second_columns},
         {"table_name": "z_history", "columns": first_columns},
     ]
+    row_count = strategy.agents.duckdb.query(sql="SELECT COUNT(*) AS count_rows FROM z_history")
+    assert row_count["rows"] == [{"count_rows": 3}]
+    close_query = strategy.agents.duckdb.query(sql="SELECT close FROM z_history ORDER BY 1 LIMIT 1")
+    assert close_query["row_count"] == 1
+    assert "close" in close_query["columns"]
     assert all("available_tables" not in meta for meta in strategy.agents.duckdb._table_meta.values())
 
 
