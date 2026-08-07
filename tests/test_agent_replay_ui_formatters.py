@@ -232,6 +232,62 @@ def test_orders_submit_order_formatter_extracts_nested_order_payload():
     assert "{'symbol'" not in text
 
 
+def test_orders_confirm_order_formatter_explains_confirmed_fill():
+    text = explain_tool_result(
+        "orders_confirm_order",
+        {"identifier": "order-123", "symbol": "VNQ", "side": "sell", "expected_quantity": 10},
+        {
+            "identifier": "order-123",
+            "confirmed": True,
+            "can_continue": True,
+            "confirmation_status": "filled",
+            "attempt_count": 2,
+            "order": {
+                "identifier": "order-123",
+                "status": "fill",
+                "side": "sell",
+                "quantity": 10,
+                "asset": {"symbol": "VNQ", "asset_type": "stock"},
+            },
+            "warnings": [],
+        },
+        None,
+    )
+
+    assert "Confirmed order order-123" in text
+    assert "sell 10 VNQ" in text
+    assert "2 attempts" in text
+    assert "can_continue=true" in text
+
+
+def test_orders_confirm_order_formatter_explains_blocked_confirmation():
+    text = explain_tool_result(
+        "orders_confirm_order",
+        {"identifier": "order-123", "symbol": "VNQ", "side": "sell", "expected_quantity": 10},
+        {
+            "identifier": "order-123",
+            "confirmed": False,
+            "can_continue": False,
+            "confirmation_status": "open_after_retries",
+            "attempt_count": 3,
+            "order": {
+                "identifier": "order-123",
+                "status": "new",
+                "side": "sell",
+                "quantity": 10,
+                "asset": {"symbol": "VNQ", "asset_type": "stock"},
+            },
+            "warnings": ["Order remained active after 3 confirmation attempts."],
+        },
+        None,
+    )
+
+    assert "Confirmation blocked" in text
+    assert "open_after_retries" in text
+    assert "can_continue=false" in text
+    assert "Order remained active" in text
+
+
 def test_explain_tool_result_does_not_mutate_inputs():
     arguments = {"symbol": "SPY", "nested": {"limit": 1}}
     raw_result = {

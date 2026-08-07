@@ -395,6 +395,44 @@ def _orders_submit_order(args: dict[str, Any], raw_result: Any) -> str:
     return f"Order submission returned for {order_text}.{status_text}{id_text}"
 
 
+def _orders_confirm_order(args: dict[str, Any], raw_result: Any) -> str:
+    result = _as_dict(raw_result)
+    order = _nested_dict(result, "order") or {}
+    symbol = _asset_symbol(order) or _first_present(args, "symbol")
+    qty = _first_present(order, "qty", "quantity", "shares") or _first_present(
+        args,
+        "expected_quantity",
+        "quantity",
+        "shares",
+    )
+    side = _first_present(order, "side", "action") or _first_present(args, "side", "action")
+    order_id = _first_present(result, "identifier", "id", "order_id") or _first_present(
+        order,
+        "identifier",
+        "id",
+        "order_id",
+    )
+    status = _first_present(result, "confirmation_status", "status")
+    attempt_count = _first_present(result, "attempt_count", "attempts_count")
+    warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+    order_text = f"{_text(side)} {_text(qty)} {_text(symbol)}"
+    attempts_text = ""
+    if attempt_count is not None:
+        attempts_text = f" after {_text(attempt_count)} attempts"
+    if result.get("confirmed") is True:
+        return (
+            f"Confirmed order {_text(order_id)} for {order_text}{attempts_text}. "
+            f"Status: {_text(status)}. can_continue=true."
+        )
+    warning_text = ""
+    if warnings:
+        warning_text = f" Warning: {_text(warnings[0])}"
+    return (
+        f"Confirmation blocked for order {_text(order_id)} for {order_text}{attempts_text}. "
+        f"Status: {_text(status)}. can_continue=false.{warning_text}"
+    )
+
+
 def _remember_decision(args: dict[str, Any], raw_result: Any) -> str:
     result = _as_dict(raw_result)
     key = _first_present(result, "key", "memory_key", "id") or _first_present(args, "key", "memory_key", "id")
@@ -417,5 +455,6 @@ _FORMATTERS = {
     "get_filings": _get_filings,
     "search_filing": _search_filing,
     "orders_submit_order": _orders_submit_order,
+    "orders_confirm_order": _orders_confirm_order,
     "remember_decision": _remember_decision,
 }
