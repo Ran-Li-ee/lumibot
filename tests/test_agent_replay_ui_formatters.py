@@ -260,6 +260,32 @@ def test_orders_confirm_order_formatter_explains_confirmed_fill():
     assert "can_continue=true" in text
 
 
+def test_orders_confirm_order_formatter_singularizes_one_attempt():
+    text = explain_tool_result(
+        "orders_confirm_order",
+        {"identifier": "order-123", "symbol": "VNQ", "side": "sell", "expected_quantity": 10},
+        {
+            "identifier": "order-123",
+            "confirmed": True,
+            "can_continue": True,
+            "confirmation_status": "filled",
+            "attempt_count": 1,
+            "order": {
+                "identifier": "order-123",
+                "status": "fill",
+                "side": "sell",
+                "quantity": 10,
+                "asset": {"symbol": "VNQ", "asset_type": "stock"},
+            },
+            "warnings": [],
+        },
+        None,
+    )
+
+    assert "after 1 attempt" in text
+    assert "after 1 attempts" not in text
+
+
 def test_orders_confirm_order_formatter_explains_blocked_confirmation():
     text = explain_tool_result(
         "orders_confirm_order",

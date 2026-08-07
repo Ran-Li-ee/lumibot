@@ -418,7 +418,8 @@ def _orders_confirm_order(args: dict[str, Any], raw_result: Any) -> str:
     order_text = f"{_text(side)} {_text(qty)} {_text(symbol)}"
     attempts_text = ""
     if attempt_count is not None:
-        attempts_text = f" after {_text(attempt_count)} attempts"
+        attempt_label = "attempt" if attempt_count == 1 else "attempts"
+        attempts_text = f" after {_text(attempt_count)} {attempt_label}"
     if result.get("confirmed") is True:
         return (
             f"Confirmed order {_text(order_id)} for {order_text}{attempts_text}. "
