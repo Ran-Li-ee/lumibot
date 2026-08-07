@@ -1526,17 +1526,14 @@ def test_decision_prompt_requests_structured_execution_plan():
         "use numeric share quantities",
         "do not use full_position, current_position, max_affordable_cash, or max_affordable_after_prior_sells",
         "calculate the share quantity from account tool output",
-        "choose order_type before calculating quantity",
+        'all executable orders must use order_type "market"',
+        "do not include limit_price, stop_price, stop_limit_price, trail_price, or trail_percent",
         "maximum buy quantity must be no greater than floor(0.98 * available_cash_after_prior_sells / sizing_price)",
         "output only the final numeric share quantity",
-        "for market buys, use a conservative sizing_price based on available price evidence",
+        "use a conservative market sizing price based on available price evidence",
         "it may be higher than market_last_price in daily backtests",
-        "for limit buys, use limit_price",
-        "for stop_limit buys, use stop_limit_price or the final bounded execution price",
         "use the 98% cash rule only as an internal sizing rule",
         "do not output cash_buffer_pct or any buffer field in execution_plan",
-        "buy orders must use market, limit, smart_limit, or stop_limit",
-        "do not use stop or trailing_stop for a buy order",
         "compare the holding against the strongest candidate",
         "choose rotate only when the candidate is clearly stronger",
         "planned sell and buy quantities can be expressed as executable numeric share orders",
@@ -1555,6 +1552,18 @@ def test_decision_prompt_requests_structured_execution_plan():
         "do not include cash_buffer_pct in the execution order",
     ):
         assert forbidden_cash_buffer_phrase not in decision_prompt_lower
+    for forbidden_bounded_price_phrase in (
+        "optional bounded-price fields include",
+        "choose order_type before calculating quantity",
+        "choose sizing_price based on order_type",
+        "for limit buys",
+        "for stop_limit buys",
+        "buy orders must use market, limit",
+        "smart_limit",
+        "do not use stop or trailing_stop",
+        "bounded execution price",
+    ):
+        assert forbidden_bounded_price_phrase not in decision_prompt_lower
 
     for strict_phrase in (
         "return only one valid json object",
@@ -1568,7 +1577,6 @@ def test_decision_prompt_requests_structured_execution_plan():
         "execution_plan must include schema_version, intent, and orders",
         "intent must be one of hold, enter_position, rotate, reduce_position, close_position",
         "each executable order must include sequence, symbol, side, quantity_mode, quantity, asset_type, order_type, and time_in_force",
-        "optional bounded-price fields include limit_price, stop_price, and stop_limit_price",
     ):
         assert prompt_phrase in decision_prompt_lower
 

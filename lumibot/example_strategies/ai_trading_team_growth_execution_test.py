@@ -440,21 +440,17 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "enter_position, rotate, reduce_position, close_position. Each executable order must include "
                 "sequence, symbol, side, quantity_mode, quantity, asset_type, order_type, and time_in_force. "
                 'quantity_mode must be exactly "shares" for every executable order. '
-                "Optional bounded-price fields include limit_price, stop_price, and stop_limit_price. Use numeric "
-                "share quantities; do not use full_position, current_position, max_affordable_cash, or "
-                "max_affordable_after_prior_sells. Before a non-hold decision, call account_positions and "
-                "account_portfolio. Call market_last_price when sizing buy orders. Sizing and order construction "
-                "rules: choose order_type before calculating quantity. For selling all or part of a position, "
-                "calculate the share quantity from account tool output. For buy sizing, choose sizing_price based on "
-                "order_type. For market buys, use a conservative sizing_price based on available price evidence; it "
-                "may be higher than market_last_price in daily backtests. For limit buys, use limit_price. For "
-                "stop_limit buys, use stop_limit_price or the final bounded execution price. Use the 98% cash rule "
+                'All executable orders must use order_type "market". Do not include limit_price, stop_price, '
+                "stop_limit_price, trail_price, or trail_percent. Use numeric share quantities; do not use "
+                "full_position, current_position, max_affordable_cash, or max_affordable_after_prior_sells. "
+                "Before a non-hold decision, call account_positions and account_portfolio. Call market_last_price "
+                "when sizing buy orders. For selling all or part of a position, calculate the share quantity from "
+                "account tool output. For buy sizing, use a conservative market sizing price based on available "
+                "price evidence; it may be higher than market_last_price in daily backtests. Use the 98% cash rule "
                 "only as an internal sizing rule: maximum buy quantity must be no greater than "
                 "floor(0.98 * available_cash_after_prior_sells / sizing_price). Output only the final numeric share "
-                "quantity. Do not output "
-                "cash_buffer_pct or any buffer field in execution_plan. Buy orders must use market, limit, "
-                "smart_limit, or stop_limit. Do not use stop or trailing_stop for a buy order because those order "
-                "types do not provide a bounded execution price. Never produce orders that would make cash negative. "
+                "quantity. Do not output cash_buffer_pct or any buffer field in execution_plan. Never produce "
+                "orders that would make cash negative. "
                 'For rotate decisions, set sequence: 1 with side: "sell" for decision.from, then set sequence: 2 '
                 'with side: "buy" for decision.to.'
             ),
