@@ -14,9 +14,152 @@
   LiteLLM input. Projection clipping is explicit, native non-LiteLLM paths are
   marked not applicable, and no secrets or raw HTTP traffic are captured.
 
-## 4.5.75 - 2026-07-13
+## 4.5.83 - 2026-08-05
 
-Deploy marker: `deploy 4.5.75`
+Deploy marker: `deploy 4.5.83`
+
+### Added
+- **AI agents can now operate generic option and multi-leg workflows through
+  built-in LumiBot tools.** Agents can retrieve chains and strikes, inspect
+  exact-contract Greeks and market quality, find listed strikes by delta,
+  calculate signed multi-leg prices, and submit atomic multi-leg orders. The
+  new ``ai_iron_condor.py`` example keeps all selection, sizing, construction,
+  execution, and management decisions inside one agent system prompt.
+
+### Changed
+- **Model requests no longer send a temperature parameter.** LumiBot now uses
+  each provider model's current default behavior instead of maintaining a
+  provider-specific temperature compatibility branch.
+
+## 4.5.82 - 2026-08-03
+
+Deploy marker: `deploy 4.5.82`
+
+### Fixed
+- **IBKR history caches now distinguish confirmed absence from incomplete or
+  transient responses.** Only confirmed no-data results create expiring
+  cross-process markers. Partial payloads and downloader failures retain an
+  in-process cooldown without poisoning later backtests. Daily stock and index
+  gaps repair in small bounded segments, all-placeholder caches can recover,
+  stale stock/index contract identifiers receive one validated refresh, and
+  `settings.json` records a credential-free `data_health` summary. Health
+  evidence caps missing-session details, uses typed reasons instead of provider
+  error text, and keeps cache-only marker columns out of strategy dataframes.
+- **Agent runtime state no longer duplicates unbounded model summaries.**
+  Bounded memory notes continue to provide cross-iteration context, while run
+  metadata archives legacy duplicate summaries once before removing them from
+  ``self.vars``. Full memory and observability history remains in JSONL, SQLite,
+  and Parquet artifacts.
+- **The README star-history integration now has an end-to-end health check.**
+  A scheduled workflow verifies the real rendered chart instead of treating a
+  configured but unauthorized GitHub token as healthy. The rotation runbook now
+  records the required organization owner, repository scope, and permissions.
+  Worker failures now remain valid SVG after long escaped error messages, and
+  the README chart URLs bypass GitHub's cached broken response after rotation.
+
+## 4.5.81 - 2026-07-30
+
+Deploy marker: `deploy 4.5.81`
+
+### Fixed
+- **IBKR stock and index hourly caches now repair large internal holes lazily.**
+  LumiBot detects gaps longer than a normal market closure, downloads the
+  missing hourly range in bounded pages, merges real bars without deleting the
+  shared cache, and preserves partial progress for a later run. Complete warm
+  caches make no repair requests.
+- **IBKR cache repair no longer lets one symbol starve later symbols.** Daily
+  repair uses a per-series deadline and one bounded range request. Hourly repair
+  has its own deadline, and partial hourly progress is not mislabeled as a
+  24-hour no-data window.
+- **Closed-market request boundaries no longer create false underfill
+  warnings.** Weekend and overnight stock/index boundaries are evaluated
+  against the first market open and last market close.
+
+## 4.5.80 - 2026-07-30
+
+Deploy marker: `deploy 4.5.80`
+
+### Fixed
+- **Release validation now uses the same isolated test shards as protected pull
+  requests.** Unit and backtest tests no longer share one process that can leak
+  global state across unrelated files or consume the entire release timeout
+  before reporting failures.
+
+## 4.5.79 - 2026-07-29
+
+Deploy marker: `deploy 4.5.79`
+
+### Added
+- **Public framework comparisons now include QuantConnect LEAN and primary
+  sources.** The documentation comparison hub identifies the verification date,
+  links to official project documentation, and explains the product roles and
+  limitations without claiming a universal winner.
+- **Multi-asset market-data reads now preserve safe per-asset failures.**
+  Successful assets remain available while unavailable assets include a
+  normalized category, error type, and retryability without exposing provider
+  response bodies or credentials.
+
+### Fixed
+- **Scheduled `run_once()` strategies now publish their final cloud snapshot from
+  LumiBot after broker-event draining and strategy shutdown hooks complete.**
+  Account balances, positions, and terminal order state are captured before the
+  broker connection closes, and a listener publication failure remains
+  non-fatal to the completed trading run.
+- **Bulk historical reads now pass session selection through the provider-neutral
+  data-source interface.** Every supported broker receives the same
+  `include_after_hours` option through LumiBot rather than requiring a
+  provider-specific caller.
+- **Scheduled closed-market preparation remains protected.** The explicit
+  `closed_market_prepare` lifecycle continues to block broker submission,
+  cancellation, and modification APIs while preparation code runs.
+- **IBKR daily cache gaps repair themselves without blocking backtests.**
+  Completed missing US stock and index sessions are fetched in bounded monthly
+  requests, merged into the available series, and protected by expiring retry
+  markers when the downloader has no data.
+- **Concurrent IBKR remote-cache writers no longer discard newer bars.**
+  Conditional S3 writes merge the current remote parquet with the local update
+  after a conflict, while real bars take precedence over no-data placeholders.
+
+### Changed
+- **Documentation sitemap dates now reflect source changes.** Each public page
+  uses its latest committed source date instead of making every page appear
+  updated whenever the documentation build runs.
+
+## 4.5.78 - 2026-07-16
+
+Deploy marker: this release's `deploy 4.5.78` commit.
+
+### Added
+- **Live portfolio updates can target an environment-specific listener.**
+  `LISTENER_WRITE_URL` allows account observations to be published to a custom
+  listener while preserving the existing production endpoint as the
+  compatibility default.
+- **Scheduled strategies can prepare data safely while markets are closed.**
+  An explicit `closed_market_prepare` target event invokes a dedicated strategy
+  lifecycle with supported broker order mutations blocked, allowing a later
+  market-open task to consume externally persisted plans without enabling
+  after-hours trading.
+- **Public project and community navigation is easier to use.**
+  The README and documentation home page now expose the source repository,
+  Reddit community, and Discord community more clearly, including responsive
+  mobile navigation improvements.
+
+## 4.5.77 - Unreleased
+
+### Fixed
+- **IBKR Client Portal order refresh now reads returned JSON order rows.**
+  Direct lookup normalizes numeric and string order IDs instead of treating
+  response dictionaries like TWS objects or fabricating a placeholder order
+  when no broker row exists.
+- **Alpaca live option chains preserve executable quote data.**
+  `get_chain_full_info()` now consumes Alpaca's native option snapshots so
+  strategies receive current bid, ask, quote size, latest trade, implied
+  volatility, and greeks instead of synthetic zero bid/ask fields. This keeps
+  option-credit guards and worked-order logic tied to broker-visible quotes.
+
+## 4.5.76 - 2026-07-13
+
+Deploy marker: `deploy 4.5.76`
 
 ### Added
 - **IBKR Client Portal REST now has a replaceable gateway and HTTP transport
@@ -60,6 +203,8 @@ Deploy marker: `deploy 4.5.75`
   boundary, mandatory next-version checkout verification, and forced Bot Manager
   image rebuild requirement for every LumiBot version bump.
 - **The README Star History chart renders correctly in light and dark themes.**
+
+## 4.5.75 - Unreleased
 
 ## 4.5.74 - 2026-07-08
 

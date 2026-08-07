@@ -4,11 +4,18 @@
 [![Python](https://img.shields.io/pypi/pyversions/lumibot)](https://pypi.org/project/lumibot/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-# Lumibot: Backtestable AI Agents and Python Algorithmic Trading
+# Lumibot
 
-**Build deterministic trading strategies, AI trading agents, and AI trading teams for stocks, options, crypto, futures, forex, prediction markets, SEC filings, FRED macro data, technical indicators, and real brokers.** Backtest, paper trade, or run live with the same Python code.
+**Build, backtest, and run algorithmic trading strategies and AI agents in Python.**
 
 **Full docs:** [lumibot.lumiwealth.com](https://lumibot.lumiwealth.com/) · **Managed cloud:** [BotSpot.trade](https://botspot.trade/sales?showLogin=1&utm_source=github&utm_medium=readme&utm_campaign=lumibot&utm_content=top_text_link&sample=lumibot_readme_deploy) · **MCP:** [BotSpot for AI coding agents](https://botspot.trade/agents?utm_source=github&utm_medium=readme&utm_campaign=lumibot&utm_content=top_mcp_link)
+
+<p align="center">
+  <strong>🌐 Community</strong><br><br>
+  <a href="https://www.reddit.com/r/BotSpotTrade/"><img src="docs/assets/community/reddit.svg" alt="Reddit" width="20" height="20"> Reddit Community</a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://discord.gg/4R9j6T3PN8"><img src="docs/assets/community/discord.svg" alt="Discord" width="20" height="20"> Discord Community</a>
+</p>
 
 <p align="center">
   <img src="docs/assets/readme/lumibot_ai_trading_agents_overview.png" alt="Lumibot AI trading agents overview" width="100%">
@@ -513,9 +520,9 @@ Crypto futures/perpetual backtests can route `Asset.AssetType.CRYPTO_FUTURE` thr
 
 <a href="https://www.star-history.com/?repos=Lumiwealth%2Flumibot&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Lumiwealth/lumibot&type=date&theme=dark&legend=top-left&sealed_token=wb5P3MSfQ5xSeKh1EePxGtv8jEkEp9wXB8eGvKUX0FzeHHL4kDcz4h_YwqmaI8cn71CDw2wvB-kQzV40SS3YFnWbzT3M-ngxp9lyqkSTFDqEJyvoQAupDYcyymGR0S2SrKAluekzR-xTEAkXUqetWIQTPgEs2en4371f17a5oimerkP2K4lGK-0lSL2K" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Lumiwealth/lumibot&type=date&legend=top-left&sealed_token=wb5P3MSfQ5xSeKh1EePxGtv8jEkEp9wXB8eGvKUX0FzeHHL4kDcz4h_YwqmaI8cn71CDw2wvB-kQzV40SS3YFnWbzT3M-ngxp9lyqkSTFDqEJyvoQAupDYcyymGR0S2SrKAluekzR-xTEAkXUqetWIQTPgEs2en4371f17a5oimerkP2K4lGK-0lSL2K" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Lumiwealth/lumibot&type=date&legend=top-left&sealed_token=wb5P3MSfQ5xSeKh1EePxGtv8jEkEp9wXB8eGvKUX0FzeHHL4kDcz4h_YwqmaI8cn71CDw2wvB-kQzV40SS3YFnWbzT3M-ngxp9lyqkSTFDqEJyvoQAupDYcyymGR0S2SrKAluekzR-xTEAkXUqetWIQTPgEs2en4371f17a5oimerkP2K4lGK-0lSL2K" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://lumibot-star-history.lumiwealth.workers.dev/chart.svg?theme=dark&amp;v=20260802" />
+   <source media="(prefers-color-scheme: light)" srcset="https://lumibot-star-history.lumiwealth.workers.dev/chart.svg?theme=light&amp;v=20260802" />
+   <img alt="Live LumiBot Star History Chart" src="https://lumibot-star-history.lumiwealth.workers.dev/chart.svg?theme=light&amp;v=20260802" />
  </picture>
 </a>
 

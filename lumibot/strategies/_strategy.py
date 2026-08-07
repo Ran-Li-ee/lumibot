@@ -3494,10 +3494,13 @@ class _Strategy:
             self._trader.add_strategy(strategy)
 
             self.logger.info("Starting backtest...")
+            strategy._backtest_time_start_monotonic = time.monotonic()
             try:
-                strategy._backtest_time_start_monotonic = time.monotonic()
-            except Exception:
-                pass
+                from lumibot.tools.ibkr_history_health import reset_ibkr_history_health
+
+                reset_ibkr_history_health()
+            except Exception as exc:
+                self.logger.warning("IBKR history-health telemetry reset failed: %s", exc)
             start = datetime.datetime.now()
 
             result = self._trader.run_all(
@@ -3908,7 +3911,10 @@ class _Strategy:
         cash_events = _Strategy._collect_cash_events_for_cloud(self)
         self.logger.debug(f"Number of cash events: {len(cash_events)}")
 
-        LUMIWEALTH_URL = "https://listener.lumiwealth.com/portfolio_events"
+        listener_url = (
+            os.environ.get("LISTENER_WRITE_URL", "").strip()
+            or "https://listener.lumiwealth.com/portfolio_events"
+        )
 
         headers = {
             "x-api-key": f"{self.lumiwealth_api_key}",
@@ -3956,10 +3962,15 @@ class _Strategy:
             # Send the data to the cloud
             json_data = _json_dumps(data, default=str)
             data_size_kb = len(json_data.encode('utf-8')) / 1024
-            self.logger.debug(f"Sending {data_size_kb:.2f} KB of data to {LUMIWEALTH_URL}")
+            self.logger.debug(f"Sending {data_size_kb:.2f} KB of data to {listener_url}")
             self.logger.debug(f"Request headers: {headers}")
 
-            response = requests.post(LUMIWEALTH_URL, headers=headers, data=json_data)
+            response = requests.post(
+                listener_url,
+                headers=headers,
+                data=json_data,
+                timeout=10,
+            )
 
             self.logger.debug(f"Cloud response: Status={response.status_code}, Headers={dict(response.headers)}")
 
