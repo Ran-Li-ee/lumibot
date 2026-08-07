@@ -1695,14 +1695,17 @@ def test_execution_prompt_treats_execution_plan_as_authoritative():
         "do not substitute",
         "execution-level blockers",
         "sequence order",
-        "confirmed sequence",
-        "prior sell order is no longer open",
-        "cash or buying power has updated",
-        "do not submit the dependent buy order",
         "submit the explicit numeric share quantities",
         "do not compute semantic sizing",
     ):
         assert required_phrase in prompt_text
+    for task3_confirmation_phrase in (
+        "confirmed sequence",
+        "prior sell order is no longer open",
+        "cash or buying power has updated",
+        "do not submit the dependent buy order",
+    ):
+        assert task3_confirmation_phrase not in prompt_text
     for forbidden_buffer_reference in ("cash_buffer_pct", "0.02", "2%"):
         assert forbidden_buffer_reference not in prompt_text
     for forbidden_research_reference in (
