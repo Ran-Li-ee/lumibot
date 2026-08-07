@@ -4432,6 +4432,12 @@ class Strategy(_Strategy):
             settings["thetadata_queue_telemetry"] = queue_telemetry_snapshot()
         except Exception:
             pass
+        try:
+            from lumibot.tools.ibkr_history_health import ibkr_history_health_snapshot
+
+            settings["data_health"] = ibkr_history_health_snapshot()
+        except Exception:
+            pass
         os.makedirs(os.path.dirname(settings_file), exist_ok=True)
         with open(settings_file, "w") as outfile:
             import jsonpickle
@@ -4949,6 +4955,7 @@ class Strategy(_Strategy):
             chunk_size=chunk_size,
             max_workers=max_workers,
             exchange=exchange,
+            include_after_hours=include_after_hours,
             sleep_time=effective_sleep_time
         )
 
@@ -5324,6 +5331,17 @@ class Strategy(_Strategy):
         >>>     self.log_message("Hello")
         >>>     order = self.create_order("SPY", 10, "buy")
         >>>     self.submit_order(order)
+        """
+        pass
+
+    def on_closed_market_iteration(self):
+        """Prepare data during an explicitly scheduled closed-market run.
+
+        This lifecycle is only called for scheduled one-shot runs whose internal
+        target event is ``closed_market_prepare`` and whose broker reports the
+        market closed. LumiBot blocks supported broker order submission,
+        cancellation, and modification APIs for the duration of this method.
+        Use it to fetch data and persist a plan for a later market-open run.
         """
         pass
 

@@ -68,6 +68,57 @@ def test_cloud_update_marks_successful_broker_snapshot_verified(monkeypatch):
     assert '"account_snapshot_source": "broker_balance_refresh"' in payloads[0]
 
 
+def test_cloud_update_uses_production_listener_by_default(monkeypatch):
+    strategy = _fake_strategy(balances_updated=True)
+    urls = []
+
+    monkeypatch.delenv("LISTENER_WRITE_URL", raising=False)
+    monkeypatch.setattr(
+        "lumibot.strategies._strategy.requests.post",
+        lambda url, **_kwargs: urls.append(url) or _Response(),
+    )
+
+    assert _Strategy.send_update_to_cloud(strategy) is not False
+    assert urls == ["https://listener.lumiwealth.com/portfolio_events"]
+
+
+def test_cloud_update_uses_production_listener_for_blank_override(monkeypatch):
+    strategy = _fake_strategy(balances_updated=True)
+    urls = []
+
+    monkeypatch.setenv("LISTENER_WRITE_URL", "  ")
+    monkeypatch.setattr(
+        "lumibot.strategies._strategy.requests.post",
+        lambda url, **_kwargs: urls.append(url) or _Response(),
+    )
+
+    assert _Strategy.send_update_to_cloud(strategy) is not False
+    assert urls == ["https://listener.lumiwealth.com/portfolio_events"]
+
+
+def test_cloud_update_uses_configured_listener(monkeypatch):
+    strategy = _fake_strategy(balances_updated=True)
+    urls = []
+    timeouts = []
+
+    monkeypatch.setenv(
+        "LISTENER_WRITE_URL",
+        "https://listener.dev.example/portfolio_events",
+    )
+    monkeypatch.setattr(
+        "lumibot.strategies._strategy.requests.post",
+        lambda url, **kwargs: (
+            urls.append(url),
+            timeouts.append(kwargs.get("timeout")),
+            _Response(),
+        )[-1],
+    )
+
+    assert _Strategy.send_update_to_cloud(strategy) is not False
+    assert urls == ["https://listener.dev.example/portfolio_events"]
+    assert timeouts == [10]
+
+
 def test_cloud_update_refreshes_positions_before_publish(monkeypatch):
     strategy = _fake_strategy(balances_updated=True)
     sync_calls = []
@@ -87,6 +138,41 @@ def test_cloud_update_refreshes_positions_before_publish(monkeypatch):
     assert payloads[0]["positions"] == []
     assert payloads[0]["positions_snapshot_status"] == "verified"
     assert payloads[0]["positions_snapshot_source"] == "broker_positions_refresh"
+
+
+def test_cloud_update_preserves_terminal_filled_orders(monkeypatch):
+    strategy = _fake_strategy(balances_updated=True)
+    strategy.get_orders = lambda: [
+        SimpleNamespace(
+            to_dict=lambda: {
+                "identifier": "synthetic-filled-order-123",
+                "symbol": "TQQQ",
+                "side": "buy",
+                "quantity": 100,
+                "status": "filled",
+                "avg_fill_price": 55.25,
+                "broker_update_date": "2026-07-29T13:45:30+00:00",
+            }
+        )
+    ]
+    payloads = []
+
+    def fake_post(url, headers=None, data=None, **kwargs):
+        payloads.append(json.loads(data))
+        return _Response()
+
+    monkeypatch.setattr("lumibot.strategies._strategy.requests.post", fake_post)
+
+    assert _Strategy.send_update_to_cloud(strategy) is not False
+    assert payloads[0]["orders"] == [{
+        "identifier": "synthetic-filled-order-123",
+        "symbol": "TQQQ",
+        "side": "buy",
+        "quantity": 100,
+        "status": "filled",
+        "avg_fill_price": 55.25,
+        "broker_update_date": "2026-07-29T13:45:30+00:00",
+    }]
 
 
 def test_cloud_update_omits_positions_when_position_refresh_fails(monkeypatch):
