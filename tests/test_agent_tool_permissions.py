@@ -437,6 +437,7 @@ class _ConfirmBroker:
     def __init__(self, strategy):
         self.strategy = strategy
         self.process_pending_calls = 0
+        self._first_iteration = False
 
     def process_pending_orders(self, strategy=None):
         self.process_pending_calls += 1
@@ -447,6 +448,27 @@ class _ConfirmBroker:
             target_strategy.order.avg_fill_price = 97.12
             target_strategy.positions = [_ConfirmPosition("USD", 2000.0)]
             target_strategy.cash = 2000.0
+
+
+class _ConfirmExecutor:
+    def __init__(self, strategy, *, cash_after_queue=2000.0):
+        self.strategy = strategy
+        self.cash_after_queue = cash_after_queue
+        self.process_queue_calls = 0
+        self.observed_first_iteration_flags = []
+
+    def process_queue(self):
+        self.process_queue_calls += 1
+        self.observed_first_iteration_flags.append(
+            (
+                getattr(self.strategy, "_first_iteration", None),
+                getattr(self.strategy.broker, "_first_iteration", None),
+            )
+        )
+        if any(flag is True for flag in self.observed_first_iteration_flags[-1]):
+            return
+        self.strategy.cash = self.cash_after_queue
+        self.strategy.positions = [_ConfirmPosition("USD", self.cash_after_queue)]
 
 
 class _ConfirmStrategy(_Strategy):
@@ -512,6 +534,78 @@ def test_order_confirm_tool_confirms_filled_order_after_processing_pending():
     assert result["order"]["avg_fill_price"] == 97.12
     assert strategy.broker.process_pending_calls == 1
     assert strategy.get_order_calls[0]["broker_refresh"] is True
+
+
+def test_order_confirm_tool_flushes_backtest_executor_queue_before_cash_checks():
+    from lumibot.components.agents.builtins import _bind_confirm_order
+
+    strategy = _ConfirmStrategy(initial_status="new", fill_after_pending_calls=1)
+    strategy._executor_instance = _ConfirmExecutor(strategy, cash_after_queue=1971.2)
+
+    def fill_order_but_leave_cash_stale(strategy=None):
+        target_strategy = strategy or outer_strategy
+        target_strategy.broker.process_pending_calls += 1
+        target_strategy.order.status = "fill"
+        target_strategy.order.position_filled = True
+        target_strategy.order.avg_fill_price = 97.12
+        target_strategy.positions = [_ConfirmPosition("USD", 1000.0)]
+
+    outer_strategy = strategy
+    strategy.broker.process_pending_orders = fill_order_but_leave_cash_stale
+    tool = _bind_confirm_order(strategy, manager=None)
+
+    result = tool.function(
+        identifier="order-123",
+        symbol="VNQ",
+        side="sell",
+        expected_quantity=10,
+        position_before_quantity=10,
+        cash_before=1000,
+    )
+
+    assert result["confirmed"] is True
+    assert result["can_continue"] is True
+    assert result["checks"]["position_moved_as_expected"] is True
+    assert result["checks"]["cash_moved_as_expected"] is True
+    assert result["account_snapshot"]["cash"] == 1971.2
+    assert strategy._executor_instance.process_queue_calls == 1
+
+
+def test_order_confirm_tool_flushes_current_order_events_during_first_iteration():
+    from lumibot.components.agents.builtins import _bind_confirm_order
+
+    strategy = _ConfirmStrategy(initial_status="new", fill_after_pending_calls=1)
+    strategy._first_iteration = True
+    strategy.broker._first_iteration = True
+    strategy._executor_instance = _ConfirmExecutor(strategy, cash_after_queue=1971.2)
+
+    def fill_order_but_leave_cash_stale(strategy=None):
+        target_strategy = strategy or outer_strategy
+        target_strategy.broker.process_pending_calls += 1
+        target_strategy.order.status = "fill"
+        target_strategy.order.position_filled = True
+        target_strategy.order.avg_fill_price = 97.12
+        target_strategy.positions = [_ConfirmPosition("USD", 1000.0)]
+
+    outer_strategy = strategy
+    strategy.broker.process_pending_orders = fill_order_but_leave_cash_stale
+    tool = _bind_confirm_order(strategy, manager=None)
+
+    result = tool.function(
+        identifier="order-123",
+        symbol="VNQ",
+        side="sell",
+        expected_quantity=10,
+        position_before_quantity=10,
+        cash_before=1000,
+    )
+
+    assert result["confirmed"] is True
+    assert result["can_continue"] is True
+    assert result["account_snapshot"]["cash"] == 1971.2
+    assert strategy._first_iteration is True
+    assert strategy.broker._first_iteration is True
+    assert strategy._executor_instance.observed_first_iteration_flags == [(False, False)]
 
 
 def test_order_confirm_tool_returns_open_after_retries_and_caps_attempts():

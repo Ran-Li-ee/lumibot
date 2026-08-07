@@ -83,10 +83,38 @@ def _wrapped_tools(strategy, definitions):
 
 def _iron_condor_legs():
     return [
-        {"symbol": "SPY", "expiration": "2026-09-18", "strike": 610, "right": "put", "quantity": 1, "side": "buy_to_open"},
-        {"symbol": "SPY", "expiration": "2026-09-18", "strike": 615, "right": "put", "quantity": 1, "side": "sell_to_open"},
-        {"symbol": "SPY", "expiration": "2026-09-18", "strike": 645, "right": "call", "quantity": 1, "side": "sell_to_open"},
-        {"symbol": "SPY", "expiration": "2026-09-18", "strike": 650, "right": "call", "quantity": 1, "side": "buy_to_open"},
+        {
+            "symbol": "SPY",
+            "expiration": "2026-09-18",
+            "strike": 610,
+            "right": "put",
+            "quantity": 1,
+            "side": "buy_to_open",
+        },
+        {
+            "symbol": "SPY",
+            "expiration": "2026-09-18",
+            "strike": 615,
+            "right": "put",
+            "quantity": 1,
+            "side": "sell_to_open",
+        },
+        {
+            "symbol": "SPY",
+            "expiration": "2026-09-18",
+            "strike": 645,
+            "right": "call",
+            "quantity": 1,
+            "side": "sell_to_open",
+        },
+        {
+            "symbol": "SPY",
+            "expiration": "2026-09-18",
+            "strike": 650,
+            "right": "call",
+            "quantity": 1,
+            "side": "buy_to_open",
+        },
     ]
 
 
@@ -100,6 +128,7 @@ def test_default_agent_tools_expose_generic_option_discovery_and_multileg_execut
         "options_find_strike_for_delta",
         "options_evaluate_market",
         "options_calculate_multileg_price",
+        "orders_confirm_order",
         "orders_submit_multileg",
     }.issubset(names)
     assert not any("condor" in name for name in names)

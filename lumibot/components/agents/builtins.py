@@ -1361,6 +1361,31 @@ def _process_pending_orders_for_confirmation(strategy: Any) -> bool:
         process_pending_orders(strategy=strategy)
     except TypeError:
         process_pending_orders(strategy)
+    _flush_strategy_event_queue_for_confirmation(strategy)
+    return True
+
+
+def _flush_strategy_event_queue_for_confirmation(strategy: Any) -> bool:
+    executor = getattr(strategy, "__dict__", {}).get("_executor_instance")
+    process_queue = getattr(executor, "process_queue", None)
+    if not callable(process_queue):
+        return False
+    broker = getattr(strategy, "broker", None)
+    strategy_first_iteration = getattr(strategy, "_first_iteration", None)
+    broker_first_iteration = getattr(broker, "_first_iteration", None)
+    try:
+        if strategy_first_iteration is True:
+            setattr(strategy, "_first_iteration", False)
+        if broker is not None and broker_first_iteration is True:
+            setattr(broker, "_first_iteration", False)
+        process_queue()
+    except Exception:
+        return False
+    finally:
+        if strategy_first_iteration is True:
+            setattr(strategy, "_first_iteration", strategy_first_iteration)
+        if broker is not None and broker_first_iteration is True:
+            setattr(broker, "_first_iteration", broker_first_iteration)
     return True
 
 
@@ -1492,9 +1517,9 @@ def _confirmation_checks(
         cash_value = float(current_cash)
         side_value = str(side).strip().lower()
         if side_value in {"sell", "sell_to_close", "sell_short", "sell_to_open"}:
-            checks["cash_moved_as_expected"] = cash_value >= before_cash
+            checks["cash_moved_as_expected"] = cash_value > before_cash + 1e-9
         elif side_value in {"buy", "buy_to_open", "buy_to_close", "buy_to_cover"}:
-            checks["cash_moved_as_expected"] = cash_value <= before_cash
+            checks["cash_moved_as_expected"] = cash_value < before_cash - 1e-9
 
     return checks
 
@@ -2756,6 +2781,7 @@ class _BuiltinTools:
             self.memory.update_thesis(),
             self.memory.close_thesis(),
             self.orders.submit(),
+            self.orders.confirm(),
             self.orders.submit_multileg(),
             self.orders.cancel(),
             self.orders.open_orders(),
