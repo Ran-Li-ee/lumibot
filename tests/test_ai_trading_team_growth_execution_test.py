@@ -1580,7 +1580,8 @@ def test_decision_prompt_requests_structured_execution_plan():
     for prompt_phrase in (
         "execution_plan must include schema_version, intent, and orders",
         "intent must be one of hold, enter_position, rotate, reduce_position, close_position",
-        "each executable order must include sequence, symbol, side, quantity_mode, quantity, asset_type, order_type, and time_in_force",
+        "each executable order must include sequence, symbol, side, quantity_mode, quantity, "
+        "asset_type, order_type, and time_in_force",
     ):
         assert prompt_phrase in decision_prompt_lower
 
