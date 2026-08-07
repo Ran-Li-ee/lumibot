@@ -1628,7 +1628,7 @@ def _bind_confirm_order(strategy: Any, manager: Any) -> BoundTool:
             "continue with later orders. This tool does not submit, cancel, or modify orders."
         ),
         function=confirm_order,
-        metadata={"kind": "builtin", "replay_on_cache": True},
+        metadata={"kind": "builtin", "replay_on_cache": True, "mutates_trading": True},
     )
 
 
@@ -2667,6 +2667,7 @@ class _OrderTools:
             name="orders_confirm_order",
             description="Confirm a submitted order by identifier before continuing execution.",
             binder=_bind_confirm_order,
+            metadata={"mutates_trading": True},
         )
 
     def cancel(self) -> ToolDefinition:

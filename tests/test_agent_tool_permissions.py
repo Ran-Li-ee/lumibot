@@ -556,6 +556,60 @@ def test_order_confirm_tool_returns_terminal_rejected_failure():
     assert "terminal status" in result["warnings"][0]
 
 
+def test_order_confirm_tool_returns_partial_fill_blocker_with_payload_shape():
+    from lumibot.components.agents.builtins import _bind_confirm_order
+
+    strategy = _ConfirmStrategy(initial_status="partial_fill", fill_after_pending_calls=99)
+    tool = _bind_confirm_order(strategy, manager=None)
+
+    result = tool.function(
+        identifier="order-123",
+        symbol="VNQ",
+        side="sell",
+        expected_quantity=10,
+        position_before_quantity=10,
+        cash_before=1000,
+    )
+
+    assert result["identifier"] == "order-123"
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["confirmation_status"] == "partially_filled"
+    assert result["attempt_count"] == 1
+    assert result["attempts"] == [
+        {
+            "attempt": 1,
+            "processed_pending_orders": True,
+            "status": "partially_filled",
+            "is_active": True,
+            "is_filled": False,
+        }
+    ]
+    assert result["checks"]["order_found"] is True
+    assert result["checks"]["order_filled"] is False
+    assert result["order"]["identifier"] == "order-123"
+    assert result["order"]["status"] == "partial_fill"
+    assert result["order"]["side"] == "sell"
+    assert result["order"]["asset"] == {
+        "symbol": "VNQ",
+        "asset_type": "stock",
+        "expiration": None,
+        "strike": None,
+        "right": None,
+        "multiplier": None,
+    }
+    assert result["order"]["quantity"] == 10.0
+    assert result["order"]["filled_quantity"] is None
+    assert result["order"]["is_active"] is True
+    assert result["order"]["is_filled"] is False
+    assert result["order"]["is_canceled"] is False
+    assert result["account_snapshot"]["cash"] == 1000.0
+    assert result["account_snapshot"]["portfolio_value"] == 1000.0
+    assert result["account_snapshot"]["positions"][1]["asset"]["symbol"] == "VNQ"
+    assert result["account_snapshot"]["positions"][1]["quantity"] == 10.0
+    assert "partially filled" in result["warnings"][0]
+
+
 def test_order_confirm_tool_returns_not_found_for_unknown_identifier():
     from lumibot.components.agents.builtins import _bind_confirm_order
 
@@ -577,6 +631,32 @@ def test_builtin_order_tools_expose_explicit_confirm_definition():
     assert tool.name == "orders_confirm_order"
     assert "Confirm" in tool.description
     assert callable(tool.binder)
+
+
+def test_builtin_order_tools_respect_allow_trading_flag():
+    strategy = _Strategy()
+    manager = AgentManager(strategy)
+    confirm_definition = BuiltinTools.orders.confirm()
+    confirm_tool = confirm_definition.binder(strategy, manager)
+
+    assert confirm_definition.metadata["mutates_trading"] is True
+    assert confirm_tool.metadata["mutates_trading"] is True
+
+    restricted = manager.create(
+        name="restricted_confirm",
+        tools=[confirm_definition],
+        include_builtin_tools=False,
+        allow_trading=False,
+    )
+    permitted = manager.create(
+        name="permitted_confirm",
+        tools=[confirm_definition],
+        include_builtin_tools=False,
+        allow_trading=True,
+    )
+
+    assert "orders_confirm_order" not in {tool.name for tool in restricted._ensure_bound_tools()}
+    assert "orders_confirm_order" in {tool.name for tool in permitted._ensure_bound_tools()}
 
 
 def test_builtin_indicator_schema_is_gemini_function_declaration_compatible():
