@@ -387,6 +387,198 @@ def test_order_submit_tool_records_memory_event(monkeypatch, tmp_path):
     assert order_events.iloc[0]["model_call_id"] == "call-order-1"
 
 
+class _ConfirmAsset:
+    def __init__(self, symbol="VNQ", asset_type="stock"):
+        self.symbol = symbol
+        self.asset_type = asset_type
+
+
+class _ConfirmPosition:
+    def __init__(self, symbol, quantity):
+        self.asset = _ConfirmAsset(symbol)
+        self.quantity = quantity
+        self.avg_fill_price = None
+        self.market_value = None
+        self.pnl = None
+        self.pnl_percent = None
+
+
+class _ConfirmOrder:
+    def __init__(self, *, status="new", side="sell", quantity=10, symbol="VNQ"):
+        self.identifier = "order-123"
+        self.status = status
+        self.side = side
+        self.asset = _ConfirmAsset(symbol)
+        self.quantity = quantity
+        self.order_type = "market"
+        self.time_in_force = "day"
+        self.limit_price = None
+        self.stop_price = None
+        self.avg_fill_price = None
+        self.transactions = []
+        self.position_filled = status in {"fill", "filled"}
+
+    def is_filled(self):
+        return self.position_filled or str(self.status).lower() in {"fill", "filled", "cash_settled"}
+
+    def is_active(self):
+        return not self.is_filled() and not self.is_canceled()
+
+    def is_canceled(self):
+        return str(self.status).lower() in {"canceled", "cancelled", "error", "expired", "rejected"}
+
+    def get_fill_price(self):
+        return self.avg_fill_price
+
+
+class _ConfirmBroker:
+    IS_BACKTESTING_BROKER = True
+
+    def __init__(self, strategy):
+        self.strategy = strategy
+        self.process_pending_calls = 0
+
+    def process_pending_orders(self, strategy=None):
+        self.process_pending_calls += 1
+        target_strategy = strategy or self.strategy
+        if self.process_pending_calls >= target_strategy.fill_after_pending_calls:
+            target_strategy.order.status = "fill"
+            target_strategy.order.position_filled = True
+            target_strategy.order.avg_fill_price = 97.12
+            target_strategy.positions = [_ConfirmPosition("USD", 2000.0)]
+            target_strategy.cash = 2000.0
+
+
+class _ConfirmStrategy(_Strategy):
+    def __init__(self, *, initial_status="new", fill_after_pending_calls=1):
+        self.order = _ConfirmOrder(status=initial_status)
+        self.fill_after_pending_calls = fill_after_pending_calls
+        self.cash = 1000.0
+        self.positions = [_ConfirmPosition("USD", 1000.0), _ConfirmPosition("VNQ", 10.0)]
+        self.broker = _ConfirmBroker(self)
+        self.get_order_calls = []
+
+    def get_order(self, identifier, broker_refresh=True, broker_refresh_ttl_seconds=0.0):
+        self.get_order_calls.append(
+            {
+                "identifier": identifier,
+                "broker_refresh": broker_refresh,
+                "broker_refresh_ttl_seconds": broker_refresh_ttl_seconds,
+            }
+        )
+        if identifier == self.order.identifier:
+            return self.order
+        return None
+
+    def get_orders(self, *args, **kwargs):
+        return [self.order] if self.order.is_active() else []
+
+    def get_positions(self, include_cash_positions=True):
+        return list(self.positions)
+
+    def get_cash(self):
+        return self.cash
+
+    def get_portfolio_value(self):
+        return self.cash
+
+
+def test_order_confirm_tool_confirms_filled_order_after_processing_pending():
+    from lumibot.components.agents.builtins import _bind_confirm_order
+
+    strategy = _ConfirmStrategy(initial_status="new", fill_after_pending_calls=1)
+    tool = _bind_confirm_order(strategy, manager=None)
+
+    result = tool.function(
+        identifier="order-123",
+        symbol="VNQ",
+        side="sell",
+        expected_quantity=10,
+        position_before_quantity=10,
+        cash_before=1000,
+    )
+
+    assert result["identifier"] == "order-123"
+    assert result["confirmed"] is True
+    assert result["can_continue"] is True
+    assert result["confirmation_status"] == "filled"
+    assert result["attempt_count"] == 1
+    assert result["checks"]["order_found"] is True
+    assert result["checks"]["order_filled"] is True
+    assert result["checks"]["position_moved_as_expected"] is True
+    assert result["checks"]["cash_moved_as_expected"] is True
+    assert result["order"]["is_filled"] is True
+    assert result["order"]["is_active"] is False
+    assert result["order"]["avg_fill_price"] == 97.12
+    assert strategy.broker.process_pending_calls == 1
+    assert strategy.get_order_calls[0]["broker_refresh"] is True
+
+
+def test_order_confirm_tool_returns_open_after_retries_and_caps_attempts():
+    from lumibot.components.agents.builtins import _bind_confirm_order
+
+    strategy = _ConfirmStrategy(initial_status="new", fill_after_pending_calls=99)
+    tool = _bind_confirm_order(strategy, manager=None)
+
+    result = tool.function(
+        identifier="order-123",
+        symbol="VNQ",
+        side="sell",
+        expected_quantity=10,
+        position_before_quantity=10,
+        cash_before=1000,
+        max_attempts=99,
+        wait_seconds=0,
+    )
+
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["confirmation_status"] == "open_after_retries"
+    assert result["attempt_count"] == 5
+    assert len(result["attempts"]) == 5
+    assert result["checks"]["order_found"] is True
+    assert result["checks"]["order_filled"] is False
+    assert "remained active" in result["warnings"][0]
+
+
+def test_order_confirm_tool_returns_terminal_rejected_failure():
+    from lumibot.components.agents.builtins import _bind_confirm_order
+
+    strategy = _ConfirmStrategy(initial_status="rejected", fill_after_pending_calls=99)
+    tool = _bind_confirm_order(strategy, manager=None)
+
+    result = tool.function(identifier="order-123", symbol="VNQ", side="sell", expected_quantity=10)
+
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["confirmation_status"] == "rejected"
+    assert result["attempt_count"] == 1
+    assert "terminal status" in result["warnings"][0]
+
+
+def test_order_confirm_tool_returns_not_found_for_unknown_identifier():
+    from lumibot.components.agents.builtins import _bind_confirm_order
+
+    strategy = _ConfirmStrategy(initial_status="new")
+    tool = _bind_confirm_order(strategy, manager=None)
+
+    result = tool.function(identifier="missing-order", symbol="VNQ", side="sell", expected_quantity=10)
+
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["confirmation_status"] == "not_found"
+    assert result["checks"]["order_found"] is False
+    assert "not found" in result["warnings"][0].lower()
+
+
+def test_builtin_order_tools_expose_explicit_confirm_definition():
+    tool = BuiltinTools.orders.confirm()
+
+    assert tool.name == "orders_confirm_order"
+    assert "Confirm" in tool.description
+    assert callable(tool.binder)
+
+
 def test_builtin_indicator_schema_is_gemini_function_declaration_compatible():
     pytest.importorskip("google.adk.tools.function_tool")
     from google.adk.tools.function_tool import FunctionTool

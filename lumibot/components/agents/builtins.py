@@ -357,6 +357,35 @@ def _position_to_dict(position: Any) -> dict[str, Any]:
     }
 
 
+def _safe_call(obj: Any, method_name: str, default: Any = None) -> Any:
+    method = getattr(obj, method_name, None)
+    if not callable(method):
+        return default
+    try:
+        return method()
+    except Exception:
+        return default
+
+
+def _order_filled_quantity(order: Any) -> Any:
+    transactions = getattr(order, "transactions", None) or []
+    if transactions:
+        total = 0.0
+        for transaction in transactions:
+            try:
+                total += float(getattr(transaction, "quantity", 0) or 0)
+            except Exception:
+                return None
+        return total
+    if _safe_call(order, "is_filled", False):
+        quantity = getattr(order, "quantity", None)
+        try:
+            return float(quantity)
+        except Exception:
+            return quantity
+    return None
+
+
 def _order_to_dict(order: Any) -> dict[str, Any]:
     asset = getattr(order, "asset", None)
     asset_payload = _asset_to_dict(asset)
@@ -371,10 +400,22 @@ def _order_to_dict(order: Any) -> dict[str, Any]:
         "side": _jsonable(getattr(order, "side", None)),
         "asset": asset_payload,
         "quantity": quantity,
+        "filled_quantity": _jsonable(_order_filled_quantity(order)),
+        "avg_fill_price": _jsonable(
+            getattr(order, "avg_fill_price", None)
+            if getattr(order, "avg_fill_price", None) is not None
+            else _safe_call(order, "get_fill_price", None)
+        ),
+        "is_active": _jsonable(_safe_call(order, "is_active", None)),
+        "is_filled": _jsonable(_safe_call(order, "is_filled", None)),
+        "is_canceled": _jsonable(_safe_call(order, "is_canceled", None)),
         "order_type": _jsonable(getattr(order, "order_type", None)),
         "time_in_force": _jsonable(getattr(order, "time_in_force", None)),
         "limit_price": _jsonable(getattr(order, "limit_price", None)),
         "stop_price": _jsonable(getattr(order, "stop_price", None)),
+        "stop_limit_price": _jsonable(getattr(order, "stop_limit_price", None)),
+        "trail_price": _jsonable(getattr(order, "trail_price", None)),
+        "trail_percent": _jsonable(getattr(order, "trail_percent", None)),
     }
 
 
@@ -1262,6 +1303,332 @@ def _bind_open_orders(strategy: Any, manager: Any) -> BoundTool:
         description="List the strategy's currently tracked orders, including identifiers, status, side, quantity, and prices.",
         function=open_orders,
         metadata={"kind": "builtin"},
+    )
+
+
+_ORDER_CONFIRM_MAX_ATTEMPTS = 5
+_ORDER_CONFIRM_MAX_WAIT_SECONDS = 5.0
+_ORDER_CONFIRM_TERMINAL_FAILURE_STATUSES = {
+    "cancel",
+    "canceled",
+    "cancelled",
+    "error",
+    "expired",
+    "rejected",
+}
+_ORDER_CONFIRM_PARTIAL_STATUSES = {"partial_fill", "partially_filled"}
+
+
+def _coerce_confirm_attempts(max_attempts: Any) -> int:
+    try:
+        attempts = int(max_attempts)
+    except Exception:
+        attempts = 3
+    return min(max(attempts, 1), _ORDER_CONFIRM_MAX_ATTEMPTS)
+
+
+def _coerce_confirm_wait_seconds(wait_seconds: Any, strategy: Any) -> float:
+    if wait_seconds is None:
+        wait_seconds = 0.0 if bool(getattr(strategy, "is_backtesting", False)) else 1.0
+    try:
+        wait = float(wait_seconds)
+    except Exception:
+        wait = 0.0
+    if not math.isfinite(wait):
+        wait = 0.0
+    return min(max(wait, 0.0), _ORDER_CONFIRM_MAX_WAIT_SECONDS)
+
+
+def _get_order_for_confirmation(strategy: Any, identifier: str) -> Any:
+    get_order = getattr(strategy, "get_order", None)
+    if not callable(get_order):
+        return None
+    try:
+        return get_order(identifier, broker_refresh=True, broker_refresh_ttl_seconds=0.0)
+    except TypeError:
+        try:
+            return get_order(identifier, broker_refresh=True)
+        except TypeError:
+            return get_order(identifier)
+
+
+def _process_pending_orders_for_confirmation(strategy: Any) -> bool:
+    broker = getattr(strategy, "broker", None)
+    process_pending_orders = getattr(broker, "process_pending_orders", None)
+    if not bool(getattr(strategy, "is_backtesting", False)) or not callable(process_pending_orders):
+        return False
+    try:
+        process_pending_orders(strategy=strategy)
+    except TypeError:
+        process_pending_orders(strategy)
+    return True
+
+
+def _sleep_for_confirmation(strategy: Any, seconds: float) -> bool:
+    if seconds <= 0:
+        return False
+    sleep = getattr(strategy, "sleep", None)
+    if callable(sleep):
+        try:
+            sleep(seconds)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _position_quantity_for_symbol(strategy: Any, symbol: str | None) -> float | None:
+    if not symbol:
+        return None
+    symbol = symbol.strip().upper()
+    positions = getattr(strategy, "get_positions", None)
+    if not callable(positions):
+        return None
+    try:
+        position_list = positions(include_cash_positions=True)
+    except TypeError:
+        position_list = positions()
+    total = 0.0
+    found = False
+    for position in position_list or []:
+        asset = getattr(position, "asset", None)
+        position_symbol = str(getattr(asset, "symbol", "")).strip().upper()
+        if position_symbol != symbol:
+            continue
+        try:
+            total += float(getattr(position, "quantity", 0) or 0)
+        except Exception:
+            return None
+        found = True
+    return total if found else 0.0
+
+
+def _positions_snapshot(strategy: Any) -> list[dict[str, Any]]:
+    positions = getattr(strategy, "get_positions", None)
+    if not callable(positions):
+        return []
+    try:
+        position_list = positions(include_cash_positions=True)
+    except TypeError:
+        position_list = positions()
+    return [_position_to_dict(position) for position in position_list or []]
+
+
+def _account_snapshot(strategy: Any) -> dict[str, Any]:
+    cash = None
+    portfolio_value = None
+    get_cash = getattr(strategy, "get_cash", None)
+    get_portfolio_value = getattr(strategy, "get_portfolio_value", None)
+    if callable(get_cash):
+        try:
+            cash = get_cash()
+        except Exception:
+            cash = None
+    if callable(get_portfolio_value):
+        try:
+            portfolio_value = get_portfolio_value()
+        except Exception:
+            portfolio_value = None
+    return {
+        "cash": _jsonable(cash),
+        "portfolio_value": _jsonable(portfolio_value),
+        "positions": _positions_snapshot(strategy),
+    }
+
+
+def _order_confirmation_status(order: Any, *, attempts_exhausted: bool = False) -> str:
+    if order is None:
+        return "not_found"
+    raw_status = str(getattr(order, "status", "") or "").strip().lower()
+    if _safe_call(order, "is_filled", False):
+        if raw_status == "cash_settled":
+            return "cash_settled"
+        return "filled"
+    if raw_status in _ORDER_CONFIRM_PARTIAL_STATUSES:
+        return "partially_filled"
+    if raw_status in _ORDER_CONFIRM_TERMINAL_FAILURE_STATUSES or _safe_call(order, "is_canceled", False):
+        if raw_status in {"cancel", "cancelled"}:
+            return "canceled"
+        return raw_status or "error"
+    if attempts_exhausted and _safe_call(order, "is_active", False):
+        return "open_after_retries"
+    return raw_status or "unknown"
+
+
+def _confirmation_checks(
+    strategy: Any,
+    *,
+    order: Any,
+    symbol: str | None,
+    side: str | None,
+    expected_quantity: float | None,
+    position_before_quantity: float | None,
+    cash_before: float | None,
+    account_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    checks: dict[str, Any] = {
+        "order_found": order is not None,
+        "order_filled": bool(_safe_call(order, "is_filled", False)) if order is not None else False,
+    }
+    if order is None:
+        return checks
+
+    current_position = _position_quantity_for_symbol(strategy, symbol)
+    checks["current_position_quantity"] = _jsonable(current_position)
+    if position_before_quantity is not None and current_position is not None and side:
+        before_qty = float(position_before_quantity)
+        expected_qty = float(expected_quantity or 0)
+        side_value = str(side).strip().lower()
+        if side_value in {"sell", "sell_to_close", "sell_short", "sell_to_open"}:
+            checks["position_moved_as_expected"] = current_position <= (
+                before_qty - min(expected_qty, abs(before_qty)) + 1e-9
+            )
+        elif side_value in {"buy", "buy_to_open", "buy_to_close", "buy_to_cover"}:
+            checks["position_moved_as_expected"] = current_position >= before_qty + expected_qty - 1e-9
+
+    current_cash = account_snapshot.get("cash")
+    if cash_before is not None and current_cash is not None and side:
+        before_cash = float(cash_before)
+        cash_value = float(current_cash)
+        side_value = str(side).strip().lower()
+        if side_value in {"sell", "sell_to_close", "sell_short", "sell_to_open"}:
+            checks["cash_moved_as_expected"] = cash_value >= before_cash
+        elif side_value in {"buy", "buy_to_open", "buy_to_close", "buy_to_cover"}:
+            checks["cash_moved_as_expected"] = cash_value <= before_cash
+
+    return checks
+
+
+def _confirmation_checks_pass(checks: dict[str, Any]) -> bool:
+    for key in ("position_moved_as_expected", "cash_moved_as_expected"):
+        if key in checks and checks[key] is False:
+            return False
+    return bool(checks.get("order_found")) and bool(checks.get("order_filled"))
+
+
+def _bind_confirm_order(strategy: Any, manager: Any) -> BoundTool:
+    def confirm_order(
+        *,
+        identifier: str,
+        symbol: str | None = None,
+        side: str | None = None,
+        expected_quantity: float | None = None,
+        position_before_quantity: float | None = None,
+        cash_before: float | None = None,
+        max_attempts: int = 3,
+        wait_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        identifier = _require_non_empty_text("identifier", identifier)
+        if symbol is not None:
+            symbol = _require_single_symbol_text("symbol", symbol)
+        if expected_quantity is not None:
+            expected_quantity = _require_positive_number("expected_quantity", expected_quantity)
+        attempts_limit = _coerce_confirm_attempts(max_attempts)
+        wait_value = _coerce_confirm_wait_seconds(wait_seconds, strategy)
+        attempts: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        order = None
+        account = _account_snapshot(strategy)
+        checks: dict[str, Any] = {"order_found": False, "order_filled": False}
+        status = "unknown"
+
+        for attempt_number in range(1, attempts_limit + 1):
+            processed_pending = _process_pending_orders_for_confirmation(strategy)
+            order = _get_order_for_confirmation(strategy, identifier)
+            account = _account_snapshot(strategy)
+            status = _order_confirmation_status(
+                order,
+                attempts_exhausted=attempt_number == attempts_limit,
+            )
+            order_payload = _order_to_dict(order) if order is not None else None
+            checks = _confirmation_checks(
+                strategy,
+                order=order,
+                symbol=symbol,
+                side=side,
+                expected_quantity=expected_quantity,
+                position_before_quantity=position_before_quantity,
+                cash_before=cash_before,
+                account_snapshot=account,
+            )
+            attempts.append(
+                {
+                    "attempt": attempt_number,
+                    "processed_pending_orders": processed_pending,
+                    "status": status,
+                    "is_active": order_payload.get("is_active") if order_payload else None,
+                    "is_filled": order_payload.get("is_filled") if order_payload else None,
+                }
+            )
+
+            if order is None:
+                warnings.append(f"Order {identifier} was not found.")
+                break
+            if status in _ORDER_CONFIRM_TERMINAL_FAILURE_STATUSES or status in {
+                "canceled",
+                "expired",
+                "rejected",
+                "error",
+            }:
+                warnings.append(f"Order {identifier} reached terminal status {status}.")
+                break
+            if status == "partially_filled":
+                warnings.append(f"Order {identifier} is partially filled; dependent orders should not continue.")
+                break
+            if _confirmation_checks_pass(checks):
+                return {
+                    "identifier": identifier,
+                    "confirmed": True,
+                    "can_continue": True,
+                    "confirmation_status": status,
+                    "attempt_count": attempt_number,
+                    "order": order_payload,
+                    "account_snapshot": account,
+                    "checks": checks,
+                    "attempts": attempts,
+                    "warnings": warnings,
+                }
+            if attempt_number < attempts_limit:
+                _sleep_for_confirmation(strategy, wait_value)
+
+        if order is not None and status not in {
+            "not_found",
+            "partially_filled",
+            "canceled",
+            "expired",
+            "rejected",
+            "error",
+        }:
+            status = "open_after_retries" if _safe_call(order, "is_active", False) else status
+            if not warnings:
+                warnings.append(
+                    f"Order {identifier} remained active after {attempts_limit} confirmation attempts. "
+                    "Do not submit dependent orders."
+                )
+
+        return {
+            "identifier": identifier,
+            "confirmed": False,
+            "can_continue": False,
+            "confirmation_status": status,
+            "attempt_count": len(attempts),
+            "order": _order_to_dict(order) if order is not None else None,
+            "account_snapshot": account,
+            "checks": checks,
+            "attempts": attempts,
+            "warnings": warnings,
+        }
+
+    return BoundTool(
+        name="orders_confirm_order",
+        description=(
+            "Confirm a previously submitted order by identifier. Use this after every orders_submit_order call "
+            "before submitting any later order or writing the final execution summary. The tool refreshes the exact "
+            "order, retries internally, and returns whether the order is confirmed filled and whether it is safe to "
+            "continue with later orders. This tool does not submit, cancel, or modify orders."
+        ),
+        function=confirm_order,
+        metadata={"kind": "builtin", "replay_on_cache": True},
     )
 
 
@@ -2293,6 +2660,13 @@ class _OrderTools:
             description="Submit an order with explicit side/type/time_in_force.",
             binder=_bind_submit_order,
             metadata={"mutates_trading": True},
+        )
+
+    def confirm(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="orders_confirm_order",
+            description="Confirm a submitted order by identifier before continuing execution.",
+            binder=_bind_confirm_order,
         )
 
     def cancel(self) -> ToolDefinition:
