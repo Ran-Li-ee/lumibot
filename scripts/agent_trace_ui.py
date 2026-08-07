@@ -25,6 +25,27 @@ def default_trace_root() -> Path:
     return REPO_ROOT / ".lumibot" / "agent_runtime"
 
 
+def default_trace_roots() -> list[Path]:
+    """Return all project-local trace roots the replay UI should show by default."""
+
+    explicit_root = os.environ.get("LUMIBOT_AGENT_TRACE_ROOT")
+    if explicit_root:
+        return [Path(explicit_root)]
+
+    roots = [REPO_ROOT / ".lumibot" / "agent_runtime"]
+    global_root = global_trace_root()
+    if global_root.exists():
+        roots.append(global_root)
+    artifact_root = REPO_ROOT / "artifacts"
+    benchmark_roots = [
+        artifact_root / "ai_trading_team_example_benchmarks",
+        artifact_root / "ai_trading_team_provider_benchmarks",
+    ]
+    for benchmark_root in benchmark_roots:
+        roots.extend(sorted(benchmark_root.glob("*/*/cache/agent_runtime")))
+    return roots
+
+
 def global_trace_root() -> Path:
     """Return the legacy global Lumibot agent runtime trace root."""
 
@@ -33,19 +54,19 @@ def global_trace_root() -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve the local Lumibot agent trace replay UI.")
-    parser.add_argument("--trace-root", type=Path, default=default_trace_root())
+    parser.add_argument("--trace-root", type=Path, default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
-    app = create_app(args.trace_root)
+    trace_roots = [args.trace_root] if args.trace_root is not None else default_trace_roots()
+    app = create_app(trace_roots)
     url = f"http://{args.host}:{args.port}/"
 
-    print(f"Trace root: {args.trace_root}")
-    if args.trace_root == default_trace_root() and not args.trace_root.exists() and global_trace_root().exists():
-        print(f"Global trace root not used by default: {global_trace_root()}")
-        print("Pass --trace-root explicitly to inspect global or older project traces.")
+    print("Trace roots:")
+    for trace_root in trace_roots:
+        print(f"  - {trace_root}")
     print(f"URL: {url}")
 
     if not args.no_browser:

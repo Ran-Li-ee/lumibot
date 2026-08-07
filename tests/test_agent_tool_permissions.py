@@ -476,6 +476,69 @@ def test_agent_order_tool_submits_after_account_context_was_checked():
     assert len(strategy.submitted_orders) == 1
 
 
+def test_agent_order_tool_rejects_buy_that_would_make_cash_negative():
+    strategy = _OrderReadinessStrategy()
+    strategy.get_cash = lambda: 1000.0
+    strategy.get_portfolio_value = lambda: 1000.0
+    strategy.get_last_price = lambda asset, quote=None, exchange=None: 100.0
+    tool_map = _wrap_builtin_tools(
+        strategy,
+        [
+            BuiltinTools.account.positions(),
+            BuiltinTools.account.portfolio(),
+            BuiltinTools.market.last_price(),
+            BuiltinTools.orders.submit(),
+        ],
+    )
+
+    tool_map["account_portfolio"]()
+    tool_map["account_positions"]()
+    tool_map["market_last_price"](symbol="SPY", asset_type="stock")
+    result = tool_map["orders_submit_order"](
+        symbol="SPY",
+        quantity=11,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+    )
+
+    assert result["tool_error"] is True
+    assert result["error"]["type"] == "ValueError"
+    assert "NEGATIVE_CASH_NOT_ALLOWED" in result["error"]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_agent_order_tool_allows_buy_that_keeps_cash_positive():
+    strategy = _OrderReadinessStrategy()
+    strategy.get_cash = lambda: 1000.0
+    strategy.get_portfolio_value = lambda: 1000.0
+    strategy.get_last_price = lambda asset, quote=None, exchange=None: 100.0
+    tool_map = _wrap_builtin_tools(
+        strategy,
+        [
+            BuiltinTools.account.positions(),
+            BuiltinTools.account.portfolio(),
+            BuiltinTools.market.last_price(),
+            BuiltinTools.orders.submit(),
+        ],
+    )
+
+    tool_map["account_portfolio"]()
+    tool_map["account_positions"]()
+    tool_map["market_last_price"](symbol="SPY", asset_type="stock")
+    result = tool_map["orders_submit_order"](
+        symbol="SPY",
+        quantity=9,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+    )
+
+    assert "tool_error" not in result
+    assert result["order"]["quantity"] == 9.0
+    assert len(strategy.submitted_orders) == 1
+
+
 def test_agent_order_tool_requires_last_price_for_ordered_symbol():
     strategy = _OrderReadinessStrategy()
     tool_map = _wrap_builtin_tools(

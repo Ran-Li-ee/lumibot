@@ -107,6 +107,10 @@ def _run_one_strategy(name: str, args: argparse.Namespace, root: str) -> dict[st
     trades_file = run_dir / "trades.csv"
     settings_file = run_dir / "settings.json"
     logfile = run_dir / "backtest.log"
+    base_filename = _slug(name).replace("-", "_")
+    account_curve_file = run_dir / f"{base_filename}_account_curve.html"
+    tearsheet_file = run_dir / f"{base_filename}_tearsheet.html"
+    tearsheet_metrics_file = run_dir / f"{base_filename}_tearsheet_metrics.json"
     started = time.perf_counter()
     try:
         result, strategy = strategy_class.run_backtest(
@@ -120,9 +124,12 @@ def _run_one_strategy(name: str, args: argparse.Namespace, root: str) -> dict[st
             trades_file=str(trades_file),
             settings_file=str(settings_file),
             logfile=str(logfile),
-            analyze_backtest=False,
-            show_plot=False,
-            save_tearsheet=False,
+            analyze_backtest=True,
+            plot_file_html=str(account_curve_file),
+            tearsheet_file=str(tearsheet_file),
+            tearsheet_metrics_file=str(tearsheet_metrics_file),
+            show_plot=True,
+            save_tearsheet=True,
             show_tearsheet=False,
             show_indicators=False,
             save_logfile=True,
@@ -140,6 +147,11 @@ def _run_one_strategy(name: str, args: argparse.Namespace, root: str) -> dict[st
             "stats_file": str(stats_file.resolve()) if stats_file.exists() else None,
             "trades_file": str(trades_file.resolve()) if trades_file.exists() else None,
             "settings_file": str(settings_file.resolve()) if settings_file.exists() else None,
+            "account_curve_file": str(account_curve_file.resolve()) if account_curve_file.exists() else None,
+            "tearsheet_file": str(tearsheet_file.resolve()) if tearsheet_file.exists() else None,
+            "tearsheet_metrics_file": str(tearsheet_metrics_file.resolve())
+            if tearsheet_metrics_file.exists()
+            else None,
             "logfile": str(logfile.resolve()) if logfile.exists() else None,
         }
     except Exception as exc:

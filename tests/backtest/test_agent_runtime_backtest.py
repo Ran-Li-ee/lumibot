@@ -1,7 +1,9 @@
-import logging
+import asyncio
+import gzip
 import json
+import logging
 from datetime import date, datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pandas as pd
 import pytest
@@ -16,7 +18,16 @@ def _utc_iso_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _event(kind: str, *, text: str | None = None, tool_name: str | None = None, payload: dict | None = None):
+def _event(
+    kind: str,
+    *,
+    text: str | None = None,
+    tool_name: str | None = None,
+    payload: dict | None = None,
+    call_id: str | None = None,
+    event_id: str | None = None,
+    invocation_id: str | None = None,
+):
     from lumibot.components.agents import AgentTraceEvent
 
     return AgentTraceEvent(
@@ -25,6 +36,9 @@ def _event(kind: str, *, text: str | None = None, tool_name: str | None = None, 
         tool_name=tool_name,
         payload=payload,
         timestamp=_utc_iso_timestamp(),
+        call_id=call_id,
+        event_id=event_id,
+        invocation_id=invocation_id,
     )
 
 
@@ -93,7 +107,12 @@ class StockPlanRuntime:
         else:
             summary = "Held the current stock position."
         events.append(_event("text", text=summary))
-        return AgentRunResult(summary=summary, model=request.model, events=events)
+        return AgentRunResult(
+            summary=summary,
+            model=request.model,
+            events=events,
+            boundary_trace=request.boundary_collector.export(),
+        )
 
 
 class OptionPlanRuntime:
@@ -222,8 +241,121 @@ class PromptCaptureRuntime:
         )
 
 
+class BoundaryResultRuntime:
+    def __init__(self):
+        self.call_count = 0
+
+    def run(self, request):
+        self.call_count += 1
+        collector = request.boundary_collector
+        collector.record(
+            transition="B09_ADK_TO_LITELLM",
+            from_module="google_adk",
+            to_module="litellm",
+            payload={"contents": [{"role": "user", "text": "test"}]},
+        )
+        return AgentRunResult(
+            summary="RESULT: done",
+            model=request.model,
+            events=[
+                _event(
+                    "text",
+                    text="RESULT: done",
+                    call_id="call-1",
+                    event_id="event-1",
+                    invocation_id="invocation-1",
+                )
+            ],
+            boundary_trace=collector.export(),
+        )
+
+
+class SensitiveReplayRuntime:
+    def __init__(self, api_token, bearer_token):
+        self.api_token = api_token
+        self.bearer_token = bearer_token
+        self.call_count = 0
+
+    def run(self, request):
+        self.call_count += 1
+        collector = request.boundary_collector
+        collector.record(
+            transition="B09_ADK_TO_LITELLM",
+            from_module="google_adk",
+            to_module="litellm",
+            payload={"model": request.model, "contents": []},
+        )
+        summary = (
+            f"RESULT: used {self.api_token}; "
+            f"Authorization: Bearer {self.bearer_token}"
+        )
+        return AgentRunResult(
+            summary=summary,
+            model=request.model,
+            events=[
+                _event(
+                    "tool_call",
+                    tool_name="secret_tool",
+                    payload={
+                        "api_key": self.api_token,
+                        "Authorization": f"Bearer {self.bearer_token}",
+                    },
+                    call_id="secret-call",
+                ),
+                _event(
+                    "tool_result",
+                    tool_name="secret_tool",
+                    payload={
+                        "tool_error": True,
+                        "error": {
+                            "type": "TimeoutError",
+                            "message": summary,
+                        },
+                    },
+                    call_id="secret-call",
+                ),
+                _event("text", text=summary),
+            ],
+            usage={
+                "prompt_tokens": 101,
+                "completion_tokens": 23,
+                "total_tokens": 124,
+                "cache_write_input_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 80},
+                "completion_tokens_details": {"reasoning_tokens": 9},
+            },
+            boundary_trace=collector.export(),
+        )
+
+
+class BoundaryFailingRuntime:
+    def __init__(self, error):
+        self.error = error
+
+    def run(self, request):
+        collector = request.boundary_collector
+        collector.record(
+            transition="B09_ADK_TO_LITELLM",
+            from_module="google_adk",
+            to_module="litellm",
+            model_turn_id=collector.start_model_turn(),
+            payload={"model": request.model, "contents": []},
+        )
+        raise self.error
+
+
+class NoBoundaryResultRuntime:
+    def run(self, request):
+        return AgentRunResult(
+            summary="RESULT: no boundary capture",
+            model=request.model,
+            events=[_event("text", text="RESULT: no boundary capture")],
+        )
+
+
 class UsageTelemetryRuntime:
     call_count = 0
+    last_result = None
 
     def run(self, request):
         type(self).call_count += 1
@@ -244,12 +376,14 @@ class UsageTelemetryRuntime:
             _event("usage", payload=usage),
             _event("text", text="RESULT: Held cash after validating telemetry."),
         ]
-        return AgentRunResult(
+        result = AgentRunResult(
             summary="RESULT: Held cash after validating telemetry.",
             model=request.model,
             events=events,
             usage=usage,
         )
+        type(self).last_result = result
+        return result
 
 
 class FutureTimestampRuntime:
@@ -297,6 +431,7 @@ class AgentStockBacktestStrategy(Strategy):
     def initialize(self):
         self.sleeptime = "1M"
         self.asset = Asset("AGST", Asset.AssetType.STOCK)
+        self.last_agent_result = None
         self.agents.create(
             name="research",
             system_prompt="Use DuckDB and buy once if no position exists.",
@@ -343,7 +478,7 @@ class AgentStockBacktestStrategy(Strategy):
         return BuiltinTools.orders.submit()
 
     def on_trading_iteration(self):
-        self.agents["research"].run(
+        self.last_agent_result = self.agents["research"].run(
             context={
                 "symbol": self.asset.symbol,
                 "length": 3,
@@ -627,6 +762,905 @@ def _build_minute_stress_pandas_data():
     return {asset: Data(asset, df, timestep="minute")}
 
 
+class BoundaryTraceTestVars(dict):
+    def set(self, key, value):
+        self[key] = value
+
+
+class BoundaryTraceTestStrategy:
+    name = "BoundaryTraceStrategy"
+    market = "24/7"
+
+    def __init__(self, *, is_backtesting):
+        from lumibot.components.agents.manager import AgentManager
+
+        self.is_backtesting = is_backtesting
+        self.vars = BoundaryTraceTestVars()
+        self.parameters = {}
+        self.agents = AgentManager(self)
+
+    def get_datetime(self):
+        return None
+
+    def log_message(self, *args, **kwargs):
+        return None
+
+
+def _build_boundary_trace_handle(monkeypatch, tmp_path, *, is_backtesting, runtime=None):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path))
+    strategy = BoundaryTraceTestStrategy(is_backtesting=is_backtesting)
+    if runtime is None:
+        runtime = BoundaryResultRuntime()
+    handle = strategy.agents.create(
+        name="trace_agent",
+        system_prompt="test",
+        include_builtin_tools=False,
+        _runtime=runtime,
+    )
+    monkeypatch.setattr(strategy.agents, "_record_agent_observability", lambda **kwargs: None)
+    monkeypatch.setattr(handle, "_append_memory", lambda result: None)
+    monkeypatch.setattr(handle, "_append_run_artifact_summary", lambda result, context: None)
+    monkeypatch.setattr(handle, "_log_run_summary", lambda result, context: None)
+    return handle, runtime
+
+
+def test_google_adk_runtime_exports_request_boundary_collector(monkeypatch, tmp_path):
+    from lumibot.components.agents.boundary_trace import BoundaryTraceCollector
+    from lumibot.components.agents.runtime import GoogleADKRuntime, RuntimeRequest
+
+    collector = BoundaryTraceCollector(
+        agent_run_id="google-run",
+        artifact_root=tmp_path,
+    )
+    request = RuntimeRequest(
+        agent_name="google_agent",
+        model="test-model",
+        system_prompt="test",
+        task_prompt="test",
+        context=None,
+        runtime_context=None,
+        memory_state=None,
+        memory_notes=[],
+        bound_tools=[],
+        agent_run_id="google-run",
+        boundary_collector=collector,
+        run_timeout_seconds=None,
+    )
+    runtime = GoogleADKRuntime()
+
+    async def successful_run(_request):
+        return AgentRunResult(
+            summary="RESULT: done",
+            model=_request.model,
+            events=[_event("text", text="RESULT: done")],
+        )
+
+    monkeypatch.setattr(runtime, "_run_async", successful_run)
+
+    result = runtime.run(request)
+
+    assert result.boundary_trace == {
+        "schema_version": 1,
+        "agent_run_id": "google-run",
+        "capture_scope": "semantic_boundaries",
+        "provider_wire_capture": False,
+        "events": [],
+        "diagnostics": [],
+    }
+
+
+def test_agent_run_result_accepts_boundary_trace():
+    boundary_trace = {"schema_version": 1, "agent_run_id": "test-run"}
+
+    result = AgentRunResult(
+        summary="RESULT: done",
+        model="test-model",
+        events=[],
+        boundary_trace=boundary_trace,
+    )
+
+    assert result.boundary_trace == boundary_trace
+
+
+def test_agent_trace_persists_boundary_trace_without_changing_legacy_events(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+
+    handle.run(task_prompt="test")
+
+    trace_path = next((tmp_path / "agent_runtime" / "traces" / "trace_agent").glob("*.json"))
+    payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert payload["events"][0]["kind"] == "text"
+    assert payload["events"][0]["call_id"] == "call-1"
+    assert payload["events"][0]["event_id"] == "event-1"
+    assert payload["events"][0]["invocation_id"] == "invocation-1"
+    assert payload["boundary_trace"]["schema_version"] == 1
+    assert payload["boundary_trace"]["agent_run_id"]
+    assert list(trace_path.parent.glob("*.tmp")) == []
+
+
+def test_handled_agent_failure_persists_partial_boundary_trace(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(TimeoutError("provider timeout")),
+    )
+
+    result = handle.run(task_prompt="test")
+
+    assert "Skipped this iteration" in result.summary
+    trace_path = Path(result.payload["trace_path"])
+    assert trace_path.is_file()
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["boundary_trace"]["events"]
+    assert trace["boundary_trace"]["diagnostics"]
+    assert trace["boundary_trace"]["events"][0]["transition"] == "B09_ADK_TO_LITELLM"
+    assert "provider timeout" in trace["boundary_trace"]["diagnostics"][-1]["message"]
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_handled_agent_failure_redacts_secrets_from_complete_trace(monkeypatch, tmp_path):
+    api_token = "sk-proj-synthetic-runtime-secret"
+    bearer_token = "synthetic-bearer-runtime-secret"
+    error = TimeoutError(
+        f"provider timeout for {api_token}; Authorization: Bearer {bearer_token}"
+    )
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(error),
+    )
+
+    result = handle.run(task_prompt="test")
+
+    trace_path = Path(result.payload["trace_path"])
+    trace_text = trace_path.read_text(encoding="utf-8")
+    trace = json.loads(trace_text)
+    for secret in (api_token, bearer_token):
+        assert secret not in trace_text
+        assert secret not in result.summary
+        assert secret not in result.events[0].text
+        assert secret not in json.dumps(result.events[0].payload)
+        assert secret not in json.dumps(result.warnings)
+        assert secret not in json.dumps(result.payload)
+    assert "category=transient" in result.summary
+    assert "TimeoutError" in result.summary
+    assert "[REDACTED]" in result.summary
+    assert "TimeoutError" in trace["events"][0]["payload"]["traceback"]
+    assert "[REDACTED]" in trace["events"][0]["payload"]["traceback"]
+    assert trace["boundary_trace"]["diagnostics"][-1]["kind"] == "agent_runtime_failed"
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError],
+)
+def test_runtime_control_flow_exceptions_propagate(monkeypatch, tmp_path, error_type):
+    error = error_type("stop agent run")
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=False,
+        runtime=BoundaryFailingRuntime(error),
+    )
+
+    with pytest.raises(error_type) as exc_info:
+        handle.run(task_prompt="test")
+
+    assert exc_info.value is error
+    assert list((tmp_path / "agent_runtime" / "traces").rglob("*.json")) == []
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_trace_write_failure_does_not_change_successful_agent_result(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+    )
+
+    def fail_trace_write(*_args, **_kwargs):
+        raise OSError("trace disk unavailable")
+
+    monkeypatch.setattr(handle, "_write_trace", fail_trace_write)
+
+    result = handle.run(task_prompt="test")
+
+    assert result.summary == "RESULT: done"
+    assert result.events[0].text == "RESULT: done"
+    assert result.events[0].call_id == "call-1"
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    assert result.boundary_trace["diagnostics"][-1]["kind"] == "trace_write_failed"
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_non_os_trace_write_failure_does_not_change_successful_agent_result(
+    monkeypatch,
+    tmp_path,
+):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+    )
+
+    def fail_trace_write(*_args, **_kwargs):
+        raise ValueError("trace serialization failed")
+
+    monkeypatch.setattr(handle, "_write_trace", fail_trace_write)
+
+    result = handle.run(task_prompt="test")
+
+    assert result.summary == "RESULT: done"
+    assert result.events[0].text == "RESULT: done"
+    assert result.events[0].call_id == "call-1"
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    diagnostic = result.boundary_trace["diagnostics"][-1]
+    assert diagnostic["kind"] == "trace_write_failed"
+    assert diagnostic["message"] == "trace serialization failed"
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_trace_build_failure_does_not_change_successful_agent_result(monkeypatch, tmp_path):
+    secret = "sk-proj-synthetic-trace-build-secret"
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+    )
+
+    def fail_trace_build(**_kwargs):
+        raise ValueError(f"trace build failed for {secret}")
+
+    monkeypatch.setattr(handle, "_build_trace_payload", fail_trace_build)
+
+    result = handle.run(task_prompt="test")
+
+    assert result.summary == "RESULT: done"
+    assert result.events[0].text == "RESULT: done"
+    assert result.events[0].call_id == "call-1"
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    diagnostic = result.boundary_trace["diagnostics"][-1]
+    assert diagnostic["kind"] == "trace_write_failed"
+    assert diagnostic["message"] == "trace build failed for [REDACTED]"
+    assert secret not in json.dumps(result.boundary_trace)
+    assert list((tmp_path / "agent_runtime" / "traces").rglob("*.json")) == []
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_handled_failure_survives_non_os_trace_write_failure(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(TimeoutError("provider timeout")),
+    )
+
+    def fail_trace_write(*_args, **_kwargs):
+        raise TypeError("trace payload is not serializable")
+
+    monkeypatch.setattr(handle, "_write_trace", fail_trace_write)
+
+    result = handle.run(task_prompt="test")
+
+    assert "Skipped this iteration" in result.summary
+    assert "no trades placed" in result.summary
+    assert result.cache_key is None
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    diagnostic = result.boundary_trace["diagnostics"][-1]
+    assert diagnostic["kind"] == "trace_write_failed"
+    assert diagnostic["message"] == "trace payload is not serializable"
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_handled_failure_survives_trace_build_failure(monkeypatch, tmp_path):
+    secret = "synthetic-trace-build-bearer-secret"
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(TimeoutError("provider timeout")),
+    )
+
+    def fail_trace_build(**_kwargs):
+        raise TypeError(f"trace build failed; Authorization: Bearer {secret}")
+
+    monkeypatch.setattr(handle, "_build_trace_payload", fail_trace_build)
+
+    result = handle.run(task_prompt="test")
+
+    assert "Skipped this iteration" in result.summary
+    assert "no trades placed" in result.summary
+    assert result.cache_key is None
+    assert result.payload["runtime_error"] is True
+    assert result.payload["trace_path"] is None
+    assert result.payload["trace_write_error"] is True
+    diagnostic = result.boundary_trace["diagnostics"][-1]
+    assert diagnostic["kind"] == "trace_write_failed"
+    assert diagnostic["message"] == "trace build failed; Authorization: [REDACTED]"
+    assert secret not in json.dumps(result.boundary_trace)
+    assert list((tmp_path / "agent_runtime" / "traces").rglob("*.json")) == []
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Exception("invalid API key"),
+        Exception("invalid model"),
+        Exception("insufficient_quota"),
+    ],
+    ids=["auth", "config", "billing"],
+)
+def test_backtest_permanent_agent_errors_still_reraise(monkeypatch, tmp_path, error):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=BoundaryFailingRuntime(error),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        handle.run(task_prompt="test")
+
+    assert exc_info.value is error
+    assert list((tmp_path / "agent_runtime" / "traces").rglob("*.json")) == []
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+@pytest.mark.parametrize(
+    "side_effect_name",
+    [
+        "_record_agent_observability",
+        "_append_memory",
+        "_append_run_artifact_summary",
+        "_log_run_summary",
+    ],
+)
+@pytest.mark.parametrize("handled_failure", [False, True], ids=["success", "handled_failure"])
+def test_post_result_artifact_failures_do_not_replace_agent_result(
+    monkeypatch,
+    tmp_path,
+    side_effect_name,
+    handled_failure,
+):
+    runtime = (
+        BoundaryFailingRuntime(TimeoutError("provider timeout"))
+        if handled_failure
+        else BoundaryResultRuntime()
+    )
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=runtime,
+    )
+
+    def fail_side_effect(*_args, **_kwargs):
+        raise ValueError(f"{side_effect_name} unavailable")
+
+    target = handle.manager if side_effect_name == "_record_agent_observability" else handle
+    monkeypatch.setattr(target, side_effect_name, fail_side_effect)
+
+    result = handle.run(task_prompt="test")
+
+    if handled_failure:
+        assert "Skipped this iteration" in result.summary
+        assert "no trades placed" in result.summary
+        assert result.cache_key is None
+        assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+    else:
+        assert result.summary == "RESULT: done"
+        assert result.events[0].text == "RESULT: done"
+    assert Path(result.payload["trace_path"]).is_file()
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError],
+)
+def test_post_result_control_flow_exceptions_propagate(
+    monkeypatch,
+    tmp_path,
+    error_type,
+):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=False,
+    )
+    error = error_type("stop artifact finalization")
+
+    def cancel_memory(_result):
+        raise error
+
+    monkeypatch.setattr(handle, "_append_memory", cancel_memory)
+
+    with pytest.raises(error_type) as exc_info:
+        handle.run(task_prompt="test")
+
+    assert exc_info.value is error
+
+
+def test_replay_cache_write_failure_does_not_replace_successful_result(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+    )
+
+    def fail_cache_write(*_args, **_kwargs):
+        raise ValueError("replay cache unavailable")
+
+    monkeypatch.setattr(handle.manager.replay_cache, "save", fail_cache_write)
+
+    result = handle.run(task_prompt="test")
+
+    assert result.summary == "RESULT: done"
+    assert result.events[0].text == "RESULT: done"
+    assert Path(result.payload["trace_path"]).is_file()
+    assert list((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz")) == []
+
+
+def test_corrupt_replay_cache_is_a_miss_after_partial_save_failure(monkeypatch, tmp_path):
+    runtime = BoundaryResultRuntime()
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=runtime,
+    )
+    replay_cache = handle.manager.replay_cache
+    real_save = replay_cache.save
+    partial_cache_path = None
+
+    def fail_with_partial_cache(cache_key, _payload):
+        nonlocal partial_cache_path
+        partial_cache_path = replay_cache._path_for(cache_key)
+        partial_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_cache_path.write_bytes(b"synthetic-partial-gzip")
+        raise OSError("synthetic replay cache save failure")
+
+    monkeypatch.setattr(replay_cache, "save", fail_with_partial_cache)
+
+    first_result = handle.run(task_prompt="test")
+
+    assert first_result.summary == "RESULT: done"
+    assert first_result.cache_hit is False
+    assert runtime.call_count == 1
+    assert partial_cache_path is not None
+    assert partial_cache_path.read_bytes() == b"synthetic-partial-gzip"
+
+    monkeypatch.setattr(replay_cache, "save", real_save)
+
+    second_result = handle.run(task_prompt="test")
+
+    assert second_result.summary == "RESULT: done"
+    assert second_result.cache_hit is False
+    assert second_result.cache_key == first_result.cache_key
+    assert runtime.call_count == 2
+    assert replay_cache.load(second_result.cache_key)["summary"] == "RESULT: done"
+
+
+def test_remote_replay_cache_hydration_error_is_a_miss_and_recovers(monkeypatch, tmp_path):
+    runtime = BoundaryResultRuntime()
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=runtime,
+    )
+    replay_cache = handle.manager.replay_cache
+    real_ensure_local_file = replay_cache.remote_cache.ensure_local_file
+    hydration_attempts = 0
+
+    def fail_first_hydration(path):
+        nonlocal hydration_attempts
+        hydration_attempts += 1
+        if hydration_attempts == 1:
+            raise ValueError("synthetic remote hydration failure")
+        return real_ensure_local_file(path)
+
+    monkeypatch.setattr(
+        replay_cache.remote_cache,
+        "ensure_local_file",
+        fail_first_hydration,
+    )
+
+    first_result = handle.run(task_prompt="test")
+    second_result = handle.run(task_prompt="test")
+
+    assert first_result.summary == "RESULT: done"
+    assert first_result.cache_hit is False
+    assert second_result.cache_hit is True
+    assert runtime.call_count == 1
+    assert hydration_attempts == 2
+
+
+def test_agent_trace_atomic_replace_uses_same_directory(monkeypatch, tmp_path):
+    from lumibot.components.agents import manager as manager_module
+
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+    replace_calls = []
+    real_replace = manager_module.os.replace
+
+    def observed_replace(source, target):
+        source_path = Path(source)
+        target_path = Path(target)
+        replace_calls.append((source_path, target_path))
+        assert source_path.parent == target_path.parent
+        assert source_path.is_file()
+        assert not target_path.exists()
+        real_replace(source, target)
+
+    monkeypatch.setattr(manager_module.os, "replace", observed_replace)
+
+    trace_path = handle._write_trace(
+        AgentRunResult(summary="done", model="test-model", events=[]),
+        {"summary": "done"},
+    )
+
+    assert len(replace_calls) == 1
+    assert replace_calls[0][1] == trace_path
+    assert trace_path.is_file()
+    assert list(trace_path.parent.glob("*.tmp")) == []
+
+
+def test_agent_trace_redaction_preserves_numeric_token_usage(monkeypatch, tmp_path):
+    from lumibot.components.agents.manager import _normalize_redacted_payload
+
+    api_token = "sk-proj-synthetic-persisted-usage-secret"
+    bearer_token = "synthetic-persisted-usage-bearer-secret"
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+    usage = {
+        "prompt_tokens": 101,
+        "completion_tokens": 23,
+        "total_tokens": 124,
+        "cache_write_input_tokens": 7,
+        "prompt_tokens_details": {"cached_tokens": 80},
+        "completion_tokens_details": {"reasoning_tokens": 9},
+    }
+
+    trace_path = handle._write_trace(
+        AgentRunResult(summary="done", model="test-model", events=[]),
+        _normalize_redacted_payload(
+            {
+                "usage": usage,
+                "api_key": api_token,
+                "header": f"Authorization: Bearer {bearer_token}",
+            }
+        ),
+    )
+
+    trace_text = trace_path.read_text(encoding="utf-8")
+    trace = json.loads(trace_text)
+    assert trace["usage"] == usage
+    assert trace["api_key"] == "[REDACTED]"
+    assert trace["header"] == "Authorization: [REDACTED]"
+    assert api_token not in trace_text
+    assert bearer_token not in trace_text
+
+
+def test_agent_run_artifact_summary_redacts_complete_jsonl_record(monkeypatch, tmp_path):
+    api_token = "sk-proj-synthetic-run-summary-secret"
+    bearer_token = "synthetic-run-summary-bearer-secret"
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+    result = AgentRunResult(
+        summary=f"RESULT: {api_token}; Authorization: Bearer {bearer_token}",
+        model="test-model",
+        events=[
+            _event(
+                "tool_call",
+                tool_name=f"tool-{api_token}",
+                payload={"Authorization": f"Bearer {bearer_token}"},
+            )
+        ],
+        usage={
+            "prompt_tokens": 101,
+            "completion_tokens": 23,
+            "total_tokens": 124,
+            "cache_creation_input_tokens": 7,
+            "completion_tokens_details": {"reasoning_tokens": 9},
+        },
+        warnings=[
+            {
+                "kind": "synthetic_warning",
+                "message": f"warning for {api_token}; Bearer {bearer_token}",
+            }
+        ],
+    )
+    result.payload = {"trace_path": None}
+
+    type(handle)._append_run_artifact_summary(
+        handle,
+        result,
+        {"mode": "live"},
+    )
+
+    summary_path = tmp_path / "agent_runtime" / "agent_run_summaries.jsonl"
+    summary_text = summary_path.read_text(encoding="utf-8")
+    summary_record = json.loads(summary_text)
+    assert api_token not in summary_text
+    assert bearer_token not in summary_text
+    assert summary_record["usage"]["input_tokens"] == 101
+    assert summary_record["usage"]["output_tokens"] == 23
+    assert summary_record["usage"]["total_tokens"] == 124
+    assert summary_record["usage"]["thinking_tokens"] == 9
+    assert summary_record["usage"]["cache_write_input_tokens"] == 7
+    assert "[REDACTED]" in summary_record["summary"]
+    assert "[REDACTED]" in summary_record["warning_messages"][0]
+    assert "[REDACTED]" in summary_record["tool_calls"][0]
+
+
+def test_agent_trace_replace_failure_cleans_temp_without_partial_target(monkeypatch, tmp_path):
+    from lumibot.components.agents import manager as manager_module
+
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=False)
+    replace_calls = []
+
+    def failing_replace(source, target):
+        source_path = Path(source)
+        target_path = Path(target)
+        replace_calls.append((source_path, target_path))
+        assert source_path.parent == target_path.parent
+        assert source_path.is_file()
+        assert not target_path.exists()
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(manager_module.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        handle._write_trace(
+            AgentRunResult(summary="done", model="test-model", events=[]),
+            {"summary": "done"},
+        )
+
+    assert len(replace_calls) == 1
+    trace_dir = tmp_path / "agent_runtime" / "traces" / "trace_agent"
+    assert list(trace_dir.glob("*.tmp")) == []
+    assert list(trace_dir.glob("*.json")) == []
+
+
+def test_agent_replay_cache_uses_portable_boundary_trace_reference(monkeypatch, tmp_path):
+    from lumibot.components.agents import manager as manager_module
+
+    collector_calls = []
+    collector_class = manager_module.BoundaryTraceCollector
+
+    def tracking_collector(**kwargs):
+        collector_calls.append(kwargs)
+        return collector_class(**kwargs)
+
+    monkeypatch.setattr(manager_module, "BoundaryTraceCollector", tracking_collector)
+    handle, runtime = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=True)
+
+    live_result = handle.run(task_prompt="test")
+    cached_result = handle.run(task_prompt="test")
+
+    cache_path = next((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz"))
+    with gzip.open(cache_path, "rt", encoding="utf-8") as cache_file:
+        cache_text = cache_file.read()
+    cached_payload = json.loads(cache_text)
+    assert tmp_path.as_posix() not in cache_text.replace("\\", "/")
+    reference = cached_payload["boundary_trace_ref"]
+    payload_trace_path = cached_payload["payload"]["trace_path"]
+    assert "boundary_trace" not in cached_payload
+    assert reference == {
+        "status": "available_original_trace",
+        "trace_path": reference["trace_path"],
+        "agent_run_id": live_result.boundary_trace["agent_run_id"],
+    }
+    assert payload_trace_path == reference["trace_path"]
+    for portable_path in (payload_trace_path, reference["trace_path"]):
+        assert PureWindowsPath(portable_path).drive == ""
+        assert not PureWindowsPath(portable_path).is_absolute()
+        assert not PurePosixPath(portable_path).is_absolute()
+        assert "\\" not in portable_path
+        assert (tmp_path / "agent_runtime" / portable_path).is_file()
+    assert reference["trace_path"].startswith("traces/trace_agent/")
+    live_trace_path = Path(live_result.payload["trace_path"])
+    cached_trace_path = Path(cached_result.payload["trace_path"])
+    assert live_trace_path.is_absolute()
+    assert cached_trace_path.is_absolute()
+    assert live_trace_path.is_file()
+    assert cached_trace_path.is_file()
+    assert live_trace_path == cached_trace_path
+    assert cached_payload["events"][0]["call_id"] == "call-1"
+    assert cached_payload["events"][0]["event_id"] == "event-1"
+    assert cached_payload["events"][0]["invocation_id"] == "invocation-1"
+    assert runtime.call_count == 1
+    assert len(collector_calls) == 1
+    assert cached_result.boundary_trace == {
+        **reference,
+        "schema_version": 1,
+        "execution_source": "replay_cache",
+        "events": [],
+        "diagnostics": [],
+    }
+    assert cached_result.events[0].call_id == "call-1"
+    assert cached_result.events[0].event_id == "event-1"
+    assert cached_result.events[0].invocation_id == "invocation-1"
+
+
+def test_agent_replay_cache_uses_authoritative_redacted_trace_payload(monkeypatch, tmp_path):
+    api_token = "sk-proj-synthetic-replay-secret"
+    bearer_token = "synthetic-replay-bearer-secret"
+    runtime = SensitiveReplayRuntime(api_token, bearer_token)
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=runtime,
+    )
+
+    live_result = handle.run(task_prompt="test")
+
+    trace_path = Path(live_result.payload["trace_path"])
+    trace_text = trace_path.read_text(encoding="utf-8")
+    trace = json.loads(trace_text)
+    cache_path = next((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz"))
+    with gzip.open(cache_path, "rt", encoding="utf-8") as cache_file:
+        cache_text = cache_file.read()
+    cached_payload = json.loads(cache_text)
+    for secret in (api_token, bearer_token):
+        assert secret not in trace_text
+        assert secret not in cache_text
+    for field in ("summary", "events", "warnings", "usage", "timing"):
+        assert cached_payload[field] == trace[field]
+    assert cached_payload["usage"] == {
+        "prompt_tokens": 101,
+        "completion_tokens": 23,
+        "total_tokens": 124,
+        "cache_write_input_tokens": 7,
+        "prompt_tokens_details": {"cached_tokens": 80},
+        "completion_tokens_details": {"reasoning_tokens": 9},
+    }
+    reference = cached_payload["boundary_trace_ref"]
+    assert cached_payload["payload"]["trace_path"] == reference["trace_path"]
+    assert (tmp_path / "agent_runtime" / reference["trace_path"]).resolve() == trace_path.resolve()
+
+    replayed_result = handle.run(task_prompt="test")
+
+    assert runtime.call_count == 1
+    assert replayed_result.cache_hit is True
+    assert replayed_result.summary == trace["summary"]
+    assert replayed_result.usage == trace["usage"]
+    assert Path(replayed_result.payload["trace_path"]).resolve() == trace_path.resolve()
+
+
+def test_legacy_agent_replay_cache_marks_boundary_trace_unavailable(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=True)
+    trace_path = tmp_path / "agent_runtime" / "traces" / "trace_agent" / "legacy.json"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text("{}", encoding="utf-8")
+
+    result = handle._result_from_cached(
+        {
+            "summary": "Cached.",
+            "model": "test-model",
+            "events": [],
+            "warnings": [],
+            "payload": {
+                "trace_path": "C:/cache/agent_runtime/traces/trace_agent/legacy.json",
+            },
+        },
+        "legacy-key",
+    )
+
+    assert Path(result.payload["trace_path"]) == trace_path.resolve()
+    assert Path(result.payload["trace_path"]).is_file()
+    assert result.boundary_trace == {
+        "schema_version": 1,
+        "status": "unavailable_legacy_cache",
+        "execution_source": "replay_cache",
+        "events": [],
+        "diagnostics": [],
+    }
+
+
+def test_agent_replay_cache_marks_missing_boundary_capture_unavailable(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(
+        monkeypatch,
+        tmp_path,
+        is_backtesting=True,
+        runtime=NoBoundaryResultRuntime(),
+    )
+
+    live_result = handle.run(task_prompt="test")
+    cached_result = handle.run(task_prompt="test")
+
+    cache_path = next((tmp_path / "agent_runtime" / "replay").rglob("*.json.gz"))
+    with gzip.open(cache_path, "rt", encoding="utf-8") as cache_file:
+        cached_payload = json.load(cache_file)
+    assert cached_payload["boundary_trace_ref"] == {
+        "status": "unavailable_no_boundary_capture",
+        "trace_path": cached_payload["payload"]["trace_path"],
+    }
+    assert Path(live_result.payload["trace_path"]).is_file()
+    assert Path(cached_result.payload["trace_path"]).is_file()
+    assert cached_result.boundary_trace == {
+        **cached_payload["boundary_trace_ref"],
+        "schema_version": 1,
+        "execution_source": "replay_cache",
+        "events": [],
+        "diagnostics": [],
+    }
+
+
+def test_remote_cache_uses_sanitized_reference_as_authoritative_path(monkeypatch, tmp_path):
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=True)
+    trace_path = tmp_path / "agent_runtime" / "traces" / "trace_agent" / "remote.json"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text("{}", encoding="utf-8")
+
+    result = handle._result_from_cached(
+        {
+            "summary": "Cached.",
+            "model": "test-model",
+            "events": [],
+            "warnings": [],
+            "payload": {
+                "trace_path": "D:/wrong/agent_runtime/traces/trace_agent/wrong.json",
+            },
+            "boundary_trace_ref": {
+                "status": "available_original_trace",
+                "trace_path": "C:/remote/agent_runtime/traces/trace_agent/remote.json",
+                "agent_run_id": "remote-run",
+            },
+        },
+        "remote-key",
+    )
+
+    assert result.boundary_trace["trace_path"] == "traces/trace_agent/remote.json"
+    assert Path(result.payload["trace_path"]) == trace_path.resolve()
+    assert Path(result.payload["trace_path"]).is_file()
+
+
+@pytest.mark.parametrize(
+    "malicious_path",
+    [
+        "agent_runtime/C:/secret/trace.json",
+        "agent_runtime//server/share/trace.json",
+        r"agent_runtime\\server\share\trace.json",
+        "agent_runtime/../traces/trace_agent/escape.json",
+        "C:/outside/trace.json",
+        "/outside/trace.json",
+    ],
+)
+def test_cached_boundary_reference_rejects_nonportable_paths(monkeypatch, tmp_path, malicious_path):
+    handle, _ = _build_boundary_trace_handle(monkeypatch, tmp_path, is_backtesting=True)
+
+    result = handle._result_from_cached(
+        {
+            "summary": "Cached.",
+            "model": "test-model",
+            "events": [],
+            "warnings": [],
+            "payload": {"trace_path": "traces/trace_agent/untrusted-fallback.json"},
+            "boundary_trace_ref": {
+                "status": "available_original_trace",
+                "trace_path": malicious_path,
+                "agent_run_id": "remote-run",
+            },
+        },
+        "malicious-key",
+    )
+
+    assert result.boundary_trace == {
+        "schema_version": 1,
+        "status": "unavailable_invalid_trace_reference",
+        "execution_source": "replay_cache",
+        "events": [],
+        "diagnostics": [],
+    }
+    assert result.payload["trace_path"] is None
+
+
 @pytest.mark.usefixtures("disable_datasource_override")
 def test_agent_runtime_stock_backtest_replays_from_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
@@ -663,6 +1697,11 @@ def test_agent_runtime_stock_backtest_replays_from_cache(monkeypatch, tmp_path):
     assert strategy_second.get_position(Asset("AGST", Asset.AssetType.STOCK)) is not None
     second_state = strategy_second.vars.get("_agent_runtime_state", {})
     assert second_state["research"]["runs"][-1]["cache_hit"] is True
+    second_result = strategy_second.last_agent_result
+    assert second_result is not None
+    # A fresh cache entry retains the original boundary trace reference.
+    assert second_result.boundary_trace["execution_source"] == "replay_cache"
+    assert second_result.boundary_trace["status"] == "available_original_trace"
 
 
 @pytest.mark.usefixtures("disable_datasource_override")
@@ -755,12 +1794,13 @@ def test_agent_runtime_injects_base_prompt_runtime_context_and_default_summary_l
     assert "Do not trade for the sake of activity." in request.system_prompt
     assert "Do not resist intentional concentration" in request.system_prompt
     assert "Avoid leaving raw cash idle unless there is a specific reason" in request.system_prompt
+    assert "DUCKDB SQL GUIDANCE" not in request.system_prompt
     assert (
         "use the exact column names returned by market_load_history_table or pragma_table_info"
-        in request.system_prompt
+        not in request.system_prompt
     )
-    assert "often named Date, not datetime" in request.system_prompt
-    assert "Do not assume datetime exists" in request.system_prompt
+    assert "often named Date, not datetime" not in request.system_prompt
+    assert "Do not assume datetime exists" not in request.system_prompt
     assert "use datetime for timestamp columns" not in request.system_prompt
     tool_names = [tool.name for tool in request.bound_tools]
     assert len(tool_names) == len(set(tool_names))
@@ -780,6 +1820,7 @@ def test_agent_runtime_injects_base_prompt_runtime_context_and_default_summary_l
 def test_agent_detail_parquet_has_single_token_summary_row_and_full_events(monkeypatch, tmp_path):
     monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
     UsageTelemetryRuntime.call_count = 0
+    UsageTelemetryRuntime.last_result = None
     _, strategy = UsageTelemetryStrategy.run_backtest(
         datasource_class=PandasDataBacktesting,
         backtesting_start=datetime(2025, 1, 6),
@@ -823,6 +1864,19 @@ def test_agent_detail_parquet_has_single_token_summary_row_and_full_events(monke
     assert pd.to_numeric(summaries["call_latency_ms"]).ge(0).all()
     assert "I should inspect the account first." in " ".join(df["thinking_text"].fillna("").astype(str).tolist())
     assert "portfolio_value" in " ".join(df["event_payload_json"].fillna("").astype(str).tolist())
+    original_result = UsageTelemetryRuntime.last_result
+    assert original_result is not None
+    original_trace_path = Path(original_result.payload["trace_path"])
+    assert original_trace_path.is_absolute()
+    assert original_trace_path.is_file()
+    persisted_trace_paths = set(df["trace_path"].dropna().astype(str))
+    assert persisted_trace_paths
+    for persisted_trace_path in persisted_trace_paths:
+        assert PureWindowsPath(persisted_trace_path).drive == ""
+        assert not PureWindowsPath(persisted_trace_path).is_absolute()
+        assert not PurePosixPath(persisted_trace_path).is_absolute()
+        assert "\\" not in persisted_trace_path
+        assert (tmp_path / "cache" / "agent_runtime" / persisted_trace_path).is_file()
 
     non_summary = df[df["event_kind"] != "call_summary"]
     assert non_summary["call_input_tokens"].sum() == 0
@@ -912,17 +1966,375 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
         quiet_logs=True,
     )
     history_tool = BuiltinTools.market.load_history_table().binder(strategy, strategy.agents)
+    batch_tool = BuiltinTools.market.load_history_tables_summary().binder(strategy, strategy.agents)
     query_tool = BuiltinTools.duckdb.query().binder(strategy, strategy.agents)
+    tool_names = [tool.name for tool in BuiltinTools.all()]
 
     assert "exact column names" in history_tool.description
     assert "Date" in history_tool.description
     assert "Do not assume datetime exists" in history_tool.description
     assert "close" in history_tool.description
+    assert "available_tables" in history_tool.description
+    assert "currently queryable tables" in history_tool.description
+    assert "computed_summary" in history_tool.description
+    assert "read it first before writing SQL" in history_tool.description
+    assert "summary-first" in history_tool.description.lower()
+    assert "does not return full raw historical rows" in history_tool.description.lower()
+    assert "Raw rows remain queryable in DuckDB" in history_tool.description
+    assert "market_load_history_tables_summary" in tool_names
+    assert "cross-symbol summary" in batch_tool.description
+    assert "by_composite_score" in batch_tool.description
+    assert "Prefer this tool before writing DuckDB SQL" in batch_tool.description
     assert "exact column names" in query_tool.description
     assert "market_load_history_table" in query_tool.description
     assert "pragma_table_info" in query_tool.description
     assert "Do not invent datetime" in query_tool.description
     assert "close" in query_tool.description
+    assert "alias every table" in query_tool.description
+    assert "sym, Date, close, and return" in query_tool.description
+    assert "q.sym" in query_tool.description
+    assert "q.Date" in query_tool.description
+    assert "q.close" in query_tool.description
+    assert (
+        "SELECT q.Date, q.close AS qqq_close, s.close AS spy_close FROM qqq_hist AS q "
+        "JOIN spy_hist AS s ON q.Date = s.Date ORDER BY q.Date"
+    ) in query_tool.description
+
+
+def test_compute_history_summary_includes_extended_summary_metrics():
+    from lumibot.components.agents.history_summary import compute_history_summary
+
+    index = pd.date_range("2024-01-01", periods=260, freq="D", tz="America/New_York")
+    close = pd.Series([100 + i * 0.5 for i in range(260)], index=index)
+    frame = pd.DataFrame(
+        {
+            "Date": index,
+            "open": close - 0.2,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": [1_000_000 + i * 1_000 for i in range(260)],
+        }
+    )
+
+    summary = compute_history_summary(
+        frame,
+        symbol="SPY",
+        timestep="day",
+        as_of="2024-09-16T16:00:00-04:00",
+    )
+
+    assert summary["momentum"]["return_5"] is not None
+    assert summary["momentum"]["return_10"] is not None
+    assert summary["volume"]["latest_volume"] == 1_259_000.0
+    assert summary["volume"]["avg_volume_20"] is not None
+    assert summary["volume"]["volume_vs_avg_20"] is not None
+    assert summary["range"]["drawdown_from_high_20"] is not None
+    assert summary["range"]["drawdown_from_high_60"] is not None
+    assert summary["range"]["drawdown_from_high_252"] is not None
+    assert summary["scores"]["return_63_over_volatility_20"] is not None
+    assert summary["scores"]["return_126_over_volatility_20"] is not None
+    assert summary["scores"]["composite_score"] is not None
+    assert summary["availability"]["return_5"] is True
+    assert summary["availability"]["latest_volume"] is True
+    assert summary["availability"]["drawdown_from_high_20"] is True
+    assert summary["availability"]["composite_score"] is True
+
+
+def test_compute_history_summary_marks_extended_metrics_unavailable_when_data_is_short():
+    from lumibot.components.agents.history_summary import compute_history_summary
+
+    frame = pd.DataFrame(
+        {
+            "Date": pd.date_range("2024-01-01", periods=4, freq="D", tz="America/New_York"),
+            "open": [100.0, 101.0, 102.0, 103.0],
+            "high": [101.0, 102.0, 103.0, 104.0],
+            "low": [99.0, 100.0, 101.0, 102.0],
+            "close": [100.0, 101.0, 102.0, 103.0],
+            "volume": [1000, 1100, 1200, 1300],
+        }
+    )
+
+    summary = compute_history_summary(
+        frame,
+        symbol="SPY",
+        timestep="day",
+        as_of="2024-01-04T16:00:00-04:00",
+    )
+
+    assert summary["momentum"]["return_5"] is None
+    assert summary["momentum"]["return_10"] is None
+    assert summary["volume"]["avg_volume_20"] is None
+    assert summary["volume"]["volume_vs_avg_20"] is None
+    assert summary["scores"]["return_63_over_volatility_20"] is None
+    assert summary["scores"]["return_126_over_volatility_20"] is None
+    assert summary["scores"]["composite_score"] is None
+    assert summary["availability"]["return_5"] is False
+    assert summary["availability"]["avg_volume_20"] is False
+    assert summary["availability"]["composite_score"] is False
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_history_tables_summary_returns_rankings_and_queryable_tables(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    pandas_data = _build_stock_pandas_data()
+    first_asset = next(iter(pandas_data.keys()))
+    first_data = pandas_data[first_asset]
+    base_frame = first_data.df.copy()
+    first_frame = pd.concat([base_frame] * 5, ignore_index=True).iloc[:30].copy()
+    first_frame.index = pd.date_range("2025-01-06 09:30", periods=30, freq="min", tz="America/New_York")
+    first_frame[["open", "high", "low", "close"]] = first_frame[["open", "high", "low", "close"]].add(
+        range(30),
+        axis=0,
+    )
+    pandas_data[first_asset] = Data(first_asset, first_frame, timestep="minute")
+    second_asset = Asset("AGST2", Asset.AssetType.STOCK)
+    second_frame = first_frame.copy()
+    second_frame[["open", "high", "low", "close"]] = second_frame[["open", "high", "low", "close"]] * 1.1
+    pandas_data[second_asset] = Data(second_asset, second_frame, timestep="minute")
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=pandas_data,
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    summary = strategy.agents.duckdb.load_history_tables_summary(
+        symbols=["AGST", "AGST2"],
+        length=30,
+        timestep="minute",
+        table_prefix="cmp",
+    )
+
+    assert summary["schema_version"] == "1.0"
+    assert summary["symbols"] == ["AGST", "AGST2"]
+    assert len(summary["loaded_tables"]) == 2
+    assert len(summary["universe_summary"]) == 2
+    assert "by_return_21" in summary["rankings"]
+    assert "by_return_63" in summary["rankings"]
+    assert "by_momentum_composite" in summary["rankings"]
+    assert "by_composite_score" in summary["rankings"]
+    assert summary["rankings"]["by_composite_score"]
+    for row in summary["universe_summary"]:
+        assert "composite_score" in row
+        assert "return_5" in row
+        assert "volume_vs_avg_20" in row
+        assert "drawdown_from_high_60" in row
+    assert all(table_name.startswith("cmp_") for table_name in summary["loaded_tables"].values())
+    assert {"cmp_agst", "cmp_agst2"}.issubset(set(summary["loaded_tables"].values()))
+    row_count = strategy.agents.duckdb.query(sql="SELECT COUNT(*) AS count_rows FROM cmp_agst")
+    assert row_count["rows"] == [{"count_rows": 30}]
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_history_tables_summary_disambiguates_table_prefix_collisions(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    base_data = next(iter(_build_stock_pandas_data().values()))
+    pandas_data = {}
+    for symbol, multiplier in (("BRK.B", 1.0), ("BRK/B", 1.2)):
+        asset = Asset(symbol, Asset.AssetType.STOCK)
+        frame = base_data.df.copy()
+        frame[["open", "high", "low", "close"]] = frame[["open", "high", "low", "close"]] * multiplier
+        pandas_data[asset] = Data(asset, frame, timestep="minute")
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=pandas_data,
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    summary = strategy.agents.duckdb.load_history_tables_summary(
+        symbols=["BRK.B", "BRK/B"],
+        length=3,
+        timestep="minute",
+        table_prefix="cmp",
+    )
+
+    table_names = list(summary["loaded_tables"].values())
+    assert table_names == ["cmp_brk_b", "cmp_brk_b_2"]
+    assert len(table_names) == len(set(table_names))
+    for table_name in table_names:
+        result = strategy.agents.duckdb.query(sql=f"SELECT COUNT(*) AS count_rows FROM {table_name}")
+        assert result["rows"] == [{"count_rows": 3}]
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_history_tables_summary_raises_when_all_symbols_fail(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=_build_stock_pandas_data(),
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    def fail_load_history_table(**kwargs):
+        raise RuntimeError(f"forced failure for {kwargs['symbol']}")
+
+    monkeypatch.setattr(strategy.agents.duckdb, "load_history_table", fail_load_history_table)
+
+    with pytest.raises(ValueError, match="no history tables.*symbols"):
+        strategy.agents.duckdb.load_history_tables_summary(
+            symbols=["AGST", "AGST2"],
+            length=3,
+            timestep="minute",
+            table_prefix="cmp",
+        )
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_history_tables_summary_rejects_duplicate_symbols(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=_build_stock_pandas_data(),
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    with pytest.raises(ValueError, match="duplicate symbols"):
+        strategy.agents.duckdb.load_history_tables_summary(
+            symbols=["AGST", "AGST"],
+            length=3,
+            timestep="minute",
+            table_prefix="cmp",
+        )
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
+def test_builtin_market_history_tables_summary_rejects_empty_symbols(monkeypatch, tmp_path):
+    from lumibot.components.agents import BuiltinTools
+
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=_build_stock_pandas_data(),
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+    tool = BuiltinTools.market.load_history_tables_summary().binder(strategy, strategy.agents)
+
+    with pytest.raises(ValueError, match="symbols"):
+        tool.function(symbols=[])
+
+
+@pytest.mark.usefixtures("disable_datasource_override")
+def test_duckdb_table_inventory_tracks_fresh_and_cached_history_tables(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    pandas_data = _build_stock_pandas_data()
+    first_data = next(iter(pandas_data.values()))
+    second_asset = Asset("AGST2", Asset.AssetType.STOCK)
+    second_frame = first_data.df.copy()
+    second_frame["custom_signal"] = range(len(second_frame.index))
+    pandas_data[second_asset] = Data(second_asset, second_frame, timestep="minute")
+    _, strategy = PromptCaptureStrategy.run_backtest(
+        datasource_class=PandasDataBacktesting,
+        backtesting_start=datetime(2025, 1, 6),
+        backtesting_end=datetime(2025, 1, 7),
+        pandas_data=pandas_data,
+        benchmark_asset=None,
+        analyze_backtest=False,
+        show_plot=False,
+        save_tearsheet=False,
+        show_tearsheet=False,
+        show_indicators=False,
+        save_logfile=False,
+        show_progress_bar=False,
+        quiet_logs=True,
+    )
+
+    first = strategy.agents.duckdb.load_history_table(
+        symbol="AGST",
+        length=3,
+        timestep="minute",
+        table_name="z_history",
+    )
+    second = strategy.agents.duckdb.load_history_table(
+        symbol="AGST2",
+        length=3,
+        timestep="minute",
+        table_name="a_history",
+    )
+    cached_first = strategy.agents.duckdb.load_history_table(
+        symbol="AGST",
+        length=3,
+        timestep="minute",
+        table_name="z_history",
+    )
+
+    first_columns = first["columns"]
+    second_columns = second["columns"]
+    assert first_columns != second_columns
+    assert first["computed_summary"]["symbol"] == "AGST"
+    assert first["computed_summary"]["timestep"] == "minute"
+    assert first["computed_summary"]["data_window"]["row_count"] == first["row_count"]
+    assert first["computed_summary"]["price"]["latest_close"] is not None
+    assert "rows" not in first
+    assert "data" not in first
+    assert "records" not in first
+    assert cached_first["computed_summary"] == first["computed_summary"]
+    assert first["available_tables"] == [
+        {"table_name": "z_history", "columns": first_columns},
+    ]
+    assert second["available_tables"] == [
+        {"table_name": "a_history", "columns": second_columns},
+        {"table_name": "z_history", "columns": first_columns},
+    ]
+    assert cached_first["available_tables"] == [
+        {"table_name": "a_history", "columns": second_columns},
+        {"table_name": "z_history", "columns": first_columns},
+    ]
+    row_count = strategy.agents.duckdb.query(sql="SELECT COUNT(*) AS count_rows FROM z_history")
+    assert row_count["rows"] == [{"count_rows": 3}]
+    close_query = strategy.agents.duckdb.query(sql="SELECT close FROM z_history ORDER BY 1 LIMIT 1")
+    assert close_query["row_count"] == 1
+    assert "close" in close_query["columns"]
+    assert all("available_tables" not in meta for meta in strategy.agents.duckdb._table_meta.values())
 
 
 @pytest.mark.usefixtures("disable_datasource_override")

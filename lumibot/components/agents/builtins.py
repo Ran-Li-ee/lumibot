@@ -5,11 +5,10 @@ from datetime import date, datetime, timedelta, timezone
 from importlib import import_module
 from typing import Any, Literal
 
-from .docs_tools import search_lumibot_docs
 from .asset_resolution import resolve_asset_and_quote
+from .docs_tools import search_lumibot_docs
 from .schemas import BoundTool, ToolDefinition
 from .tool_context import current_agent_tool_context
-
 
 AssetTypeArg = Literal["stock", "option", "future", "cont_future", "forex", "crypto", "index", "multileg", "us_equity"]
 OrderSideArg = Literal["buy", "sell", "buy_to_open", "sell_to_close", "sell_short", "buy_to_cover"]
@@ -209,6 +208,103 @@ def _require_agent_order_readiness(symbol: str) -> None:
         )
 
 
+def _agent_negative_cash_guard_enabled() -> bool:
+    value = os.environ.get("LUMIBOT_AGENT_ALLOW_NEGATIVE_CASH", "")
+    return value.strip().lower() not in {"1", "true", "yes", "on"}
+
+
+def _estimate_buy_order_cash_requirement(
+    strategy: Any,
+    *,
+    asset: Any,
+    quote: Any,
+    quantity: float,
+    asset_type: str,
+    order_type: str,
+    limit_price: float | None,
+    stop_price: float | None,
+    stop_limit_price: float | None,
+    exchange: str | None,
+) -> float | None:
+    if str(asset_type).strip().lower() not in {"stock", "us_equity"}:
+        return None
+
+    price: float | None = None
+    if order_type in {"limit", "smart_limit"} and limit_price is not None:
+        price = float(limit_price)
+    elif order_type == "stop_limit":
+        price = float(stop_limit_price if stop_limit_price is not None else limit_price)
+    elif order_type == "stop" and stop_price is not None:
+        price = float(stop_price)
+    elif order_type == "market":
+        raw_price = strategy.get_last_price(asset, quote=quote, exchange=exchange)
+        if raw_price is None:
+            raise ValueError(
+                "NEGATIVE_CASH_CHECK_UNAVAILABLE: orders_submit_order cannot verify affordability because "
+                f"market_last_price for {getattr(asset, 'symbol', asset)!r} returned None."
+            )
+        price = float(raw_price)
+
+    if price is None:
+        return None
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError(
+            "NEGATIVE_CASH_CHECK_UNAVAILABLE: orders_submit_order cannot verify affordability because "
+            f"estimated order price is invalid: {price!r}."
+        )
+    return quantity * price
+
+
+def _require_no_negative_cash_after_buy(
+    strategy: Any,
+    *,
+    asset: Any,
+    quote: Any,
+    quantity: float,
+    side: str,
+    asset_type: str,
+    order_type: str,
+    limit_price: float | None,
+    stop_price: float | None,
+    stop_limit_price: float | None,
+    exchange: str | None,
+) -> None:
+    if not _agent_negative_cash_guard_enabled():
+        return
+    if str(side).strip().lower() not in {"buy", "buy_to_open", "buy_to_cover"}:
+        return
+    if not callable(getattr(strategy, "get_cash", None)) or not callable(
+        getattr(strategy, "get_last_price", None)
+    ):
+        return
+
+    requirement = _estimate_buy_order_cash_requirement(
+        strategy,
+        asset=asset,
+        quote=quote,
+        quantity=quantity,
+        asset_type=asset_type,
+        order_type=order_type,
+        limit_price=limit_price,
+        stop_price=stop_price,
+        stop_limit_price=stop_limit_price,
+        exchange=exchange,
+    )
+    if requirement is None:
+        return
+
+    cash = float(strategy.get_cash())
+    if not math.isfinite(cash):
+        raise ValueError("NEGATIVE_CASH_CHECK_UNAVAILABLE: current cash is not finite.")
+    projected_cash = cash - requirement
+    if projected_cash < 0:
+        raise ValueError(
+            "NEGATIVE_CASH_NOT_ALLOWED: orders_submit_order rejected the buy order because estimated cost "
+            f"{requirement:.2f} would exceed available cash {cash:.2f} and leave cash {projected_cash:.2f}. "
+            "Reduce quantity, sell first, or explicitly enable negative cash outside the agent tool guard."
+        )
+
+
 def _asset_to_dict(asset: Any) -> dict[str, Any] | str:
     if asset is None:
         return "None"
@@ -387,6 +483,20 @@ def _bind_load_history(strategy: Any, manager: Any) -> BoundTool:
             "The symbol argument must be the exact tradable symbol, such as XLY or SPY, not a generated table name such as XLY_HIST. "
             "Use stock for normal equities. If asset_type is omitted, stock is assumed. Do not pass economic series ids such as DCOILWTICO, FEDFUNDS, or M2SL as market symbols; use macro/FRED tools for those instead. "
             "Use the exact column names returned in this tool result when querying the loaded DuckDB table. "
+            "The available_tables result field lists the currently queryable tables "
+            "and the exact columns for each table. "
+            "This is a summary-first targeted single-symbol follow-up tool, "
+            "not the default tool for every symbol in a universe ranking. "
+            "Use it when market_load_history_tables_summary is missing, contradictory, "
+            "or insufficient for one symbol. "
+            "It returns metadata and computed_summary for model use, "
+            "and does not return full raw historical rows by default. "
+            "Raw rows remain queryable in DuckDB through the returned table_name. "
+            "The computed_summary result field already includes common price, momentum, volume, trend, "
+            "range, risk, and composite-score statistics; "
+            "read it first before writing SQL for common history analysis. "
+            "For cross-symbol comparisons, prefer market_load_history_tables_summary. "
+            "Use duckdb_query only when the needed comparison or statistic is not already available in tool results. "
             "History tables loaded by this tool often expose Date as the timestamp column, not datetime; "
             "Do not assume datetime exists unless it is explicitly listed in columns. "
             "Use close for the traded price when that column is listed. "
@@ -394,6 +504,53 @@ def _bind_load_history(strategy: Any, manager: Any) -> BoundTool:
             "Example: market_load_history_table(symbol='TQQQ', length=252, timestep='day', table_name='recent_prices')."
         ),
         function=load_history_table,
+        metadata={"kind": "builtin", "replay_on_cache": True},
+    )
+
+
+def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
+    def load_history_tables_summary(
+        *,
+        symbols: list[str],
+        length: int = 252,
+        timestep: str = "day",
+        asset_type: AssetTypeArg = "stock",
+        table_prefix: str | None = None,
+        include_after_hours: bool = True,
+    ) -> dict[str, Any]:
+        if not isinstance(symbols, list) or not symbols:
+            raise ValueError("symbols must be a non-empty list.")
+        symbols = [_require_single_symbol_text("symbols", symbol) for symbol in symbols]
+        normalized_symbol_keys = [symbol.upper() for symbol in symbols]
+        if len(normalized_symbol_keys) != len(set(normalized_symbol_keys)):
+            raise ValueError("duplicate symbols are not allowed.")
+        length = _require_positive_int("length", length)
+        timestep = _require_non_empty_text("timestep", timestep)
+        return manager.duckdb.load_history_tables_summary(
+            symbols=symbols,
+            length=length,
+            timestep=timestep,
+            asset_type=asset_type,
+            table_prefix=table_prefix,
+            include_after_hours=include_after_hours,
+        )
+
+    return BoundTool(
+        name="market_load_history_tables_summary",
+        description=(
+            "Load visible historical bars for multiple symbols into DuckDB and return a cross-symbol summary. "
+            "Arguments: symbols, optional length, timestep, asset_type, table_prefix, include_after_hours. "
+            "This is the default tool for multi-symbol price-history comparison and universe ranking. "
+            "Use it before per-symbol raw history tables for common cross-symbol comparison and ranking tasks. "
+            "This summary-first tool returns factual rankings, including by_composite_score, plus recent returns, "
+            "moving averages, trend alignment, drawdown, volatility, volume context, and range position "
+            "for the requested universe. "
+            "Prefer this tool before writing DuckDB SQL for common universe ranking. "
+            "Caveat: this only loads bars visible at the current LumiBot runtime datetime. "
+            "Example: market_load_history_tables_summary("
+            "symbols=['QQQ', 'SPY'], length=252, timestep='day', table_prefix='cmp')."
+        ),
+        function=load_history_tables_summary,
         metadata={"kind": "builtin", "replay_on_cache": True},
     )
 
@@ -409,11 +566,17 @@ def _bind_duckdb_query(strategy: Any, manager: Any) -> BoundTool:
         description=(
             "Run a read-only SQL query against tables previously loaded into DuckDB. "
             "Arguments: sql, optional limit. "
-            "Load a table first with market_load_history_table, then analyze it here. "
+            "Use this as targeted follow-up only when computed summaries or rankings are insufficient "
+            "for a specific question and a relevant DuckDB table is already available. "
+            "Do not treat DuckDB as a required first step in price-history research. "
             "Use exact column names from market_load_history_table or pragma_table_info('table_name'); "
             "do not invent columns. "
             "History tables loaded by market_load_history_table often use Date as the timestamp column; "
             "Do not invent datetime unless the schema explicitly lists it. Use close for prices when listed. "
+            "For multi-table queries, alias every table and qualify shared or potentially shared columns such as "
+            "sym, Date, close, and return with the table alias, for example q.sym, q.Date, and q.close. "
+            "Example join: SELECT q.Date, q.close AS qqq_close, s.close AS spy_close FROM qqq_hist AS q "
+            "JOIN spy_hist AS s ON q.Date = s.Date ORDER BY q.Date. "
             "Caveat: only read-only SQL is allowed. "
             "Example: duckdb_query(sql='SELECT AVG(close) AS avg_close FROM recent_prices')."
         ),
@@ -1387,6 +1550,19 @@ def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
             right=right,
             quote_symbol=quote_symbol,
         )
+        _require_no_negative_cash_after_buy(
+            strategy,
+            asset=asset,
+            quote=quote,
+            quantity=quantity,
+            side=side,
+            asset_type=asset_type,
+            order_type=order_type,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            stop_limit_price=stop_limit_price,
+            exchange=exchange,
+        )
         created = strategy.create_order(
             asset,
             quantity,
@@ -1439,6 +1615,8 @@ def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
             "Valid side values: buy, sell, buy_to_open, sell_to_close, sell_short, buy_to_cover. "
             "Valid order_type values: market, limit, stop, stop_limit, trailing_stop, smart_limit. "
             "Valid time_in_force values: day, gtc, gtd. "
+            "For stock/us_equity buy-like orders, this tool estimates affordability and rejects orders that would "
+            "make cash negative unless LUMIBOT_AGENT_ALLOW_NEGATIVE_CASH is explicitly enabled. "
             "Caveats: limit orders require limit_price; stop and stop_limit orders require stop_price; trailing_stop requires trail_price or trail_percent; smart_limit uses LumiBot's built-in smart-limit behavior. "
             "Example: orders_submit_order(symbol='SPY', quantity=100, side='buy', asset_type='stock', order_type='market')."
         ),
@@ -1476,6 +1654,13 @@ class _MarketTools:
             name="market_load_history_table",
             description="Load visible historical bars into DuckDB.",
             binder=_bind_load_history,
+        )
+
+    def load_history_tables_summary(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="market_load_history_tables_summary",
+            description="Load visible historical bars for multiple symbols and summarize the universe.",
+            binder=_bind_load_history_tables_summary,
         )
 
 
@@ -1648,6 +1833,7 @@ class _BuiltinTools:
             self.account.portfolio(),
             self.market.last_price(),
             self.market.load_history_table(),
+            self.market.load_history_tables_summary(),
             self.duckdb.query(),
             self.docs.search(),
             self.news.alpaca_news(),

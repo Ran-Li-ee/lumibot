@@ -88,6 +88,22 @@ def _text(value: Any, fallback: str = "unknown") -> str:
     return str(value)
 
 
+def _number(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int | float):
+        return f"{float(value):.2f}"
+    return None
+
+
+def _percent(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int | float):
+        return f"{float(value) * 100:.2f}%"
+    return None
+
+
 def _short_list(values: list[Any], label: str) -> str:
     clean_values = [str(value) for value in values if value is not None]
     if not clean_values:
@@ -95,6 +111,18 @@ def _short_list(values: list[Any], label: str) -> str:
     shown = ", ".join(clean_values[:3])
     suffix = "" if len(clean_values) <= 3 else f", and {len(clean_values) - 3} more"
     return f" {label}: {shown}{suffix}."
+
+
+def _symbol_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    symbols = []
+    for value in values:
+        if isinstance(value, dict):
+            value = _first_present(value, "symbol", "ticker")
+        if value is not None:
+            symbols.append(str(value))
+    return symbols
 
 
 def _collection(raw_result: Any, *keys: str) -> list[Any]:
@@ -164,10 +192,125 @@ def _market_load_history_table(args: dict[str, Any], raw_result: Any) -> str:
     symbol = _first_present(result, "symbol", "ticker") or _first_present(args, "symbol", "ticker")
     table = _first_present(result, "table", "table_name") or _first_present(args, "table", "table_name")
     count = _row_count(raw_result, "rows", "data")
-    return (
+    text = (
         f"Loaded market history for {_text(symbol)} into table {_text(table)} "
         f"with {_rows_label(count)}."
     )
+    summary_text = _computed_history_summary(result.get("computed_summary"))
+    if summary_text:
+        text += f" {summary_text}"
+    return text
+
+
+def _computed_history_summary(raw_summary: Any) -> str:
+    summary = _as_dict(raw_summary)
+    if not summary:
+        return ""
+    price = _as_dict(summary.get("price"))
+    momentum = _as_dict(summary.get("momentum"))
+    volume = _as_dict(summary.get("volume"))
+    trend = _as_dict(summary.get("trend"))
+    range_summary = _as_dict(summary.get("range"))
+    risk = _as_dict(summary.get("risk"))
+    scores = _as_dict(summary.get("scores"))
+    parts = []
+    latest_close = _number(price.get("latest_close"))
+    if latest_close is not None:
+        parts.append(f"latest close {latest_close}")
+    for label, key in (
+        ("5-bar return", "return_5"),
+        ("10-bar return", "return_10"),
+        ("20-bar return", "return_20"),
+        ("21-bar return", "return_21"),
+        ("60-bar return", "return_60"),
+        ("63-bar return", "return_63"),
+        ("120-bar return", "return_120"),
+        ("126-bar return", "return_126"),
+        ("252-bar return", "return_252"),
+    ):
+        value = _percent(momentum.get(key))
+        if value is not None:
+            parts.append(f"{label} {value}")
+    value = _percent(scores.get("momentum_composite"))
+    if value is not None:
+        parts.append(f"momentum composite {value}")
+    trend_alignment = scores.get("trend_alignment")
+    if isinstance(trend_alignment, int | float) and not isinstance(trend_alignment, bool):
+        parts.append(f"trend alignment {_text(trend_alignment)}")
+    value = _number(scores.get("composite_score"))
+    if value is not None:
+        parts.append(f"composite score {value}")
+    for label, key in (
+        ("return63/vol20", "return_63_over_volatility_20"),
+        ("return126/vol20", "return_126_over_volatility_20"),
+    ):
+        value = _number(scores.get(key))
+        if value is not None:
+            parts.append(f"{label} {value}")
+    latest_volume = _number(volume.get("latest_volume"))
+    if latest_volume is not None:
+        parts.append(f"latest volume {latest_volume}")
+    value = _number(volume.get("avg_volume_20"))
+    if value is not None:
+        parts.append(f"avg volume 20 {value}")
+    value = _percent(volume.get("volume_vs_avg_20"))
+    if value is not None:
+        parts.append(f"volume vs avg20 {value}")
+    for label, key in (("SMA20", "sma_20"), ("SMA50", "sma_50"), ("SMA200", "sma_200")):
+        value = _number(trend.get(key))
+        if value is not None:
+            parts.append(f"{label} {value}")
+    value = _percent(trend.get("price_vs_sma_20"))
+    if value is not None:
+        parts.append(f"vs SMA20 {value}")
+    value = _percent(range_summary.get("distance_to_high_252"))
+    if value is not None:
+        parts.append(f"from 252-bar high {value}")
+    value = _percent(range_summary.get("distance_to_low_252"))
+    if value is not None:
+        parts.append(f"from 252-bar low {value}")
+    for label, key in (
+        ("drawdown from 20-bar high", "drawdown_from_high_20"),
+        ("drawdown from 60-bar high", "drawdown_from_high_60"),
+        ("drawdown from 252-bar high", "drawdown_from_high_252"),
+    ):
+        value = _percent(range_summary.get(key))
+        if value is not None:
+            parts.append(f"{label} {value}")
+    value = _percent(risk.get("max_drawdown_60"))
+    if value is not None:
+        parts.append(f"max drawdown 60 {value}")
+    value = _percent(risk.get("volatility_20"))
+    if value is not None:
+        parts.append(f"20-bar volatility {value}")
+    if not parts:
+        return ""
+    return "Computed summary: " + "; ".join(parts) + "."
+
+
+def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -> str:
+    result = _as_dict(raw_result)
+    count = len(_collection(raw_result, "universe_summary"))
+    parts = [f"Loaded market history summaries for {_rows_label(count, 'symbol')}"]
+    requested_symbols = args.get("symbols")
+    if isinstance(requested_symbols, list):
+        parts.append(f"{_rows_label(len(requested_symbols), 'requested symbol')}")
+
+    rankings = _as_dict(result.get("rankings"))
+    for label, key in (
+        ("return_63", "by_return_63"),
+        ("momentum_composite", "by_momentum_composite"),
+        ("composite_score", "by_composite_score"),
+    ):
+        symbols = _symbol_list(rankings.get(key))
+        if symbols:
+            parts.append(f"{label}: {', '.join(symbols[:3])}")
+
+    warnings = result.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        parts.append(_rows_label(len(warnings), "warning"))
+
+    return "; ".join(parts) + "."
 
 
 def _duckdb_query(args: dict[str, Any], raw_result: Any) -> str:
@@ -264,6 +407,7 @@ _FORMATTERS = {
     "orders_open_orders": _orders_open_orders,
     "market_last_price": _market_last_price,
     "market_load_history_table": _market_load_history_table,
+    "market_load_history_tables_summary": _market_load_history_tables_summary,
     "duckdb_query": _duckdb_query,
     "get_indicator": _get_indicator,
     "get_indicators": _get_indicators,

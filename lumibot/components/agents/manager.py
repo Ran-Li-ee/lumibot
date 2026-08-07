@@ -1,5 +1,5 @@
-import hashlib
 import functools
+import hashlib
 import inspect
 import json
 import os
@@ -7,21 +7,24 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Literal
+from uuid import uuid4
 
 from lumibot import LUMIBOT_CACHE_FOLDER
 
+from .boundary_trace import BoundaryTraceCollector
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer, ToolDefinition
 from .tool_context import agent_tool_context
 from .tools import bind_callable_tool
-
+from .trace_redaction import redact_sensitive
 
 _TIMESTAMP_HINT_RE = re.compile(
     r"(time|date|datetime|published|updated|created|accepted|released|release|as_of|realtime)",
     re.IGNORECASE,
 )
 _DEFAULT_MEMORY_NOTE_MAX_CHARS = 2000
+BaseSystemPromptMode = Literal["default", "execution_minimal"]
 
 
 class AgentModelCallLimitExceeded(RuntimeError):
@@ -48,7 +51,8 @@ def _get_pandas():
 def _get_replay_imports():
     global _REPLAY_IMPORTS
     if _REPLAY_IMPORTS is None:
-        from .replay_cache import AgentReplayCache, _normalize_json as normalize_json
+        from .replay_cache import AgentReplayCache
+        from .replay_cache import _normalize_json as normalize_json
 
         _REPLAY_IMPORTS = (AgentReplayCache, normalize_json)
     return _REPLAY_IMPORTS
@@ -56,6 +60,10 @@ def _get_replay_imports():
 
 def _normalize_json(value: Any) -> Any:
     return _get_replay_imports()[1](value)
+
+
+def _normalize_redacted_payload(value: Any) -> Any:
+    return redact_sensitive(_normalize_json(value))
 
 
 def _get_duckdb_query_layer_class():
@@ -658,12 +666,16 @@ class AgentHandle:
         include_builtin_tools: bool = True,
         model_request_timeout_seconds: float | None = None,
         run_timeout_seconds: float | None = None,
+        base_system_prompt_mode: BaseSystemPromptMode = "default",
     ) -> None:
         self.manager = manager
         self.name = name
         self.system_prompt = system_prompt
         self.default_model = default_model
         self.allow_trading = bool(allow_trading)
+        if base_system_prompt_mode not in ("default", "execution_minimal"):
+            raise ValueError(f"Unsupported base_system_prompt_mode: {base_system_prompt_mode!r}")
+        self.base_system_prompt_mode = base_system_prompt_mode
         self.model_request_timeout_seconds = model_request_timeout_seconds
         self.run_timeout_seconds = run_timeout_seconds
         from .builtins import BuiltinTools
@@ -783,86 +795,33 @@ class AgentHandle:
         }
 
     def _base_system_prompt(self, runtime_context: dict[str, Any]) -> str:
+        if self.base_system_prompt_mode == "execution_minimal":
+            return self._execution_minimal_base_system_prompt(runtime_context)
+        return self._global_runtime_rules_prompt(runtime_context)
+
+    def _global_runtime_rules_prompt(self, runtime_context: dict[str, Any]) -> str:
         mode = runtime_context.get("mode") or "live"
         lines = [
             "You are operating as a trading agent inside LumiBot.",
-            "Use the provided runtime context and tool outputs as the ground truth for the current state of the strategy.",
-            "Ground claims in tool results or runtime context instead of unsupported prior knowledge or vague market memory.",
-            "If evidence is weak, conflicting, stale, or incomplete, prefer doing nothing and explain why.",
-            "Execution mode, current datetime, current timezone, current positions, cash, equity/portfolio value, recent orders, and recent trades are provided in Runtime Context JSON.",
-            "Review current exposure, available cash, and recent activity before proposing any new trade.",
-            "",
-            "DEFAULT INVESTOR POLICY - FOLLOW THIS UNLESS THE USER'S SYSTEM PROMPT CLEARLY ASKS FOR A DIFFERENT STYLE:",
-            "Your job is to grow the account's value over time, not to maximize trade count.",
-            "Do not trade for the sake of activity. Prefer no trade over a weak trade.",
-            "Require a real thesis and real conviction before entering or rotating a position.",
-            "Do not buy an asset just because it is tradable, mentioned in news, or recently active.",
-            "Ask yourself why this should likely make money from here, why it is better than doing nothing, why it is better than what is already held, and what the downside is if you are wrong.",
-            "Use capital intentionally. Avoid token positions that are too small to matter.",
-            "Diversify when the strategy is broad and multiple opportunities compete for capital.",
-            "Assume this strategy may be one component of a broader portfolio unless the user says otherwise.",
-            "Do not resist intentional concentration when the user's strategy clearly calls for concentrated or single-asset exposure.",
-            "If you are not deploying capital into risk assets, explain why a high-quality short-duration defensive parking choice is preferable right now.",
-            "Avoid leaving raw cash idle unless there is a specific reason the defensive parking asset is unavailable or inappropriate.",
-            "When rotating, compare the new idea against the current holdings or current defensive posture and only switch if the new opportunity is clearly better.",
-            "Be aware that trading has costs. Commissions, spreads, and slippage add up, especially for thinly traded assets.",
-            "Prefer limit orders over market orders when the asset is not highly liquid.",
-            "Do not overtrade. Each round-trip has a cost, so the expected gain from a trade should clearly exceed the expected friction.",
-            "",
-            "RISK AND DRAWDOWN DISCIPLINE:",
-            "Your objective is the best risk-adjusted return over time, not the highest raw return. A smoother equity curve with a lower max drawdown is more valuable than a jagged one with a slightly higher end value, because compounding is damaged by deep drawdowns and because real users abandon strategies that hurt too much.",
-            "Remember the recovery math: a 20% drawdown requires a 25% gain to get back to even, a 50% drawdown requires a 100% gain, and an 80% drawdown requires a 400% gain. Small losses compound gently, large losses compound painfully. Limiting downside is almost always more valuable than squeezing out the last bit of upside.",
-            "Protect the downside as seriously as you pursue the upside. Size positions relative to conviction and expected volatility, not just available cash. A high-conviction low-volatility idea can take a larger share than a speculative high-volatility one.",
-            "Cut losing positions when the thesis is broken. Do not average down into a losing trade just to lower your cost basis. Reassess the thesis first, and exit if the evidence no longer supports the position.",
-            "Do not chase returns after a drawdown by increasing size or taking more aggressive exposure. That is how small drawdowns become large ones.",
-            "Think in terms of return per unit of volatility (Sharpe), return per unit of downside volatility (Sortino), and return relative to max drawdown (Calmar). The goal is compounding you can actually live with, not a headline number.",
-            "",
-            "POSITION SIZING AND ORDER EXECUTION:",
-            "Do not buy token one-share positions. Use account cash, portfolio value, current position size, and last price to calculate a sensible whole-share quantity.",
-            "Round down to whole shares when sizing positions.",
-            "Before every order, check current cash, portfolio value, current positions, and the latest price of the asset you are ordering. Lumibot rejects agent order submissions that skip those checks in the current agent run.",
-            "Estimate the order's cash impact before submitting it. Ask whether the order is likely to create negative cash or additional leverage, and only do that when it is intentional for the strategy and suitable for the asset class.",
-            "Margin and leverage behave differently across stocks, ETFs, options, futures, forex, crypto, brokers, and jurisdictions. Use judgment instead of assuming the same sizing rule works for every asset class.",
-            "When switching from one asset to another, close or reduce the current position first to free up capital before buying the replacement.",
-            "If the strategy holds a defensive parking asset (like SHV, BIL, or SGOV) and a better opportunity appears, sell the parking asset first to free the cash, then buy the new position. Do not assume parked capital is unavailable.",
-            "",
-            "TOOL USAGE:",
-            "Use your available tools to gather evidence before making any trading decision. Do not guess when a tool can give you the answer.",
-            "Before placing any trade, use tools to check current positions, available cash, and portfolio value.",
-            "Load recent price history for any asset you are considering and inspect it before deciding.",
-            "If you already hold a position and are considering adding, reducing, or selling it, call search_memory for the open thesis first and compare the current evidence against that thesis.",
-            "When available, use the built-in evidence stack before making a material equity decision: account/portfolio tools, current market prices, recent price history, DuckDB analysis, technical indicators, relevant news, macro/FRED data, SEC financial statements, SEC company facts, and SEC filings.",
-            "Do not submit a material equity order until you have called account/portfolio tools, market price/history tools, at least one technical indicator tool, a relevant news tool when configured, a macro/FRED tool when configured, and SEC financial/filing tools for relevant single-stock candidates.",
-            "For ETFs, indexes, or broad-market trades, use SEC financial/filing tools on the most relevant single-stock candidates, holdings, or alternatives you are considering; do not skip the category just because the final instrument is an ETF.",
-            "Do not repeat identical read-only evidence calls if the current task context already includes fresh results from another agent; reference those results and call again only when they are missing, stale, or conflicting.",
-            "If the user asks for an aggressive or concentrated strategy, let that user strategy prompt override the default investor style, but still ground the decision in tool evidence, position sizing, broker constraints, and backtesting look-ahead safety.",
-            "When querying DuckDB tables, use the exact column names returned by market_load_history_table or pragma_table_info.",
-            "For history tables loaded by market_load_history_table, the timestamp column is often named Date, not datetime. Do not assume datetime exists unless returned columns explicitly include it.",
-            "Use close for price columns when the returned columns include close.",
-            "When you have access to external MCP tools, explore what they offer and use them. You do not need to be told which specific tool to call.",
-            "Finish every run with a short summary sentence starting with RESULT: that explains what you did and why.",
+            "Runtime context is the ground truth for current account state, mode, datetime, timezone, "
+            "positions, cash, portfolio value, recent orders, and recent trades.",
+            "Tool outputs outrank model memory. Ground claims in tool results or runtime context instead of "
+            "unsupported prior knowledge.",
+            "Do not invent facts that are not present in runtime context or tool output.",
+            "Context pruning is a normal runtime mechanism used to manage context size.",
+            "If older tool outputs are marked as pruned, do not treat pruning itself as evidence failure.",
+            "Base your conclusion on the evidence still visible in context, and call targeted tools again if a pruned result is essential.",
         ]
         if mode == "backtesting":
             lines.extend(
                 [
                     "",
-                    "BACKTESTING SAFETY RULES - READ THIS AS A HARD REQUIREMENT:",
-                    "Look-ahead bias means using information that would not have been available at the current simulated datetime.",
-                    "If you leak future information into a backtest, the backtest becomes invalid, misleading, and useless for decision-making.",
-                    "Treat the current simulated datetime as a hard wall. Do not cross it. Do not infer across it. Do not hint across it.",
+                    "BACKTESTING SAFETY RULES:",
+                    "The current simulated datetime is a hard wall.",
+                    "Do not use future data.",
                     "Only use bars, news, macro data, filings, prices, positions, and events that were available at or before the current simulated datetime.",
-                    "Correct example: if the current simulated time is 2026-03-10 10:15 ET, you may use a news article published at 09:30 ET that same day if it appears in tool output.",
-                    "Incorrect example: using a headline published at 14:00 ET, a later macro revision, a later SEC filing, or knowledge of the close when the simulated time is still the morning.",
-                    "Incorrect example: saying 'the market later sold off' or 'inflation kept rising after this' unless that fact is explicitly visible in current tool output at or before the simulated datetime.",
-                    "Incorrect example: relying on what you remember happened historically when that information is not yet present in the runtime context or tool results.",
-                    "CRITICAL: When calling ANY external tool, if the tool has ANY parameter that controls a time range, date filter, or temporal bound, you MUST set it so that no data after the current simulated datetime can be returned.",
-                    "This applies regardless of what the parameter is named. Common names include: end, end_date, time_to, observation_end, before, until, to, date, timestamp, coed, realtime_end - but ANY parameter that limits the time range must be set.",
-                    "If a tool has a start/end date range and you only set start without setting end, the tool will likely return data up to today, which is in the future. ALWAYS set the end bound.",
-                    "Correct example: if the current simulated date is 2024-01-22 and a tool accepts end, end_date, time_to, or observation_end, pass 2024-01-22 (or the current simulated datetime) in that field.",
-                    "Incorrect example: calling a news, macro, or data tool with only a start parameter and no end parameter, allowing it to return future data by default.",
+                    "If a tool has any parameter that controls a time range, date filter, or temporal bound, set it so no data after the current simulated datetime can be returned.",
                     "If a tool response seems to include future timestamps, treat that as suspicious. Do not rely on those records without calling out the risk in your reasoning.",
-                    "If you are unsure whether information was available yet, say the evidence is insufficient and do nothing.",
-                    "Backtesting accuracy is more important than being clever. A cautious no-trade is better than a future-biased trade.",
                 ]
             )
         else:
@@ -870,21 +829,144 @@ class AgentHandle:
                 [
                     "",
                     "LIVE TRADING RULES:",
-                    "Act on the current visible market state and runtime context.",
-                    "Keep the strategy's positions, cash, and recent activity in mind before taking new actions.",
+                    "Act on the current visible account, broker, order, and market state.",
                 ]
             )
         return "\n".join(lines).strip()
 
-    def _compose_system_prompt(self, runtime_context: dict[str, Any]) -> str:
-        return "\n\n".join(
-            [
-                self._base_system_prompt(runtime_context),
-                "USER SYSTEM PROMPT:",
-                "Treat this as the strategy-specific trading objective. It may override the default investor style, but not hard safety, broker, or look-ahead-bias rules.",
-                self.system_prompt.strip(),
-            ]
-        ).strip()
+    def _execution_minimal_base_system_prompt(self, runtime_context: dict[str, Any]) -> str:
+        mode = runtime_context.get("mode") or "live"
+        lines = [
+            "You are operating as an order execution agent inside LumiBot.",
+            "Runtime context is the ground truth for current account state, mode, datetime, timezone, "
+            "positions, cash, portfolio value, recent orders, and recent trades.",
+            "Tool outputs outrank model memory.",
+            "Execute only the provided execution_plan.",
+            "Do not perform investment research, do not re-rank candidates, do not substitute symbols, and do not "
+            "change the plan.",
+            "Do not add, remove, replace, or reorder execution_plan.orders.",
+            "Before submitting any order, inspect current positions, available cash, portfolio value, open orders, "
+            "and the latest price for the ordered asset.",
+            "Execute execution_plan.orders in ascending sequence order.",
+            "When switching from one asset to another, submit the sell or reduce order before the replacement buy "
+            "order when that is the sequence provided.",
+            "Use whole-share quantities unless the tool and asset type explicitly support fractional quantities.",
+            "Block or pause only for execution-level blockers such as missing required order fields, insufficient "
+            "cash after required prior sells, broker/tool rejection, unavailable price data, or invalid order "
+            "parameters.",
+            "Report each order sequence as submitted or blocked.",
+            "Finish every run with a short summary sentence starting with RESULT: that explains what execution "
+            "action you took.",
+        ]
+        if mode == "backtesting":
+            lines.extend(
+                [
+                    "",
+                    "BACKTESTING SAFETY RULES:",
+                    "The current simulated datetime is a hard wall.",
+                    "Do not use future data.",
+                    "If a tool has any parameter that controls a time range, date filter, or temporal bound, set it "
+                    "so that no data after the current simulated datetime can be returned.",
+                    "If a tool response seems to include future timestamps, treat that as suspicious and do not "
+                    "rely on those records.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "LIVE TRADING RULES:",
+                    "Act on the current visible account, broker, order, and market state.",
+                ]
+            )
+        return "\n".join(lines).strip()
+
+    def _account_tool_policy_prompt(self, tool_names: set[str]) -> str:
+        lines = ["ACCOUNT TOOL POLICY:"]
+        if "account_positions" in tool_names:
+            lines.append("Use account_positions to inspect current holdings.")
+        if "account_portfolio" in tool_names:
+            lines.append("Use account_portfolio to inspect cash and portfolio value.")
+        if len(lines) == 1:
+            return ""
+        return "\n".join(lines)
+
+    def _history_tool_policy_prompt(self, tool_names: set[str]) -> str:
+        has_summary = "market_load_history_tables_summary" in tool_names
+        has_single = "market_load_history_table" in tool_names
+        has_duckdb = "duckdb_query" in tool_names
+        if not (has_summary or has_single or has_duckdb):
+            return ""
+
+        lines = ["PRICE/HISTORY TOOL POLICY:"]
+        if has_summary:
+            lines.append(
+                "market_load_history_tables_summary is the default tool for multi-symbol price-history comparison."
+            )
+        if has_single:
+            lines.append(
+                "market_load_history_table is targeted single-symbol follow-up when summary evidence is missing, "
+                "contradictory, or insufficient."
+            )
+        if has_summary and has_single:
+            lines.append("Do not load raw history tables for every symbol when summary rankings already answer the task.")
+        if has_duckdb:
+            lines.append(
+                "duckdb_query is targeted follow-up only when computed summaries and rankings do not answer a "
+                "specific question."
+            )
+            lines.append("Do not treat DuckDB as a required step in every research workflow.")
+        return "\n".join(lines)
+
+    def _execution_tool_policy_prompt(self, tool_names: set[str]) -> str:
+        execution_tools = {
+            "orders_submit_order",
+            "orders_cancel_order",
+            "orders_modify_order",
+            "orders_open_orders",
+        }
+        if not (tool_names & execution_tools):
+            return ""
+
+        lines = [
+            "EXECUTION TOOL POLICY:",
+            "Execution tools are not research tools.",
+        ]
+        if "orders_submit_order" in tool_names:
+            lines.append("orders_submit_order executes explicit order fields from execution_plan.orders.")
+        if "orders_open_orders" in tool_names:
+            lines.append("Use orders_open_orders to inspect outstanding orders before submitting new orders.")
+        if "orders_cancel_order" in tool_names:
+            lines.append("Use orders_cancel_order only for explicit execution-level order management.")
+        if "orders_modify_order" in tool_names:
+            lines.append("Use orders_modify_order only for explicit execution-level order management.")
+        return "\n".join(lines)
+
+    def _compose_system_prompt(
+        self,
+        runtime_context: dict[str, Any],
+        bound_tools: list[BoundTool] | None = None,
+    ) -> str:
+        prompt_parts = [
+            self._base_system_prompt(runtime_context),
+            "USER SYSTEM PROMPT:",
+            "Treat this as the strategy-specific trading objective. It may override the default investor style, "
+            "but not hard safety, broker, or look-ahead-bias rules.",
+            self.system_prompt.strip(),
+        ]
+        if bound_tools:
+            tool_names = {tool.name for tool in bound_tools}
+            account_policy = self._account_tool_policy_prompt(tool_names)
+            if account_policy:
+                prompt_parts.append(account_policy)
+            if self.base_system_prompt_mode != "execution_minimal":
+                history_policy = self._history_tool_policy_prompt(tool_names)
+                if history_policy:
+                    prompt_parts.append(history_policy)
+            execution_policy = self._execution_tool_policy_prompt(tool_names)
+            if execution_policy:
+                prompt_parts.append(execution_policy)
+        return "\n\n".join(prompt_parts).strip()
 
     def _append_memory(self, result: AgentRunResult) -> None:
         state = self._state_bucket()
@@ -1019,7 +1101,7 @@ class AgentHandle:
             ])
         elif category == "billing":
             lines.extend([
-                f"Likely cause: provider billing issue (out of credits, quota exceeded).",
+                "Likely cause: provider billing issue (out of credits, quota exceeded).",
                 f"  Check billing at: {billing_url}",
             ])
         elif category == "config":
@@ -1053,8 +1135,9 @@ class AgentHandle:
         memory_state: dict[str, Any] | None,
         effective_system_prompt: str,
         base_system_prompt: str,
+        bound_tools: list[BoundTool] | None = None,
     ) -> dict[str, Any]:
-        bound_tools = self._ensure_bound_tools()
+        available_tools = bound_tools if bound_tools is not None else self._ensure_bound_tools()
         return {
             "user_system_prompt": self.system_prompt,
             "base_system_prompt": base_system_prompt,
@@ -1071,7 +1154,7 @@ class AgentHandle:
                     "source": tool.source,
                     "metadata": _stable_tool_metadata_for_cache(tool),
                 }
-                for tool in bound_tools
+                for tool in available_tools
             ],
             "memory_notes": self._memory_prompt_notes(),
         }
@@ -1079,6 +1162,78 @@ class AgentHandle:
     @staticmethod
     def _cache_root() -> Path:
         return Path(os.environ.get("LUMIBOT_CACHE_FOLDER") or LUMIBOT_CACHE_FOLDER)
+
+    @staticmethod
+    def _portable_runtime_trace_path(value: Any) -> str:
+        raw_path = str(value or "").strip()
+        if not raw_path:
+            return ""
+
+        normalized = raw_path.replace("\\", "/")
+        raw_parts = normalized.split("/")
+        if "agent_runtime" in raw_parts:
+            artifact_index = len(raw_parts) - 1 - raw_parts[::-1].index("agent_runtime")
+            candidate = "/".join(raw_parts[artifact_index + 1 :])
+        else:
+            candidate = normalized
+        candidate_parts = candidate.split("/")
+        if (
+            not candidate
+            or candidate.startswith("/")
+            or any(part in {"", ".", ".."} or ":" in part for part in candidate_parts)
+        ):
+            return ""
+
+        posix_path = PurePosixPath(candidate)
+        windows_path = PureWindowsPath(candidate)
+        if (
+            posix_path.is_absolute()
+            or windows_path.drive
+            or windows_path.is_absolute()
+            or not posix_path.parts
+            or posix_path.parts[0] != "traces"
+        ):
+            return ""
+        return posix_path.as_posix()
+
+    def _resolved_runtime_trace_path(self, portable_path: Any) -> str | None:
+        normalized = self._portable_runtime_trace_path(portable_path)
+        if not normalized:
+            return None
+        artifact_root = self._runtime_artifact_dir().resolve()
+        target = (artifact_root / Path(*PurePosixPath(normalized).parts)).resolve()
+        try:
+            target.relative_to(artifact_root)
+        except ValueError:
+            return None
+        return str(target) if target.is_file() else None
+
+    def _sanitize_boundary_trace_reference(self, value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        portable_path = self._portable_runtime_trace_path(value.get("trace_path"))
+        if not portable_path:
+            return {"status": "unavailable_invalid_trace_reference"}
+
+        status = str(value.get("status") or "")
+        agent_run_id = str(value.get("agent_run_id") or "").strip()
+        if status == "available_original_trace":
+            if not agent_run_id:
+                return {
+                    "status": "unavailable_no_boundary_capture",
+                    "trace_path": portable_path,
+                }
+            return {
+                "status": status,
+                "trace_path": portable_path,
+                "agent_run_id": agent_run_id,
+            }
+        if status == "unavailable_no_boundary_capture":
+            return {
+                "status": status,
+                "trace_path": portable_path,
+            }
+        return {"status": "unavailable_invalid_trace_reference"}
 
     def _runtime_artifact_dir(self) -> Path:
         runtime_dir = self._cache_root() / "agent_runtime"
@@ -1090,23 +1245,86 @@ class AgentHandle:
         trace_dir.mkdir(parents=True, exist_ok=True)
         return trace_dir
 
+    def _build_trace_payload(
+        self,
+        *,
+        result: AgentRunResult,
+        model_name: str,
+        cache_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "agent": self.name,
+            "model": model_name,
+            "request": cache_payload,
+            "tool_calls": [
+                {
+                    "tool_name": event.tool_name,
+                    "payload": event.payload,
+                    "timestamp": event.timestamp,
+                }
+                for event in result.tool_calls
+            ],
+            "tool_results": [
+                {
+                    "tool_name": event.tool_name,
+                    "payload": event.payload,
+                    "timestamp": event.timestamp,
+                }
+                for event in result.tool_results
+            ],
+            "events": [
+                {
+                    "kind": event.kind,
+                    "text": event.text,
+                    "tool_name": event.tool_name,
+                    "payload": event.payload,
+                    "timestamp": event.timestamp,
+                    "call_id": event.call_id,
+                    "event_id": event.event_id,
+                    "invocation_id": event.invocation_id,
+                }
+                for event in result.events
+            ],
+            "boundary_trace": result.boundary_trace,
+            "warnings": result.warnings,
+            "summary": result.summary,
+            "usage": result.usage,
+            "timing": _runtime_timing_payload(result),
+            "duckdb_metrics": self.manager.duckdb.get_metrics(),
+        }
+
     def _write_trace(self, result: AgentRunResult, trace_payload: dict[str, Any]) -> Path:
-        trace_path = self._trace_dir() / f"{result.cache_key or 'live'}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.json"
-        trace_path.write_text(json.dumps(_normalize_json(trace_payload), indent=2, sort_keys=True), encoding="utf-8")
+        trace_path = self._trace_dir() / (
+            f"{result.cache_key or 'live'}-"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.json"
+        )
+        normalized = json.dumps(
+            trace_payload,
+            indent=2,
+            sort_keys=True,
+        )
+        temp_path = trace_path.with_suffix(f".{uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(normalized, encoding="utf-8")
+            os.replace(temp_path, trace_path)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
         return trace_path
 
     def _append_run_artifact_summary(self, result: AgentRunResult, runtime_context: dict[str, Any]) -> None:
         summary_path = self._runtime_artifact_dir() / "agent_run_summaries.jsonl"
         trace_path = ""
         if isinstance(result.payload, dict):
-            trace_path = str(result.payload.get("trace_path") or "")
-        cache_root = self._cache_root()
+            trace_path = self._portable_runtime_trace_path(result.payload.get("trace_path"))
         trace_relative_path = trace_path
         if trace_path:
-            try:
-                trace_relative_path = Path(trace_path).resolve().relative_to(cache_root.resolve()).as_posix()
-            except Exception:
-                trace_relative_path = trace_path
+            trace_path_value = Path(trace_path)
+            if not trace_path_value.parts or trace_path_value.parts[0] != "agent_runtime":
+                trace_relative_path = (Path("agent_runtime") / trace_path_value).as_posix()
         record = {
             "timestamp": self._event_timestamp(),
             "agent_name": self.name,
@@ -1122,9 +1340,35 @@ class AgentHandle:
             "trace_path": trace_path,
             "trace_relative_path": trace_relative_path,
         }
+        safe_record = _normalize_redacted_payload(record)
         with summary_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(_normalize_json(record), sort_keys=True))
+            handle.write(json.dumps(safe_record, sort_keys=True))
             handle.write("\n")
+
+    def _run_result_artifact_side_effects(
+        self,
+        *,
+        result: AgentRunResult,
+        runtime_context: dict[str, Any],
+        cache_payload: dict[str, Any],
+    ) -> None:
+        side_effects = (
+            functools.partial(
+                self.manager._record_agent_observability,
+                handle=self,
+                result=result,
+                runtime_context=runtime_context,
+                cache_payload=cache_payload,
+            ),
+            functools.partial(self._append_memory, result),
+            functools.partial(self._append_run_artifact_summary, result, runtime_context),
+            functools.partial(self._log_run_summary, result, runtime_context),
+        )
+        for side_effect in side_effects:
+            try:
+                side_effect()
+            except Exception:
+                pass
 
     def _result_from_cached(self, cached: dict[str, Any], cache_key: str) -> AgentRunResult:
         events = [
@@ -1134,11 +1378,45 @@ class AgentHandle:
                 tool_name=event.get("tool_name"),
                 payload=event.get("payload"),
                 timestamp=event.get("timestamp"),
+                call_id=event.get("call_id"),
+                event_id=event.get("event_id"),
+                invocation_id=event.get("invocation_id"),
             )
             for event in cached.get("events", [])
             if isinstance(event, dict)
         ]
         timing = cached.get("timing") if isinstance(cached.get("timing"), dict) else {}
+        has_boundary_trace_ref = "boundary_trace_ref" in cached
+        raw_boundary_trace_ref = cached.get("boundary_trace_ref")
+        boundary_trace_ref = self._sanitize_boundary_trace_reference(raw_boundary_trace_ref)
+        if has_boundary_trace_ref and boundary_trace_ref is None:
+            boundary_trace_ref = {"status": "unavailable_invalid_trace_reference"}
+        if boundary_trace_ref is not None:
+            boundary_trace = {
+                **boundary_trace_ref,
+                "schema_version": 1,
+                "execution_source": "replay_cache",
+                "events": [],
+                "diagnostics": [],
+            }
+        else:
+            boundary_trace = {
+                "schema_version": 1,
+                "status": "unavailable_legacy_cache",
+                "execution_source": "replay_cache",
+                "events": [],
+                "diagnostics": [],
+            }
+        payload = cached.get("payload")
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            portable_trace_source = (
+                boundary_trace_ref.get("trace_path")
+                if has_boundary_trace_ref and isinstance(boundary_trace_ref, dict)
+                else payload.get("trace_path")
+            )
+            portable_trace_path = self._portable_runtime_trace_path(portable_trace_source)
+            payload["trace_path"] = self._resolved_runtime_trace_path(portable_trace_path)
         return AgentRunResult(
             summary=cached.get("summary"),
             model=cached.get("model") or self.default_model,
@@ -1146,22 +1424,28 @@ class AgentHandle:
             cache_hit=True,
             cache_key=cache_key,
             usage=cached.get("usage"),
-            payload=cached.get("payload"),
+            payload=payload,
             warnings=list(cached.get("warnings") or []),
             started_at=timing.get("call_started_at"),
             first_event_at=timing.get("call_first_event_at"),
             ended_at=timing.get("call_ended_at"),
             latency_ms=_coerce_usage_int(timing.get("call_latency_ms")),
             first_event_latency_ms=_coerce_usage_int(timing.get("call_first_event_latency_ms")),
+            boundary_trace=boundary_trace,
         )
 
-    def _replay_cached_side_effects(self, result: AgentRunResult) -> None:
-        bound_tools = {tool.name: tool for tool in self._ensure_bound_tools()}
+    def _replay_cached_side_effects(
+        self,
+        result: AgentRunResult,
+        bound_tools: list[BoundTool] | None = None,
+    ) -> None:
+        available_tools = bound_tools if bound_tools is not None else self._ensure_bound_tools()
+        tools_by_name = {tool.name: tool for tool in available_tools}
         for event in result.tool_calls:
             tool_name = event.tool_name
             if not tool_name:
                 continue
-            tool = bound_tools.get(tool_name)
+            tool = tools_by_name.get(tool_name)
             if tool is None:
                 continue
             if tool.source == "mcp":
@@ -1172,11 +1456,17 @@ class AgentHandle:
             with agent_tool_context({"agent_name": self.name, "model_call_id": result.cache_key}):
                 tool.function(**payload)
 
-    def _derive_warnings(self, result: AgentRunResult, runtime_context: dict[str, Any]) -> list[dict[str, Any]]:
+    def _derive_warnings(
+        self,
+        result: AgentRunResult,
+        runtime_context: dict[str, Any],
+        bound_tools: list[BoundTool] | None = None,
+    ) -> list[dict[str, Any]]:
         warnings: list[dict[str, Any]] = []
         current_dt = _parse_datetime_like(runtime_context.get("current_datetime"))
         mode = runtime_context.get("mode")
-        if self._ensure_bound_tools() and not result.tool_calls:
+        available_tools = bound_tools if bound_tools is not None else self._ensure_bound_tools()
+        if available_tools and not result.tool_calls:
             warnings.append(
                 {
                     "kind": "no_tool_calls",
@@ -1208,7 +1498,11 @@ class AgentHandle:
             )
         held_symbols = _held_position_symbols(runtime_context)
         ordered_held_symbols = sorted(_order_tool_symbols(result).intersection(held_symbols))
-        if ordered_held_symbols and "search_memory" not in tool_names:
+        if (
+            ordered_held_symbols
+            and "search_memory" not in tool_names
+            and self.base_system_prompt_mode != "execution_minimal"
+        ):
             message = (
                 "Agent used an order tool on currently held symbol(s) without first calling "
                 f"search_memory for the open thesis: {', '.join(ordered_held_symbols)}."
@@ -1388,8 +1682,9 @@ class AgentHandle:
         )
         runtime_context = self._runtime_context()
         memory_state = self._memory_state(runtime_context)
+        bound_tools = self._ensure_bound_tools()
         base_system_prompt = self._base_system_prompt(runtime_context)
-        effective_system_prompt = self._compose_system_prompt(runtime_context)
+        effective_system_prompt = self._compose_system_prompt(runtime_context, bound_tools)
         cache_payload = self._cache_payload(
             task_prompt=task_prompt,
             context=context,
@@ -1398,6 +1693,7 @@ class AgentHandle:
             memory_state=memory_state,
             effective_system_prompt=effective_system_prompt,
             base_system_prompt=base_system_prompt,
+            bound_tools=bound_tools,
         )
         cache_key = self.manager.replay_cache.compute_key(cache_payload)
         strategy = self.manager.strategy
@@ -1406,18 +1702,19 @@ class AgentHandle:
             cached = self.manager.replay_cache.load(cache_key)
             if cached is not None:
                 result = self._result_from_cached(cached, cache_key)
-                self._replay_cached_side_effects(result)
-                self.manager._record_agent_observability(
-                    handle=self,
+                self._replay_cached_side_effects(result, bound_tools)
+                self._run_result_artifact_side_effects(
                     result=result,
                     runtime_context=runtime_context,
                     cache_payload=cache_payload,
                 )
-                self._append_memory(result)
-                self._append_run_artifact_summary(result, runtime_context)
-                self._log_run_summary(result, runtime_context)
                 return result
 
+        agent_run_id = uuid4().hex
+        boundary_collector = BoundaryTraceCollector(
+            agent_run_id=agent_run_id,
+            artifact_root=self._runtime_artifact_dir(),
+        )
         _GoogleADKRuntime, runtime_request_class, _StubAgentRuntime, _call_mcp_tool = _get_runtime_imports()
         request = runtime_request_class(
             agent_name=self.name,
@@ -1428,16 +1725,18 @@ class AgentHandle:
             runtime_context=runtime_context,
             memory_state=memory_state,
             memory_notes=self._memory_prompt_notes(),
-            bound_tools=self._ensure_bound_tools(),
+            bound_tools=bound_tools,
             model_call_id=cache_key,
             provider_prompt_cache_key=_provider_prompt_cache_key(
                 agent_name=self.name,
                 model=model_name,
                 effective_system_prompt=effective_system_prompt,
-                bound_tools=self._ensure_bound_tools(),
+                bound_tools=bound_tools,
             ),
             model_request_timeout_seconds=resolved_model_request_timeout_seconds,
             run_timeout_seconds=resolved_run_timeout_seconds,
+            agent_run_id=agent_run_id,
+            boundary_collector=boundary_collector,
         )
         self.manager._reserve_model_call(agent_name=self.name, model=model_name)
         # Strategy-level safety net with live-vs-backtest branching.
@@ -1463,10 +1762,9 @@ class AgentHandle:
         started_perf = time.perf_counter()
         try:
             result = self._runtime.run(request)
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as exc:  # noqa: BLE001 - intentional broad catch
+        except Exception as exc:
             import traceback as _tb
+
             from .runtime import _classify_agent_error
             from .schemas import AgentRunResult, AgentTraceEvent
 
@@ -1479,7 +1777,19 @@ class AgentHandle:
                 self._log_fatal_backtest_error(exc, category, model_name)
                 raise
 
-            error_detail = f"{exc.__class__.__name__}: {str(exc)[:400]}"
+            try:
+                safe_error_message = redact_sensitive(str(exc))
+                safe_traceback = redact_sensitive(
+                    "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+                )
+            except Exception as redaction_exc:
+                boundary_collector.add_diagnostic(
+                    "agent_runtime_error_redaction_failed",
+                    redaction_exc,
+                )
+                safe_error_message = "[error message unavailable: redaction failed]"
+                safe_traceback = "[traceback unavailable: redaction failed]"
+            error_detail = f"{exc.__class__.__name__}: {safe_error_message[:400]}"
             try:
                 sys.stderr.write(
                     f"[lumibot.agents] agent '{self.name}' (model={model_name!r}) call failed: "
@@ -1503,8 +1813,8 @@ class AgentHandle:
                     "runtime_error": True,
                     "error_category": category,
                     "error_class": exc.__class__.__name__,
-                    "error_message": str(exc)[:800],
-                    "traceback": "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))[-2000:],
+                    "error_message": safe_error_message[:800],
+                    "traceback": safe_traceback[-2000:],
                 },
             )
             result = AgentRunResult(
@@ -1528,7 +1838,7 @@ class AgentHandle:
                 "trace_path": None,
                 "runtime_error": True,
                 "error_class": exc.__class__.__name__,
-                "error_message": str(exc)[:800],
+                "error_message": safe_error_message[:800],
             }
             self._finalize_runtime_timing(
                 result,
@@ -1537,17 +1847,30 @@ class AgentHandle:
                 ended_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 ended_perf=time.perf_counter(),
             )
+            boundary_collector.add_diagnostic("agent_runtime_failed", exc)
+            result.boundary_trace = boundary_collector.export()
+            try:
+                trace_payload = self._build_trace_payload(
+                    result=result,
+                    model_name=model_name,
+                    cache_payload=cache_payload,
+                )
+                trace_payload = _normalize_redacted_payload(trace_payload)
+                trace_path = self._write_trace(result, trace_payload)
+            except Exception as trace_exc:
+                boundary_collector.add_diagnostic("trace_write_failed", trace_exc)
+                result.boundary_trace = boundary_collector.export()
+                result.payload["trace_path"] = None
+                result.payload["trace_write_error"] = True
+            else:
+                result.payload["trace_path"] = str(trace_path.resolve())
             # Record this skipped run in the agent's memory so the model on
             # the next iteration knows the previous cycle was skipped.
-            self.manager._record_agent_observability(
-                handle=self,
+            self._run_result_artifact_side_effects(
                 result=result,
                 runtime_context=runtime_context,
                 cache_payload=cache_payload,
             )
-            self._append_memory(result)
-            self._append_run_artifact_summary(result, runtime_context)
-            self._log_run_summary(result, runtime_context)
             return result
         self._finalize_runtime_timing(
             result,
@@ -1557,70 +1880,71 @@ class AgentHandle:
             ended_perf=time.perf_counter(),
         )
         result.cache_key = cache_key
-        result.warnings = self._derive_warnings(result, runtime_context)
-        trace_payload = {
-            "agent": self.name,
-            "model": model_name,
-            "request": cache_payload,
-            "tool_calls": [
-                {
-                    "tool_name": event.tool_name,
-                    "payload": event.payload,
-                    "timestamp": event.timestamp,
-                }
-                for event in result.tool_calls
-            ],
-            "tool_results": [
-                {
-                    "tool_name": event.tool_name,
-                    "payload": event.payload,
-                    "timestamp": event.timestamp,
-                }
-                for event in result.tool_results
-            ],
-            "events": [
-                {
-                    "kind": event.kind,
-                    "text": event.text,
-                    "tool_name": event.tool_name,
-                    "payload": event.payload,
-                    "timestamp": event.timestamp,
-                }
-                for event in result.events
-            ],
-            "warnings": result.warnings,
-            "summary": result.summary,
-            "usage": result.usage,
-            "timing": _runtime_timing_payload(result),
-            "duckdb_metrics": self.manager.duckdb.get_metrics(),
-        }
-        trace_path = self._write_trace(result, trace_payload)
-        result.payload = {
-            "trace_path": trace_path.as_posix(),
-            "warnings": result.warnings,
-        }
-        if should_replay:
-            self.manager.replay_cache.save(
-                cache_key,
-                {
-                    "summary": result.summary,
-                    "model": model_name,
-                    "events": trace_payload["events"],
-                    "warnings": result.warnings,
-                    "usage": result.usage,
-                    "payload": result.payload,
-                    "timing": _runtime_timing_payload(result),
-                },
+        result.warnings = self._derive_warnings(result, runtime_context, bound_tools)
+        try:
+            trace_payload = self._build_trace_payload(
+                result=result,
+                model_name=model_name,
+                cache_payload=cache_payload,
             )
-        self.manager._record_agent_observability(
-            handle=self,
+            trace_payload = _normalize_redacted_payload(trace_payload)
+            trace_path = self._write_trace(result, trace_payload)
+        except Exception as exc:
+            boundary_collector.add_diagnostic("trace_write_failed", exc)
+            result.boundary_trace = boundary_collector.export()
+            result.payload = {
+                "trace_path": None,
+                "warnings": result.warnings,
+                "trace_write_error": True,
+            }
+            trace_path = None
+        else:
+            result.payload = {
+                "trace_path": str(trace_path.resolve()),
+                "warnings": result.warnings,
+            }
+        if should_replay and trace_path is not None:
+            portable_trace_path = trace_path.relative_to(self._runtime_artifact_dir()).as_posix()
+            cached_payload = dict(result.payload)
+            cached_payload["trace_path"] = portable_trace_path
+            cached_payload["warnings"] = trace_payload["warnings"]
+            boundary_agent_run_id = ""
+            if isinstance(result.boundary_trace, dict):
+                boundary_agent_run_id = str(
+                    result.boundary_trace.get("agent_run_id") or ""
+                ).strip()
+            if boundary_agent_run_id:
+                boundary_trace_ref = {
+                    "status": "available_original_trace",
+                    "trace_path": portable_trace_path,
+                    "agent_run_id": boundary_agent_run_id,
+                }
+            else:
+                boundary_trace_ref = {
+                    "status": "unavailable_no_boundary_capture",
+                    "trace_path": portable_trace_path,
+                }
+            try:
+                self.manager.replay_cache.save(
+                    cache_key,
+                    {
+                        "summary": trace_payload["summary"],
+                        "model": trace_payload["model"],
+                        "events": trace_payload["events"],
+                        "warnings": trace_payload["warnings"],
+                        "usage": trace_payload["usage"],
+                        "payload": cached_payload,
+                        "timing": trace_payload["timing"],
+                        "boundary_trace_ref": boundary_trace_ref,
+                    },
+                )
+            except Exception:
+                pass
+        self._run_result_artifact_side_effects(
             result=result,
             runtime_context=runtime_context,
             cache_payload=cache_payload,
         )
-        self._append_memory(result)
-        self._append_run_artifact_summary(result, runtime_context)
-        self._log_run_summary(result, runtime_context)
         return result
 
 
@@ -1750,7 +2074,9 @@ class AgentManager:
         detail_path.parent.mkdir(parents=True, exist_ok=True)
         trace_path = ""
         if isinstance(result.payload, dict):
-            trace_path = str(result.payload.get("trace_path") or "")
+            trace_path = handle._portable_runtime_trace_path(
+                result.payload.get("trace_path")
+            )
         warning_messages = " | ".join(_sanitize_csv_text(message) for message in result.warning_messages if message)
         normalized_events = result.events or [AgentTraceEvent(kind="text", text=result.summary or "")]
         thinking_texts = _thinking_texts(result)
@@ -2065,6 +2391,7 @@ class AgentManager:
         include_builtin_tools: bool = True,
         model_request_timeout_seconds: float | None = None,
         run_timeout_seconds: float | None = None,
+        base_system_prompt_mode: BaseSystemPromptMode = "default",
     ) -> AgentHandle:
         if name in self._agents:
             raise ValueError(f"Agent with name {name!r} already exists.")
@@ -2085,6 +2412,7 @@ class AgentManager:
             include_builtin_tools=include_builtin_tools,
             model_request_timeout_seconds=model_request_timeout_seconds,
             run_timeout_seconds=run_timeout_seconds,
+            base_system_prompt_mode=base_system_prompt_mode,
         )
         if cadence is not None:
             self.strategy.log_message(

@@ -57,7 +57,7 @@ def _agent_trace(agent_name: str, context: dict, summary: str) -> dict:
     }
 
 
-def _public_agent(agent_id: str) -> dict:
+def _public_agent(agent_id: str, boundary_trace: dict | None = None) -> dict:
     return {
         "id": agent_id,
         "name": agent_id,
@@ -76,6 +76,14 @@ def _public_agent(agent_id: str) -> dict:
         "summary": f"{agent_id} summary",
         "warnings": [],
         "dependencies": [],
+        "boundary_trace": boundary_trace
+        if boundary_trace is not None
+        else {
+            "available": False,
+            "events": [],
+            "model_turns": [],
+            "message": "This trace does not contain 10-step boundary trace data.",
+        },
     }
 
 
@@ -521,6 +529,355 @@ def test_agent_detail_cards_and_subcards_are_collapsible(page, replay_url):
 
     tool_card.locator("summary").first.click()
     expect(page.locator("#toolArea pre").filter(has_text="Looked up SPY price.")).to_be_hidden()
+
+
+def test_browser_renders_boundary_trace_for_selected_agent(page, replay_url):
+    agent = _public_agent(
+        "growth_agent",
+        boundary_trace={
+            "available": True,
+            "schema_version": 1,
+            "message": "Boundary trace data is available for this agent run.",
+            "events": [
+                {
+                    "id": "event-b09",
+                    "transition": "B09_ADK_TO_LITELLM",
+                    "status": "success",
+                    "summary": {
+                        "label": "ADK builds model request",
+                        "source": "Google ADK",
+                        "target": "LiteLLM",
+                        "badges": ["success", "complete"],
+                        "preview": "1 model message(s)",
+                    },
+                    "payload": {"messages": [{"role": "user", "content": "hello"}]},
+                    "payload_meta": {"semantic_completeness": "complete"},
+                },
+                {
+                    "id": "event-b03",
+                    "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                    "status": "success",
+                    "summary": {
+                        "label": "ADK dispatches FunctionTool",
+                        "source": "Google ADK",
+                        "target": "ADK FunctionTool",
+                        "badges": ["success", "complete"],
+                        "preview": "market_last_price",
+                    },
+                    "payload": {"tool_name": "market_last_price", "args": {"symbol": "SPY"}},
+                    "payload_meta": {"semantic_completeness": "complete"},
+                },
+                {
+                    "id": "event-sidecar",
+                    "transition": "B10_LITELLM_TO_PROVIDER",
+                    "status": "success",
+                    "summary": {
+                        "label": "LiteLLM sends provider request",
+                        "source": "LiteLLM",
+                        "target": "Model provider",
+                        "badges": ["success", "sidecar"],
+                        "preview": "sidecar preview only",
+                    },
+                    "payload": {"preview": "small"},
+                    "payload_meta": {"semantic_completeness": "partial"},
+                    "sidecar": {"available": True, "event_id": "event-sidecar"},
+                },
+            ],
+            "model_turns": [
+                {
+                    "model_turn_id": "turn-1",
+                    "request_response_events": ["event-b09", "event-sidecar"],
+                    "tool_batches": [
+                        {
+                            "tool_batch_id": "turn-1:batch:0001",
+                            "tool_calls": [
+                                {
+                                    "call_id": "call-1",
+                                    "tool_name": "market_last_price",
+                                    "events": ["event-b03"],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    dataset = _public_dataset([agent], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("growth_agent")).click()
+
+    expect(page.get_by_text("LLM <-> Tool Boundary Trace")).to_be_visible()
+    expect(page.get_by_text("Model Turn 1")).to_be_visible()
+    expect(page.get_by_text("Model Request / Response")).to_be_visible()
+    expect(page.get_by_text("B09_ADK_TO_LITELLM")).to_be_visible()
+    expect(page.get_by_text("B10_LITELLM_TO_PROVIDER")).to_be_visible()
+    expect(page.get_by_text("B03_ADK_TO_FUNCTION_TOOL")).to_be_visible()
+    expect(page.get_by_text("Google ADK -> LiteLLM")).to_be_visible()
+    expect(page.locator(".boundary-call-heading").get_by_text("market_last_price")).to_be_visible()
+    expect(page.locator(".boundary-sidecar-unavailable")).to_have_count(0)
+    expect(page.locator(".boundary-sidecar-button")).to_have_count(1)
+    page.get_by_text("B10_LITELLM_TO_PROVIDER").click()
+    expect(page.get_by_role("button", name="Load full sidecar payload")).to_be_visible()
+
+
+def _boundary_trace_for_model_turn_replay() -> dict:
+    return {
+        "available": True,
+        "schema_version": 1,
+        "events": [
+            {
+                "id": "event-b09",
+                "transition": "B09_ADK_TO_LITELLM",
+                "model_turn_id": "turn-1",
+                "status": "success",
+                "payload": {"preview": "ADK request"},
+                "payload_meta": {"semantic_completeness": "complete"},
+                "summary": {
+                    "label": "ADK request",
+                    "source": "Google ADK",
+                    "target": "LiteLLM",
+                    "explanation": "Request sent.",
+                },
+            },
+            {
+                "id": "event-b01",
+                "transition": "B01_PROVIDER_TO_LITELLM",
+                "model_turn_id": "turn-1",
+                "status": "success",
+                "payload": {"response": {"tool_calls": [{"name": "orders_submit_order"}]}},
+                "payload_meta": {"semantic_completeness": "complete"},
+                "summary": {
+                    "label": "Model tool call",
+                    "source": "OpenAI LLM",
+                    "target": "LiteLLM",
+                    "explanation": "Model requested tool.",
+                },
+            },
+            {
+                "id": "event-b03",
+                "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                "model_turn_id": "turn-1",
+                "tool_batch_id": "batch-1",
+                "call_id": "call-1",
+                "status": "success",
+                "payload": {"tool_name": "orders_submit_order", "model_arguments": {"symbol": "QQQ"}},
+                "payload_meta": {"semantic_completeness": "complete"},
+                "summary": {
+                    "label": "Dispatch tool",
+                    "source": "Google ADK",
+                    "target": "ADK FunctionTool",
+                    "explanation": "Dispatch.",
+                },
+            },
+        ],
+        "model_turns": [],
+        "model_turn_replay": [
+            {
+                "model_turn_id": "turn-1",
+                "turn_index": 1,
+                "kind": "tool_calling",
+                "model_steps": [
+                    {
+                        "ui_step": "1",
+                        "transition": "B09_ADK_TO_LITELLM",
+                        "event": {
+                            "id": "event-b09",
+                            "transition": "B09_ADK_TO_LITELLM",
+                            "status": "success",
+                            "payload": {"preview": "ADK request"},
+                            "payload_meta": {"semantic_completeness": "complete"},
+                            "summary": {
+                                "label": "ADK request",
+                                "source": "Google ADK",
+                                "target": "LiteLLM",
+                                "explanation": "Request sent.",
+                            },
+                        },
+                    },
+                    {
+                        "ui_step": "3",
+                        "transition": "B01_PROVIDER_TO_LITELLM",
+                        "event": {
+                            "id": "event-b01",
+                            "transition": "B01_PROVIDER_TO_LITELLM",
+                            "status": "success",
+                            "payload": {"response": {"tool_calls": [{"name": "orders_submit_order"}]}},
+                            "payload_meta": {"semantic_completeness": "complete"},
+                            "summary": {
+                                "label": "Model tool call",
+                                "source": "OpenAI LLM",
+                                "target": "LiteLLM",
+                                "explanation": "Model requested tool.",
+                            },
+                        },
+                    },
+                ],
+                "tool_calls": [
+                    {
+                        "call_key": "call-1",
+                        "call_index": 1,
+                        "call_id": "call-1",
+                        "call_instance_id": "instance-1",
+                        "tool_batch_id": "batch-1",
+                        "tool_name": "orders_submit_order",
+                        "steps": [
+                            {
+                                "ui_step": "5.1",
+                                "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                                "event": {
+                                    "id": "event-b03",
+                                    "transition": "B03_ADK_TO_FUNCTION_TOOL",
+                                    "status": "success",
+                                    "payload": {
+                                        "tool_name": "orders_submit_order",
+                                        "model_arguments": {"symbol": "QQQ"},
+                                    },
+                                    "payload_meta": {"semantic_completeness": "complete"},
+                                    "summary": {
+                                        "label": "Dispatch tool",
+                                        "source": "Google ADK",
+                                        "target": "ADK FunctionTool",
+                                        "explanation": "Dispatch.",
+                                    },
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        "diagnostics": [],
+        "message": "Boundary trace data is available.",
+    }
+
+
+def test_browser_shows_model_turn_replay_for_boundary_trace(page, replay_url):
+    agent = _public_agent("execution_agent", boundary_trace=_boundary_trace_for_model_turn_replay())
+    dataset = _public_dataset([agent], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("execution_agent")).click()
+
+    expect(page.get_by_text("Model Turn Replay")).to_be_visible()
+    expect(page.locator(".model-turn-select")).to_be_visible()
+    expect(page.get_by_text("Tool Call 1: orders_submit_order")).to_be_visible()
+    expect(page.get_by_text("B03_ADK_TO_FUNCTION_TOOL")).to_be_visible()
+
+    page.get_by_role("button", name=re.compile(r"5\.1")).click()
+    expect(page.get_by_text("Selected Step Detail")).to_be_visible()
+    expect(page.get_by_text("QQQ")).to_be_visible()
+
+
+def test_browser_loads_boundary_sidecar_payload(page, replay_url):
+    agent = _public_agent(
+        "growth_agent",
+        boundary_trace={
+            "available": True,
+            "events": [
+                {
+                    "id": "event-sidecar",
+                    "transition": "B09_ADK_TO_LITELLM",
+                    "status": "success",
+                    "summary": {
+                        "label": "ADK builds model request",
+                        "source": "Google ADK",
+                        "target": "LiteLLM",
+                        "badges": ["success", "sidecar"],
+                        "preview": "sidecar preview",
+                    },
+                    "payload": {"preview": "small"},
+                    "payload_meta": {"semantic_completeness": "partial"},
+                    "sidecar": {"available": True, "event_id": "event-sidecar"},
+                }
+            ],
+            "model_turns": [
+                {
+                    "model_turn_id": "turn-1",
+                    "request_response_events": ["event-sidecar"],
+                    "tool_batches": [],
+                }
+            ],
+        },
+    )
+    dataset = _public_dataset([agent], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+    page.route(
+        "**/api/boundary-payload/event-sidecar",
+        lambda route: route.fulfill(json={"event_id": "event-sidecar", "payload": {"full": "payload"}}),
+    )
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("growth_agent")).click()
+    page.get_by_text("B09_ADK_TO_LITELLM").click()
+    page.get_by_role("button", name="Load full sidecar payload").click()
+
+    expect(page.get_by_text('"full": "payload"')).to_be_visible()
+    expect(page.get_by_role("button", name="Full sidecar payload loaded")).to_be_visible()
+
+
+def test_browser_boundary_trace_handles_malformed_nested_items(page, replay_url):
+    agent = _public_agent(
+        "malformed_agent",
+        boundary_trace={
+            "available": True,
+            "events": [
+                None,
+                {
+                    "id": "event-b09",
+                    "transition": "B09_ADK_TO_LITELLM",
+                    "status": "success",
+                    "summary": None,
+                    "sidecar": {"available": True},
+                },
+            ],
+            "model_turns": [
+                None,
+                {
+                    "model_turn_id": "turn-2",
+                    "request_response_events": ["event-b09"],
+                    "tool_batches": [
+                        None,
+                        {
+                            "tool_batch_id": "turn-2:batch:0001",
+                            "tool_calls": [
+                                None,
+                                {
+                                    "events": ["event-b09"],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+    dataset = _public_dataset([agent], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("malformed_agent")).click()
+
+    expect(page.get_by_text("LLM <-> Tool Boundary Trace")).to_be_visible()
+    expect(page.get_by_text("Model Turn unknown")).to_be_visible()
+    page.get_by_text("Model Turn 2").click()
+    expect(page.get_by_text("Tool Batch unknown")).to_be_visible()
+    page.get_by_text("Tool Batch turn-2:batch:0001").click()
+    expect(page.locator(".boundary-call-heading").get_by_text("Unknown tool").first).to_be_visible()
+    expect(page.locator(".boundary-call-heading").get_by_text("unknown call").first).to_be_visible()
+
+
+def test_browser_renders_boundary_trace_legacy_fallback(page, replay_url):
+    dataset = _public_dataset([_public_agent("legacy_agent")], [])
+    page.route("**/api/dataset", lambda route: route.fulfill(json=dataset))
+
+    page.goto(replay_url)
+    page.get_by_role("button", name=re.compile("legacy_agent")).click()
+
+    expect(page.get_by_text("This trace does not contain 10-step boundary trace data")).to_be_visible()
 
 
 def test_clicking_agent_still_shows_detail_without_dependency_panel(page, replay_url):

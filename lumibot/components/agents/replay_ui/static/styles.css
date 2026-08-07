@@ -87,7 +87,7 @@ h3 {
 
 .workflow-controls {
   display: grid;
-  grid-template-columns: minmax(160px, 280px) minmax(160px, 280px) minmax(220px, 420px) auto auto;
+  grid-template-columns: minmax(160px, 280px) minmax(160px, 280px) minmax(220px, 420px) auto auto auto auto;
   gap: 12px;
   align-items: end;
   min-width: 0;
@@ -171,6 +171,9 @@ select:disabled {
 }
 
 .secondary-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 32px;
   padding: 6px 10px;
   border: 1px solid var(--border-strong);
@@ -181,12 +184,22 @@ select:disabled {
   font-size: 12px;
   font-weight: 650;
   cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
 }
 
 .secondary-button:hover,
 .secondary-button:focus-visible {
   border-color: var(--accent);
   outline: none;
+}
+
+.artifact-link.disabled {
+  color: var(--muted);
+  background: var(--panel-muted);
+  cursor: not-allowed;
+  opacity: 0.7;
+  pointer-events: none;
 }
 
 .workflow-graph {
@@ -542,6 +555,270 @@ pre,
   background: #ffffff;
 }
 
+.boundary-trace {
+  display: grid;
+  gap: 12px;
+}
+
+.boundary-event-group {
+  display: grid;
+  gap: 8px;
+}
+
+.boundary-event-group h4 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.boundary-call-span {
+  margin: 8px 0;
+  padding: 10px;
+  border: 1px solid #cbd5d1;
+  border-radius: 6px;
+  background: #fbfcfb;
+}
+
+.boundary-call-heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.boundary-call-heading span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.boundary-event {
+  padding: 8px;
+  border: 1px solid #d6ddd9;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.boundary-event + .boundary-event {
+  margin-top: 8px;
+}
+
+.boundary-event summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.boundary-code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-weight: 700;
+}
+
+.boundary-label {
+  font-weight: 600;
+}
+
+.boundary-route {
+  color: #52615a;
+}
+
+.boundary-badge {
+  padding: 2px 7px;
+  border: 1px solid #b8c4be;
+  border-radius: 999px;
+  background: #eef4f1;
+  font-size: 12px;
+}
+
+.boundary-event-body {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.boundary-preview {
+  padding-left: 8px;
+  border-left: 3px solid #78958a;
+  color: #26312c;
+  overflow-wrap: anywhere;
+}
+
+.boundary-sidecar-controls {
+  display: grid;
+  gap: 8px;
+}
+
+.boundary-sidecar-button {
+  width: fit-content;
+}
+
+.boundary-sidecar-button:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.boundary-sidecar-output {
+  max-height: 360px;
+  overflow: auto;
+}
+
+.boundary-sidecar-output.error {
+  color: var(--danger);
+}
+
+.boundary-sidecar-unavailable {
+  width: fit-content;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  background: #f5f7f6;
+  font-size: 12px;
+}
+
+.model-turn-replay {
+  border: 1px solid var(--border);
+  padding: 12px;
+  margin-bottom: 16px;
+  background: var(--panel);
+}
+
+.model-turn-replay h4 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.model-turn-replay-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.model-turn-selector {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.model-turn-select {
+  min-width: 150px;
+}
+
+.model-turn-replay-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(320px, 1.1fr);
+  gap: 12px;
+}
+
+.model-turn-flow,
+.boundary-step-detail {
+  border: 1px solid var(--border);
+  background: var(--panel-muted);
+  padding: 10px;
+  min-width: 0;
+}
+
+.boundary-flow-lane {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.boundary-flow-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 32px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.boundary-flow-step:hover,
+.boundary-flow-step:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.boundary-flow-step.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-muted);
+}
+
+.boundary-flow-step.partial {
+  border-style: dashed;
+}
+
+.boundary-flow-step-number {
+  font-weight: 700;
+}
+
+.boundary-flow-step-label {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.tool-call-flow {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  margin-top: 10px;
+}
+
+.tool-call-flow-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.tool-call-flow-title strong,
+.tool-call-flow-title span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.boundary-step-detail {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.boundary-step-detail-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.boundary-step-detail-meta div {
+  border: 1px solid var(--border);
+  padding: 6px;
+  background: var(--panel);
+}
+
+.boundary-step-detail-meta strong,
+.boundary-step-detail-meta span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.boundary-step-detail-meta strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
 .warnings {
   margin-top: 12px;
   padding-top: 12px;
@@ -572,5 +849,18 @@ pre,
 
   .workflow-diagram {
     gap: 22px;
+  }
+
+  .model-turn-replay-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .model-turn-replay-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .boundary-step-detail-meta {
+    grid-template-columns: 1fr;
   }
 }

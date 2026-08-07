@@ -10,7 +10,7 @@ from typing import Any
 from lumibot.tools.helpers import parse_timestep_qty_and_unit
 
 from .asset_resolution import resolve_asset_and_quote
-
+from .history_summary import build_universe_history_summary, compute_history_summary
 
 _READ_ONLY_SQL_RE = re.compile(r"^\s*(select|with|show|describe|pragma|explain)\b", re.IGNORECASE)
 
@@ -121,7 +121,13 @@ class DuckDBQueryLayer:
         broker = getattr(self.strategy, "broker", None)
         return getattr(broker, "data_source", None)
 
-    def _lookup_source_frame(self, *, asset: Any, quote: Any, timestep: str) -> tuple[tuple[Any, ...], Any, pd.DataFrame] | None:
+    def _lookup_source_frame(
+        self,
+        *,
+        asset: Any,
+        quote: Any,
+        timestep: str,
+    ) -> tuple[tuple[Any, ...], Any, pd.DataFrame] | None:
         data_source = self._data_source()
         store = getattr(data_source, "_data_store", None)
         finder = getattr(data_source, "find_asset_in_data_store", None)
@@ -159,6 +165,20 @@ class DuckDBQueryLayer:
         self._table_meta[table_name] = info
         return info
 
+    def _available_table_schemas(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "table_name": str(table_name),
+                "columns": [str(column) for column in meta.get("columns", [])],
+            }
+            for table_name, meta in sorted(self._table_meta.items())
+            if meta.get("kind") != "source_frame"
+        ]
+
+    def _read_registered_table(self, table_name: str) -> pd.DataFrame:
+        safe_name = self._safe_identifier(table_name)
+        return self.connection.execute(f"SELECT * FROM {self._quote_identifier(safe_name)}").fetch_df()
+
     def _ensure_source_table(
         self,
         *,
@@ -174,11 +194,19 @@ class DuckDBQueryLayer:
             self.metrics["history_bind_cache_hits"] += 1.0
             return cached
         normalized = self._normalize_index(frame)
-        datetime_column = next((col for col in normalized.columns if "date" in str(col).lower() or "time" in str(col).lower()), None)
+        datetime_column = next(
+            (col for col in normalized.columns if "date" in str(col).lower() or "time" in str(col).lower()),
+            None,
+        )
         if datetime_column is None:
             datetime_column = normalized.columns[0]
         normalized[datetime_column] = pd.to_datetime(normalized[datetime_column])
-        table_name = self._source_table_name(symbol=symbol, asset_type=asset_type, timestep=timestep, store_key=store_key)
+        table_name = self._source_table_name(
+            symbol=symbol,
+            asset_type=asset_type,
+            timestep=timestep,
+            store_key=store_key,
+        )
         info = self._register_frame(
             table_name,
             normalized,
@@ -279,7 +307,9 @@ class DuckDBQueryLayer:
         cached = self._history_cache.get(cache_key)
         if cached is not None:
             self.metrics["history_cache_hits"] += 1.0
-            return dict(cached)
+            result = dict(cached)
+            result["available_tables"] = self._available_table_schemas()
+            return result
         asset, quote = resolve_asset_and_quote(
             self.strategy,
             symbol=symbol,
@@ -291,6 +321,7 @@ class DuckDBQueryLayer:
         )
         source_entry = self._lookup_source_frame(asset=asset, quote=quote, timestep=timestep)
         info: dict[str, Any]
+        summary_frame: pd.DataFrame
         if source_entry is not None:
             store_key, _data, frame = source_entry
             source_info = self._ensure_source_table(
@@ -308,6 +339,7 @@ class DuckDBQueryLayer:
                 asset_type=asset_type,
                 timestep=timestep,
             )
+            summary_frame = self._read_registered_table(str(info["table_name"]))
         else:
             bars = None
             frame = None
@@ -328,6 +360,7 @@ class DuckDBQueryLayer:
             if frame is None:
                 frame = pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
             normalized = self._normalize_index(frame)
+            summary_frame = normalized
             if table_name is None:
                 base = self._slugify(f"{symbol}_{asset_type}_{timestep}")
                 self._name_counters[base] += 1
@@ -339,15 +372,96 @@ class DuckDBQueryLayer:
                     "symbol": symbol,
                     "asset_type": asset_type,
                     "timestep": timestep,
-                    "loaded_at": self.strategy.get_datetime().isoformat() if hasattr(self.strategy, "get_datetime") else None,
+                    "loaded_at": (
+                        self.strategy.get_datetime().isoformat() if hasattr(self.strategy, "get_datetime") else None
+                    ),
                     "kind": "slice_frame",
                 },
             )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.metrics["history_load_ms"] += float(elapsed_ms)
         info["load_ms"] = round(elapsed_ms, 3)
+        info["computed_summary"] = compute_history_summary(
+            summary_frame,
+            symbol=symbol,
+            timestep=timestep,
+            as_of=info.get("loaded_at"),
+        )
         self._history_cache[cache_key] = dict(info)
-        return info
+        result = dict(info)
+        result["available_tables"] = self._available_table_schemas()
+        return result
+
+    def load_history_tables_summary(
+        self,
+        *,
+        symbols: list[str],
+        length: int,
+        timestep: str = "day",
+        asset_type: str = "stock",
+        table_prefix: str | None = None,
+        include_after_hours: bool = True,
+    ) -> dict[str, Any]:
+        if not isinstance(symbols, list) or not symbols:
+            raise ValueError("symbols must be a non-empty list.")
+        normalized_symbols = [str(symbol).strip() for symbol in symbols]
+        if any(not symbol for symbol in normalized_symbols):
+            raise ValueError("symbols must contain non-empty symbol values.")
+        symbol_keys = [symbol.upper() for symbol in normalized_symbols]
+        duplicate_keys = [symbol for symbol in dict.fromkeys(symbol_keys) if symbol_keys.count(symbol) > 1]
+        if duplicate_keys:
+            duplicates = ", ".join(duplicate_keys)
+            raise ValueError(f"duplicate symbols are not allowed: {duplicates}")
+        current_dt = self._current_datetime()
+        as_of = current_dt.isoformat() if hasattr(current_dt, "isoformat") else None
+        summaries: dict[str, dict[str, Any]] = {}
+        loaded_tables: dict[str, dict[str, Any]] = {}
+        warnings: list[str] = []
+
+        prefix = self._slugify(table_prefix) if table_prefix else None
+        table_name_counts: defaultdict[str, int] = defaultdict(int)
+        for symbol in normalized_symbols:
+            table_name = None
+            if prefix:
+                table_base = f"{prefix}_{self._slugify(symbol)}"
+                table_name_counts[table_base] += 1
+                table_name = table_base
+                if table_name_counts[table_base] > 1:
+                    table_name = f"{table_base}_{table_name_counts[table_base]}"
+            try:
+                table_info = self.load_history_table(
+                    symbol=symbol,
+                    length=length,
+                    timestep=timestep,
+                    table_name=table_name,
+                    asset_type=asset_type,
+                    include_after_hours=include_after_hours,
+                )
+            except Exception as exc:
+                warnings.append(f"{symbol}: failed to load history table: {exc}")
+                continue
+
+            summary = table_info.get("computed_summary")
+            if not isinstance(summary, dict):
+                warnings.append(f"{symbol}: loaded history table did not include computed_summary.")
+            else:
+                summaries[symbol] = summary
+            loaded_tables[symbol] = str(table_info.get("table_name") or "")
+
+        if not loaded_tables:
+            warning_text = "; ".join(warnings) if warnings else "no successful symbol loads"
+            raise ValueError(f"no history tables could be loaded for symbols {normalized_symbols}: {warning_text}")
+
+        result = build_universe_history_summary(
+            summaries,
+            symbols=normalized_symbols,
+            timestep=timestep,
+            length=int(length),
+            as_of=as_of,
+            loaded_tables=loaded_tables,
+            warnings=warnings,
+        )
+        return result
 
     def query(self, *, sql: str, limit: int = 200) -> dict[str, Any]:
         if not sql or not _READ_ONLY_SQL_RE.match(sql):
