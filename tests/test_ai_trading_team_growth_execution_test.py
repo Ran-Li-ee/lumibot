@@ -1522,14 +1522,14 @@ def test_decision_prompt_requests_structured_execution_plan():
 
     for prompt_phrase in (
         "before a non-hold decision, call account_positions and account_portfolio",
-        "call market_last_price when sizing buy orders",
-        "use numeric share quantities",
+        "for buy sizing, call market_last_price and use a conservative market sizing price",
+        "use numeric whole-share quantities",
         "do not use full_position, current_position, max_affordable_cash, or max_affordable_after_prior_sells",
         "calculate the share quantity from account tool output",
         'all executable orders must use order_type "market"',
-        "do not include limit_price, stop_price, stop_limit_price, trail_price, or trail_percent",
+        "do not output limit_price, stop_price, stop_limit_price, trail_price, or trail_percent",
         "maximum buy quantity must be no greater than floor(0.98 * available_cash_after_prior_sells / sizing_price)",
-        "output only the final numeric share quantity",
+        "return only the final numeric whole-share quantity",
         "use a conservative market sizing price based on available price evidence",
         "it may be higher than market_last_price in daily backtests",
         "use the 98% cash rule only as an internal sizing rule",
@@ -1559,6 +1559,10 @@ def test_decision_prompt_requests_structured_execution_plan():
         "for limit buys",
         "for stop_limit buys",
         "buy orders must use market, limit",
+        "limit order",
+        "stop order",
+        "stop-limit order",
+        "trailing-stop order",
         "smart_limit",
         "do not use stop or trailing_stop",
         "bounded execution price",
@@ -1675,14 +1679,28 @@ def test_growth_decision_execution_agents_receive_distinct_tool_surfaces():
         "market_last_price",
         "orders_open_orders",
         "orders_submit_order",
+        "orders_confirm_order",
     }
+    assert "orders_confirm_order" not in created_tool_names(created["growth_agent"])
+    assert "orders_confirm_order" not in created_tool_names(created["decision_agent"])
 
 
 def test_execution_prompt_treats_execution_plan_as_authoritative():
     _strategy_module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
     for name in ("growth_agent", "decision_agent", "execution_agent"):
-        agent_manager._agents[name] = RecordingAgent(name)
+        agent_manager._agents[name] = RecordingAgent(name, agent_manager.summaries, agent_manager.tool_calls)
+    agent_manager.summaries["decision_agent"] = (
+        '{"decision":{"type":"buy","from":"USD","to":"GLD","reason_brief":"keep this out of execution"},'
+        '"execution_plan":{"schema_version":1,"intent":"enter_position","orders":[{"sequence":1,'
+        '"action":"submit_order","symbol":"GLD","side":"buy","quantity":980,'
+        '"quantity_mode":"shares","order_type":"market"}],"constraints":{}}}'
+    )
+    agent_manager.tool_calls["decision_agent"] = [
+        "account_positions",
+        "account_portfolio",
+        "market_last_price",
+    ]
     strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
 
     strategy.initialize()
@@ -1699,14 +1717,33 @@ def test_execution_prompt_treats_execution_plan_as_authoritative():
 
     for required_phrase in (
         "execution_plan.orders",
+        "execution_plan.orders as authoritative",
         "do not re-rank",
         "do not substitute",
+        "do not add, remove, replace, or reorder orders",
         "execution-level blockers",
         "sequence order",
         "submit the explicit numeric share quantities",
         "do not compute semantic sizing",
+        "orders_confirm_order",
+        "after every orders_submit_order",
+        "returned identifier",
+        "can_continue=true",
+        "can_continue=false",
+        "stop all remaining orders",
+        "use only market orders",
+        "if any execution_plan order is not a market order",
     ):
         assert required_phrase in prompt_text
+    for task_prompt_phrase in (
+        "execute only the provided execution_plan object",
+        "inspect account state, open orders, positions, and latest prices",
+        "submit only execution_plan.orders",
+        "after every submit, confirm that same order with orders_confirm_order",
+        "preserve sequence order",
+        "submitted, confirmed, or blocked",
+    ):
+        assert task_prompt_phrase in prompt_text
     for task3_confirmation_phrase in (
         "confirmed sequence",
         "prior sell order is no longer open",

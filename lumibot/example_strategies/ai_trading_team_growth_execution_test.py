@@ -440,17 +440,17 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "enter_position, rotate, reduce_position, close_position. Each executable order must include "
                 "sequence, symbol, side, quantity_mode, quantity, asset_type, order_type, and time_in_force. "
                 'quantity_mode must be exactly "shares" for every executable order. '
-                'All executable orders must use order_type "market". Do not include limit_price, stop_price, '
-                "stop_limit_price, trail_price, or trail_percent. Use numeric share quantities; do not use "
+                'All executable orders must use order_type "market". Do not output limit_price, stop_price, '
+                "stop_limit_price, trail_price, or trail_percent. Use numeric whole-share quantities; do not use "
                 "full_position, current_position, max_affordable_cash, or max_affordable_after_prior_sells. "
-                "Before a non-hold decision, call account_positions and account_portfolio. Call market_last_price "
-                "when sizing buy orders. For selling all or part of a position, calculate the share quantity from "
-                "account tool output. For buy sizing, use a conservative market sizing price based on available "
-                "price evidence; it may be higher than market_last_price in daily backtests. Use the 98% cash rule "
-                "only as an internal sizing rule: maximum buy quantity must be no greater than "
-                "floor(0.98 * available_cash_after_prior_sells / sizing_price). Output only the final numeric share "
-                "quantity. Do not output cash_buffer_pct or any buffer field in execution_plan. Never produce "
-                "orders that would make cash negative. "
+                "Before a non-hold decision, call account_positions and account_portfolio. For buy sizing, call "
+                "market_last_price and use a conservative market sizing price based on available price evidence; it "
+                "may be higher than market_last_price in daily backtests. For selling all or part of a position, "
+                "calculate the share quantity from account tool output. Use the 98% cash rule only as an internal "
+                "sizing rule: maximum buy quantity must be no greater than "
+                "floor(0.98 * available_cash_after_prior_sells / sizing_price). Return only the final numeric "
+                "whole-share quantity. Do not output cash_buffer_pct or any buffer field in execution_plan. Never "
+                "produce orders that would make cash negative. "
                 'For rotate decisions, set sequence: 1 with side: "sell" for decision.from, then set sequence: 2 '
                 'with side: "buy" for decision.to.'
             ),
@@ -467,16 +467,24 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 BuiltinTools.market.last_price(),
                 BuiltinTools.orders.open_orders(),
                 BuiltinTools.orders.submit(),
+                BuiltinTools.orders.confirm(),
             ],
             system_prompt=(
                 "Execution agent role: execute only the provided execution_plan object using native execution tools, "
-                "especially orders_submit_order. Treat execution_plan.orders as authoritative. Do not read or infer "
-                "investment reasons. Do not re-rank candidates, do not substitute symbols, and do not use upstream "
-                "research to override the plan. Do not add, remove, replace, or reorder orders. Inspect positions, "
-                "portfolio, open orders, and latest prices before submitting orders. Execute orders in ascending "
-                "sequence order. Submit the explicit numeric share quantities in execution_plan.orders. Do not "
-                "compute semantic sizing. Block or pause only for execution-level blockers. Execution report "
-                "contract: report each sequence as submitted or blocked, and finish with a short RESULT summary."
+                "especially orders_submit_order and orders_confirm_order. Treat execution_plan.orders as "
+                "authoritative. Do not read or infer investment reasons. Do not re-rank candidates, do not "
+                "substitute symbols, and do not use upstream research to override the plan. Do not add, remove, "
+                "replace, or reorder orders. Use only market orders. If any execution_plan order is not a market "
+                "order, block it as an execution-level blocker. Inspect positions, portfolio, open orders, and "
+                "latest prices before submitting orders. Submit orders in ascending sequence order. After every "
+                "orders_submit_order call, immediately call orders_confirm_order with the returned identifier, "
+                "symbol, side, and expected_quantity. Do not submit any later order and do not write the final "
+                "summary until that order is confirmed. If orders_confirm_order returns can_continue=true, continue "
+                "to the next sequence. If orders_confirm_order returns can_continue=false, stop all remaining orders "
+                "and report the confirmation blocker. Submit the explicit numeric share quantities in "
+                "execution_plan.orders. Do not compute semantic sizing. Block or pause only for execution-level "
+                "blockers. Execution report contract: report each sequence as submitted, confirmed, or blocked, and "
+                "finish with a short RESULT summary."
             ),
         )
 
@@ -516,8 +524,9 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
         self.agents["execution_agent"].run(
             task_prompt=(
                 "Execute only the provided execution_plan object. Inspect account state, open orders, positions, and "
-                "latest prices, then submit only execution_plan.orders with orders_submit_order. Preserve sequence "
-                "order and report each sequence as submitted or blocked. Block solely for execution-level blockers."
+                "latest prices, then submit only execution_plan.orders with orders_submit_order. After every submit, "
+                "confirm that same order with orders_confirm_order before continuing. Preserve sequence order and "
+                "report each sequence as submitted, confirmed, or blocked. Block solely for execution-level blockers."
             ),
             context={"date": context["date"], "execution_plan": execution_plan},
         )
