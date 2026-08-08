@@ -13,6 +13,26 @@ def load_strategy_module():
     return module, module.AITradingTeamMockGrowthInflationQuadrantStrategy
 
 
+def test_regimes_are_exact_growth_inflation_quadrants():
+    module, _strategy_class = load_strategy_module()
+
+    assert module.REGIMES == (
+        "growth_up_inflation_down",
+        "growth_up_inflation_up",
+        "growth_down_inflation_up",
+        "growth_down_inflation_down",
+    )
+
+
+def test_strategy_initially_subclasses_growth_execution_test_strategy():
+    _module, strategy_class = load_strategy_module()
+    from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
+        AITradingTeamGrowthExecutionTestStrategy,
+    )
+
+    assert issubclass(strategy_class, AITradingTeamGrowthExecutionTestStrategy)
+
+
 def test_basket_universes_have_at_least_five_semantically_valid_symbols():
     module, _strategy_class = load_strategy_module()
 

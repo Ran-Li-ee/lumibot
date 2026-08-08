@@ -9,6 +9,9 @@ from typing import Any
 
 from lumibot.components.agents.builtins import BuiltinTools
 from lumibot.components.agents.schemas import BoundTool
+from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
+    AITradingTeamGrowthExecutionTestStrategy,
+)
 from lumibot.strategies.strategy import Strategy
 
 REGIMES = (
@@ -110,5 +113,5 @@ def mock_macro_regime_classifier(
     }
 
 
-class AITradingTeamMockGrowthInflationQuadrantStrategy(Strategy):
+class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecutionTestStrategy):
     parameters = {}
