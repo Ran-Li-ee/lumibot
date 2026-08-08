@@ -10,6 +10,8 @@ from lumibot.components.agents.builtins import BuiltinTools
 from lumibot.components.agents.schemas import BoundTool, ToolDefinition
 from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
     AITradingTeamGrowthExecutionTestStrategy,
+    validate_decision_buy_sizing,
+    validate_execution_plan_cash_safety,
 )
 
 REGIMES = (
@@ -542,6 +544,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             execution_plan = parse_execution_plan_from_portfolio_summary(portfolio_result.summary)
             validate_portfolio_decision_tool_evidence(execution_plan, portfolio_result)
             validate_execution_plan_symbols(execution_plan, list(basket_reports_by_id.values()))
+            validate_decision_buy_sizing(self, execution_plan)
+            validate_execution_plan_cash_safety(self, execution_plan)
         except ValueError as exc:
             self._last_execution_plan_error = str(exc)
             print(f"Mock quadrant workflow blocked: {exc}")

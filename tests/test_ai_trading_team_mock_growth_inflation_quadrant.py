@@ -668,3 +668,118 @@ def test_hold_plan_skips_execution_agent():
 
     assert agent_manager["portfolio_decision_agent"].calls
     assert agent_manager["execution_agent"].calls == []
+
+
+def _seed_active_equity_workflow(agent_manager, module, execution_plan):
+    macro_report = {
+        "basket_weights": {"equity": 1.0, "commodity": 0.0, "tips": 0.0, "nominal_bond": 0.0},
+    }
+    basket_reports = {
+        "equity_basket_agent": {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["equity"],
+            "selected_symbol": "QQQ",
+        },
+        "commodity_basket_agent": {
+            "basket_id": "commodity",
+            "target_weight": 0.0,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["commodity"],
+            "selected_symbol": None,
+        },
+        "tips_basket_agent": {
+            "basket_id": "tips",
+            "target_weight": 0.0,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["tips"],
+            "selected_symbol": None,
+        },
+        "nominal_bond_basket_agent": {
+            "basket_id": "nominal_bond",
+            "target_weight": 0.0,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["nominal_bond"],
+            "selected_symbol": None,
+        },
+    }
+
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    for agent_name, report in basket_reports.items():
+        agent_manager.summaries[agent_name] = _json_summary(report)
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary(
+        {
+            "decision": {"type": "rebalance", "reason_brief": "safety regression"},
+            "execution_plan": execution_plan,
+        }
+    )
+    agent_manager.tool_calls["portfolio_decision_agent"] = [
+        "account_positions",
+        "account_portfolio",
+        "market_last_price",
+    ]
+
+
+def test_oversized_buy_plan_blocks_before_execution_agent():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.get_cash = lambda: 100.0
+    strategy.get_portfolio_value = lambda: 100.0
+    strategy.get_last_price = lambda symbol: 100.0
+    strategy.initialize()
+    _seed_active_equity_workflow(
+        agent_manager,
+        module,
+        {
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "symbol": "QQQ",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 1000,
+                    "order_type": "market",
+                },
+            ],
+        },
+    )
+
+    strategy.on_trading_iteration()
+
+    assert "NEGATIVE_CASH_NOT_ALLOWED" in strategy._last_execution_plan_error
+    assert agent_manager["execution_agent"].calls == []
+
+
+def test_sell_without_position_blocks_before_execution_agent():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.get_positions = lambda include_cash_positions=False: []
+    strategy.initialize()
+    _seed_active_equity_workflow(
+        agent_manager,
+        module,
+        {
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "symbol": "QQQ",
+                    "side": "sell",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "order_type": "market",
+                },
+            ],
+        },
+    )
+
+    strategy.on_trading_iteration()
+
+    assert "DECISION_SELL_POSITION_REQUIRED" in strategy._last_execution_plan_error
+    assert agent_manager["execution_agent"].calls == []
