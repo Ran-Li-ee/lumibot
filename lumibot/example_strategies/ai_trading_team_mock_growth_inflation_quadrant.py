@@ -1,18 +1,11 @@
 import hashlib
-import json
-import math
-import os
 from datetime import date as date_type
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from lumibot.components.agents.builtins import BuiltinTools
-from lumibot.components.agents.schemas import BoundTool
 from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
     AITradingTeamGrowthExecutionTestStrategy,
 )
-from lumibot.strategies.strategy import Strategy
 
 REGIMES = (
     "growth_up_inflation_down",
@@ -64,7 +57,7 @@ def _parse_iso_date(value: str) -> date_type:
 
 
 def _seeded_regime_index(date: str, seed: int) -> int:
-    digest = hashlib.sha256(f"{date}|{seed}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{date}|{seed}".encode()).hexdigest()
     return int(digest[:12], 16) % len(REGIMES)
 
 
@@ -114,4 +107,4 @@ def mock_macro_regime_classifier(
 
 
 class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecutionTestStrategy):
-    parameters = {}
+    parameters = dict(AITradingTeamGrowthExecutionTestStrategy.parameters)

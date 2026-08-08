@@ -1,7 +1,4 @@
 import importlib
-import json
-from datetime import datetime
-from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +28,17 @@ def test_strategy_initially_subclasses_growth_execution_test_strategy():
     )
 
     assert issubclass(strategy_class, AITradingTeamGrowthExecutionTestStrategy)
+
+
+def test_strategy_parameters_copy_growth_execution_defaults():
+    _module, strategy_class = load_strategy_module()
+    from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
+        AITradingTeamGrowthExecutionTestStrategy,
+    )
+
+    assert strategy_class.parameters == dict(AITradingTeamGrowthExecutionTestStrategy.parameters)
+    assert strategy_class.parameters is not AITradingTeamGrowthExecutionTestStrategy.parameters
+    assert "universe" in strategy_class.parameters
 
 
 def test_basket_universes_have_at_least_five_semantically_valid_symbols():
