@@ -30,7 +30,14 @@ REJECTED_SEMANTIC_QUANTITY_MODES = {
     "max_affordable_cash",
     "max_affordable_after_prior_sells",
 }
-ALLOWED_ORDER_TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop", "smart_limit"}
+ALLOWED_ORDER_TYPES = {"market"}
+MARKET_ONLY_FORBIDDEN_PRICE_FIELDS = (
+    "limit_price",
+    "stop_price",
+    "stop_limit_price",
+    "trail_price",
+    "trail_percent",
+)
 REQUIRED_DECISION_ACCOUNT_TOOLS = {"account_positions", "account_portfolio"}
 REQUIRED_DECISION_BUY_SIZING_TOOLS = {"market_last_price"}
 SYSTEM_EXECUTION_CONSTRAINTS = {
@@ -125,7 +132,13 @@ def _normalize_order(order):
 
     order_type = str(order.get("order_type", "market")).strip().lower()
     if order_type not in ALLOWED_ORDER_TYPES:
-        raise ValueError(f"unsupported order_type: {order_type}")
+        raise ValueError(
+            "unsupported order_type for daily market-only strategy: "
+            f"{order_type}. Use order_type='market'."
+        )
+    for field in MARKET_ONLY_FORBIDDEN_PRICE_FIELDS:
+        if order.get(field) is not None:
+            raise ValueError(f"market-only execution_plan must not include {field}.")
 
     return {
         "sequence": sequence,
@@ -205,11 +218,6 @@ def parse_execution_plan_from_decision_summary(summary):
         buy_index = buy_indexes[0]
         if any(order["side"] == "sell" for order in normalized_orders[buy_index + 1 :]):
             raise ValueError("execution_plan must place all sell orders before the buy order.")
-        buy_order_type = normalized_orders[buy_index]["order_type"]
-        if buy_order_type in {"stop", "trailing_stop"}:
-            raise ValueError(
-                f"buy order_type {buy_order_type!r} does not provide a bounded execution price."
-            )
 
     if "constraints" in plan:
         constraints = plan["constraints"]
@@ -233,21 +241,6 @@ def _agent_result_tool_names(result):
 
 
 def _raw_execution_order_price(strategy, order):
-    order_type = str(order.get("order_type", "market")).strip().lower()
-    price_field = None
-    if order_type in {"limit", "smart_limit"}:
-        price_field = "limit_price"
-    elif order_type == "stop":
-        price_field = "stop_price"
-    elif order_type == "stop_limit":
-        price_field = "stop_limit_price" if order.get("stop_limit_price") is not None else "limit_price"
-
-    if price_field is not None:
-        raw_price = order.get(price_field)
-        if raw_price is None:
-            raise ValueError(f"PRICE_REQUIRED: {order_type} order requires {price_field}.")
-        return raw_price, price_field
-
     raw_price = strategy.get_last_price(order["symbol"])
     if raw_price is None:
         raise ValueError(f"PRICE_REQUIRED: cannot validate execution plan because {order['symbol']} has no last price.")
@@ -255,13 +248,7 @@ def _raw_execution_order_price(strategy, order):
 
 
 def _execution_order_price(strategy, order):
-    raw_price, price_field = _raw_execution_order_price(strategy, order)
-    if price_field is not None:
-        price = float(raw_price)
-        if not math.isfinite(price) or price <= 0:
-            raise ValueError(f"{price_field} must be a positive finite price.")
-        return price
-
+    raw_price, _price_field = _raw_execution_order_price(strategy, order)
     price = float(raw_price)
     if not math.isfinite(price) or price <= 0:
         raise ValueError(f"PRICE_REQUIRED: invalid last price for {order['symbol']}: {raw_price!r}.")
@@ -279,12 +266,10 @@ def _decimal_number(value, label):
 
 
 def _decision_order_price(strategy, order):
-    raw_price, price_field = _raw_execution_order_price(strategy, order)
-    label = price_field or f"last price for {order['symbol']}"
+    raw_price, _price_field = _raw_execution_order_price(strategy, order)
+    label = f"last price for {order['symbol']}"
     price = _decimal_number(raw_price, label)
     if price <= 0:
-        if price_field is not None:
-            raise ValueError(f"{price_field} must be a positive finite price.")
         raise ValueError(f"PRICE_REQUIRED: invalid last price for {order['symbol']}: {raw_price!r}.")
     return price
 
@@ -315,7 +300,6 @@ def validate_decision_buy_sizing(strategy, execution_plan):
         if any(order["side"] == "sell" for order in execution_plan["orders"])
         else {}
     )
-    uncertain_sell_proceeds = Decimal("0")
     orders = sorted(execution_plan["orders"], key=lambda order: order["sequence"])
     for order in orders:
         price = _decision_order_price(strategy, order)
@@ -334,23 +318,11 @@ def validate_decision_buy_sizing(strategy, execution_plan):
                     f"for {order['symbol']} requests {quantity} shares but only {held_quantity} are held."
                 )
             holdings[order["symbol"]] = held_quantity - quantity
-            if order.get("order_type", "market") == "market":
-                simulated_cash += notional
-            else:
-                uncertain_sell_proceeds += notional
+            simulated_cash += notional
             continue
         if order["side"] != "buy":
             continue
 
-        if (
-            uncertain_sell_proceeds > 0
-            and simulated_cash - notional < 0
-            and simulated_cash + uncertain_sell_proceeds - notional >= 0
-        ):
-            raise ValueError(
-                "DECISION_BUY_REQUIRES_MARKET_SELL_PROCEEDS: a later buy may use prior sell proceeds "
-                "only when those sells are market orders."
-            )
         simulated_cash -= notional
 
 
@@ -369,8 +341,7 @@ def validate_execution_plan_cash_safety(strategy, execution_plan):
         price = _execution_order_price(strategy, order)
         notional = float(order["quantity"]) * price
         if order["side"] == "sell":
-            if order.get("order_type", "market") == "market":
-                simulated_cash += notional
+            simulated_cash += notional
             continue
         if order["side"] != "buy":
             continue
@@ -469,21 +440,17 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 "enter_position, rotate, reduce_position, close_position. Each executable order must include "
                 "sequence, symbol, side, quantity_mode, quantity, asset_type, order_type, and time_in_force. "
                 'quantity_mode must be exactly "shares" for every executable order. '
-                "Optional bounded-price fields include limit_price, stop_price, and stop_limit_price. Use numeric "
-                "share quantities; do not use full_position, current_position, max_affordable_cash, or "
-                "max_affordable_after_prior_sells. Before a non-hold decision, call account_positions and "
-                "account_portfolio. Call market_last_price when sizing buy orders. Sizing and order construction "
-                "rules: choose order_type before calculating quantity. For selling all or part of a position, "
-                "calculate the share quantity from account tool output. For buy sizing, choose sizing_price based on "
-                "order_type. For market buys, use a conservative sizing_price based on available price evidence; it "
-                "may be higher than market_last_price in daily backtests. For limit buys, use limit_price. For "
-                "stop_limit buys, use stop_limit_price or the final bounded execution price. Use the 98% cash rule "
-                "only as an internal sizing rule: maximum buy quantity must be no greater than "
-                "floor(0.98 * available_cash_after_prior_sells / sizing_price). Output only the final numeric share "
-                "quantity. Do not output "
-                "cash_buffer_pct or any buffer field in execution_plan. Buy orders must use market, limit, "
-                "smart_limit, or stop_limit. Do not use stop or trailing_stop for a buy order because those order "
-                "types do not provide a bounded execution price. Never produce orders that would make cash negative. "
+                'All executable orders must use order_type "market". Do not output limit_price, stop_price, '
+                "stop_limit_price, trail_price, or trail_percent. Use numeric whole-share quantities; do not use "
+                "full_position, current_position, max_affordable_cash, or max_affordable_after_prior_sells. "
+                "Before a non-hold decision, call account_positions and account_portfolio. For buy sizing, call "
+                "market_last_price and use a conservative market sizing price based on available price evidence; it "
+                "may be higher than market_last_price in daily backtests. For selling all or part of a position, "
+                "calculate the share quantity from account tool output. Use the 98% cash rule only as an internal "
+                "sizing rule: maximum buy quantity must be no greater than "
+                "floor(0.98 * available_cash_after_prior_sells / sizing_price). Return only the final numeric "
+                "whole-share quantity. Do not output cash_buffer_pct or any buffer field in execution_plan. Never "
+                "produce orders that would make cash negative. "
                 'For rotate decisions, set sequence: 1 with side: "sell" for decision.from, then set sequence: 2 '
                 'with side: "buy" for decision.to.'
             ),
@@ -500,16 +467,24 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
                 BuiltinTools.market.last_price(),
                 BuiltinTools.orders.open_orders(),
                 BuiltinTools.orders.submit(),
+                BuiltinTools.orders.confirm(),
             ],
             system_prompt=(
                 "Execution agent role: execute only the provided execution_plan object using native execution tools, "
-                "especially orders_submit_order. Treat execution_plan.orders as authoritative. Do not read or infer "
-                "investment reasons. Do not re-rank candidates, do not substitute symbols, and do not use upstream "
-                "research to override the plan. Do not add, remove, replace, or reorder orders. Inspect positions, "
-                "portfolio, open orders, and latest prices before submitting orders. Execute orders in ascending "
-                "sequence order. Submit the explicit numeric share quantities in execution_plan.orders. Do not "
-                "compute semantic sizing. Block or pause only for execution-level blockers. Execution report "
-                "contract: report each sequence as submitted or blocked, and finish with a short RESULT summary."
+                "especially orders_submit_order and orders_confirm_order. Treat execution_plan.orders as "
+                "authoritative. Do not read or infer investment reasons. Do not re-rank candidates, do not "
+                "substitute symbols, and do not use upstream research to override the plan. Do not add, remove, "
+                "replace, or reorder orders. Use only market orders. If any execution_plan order is not a market "
+                "order, block it as an execution-level blocker. Inspect positions, portfolio, open orders, and "
+                "latest prices before submitting orders. Submit orders in ascending sequence order. After every "
+                "orders_submit_order call, immediately call orders_confirm_order with the returned identifier, "
+                "symbol, side, and expected_quantity. Do not submit any later order and do not write the final "
+                "summary until that order is confirmed. If orders_confirm_order returns can_continue=true, continue "
+                "to the next sequence. If orders_confirm_order returns can_continue=false, stop all remaining orders "
+                "and report the confirmation blocker. Submit the explicit numeric share quantities in "
+                "execution_plan.orders. Do not compute semantic sizing. Block or pause only for execution-level "
+                "blockers. Execution report contract: report each sequence as submitted, confirmed, or blocked, and "
+                "finish with a short RESULT summary."
             ),
         )
 
@@ -549,8 +524,9 @@ class AITradingTeamGrowthExecutionTestStrategy(Strategy):
         self.agents["execution_agent"].run(
             task_prompt=(
                 "Execute only the provided execution_plan object. Inspect account state, open orders, positions, and "
-                "latest prices, then submit only execution_plan.orders with orders_submit_order. Preserve sequence "
-                "order and report each sequence as submitted or blocked. Block solely for execution-level blockers."
+                "latest prices, then submit only execution_plan.orders with orders_submit_order. After every submit, "
+                "confirm that same order with orders_confirm_order before continuing. Preserve sequence order and "
+                "report each sequence as submitted, confirmed, or blocked. Block solely for execution-level blockers."
             ),
             context={"date": context["date"], "execution_plan": execution_plan},
         )

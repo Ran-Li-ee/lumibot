@@ -302,32 +302,63 @@ def test_parse_execution_plan_rejects_sell_after_buy():
         strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
 
 
-@pytest.mark.parametrize("order_type", ["stop", "trailing_stop"])
-def test_parse_execution_plan_rejects_buy_order_without_bounded_execution_price(order_type):
+def test_parse_execution_plan_rejects_non_market_order_type():
     strategy_module, _strategy_class = load_strategy_module()
-    raw_summary = json.dumps(
-        {
-            "execution_plan": {
-                "schema_version": 1,
-                "intent": "enter_position",
-                "orders": [
-                    {
-                        "sequence": 1,
-                        "symbol": "SPY",
-                        "side": "buy",
-                        "quantity": 10,
-                        "quantity_mode": "shares",
-                        "order_type": order_type,
-                        "stop_price": 100,
-                        "trail_percent": 1,
-                    }
-                ],
+    for order_type in ("limit", "smart_limit", "stop", "stop_limit", "trailing_stop"):
+        raw_summary = json.dumps(
+            {
+                "execution_plan": {
+                    "schema_version": 1,
+                    "intent": "enter_position",
+                    "orders": [
+                        {
+                            "sequence": 1,
+                            "action": "submit_order",
+                            "symbol": "SPY",
+                            "side": "buy",
+                            "quantity": 10,
+                            "quantity_mode": "shares",
+                            "asset_type": "stock",
+                            "order_type": order_type,
+                            "time_in_force": "day",
+                        }
+                    ],
+                }
             }
-        }
-    )
+        )
 
-    with pytest.raises(ValueError, match="bounded execution price"):
-        strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
+        with pytest.raises(ValueError, match="market-only"):
+            strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
+
+
+def test_parse_execution_plan_rejects_market_order_with_actionable_price_fields():
+    strategy_module, _strategy_class = load_strategy_module()
+    for field in ("limit_price", "stop_price", "stop_limit_price", "trail_price", "trail_percent"):
+        raw_summary = json.dumps(
+            {
+                "execution_plan": {
+                    "schema_version": 1,
+                    "intent": "enter_position",
+                    "orders": [
+                        {
+                            "sequence": 1,
+                            "action": "submit_order",
+                            "symbol": "SPY",
+                            "side": "buy",
+                            "quantity": 10,
+                            "quantity_mode": "shares",
+                            "asset_type": "stock",
+                            "order_type": "market",
+                            field: 95.0,
+                            "time_in_force": "day",
+                        }
+                    ],
+                }
+            }
+        )
+
+        with pytest.raises(ValueError, match=rf"market-only execution_plan must not include {field}"):
+            strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
 
 
 def test_parse_execution_plan_rejects_more_than_one_buy_order():
@@ -831,29 +862,30 @@ def test_non_hold_decision_without_account_tool_evidence_blocks_execution_agent(
     assert "Execution plan blocked" in captured.out
 
 
-def test_decision_buy_sizing_accepts_previous_vnq_plan_inside_tolerance_band():
+def test_parse_execution_plan_rejects_previous_limit_vnq_plan():
     strategy_module, _strategy_class = load_strategy_module()
-    strategy = SimpleNamespace(
-        get_cash=lambda: 100000.0,
-        get_portfolio_value=lambda: 100000.0,
-        get_last_price=lambda symbol: 95.32,
-    )
-    plan = {
-        "intent": "enter_position",
-        "orders": [
-            {
-                "sequence": 1,
-                "symbol": "VNQ",
-                "side": "buy",
-                "quantity": 1029.0,
-                "order_type": "limit",
-                "limit_price": 95.32,
+    raw_summary = json.dumps(
+        {
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "enter_position",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "symbol": "VNQ",
+                        "side": "buy",
+                        "quantity": 1029.0,
+                        "quantity_mode": "shares",
+                        "order_type": "limit",
+                        "limit_price": 95.32,
+                    }
+                ],
             }
-        ],
-        "constraints": {"allow_negative_cash": False},
-    }
+        }
+    )
 
-    strategy_module.validate_decision_buy_sizing(strategy, plan)
+    with pytest.raises(ValueError, match="market-only"):
+        strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
 
 
 @pytest.mark.parametrize("quantity", [97.0, 99.0])
@@ -1027,77 +1059,56 @@ def test_decision_buy_sizing_rejects_nonexistent_or_oversized_sell(
         strategy_module.validate_decision_buy_sizing(strategy, plan)
 
 
-def test_decision_buy_sizing_requires_market_sell_when_proceeds_fund_later_buy():
+def test_parse_execution_plan_rejects_limit_sell_when_proceeds_would_fund_later_buy():
     strategy_module, _strategy_class = load_strategy_module()
-    prices = {"VNQ": 100.0, "FXI": 50.0}
-    strategy = SimpleNamespace(
-        get_cash=lambda: 100.0,
-        get_portfolio_value=lambda: 10100.0,
-        get_last_price=lambda symbol: prices[str(symbol)],
-        get_positions=lambda: [
-            SimpleNamespace(asset=SimpleNamespace(symbol="VNQ"), quantity=100.0),
-        ],
+    raw_summary = json.dumps(
+        {
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rotate",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "symbol": "VNQ",
+                        "side": "sell",
+                        "quantity": 100.0,
+                        "quantity_mode": "shares",
+                        "order_type": "limit",
+                        "limit_price": 100.0,
+                    },
+                    {
+                        "sequence": 2,
+                        "symbol": "FXI",
+                        "side": "buy",
+                        "quantity": 197.0,
+                        "quantity_mode": "shares",
+                        "order_type": "market",
+                    },
+                ],
+            }
+        }
     )
-    plan = {
-        "intent": "rotate",
-        "orders": [
-            {
-                "sequence": 1,
-                "symbol": "VNQ",
-                "side": "sell",
-                "quantity": 100.0,
-                "order_type": "limit",
-                "limit_price": 100.0,
-            },
-            {
-                "sequence": 2,
-                "symbol": "FXI",
-                "side": "buy",
-                "quantity": 197.0,
-                "order_type": "market",
-            },
-        ],
-        "constraints": {"allow_negative_cash": False},
-    }
 
-    with pytest.raises(ValueError, match="DECISION_BUY_REQUIRES_MARKET_SELL_PROCEEDS"):
-        strategy_module.validate_decision_buy_sizing(strategy, plan)
+    with pytest.raises(ValueError, match="market-only"):
+        strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
 
 
-@pytest.mark.parametrize(
-    ("order", "expected_price"),
-    [
-        (
-            {
-                "symbol": "SPY",
-                "order_type": "market",
-                "limit_price": 1.0,
-                "stop_price": 2.0,
-                "stop_limit_price": 3.0,
-            },
-            100.0,
-        ),
-        ({"symbol": "SPY", "order_type": "limit", "limit_price": 90.0}, 90.0),
-        ({"symbol": "SPY", "order_type": "smart_limit", "limit_price": 91.0}, 91.0),
-        ({"symbol": "SPY", "order_type": "stop", "stop_price": 105.0}, 105.0),
-        (
-            {
-                "symbol": "SPY",
-                "order_type": "stop_limit",
-                "limit_price": 80.0,
-                "stop_limit_price": 95.0,
-                "stop_price": 90.0,
-            },
-            95.0,
-        ),
-        ({"symbol": "SPY", "order_type": "trailing_stop", "trail_percent": 2.0}, 100.0),
-    ],
-)
-def test_execution_order_price_matches_native_order_type_semantics(order, expected_price):
+def test_execution_order_price_for_market_order_uses_last_price():
     strategy_module, _strategy_class = load_strategy_module()
     strategy = SimpleNamespace(get_last_price=lambda symbol: 100.0)
 
-    assert strategy_module._execution_order_price(strategy, order) == expected_price
+    price = strategy_module._execution_order_price(
+        strategy,
+        {
+            "symbol": "SPY",
+            "order_type": "market",
+            "limit_price": None,
+            "stop_price": None,
+            "stop_limit_price": None,
+        },
+    )
+
+    assert price == 100.0
 
 
 def test_decision_buy_sizing_handles_near_integer_decimal_floor_boundary():
@@ -1397,32 +1408,30 @@ def test_execution_cash_safety_allows_positive_cash_below_decision_buffer():
     strategy_module.validate_execution_plan_cash_safety(strategy, plan)
 
 
-def test_market_order_cash_safety_uses_latest_price_not_irrelevant_stop_price():
+def test_parse_execution_plan_rejects_market_order_stop_price_before_cash_safety():
     strategy_module, _strategy_class = load_strategy_module()
-    strategy = SimpleNamespace(
-        get_cash=lambda: 1000.0,
-        get_portfolio_value=lambda: 1000.0,
-        get_last_price=lambda symbol: 100.0,
-    )
-    plan = {
-        "intent": "enter_position",
-        "orders": [
-            {
-                "sequence": 1,
-                "symbol": "SPY",
-                "side": "buy",
-                "quantity": 11.0,
-                "order_type": "market",
-                "limit_price": None,
-                "stop_price": 50.0,
-                "stop_limit_price": None,
+    raw_summary = json.dumps(
+        {
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "enter_position",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity": 11.0,
+                        "quantity_mode": "shares",
+                        "order_type": "market",
+                        "stop_price": 50.0,
+                    }
+                ],
             }
-        ],
-        "constraints": {"allow_negative_cash": False},
-    }
+        }
+    )
 
-    with pytest.raises(ValueError, match="NEGATIVE_CASH_NOT_ALLOWED"):
-        strategy_module.validate_execution_plan_cash_safety(strategy, plan)
+    with pytest.raises(ValueError, match="market-only execution_plan must not include stop_price"):
+        strategy_module.parse_execution_plan_from_decision_summary(raw_summary)
 
 
 def test_execution_plan_cash_safety_blocks_negative_cash_even_without_buffer():
@@ -1513,21 +1522,18 @@ def test_decision_prompt_requests_structured_execution_plan():
 
     for prompt_phrase in (
         "before a non-hold decision, call account_positions and account_portfolio",
-        "call market_last_price when sizing buy orders",
-        "use numeric share quantities",
+        "for buy sizing, call market_last_price and use a conservative market sizing price",
+        "use numeric whole-share quantities",
         "do not use full_position, current_position, max_affordable_cash, or max_affordable_after_prior_sells",
         "calculate the share quantity from account tool output",
-        "choose order_type before calculating quantity",
+        'all executable orders must use order_type "market"',
+        "do not output limit_price, stop_price, stop_limit_price, trail_price, or trail_percent",
         "maximum buy quantity must be no greater than floor(0.98 * available_cash_after_prior_sells / sizing_price)",
-        "output only the final numeric share quantity",
-        "for market buys, use a conservative sizing_price based on available price evidence",
+        "return only the final numeric whole-share quantity",
+        "use a conservative market sizing price based on available price evidence",
         "it may be higher than market_last_price in daily backtests",
-        "for limit buys, use limit_price",
-        "for stop_limit buys, use stop_limit_price or the final bounded execution price",
         "use the 98% cash rule only as an internal sizing rule",
         "do not output cash_buffer_pct or any buffer field in execution_plan",
-        "buy orders must use market, limit, smart_limit, or stop_limit",
-        "do not use stop or trailing_stop for a buy order",
         "compare the holding against the strongest candidate",
         "choose rotate only when the candidate is clearly stronger",
         "planned sell and buy quantities can be expressed as executable numeric share orders",
@@ -1546,6 +1552,22 @@ def test_decision_prompt_requests_structured_execution_plan():
         "do not include cash_buffer_pct in the execution order",
     ):
         assert forbidden_cash_buffer_phrase not in decision_prompt_lower
+    for forbidden_bounded_price_phrase in (
+        "optional bounded-price fields include",
+        "choose order_type before calculating quantity",
+        "choose sizing_price based on order_type",
+        "for limit buys",
+        "for stop_limit buys",
+        "buy orders must use market, limit",
+        "limit order",
+        "stop order",
+        "stop-limit order",
+        "trailing-stop order",
+        "smart_limit",
+        "do not use stop or trailing_stop",
+        "bounded execution price",
+    ):
+        assert forbidden_bounded_price_phrase not in decision_prompt_lower
 
     for strict_phrase in (
         "return only one valid json object",
@@ -1558,8 +1580,8 @@ def test_decision_prompt_requests_structured_execution_plan():
     for prompt_phrase in (
         "execution_plan must include schema_version, intent, and orders",
         "intent must be one of hold, enter_position, rotate, reduce_position, close_position",
-        "each executable order must include sequence, symbol, side, quantity_mode, quantity, asset_type, order_type, and time_in_force",
-        "optional bounded-price fields include limit_price, stop_price, and stop_limit_price",
+        "each executable order must include sequence, symbol, side, quantity_mode, quantity, "
+        "asset_type, order_type, and time_in_force",
     ):
         assert prompt_phrase in decision_prompt_lower
 
@@ -1658,14 +1680,28 @@ def test_growth_decision_execution_agents_receive_distinct_tool_surfaces():
         "market_last_price",
         "orders_open_orders",
         "orders_submit_order",
+        "orders_confirm_order",
     }
+    assert "orders_confirm_order" not in created_tool_names(created["growth_agent"])
+    assert "orders_confirm_order" not in created_tool_names(created["decision_agent"])
 
 
 def test_execution_prompt_treats_execution_plan_as_authoritative():
     _strategy_module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
     for name in ("growth_agent", "decision_agent", "execution_agent"):
-        agent_manager._agents[name] = RecordingAgent(name)
+        agent_manager._agents[name] = RecordingAgent(name, agent_manager.summaries, agent_manager.tool_calls)
+    agent_manager.summaries["decision_agent"] = (
+        '{"decision":{"type":"buy","from":"USD","to":"GLD","reason_brief":"keep this out of execution"},'
+        '"execution_plan":{"schema_version":1,"intent":"enter_position","orders":[{"sequence":1,'
+        '"action":"submit_order","symbol":"GLD","side":"buy","quantity":980,'
+        '"quantity_mode":"shares","order_type":"market"}],"constraints":{}}}'
+    )
+    agent_manager.tool_calls["decision_agent"] = [
+        "account_positions",
+        "account_portfolio",
+        "market_last_price",
+    ]
     strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
 
     strategy.initialize()
@@ -1682,14 +1718,40 @@ def test_execution_prompt_treats_execution_plan_as_authoritative():
 
     for required_phrase in (
         "execution_plan.orders",
+        "execution_plan.orders as authoritative",
         "do not re-rank",
         "do not substitute",
+        "do not add, remove, replace, or reorder orders",
         "execution-level blockers",
         "sequence order",
         "submit the explicit numeric share quantities",
         "do not compute semantic sizing",
+        "orders_confirm_order",
+        "after every orders_submit_order",
+        "returned identifier",
+        "can_continue=true",
+        "can_continue=false",
+        "stop all remaining orders",
+        "use only market orders",
+        "if any execution_plan order is not a market order",
     ):
         assert required_phrase in prompt_text
+    for task_prompt_phrase in (
+        "execute only the provided execution_plan object",
+        "inspect account state, open orders, positions, and latest prices",
+        "submit only execution_plan.orders",
+        "after every submit, confirm that same order with orders_confirm_order",
+        "preserve sequence order",
+        "submitted, confirmed, or blocked",
+    ):
+        assert task_prompt_phrase in prompt_text
+    for task3_confirmation_phrase in (
+        "confirmed sequence",
+        "prior sell order is no longer open",
+        "cash or buying power has updated",
+        "do not submit the dependent buy order",
+    ):
+        assert task3_confirmation_phrase not in prompt_text
     for forbidden_buffer_reference in ("cash_buffer_pct", "0.02", "2%"):
         assert forbidden_buffer_reference not in prompt_text
     for forbidden_research_reference in (
