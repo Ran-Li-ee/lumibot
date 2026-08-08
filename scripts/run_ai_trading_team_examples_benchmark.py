@@ -34,12 +34,16 @@ from lumibot.example_strategies.ai_trading_team_citadel_sector_pods import (  # 
 from lumibot.example_strategies.ai_trading_team_growth_execution_test import (  # noqa: E402
     AITradingTeamGrowthExecutionTestStrategy,
 )
+from lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant import (  # noqa: E402
+    AITradingTeamMockGrowthInflationQuadrantStrategy,
+)
 from lumibot.example_strategies.ai_trading_team_ray_dalio_idea_meritocracy import (  # noqa: E402
     AITradingTeamRayDalioIdeaMeritocracyStrategy,
 )
 from lumibot.example_strategies.ai_trading_team_warren_buffett_value import (  # noqa: E402
     AITradingTeamWarrenBuffettValueStrategy,
 )
+from scripts.run_ai_committee_provider_benchmark import _missing_key_label  # noqa: E402
 
 ARTIFACT_ROOT = Path("artifacts") / "ai_trading_team_example_benchmarks"
 STRATEGIES = {
@@ -50,6 +54,7 @@ STRATEGIES = {
     "bill-ackman-concentrated": AITradingTeamBillAckmanConcentratedStrategy,
     "citadel-sector-pods": AITradingTeamCitadelSectorPodsStrategy,
     "growth-execution-test": AITradingTeamGrowthExecutionTestStrategy,
+    "mock-growth-inflation-quadrant": AITradingTeamMockGrowthInflationQuadrantStrategy,
 }
 
 
@@ -182,8 +187,10 @@ def main() -> None:
     args = parser.parse_args()
 
     _load_env_file(Path(args.env_file))
-    if not os.environ.get("GOOGLE_API_KEY") and not os.environ.get("GEMINI_API_KEY"):
-        raise RuntimeError("GOOGLE_API_KEY or GEMINI_API_KEY is required for these examples.")
+    active_model = os.environ.get("AI_TRADING_TEAM_MODEL", "gemini-3.1-flash-lite")
+    missing_key = _missing_key_label(active_model)
+    if missing_key:
+        raise RuntimeError(f"Missing required provider API key(s) for {active_model}: {missing_key}")
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     root = ARTIFACT_ROOT / run_id

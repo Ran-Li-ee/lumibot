@@ -68,6 +68,26 @@ def load_strategy_module():
     return module, module.AITradingTeamMockGrowthInflationQuadrantStrategy
 
 
+def test_examples_benchmark_exposes_mock_quadrant_strategy():
+    benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
+
+    assert "mock-growth-inflation-quadrant" in benchmark.STRATEGIES
+    assert (
+        benchmark.STRATEGIES["mock-growth-inflation-quadrant"].__name__
+        == "AITradingTeamMockGrowthInflationQuadrantStrategy"
+    )
+
+
+def test_examples_benchmark_uses_model_specific_key_check(monkeypatch):
+    benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
+    monkeypatch.setenv("AI_TRADING_TEAM_MODEL", "openai/gpt-5.6-luna")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    assert benchmark._missing_key_label("openai/gpt-5.6-luna") is None
+
+
 def test_regimes_are_exact_growth_inflation_quadrants():
     module, _strategy_class = load_strategy_module()
 
