@@ -43,7 +43,6 @@ from lumibot.example_strategies.ai_trading_team_ray_dalio_idea_meritocracy impor
 from lumibot.example_strategies.ai_trading_team_warren_buffett_value import (  # noqa: E402
     AITradingTeamWarrenBuffettValueStrategy,
 )
-from scripts.run_ai_committee_provider_benchmark import _missing_key_label  # noqa: E402
 
 ARTIFACT_ROOT = Path("artifacts") / "ai_trading_team_example_benchmarks"
 STRATEGIES = {
@@ -56,6 +55,34 @@ STRATEGIES = {
     "growth-execution-test": AITradingTeamGrowthExecutionTestStrategy,
     "mock-growth-inflation-quadrant": AITradingTeamMockGrowthInflationQuadrantStrategy,
 }
+
+
+def _required_key_options(model: str) -> list[str]:
+    lower = model.strip().lower()
+    if lower.startswith("gemini-") or lower.startswith("models/gemini"):
+        return ["GOOGLE_API_KEY", "GEMINI_API_KEY"]
+    if lower.startswith("openai/"):
+        return ["OPENAI_API_KEY"]
+    if lower.startswith("anthropic/"):
+        return ["ANTHROPIC_API_KEY"]
+    if lower.startswith("xai/"):
+        return ["XAI_API_KEY", "GROK_API_KEY"]
+    if lower.startswith("deepseek/"):
+        return ["DEEPSEEK_API_KEY"]
+    if lower.startswith("together_ai/"):
+        return ["TOGETHERAI_API_KEY", "TOGETHER_API_KEY"]
+    if lower.startswith("cerebras/"):
+        return ["CEREBRAS_API_KEY"]
+    return []
+
+
+def _missing_key_label(model: str) -> str | None:
+    keys = _required_key_options(model)
+    if not keys:
+        return None
+    if any(os.environ.get(key) for key in keys):
+        return None
+    return " or ".join(keys)
 
 
 def _json_safe(value: Any) -> Any:

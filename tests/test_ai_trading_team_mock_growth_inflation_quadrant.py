@@ -1,5 +1,6 @@
 import importlib
 import json
+import sys
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -86,6 +87,43 @@ def test_examples_benchmark_uses_model_specific_key_check(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
     assert benchmark._missing_key_label("openai/gpt-5.6-luna") is None
+
+
+def test_examples_benchmark_main_uses_model_specific_key_gate(monkeypatch):
+    benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
+    monkeypatch.setenv("AI_TRADING_TEAM_MODEL", "openai/gpt-5.6-luna")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_ai_trading_team_examples_benchmark.py",
+            "--env-file",
+            "missing-ai-trading-team-env-file-for-test.env",
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        benchmark.main()
+
+
+def test_examples_benchmark_import_does_not_require_backtesting_stack(monkeypatch):
+    sys.modules.pop("scripts.run_ai_trading_team_examples_benchmark", None)
+    sys.modules.pop("scripts.run_ai_committee_provider_benchmark", None)
+    real_import = __import__
+
+    def fail_optional_backtesting_import(name, *args, **kwargs):
+        if name in {"lumibot.backtesting", "lumibot.entities"}:
+            raise ModuleNotFoundError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fail_optional_backtesting_import)
+
+    benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
+
+    assert "mock-growth-inflation-quadrant" in benchmark.STRATEGIES
 
 
 def test_regimes_are_exact_growth_inflation_quadrants():
