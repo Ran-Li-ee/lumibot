@@ -1,4 +1,6 @@
 import hashlib
+import json
+import math
 from datetime import date as date_type
 from datetime import datetime
 from typing import Any
@@ -47,6 +49,29 @@ MOCK_WEIGHT_BY_REGIME = {
         "tips": 0.25,
         "nominal_bond": 0.50,
     },
+}
+
+ALLOWED_INTENTS = {"hold", "rebalance"}
+ALLOWED_ACTIONS = {"submit_order"}
+ALLOWED_SIDES = {"buy", "sell"}
+ALLOWED_QUANTITY_MODES = {"shares"}
+REJECTED_SEMANTIC_QUANTITY_MODES = {
+    "current_position",
+    "full_position",
+    "max_affordable_cash",
+    "max_affordable_after_prior_sells",
+}
+ALLOWED_ORDER_TYPES = {"market"}
+MARKET_ONLY_FORBIDDEN_PRICE_FIELDS = (
+    "limit_price",
+    "stop_price",
+    "stop_limit_price",
+    "trail_price",
+    "trail_percent",
+)
+SYSTEM_EXECUTION_CONSTRAINTS = {
+    "allow_negative_cash": False,
+    "if_any_order_blocked": "stop_remaining_orders",
 }
 
 
@@ -144,6 +169,206 @@ def make_macro_regime_classifier_tool() -> ToolDefinition:
         )
 
     return ToolDefinition(name=name, description=description, binder=binder, metadata=metadata)
+
+
+def _extract_first_json_object(text: str) -> str:
+    if not isinstance(text, str):
+        raise ValueError("Portfolio summary must be text.")
+
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in portfolio summary.")
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+
+    raise ValueError("Unclosed JSON object in portfolio summary.")
+
+
+def _require_dict(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object.")
+    return value
+
+
+def _normalize_order(order: Any) -> dict[str, Any]:
+    order = _require_dict(order, "order")
+    for field in ("sequence", "symbol", "side", "quantity_mode"):
+        if field not in order:
+            raise ValueError(f"missing required order field: {field}")
+
+    sequence = order["sequence"]
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
+        raise ValueError("order sequence must be a positive integer.")
+
+    if not isinstance(order["symbol"], str):
+        raise ValueError("order symbol must be a string.")
+    symbol = order["symbol"].strip().upper()
+    if not symbol:
+        raise ValueError("order symbol must be non-empty.")
+
+    side = str(order["side"]).strip().lower()
+    if side not in ALLOWED_SIDES:
+        raise ValueError(f"unsupported order side: {side}")
+
+    action = str(order.get("action", "submit_order")).strip().lower()
+    if action not in ALLOWED_ACTIONS:
+        raise ValueError(f"unsupported order action: {action}")
+
+    quantity_mode = str(order["quantity_mode"]).strip().lower()
+    if quantity_mode in REJECTED_SEMANTIC_QUANTITY_MODES:
+        raise ValueError(
+            "executable orders must use explicit shares quantity_mode; "
+            f"got semantic quantity_mode: {quantity_mode}"
+        )
+    if quantity_mode not in ALLOWED_QUANTITY_MODES:
+        raise ValueError(f"unsupported order quantity_mode: {quantity_mode}")
+
+    if "quantity" not in order or order["quantity"] is None:
+        raise ValueError("order quantity is required for shares quantity_mode.")
+    if isinstance(order["quantity"], bool):
+        raise ValueError("order quantity must be a positive whole-share integer.")
+    try:
+        quantity = float(order["quantity"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("order quantity must be positive for shares quantity_mode.") from exc
+    if not math.isfinite(quantity) or quantity <= 0:
+        raise ValueError("order quantity must be positive for shares quantity_mode.")
+    if not quantity.is_integer():
+        raise ValueError("order quantity must be a positive whole-share integer.")
+
+    order_type = str(order.get("order_type", "market")).strip().lower()
+    if order_type not in ALLOWED_ORDER_TYPES:
+        raise ValueError(
+            "unsupported order_type for market-only mock quadrant strategy: "
+            f"{order_type}. Use order_type='market'."
+        )
+    for field in MARKET_ONLY_FORBIDDEN_PRICE_FIELDS:
+        if order.get(field) is not None:
+            raise ValueError(f"market-only execution_plan must not include {field}.")
+
+    return {
+        "sequence": sequence,
+        "action": action,
+        "symbol": symbol,
+        "asset_type": str(order.get("asset_type", "stock")).strip().lower(),
+        "side": side,
+        "quantity": quantity,
+        "quantity_mode": quantity_mode,
+        "order_type": order_type,
+        "time_in_force": str(order.get("time_in_force", "day")).strip().lower(),
+    }
+
+
+def parse_execution_plan_from_portfolio_summary(summary: str) -> dict[str, Any]:
+    raw_json = _extract_first_json_object(summary)
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Portfolio summary JSON is invalid: {exc.msg}.") from exc
+
+    payload = _require_dict(payload, "portfolio summary JSON")
+    if "execution_plan" not in payload:
+        raise ValueError("portfolio summary JSON must include execution_plan.")
+    plan = _require_dict(payload["execution_plan"], "execution_plan")
+
+    if "schema_version" not in plan:
+        raise ValueError("execution_plan schema_version is required.")
+    schema_version = plan["schema_version"]
+    if isinstance(schema_version, bool):
+        raise ValueError(f"unsupported execution_plan schema_version: {schema_version}")
+    if isinstance(schema_version, (int, float)):
+        if schema_version != 1:
+            raise ValueError(f"unsupported execution_plan schema_version: {schema_version}")
+    elif isinstance(schema_version, str):
+        if schema_version.strip() not in {"1", "1.0"}:
+            raise ValueError(f"unsupported execution_plan schema_version: {schema_version}")
+    else:
+        raise ValueError(f"unsupported execution_plan schema_version: {schema_version}")
+
+    intent = str(plan.get("intent") or "").strip().lower()
+    if not intent:
+        raise ValueError("execution_plan intent is required.")
+    if intent not in ALLOWED_INTENTS:
+        raise ValueError(f"unsupported execution_plan intent: {intent}")
+
+    if "orders" not in plan:
+        raise ValueError("execution_plan orders are required.")
+    orders = plan["orders"]
+    if not isinstance(orders, list):
+        raise ValueError("execution_plan orders must be a list.")
+    if intent == "hold" and orders:
+        raise ValueError("hold intent cannot include orders.")
+    if intent == "rebalance" and not orders:
+        raise ValueError("execution_plan orders are required for rebalance intent.")
+
+    normalized_orders = sorted((_normalize_order(order) for order in orders), key=lambda order: order["sequence"])
+    order_sequences = [order["sequence"] for order in normalized_orders]
+    if len(order_sequences) != len(set(order_sequences)):
+        raise ValueError("duplicate order sequence.")
+
+    buy_seen = False
+    for order in normalized_orders:
+        if order["side"] == "buy":
+            buy_seen = True
+        elif buy_seen and order["side"] == "sell":
+            raise ValueError("execution_plan must place sell orders before buy orders.")
+
+    return {
+        "schema_version": 1,
+        "intent": intent,
+        "orders": normalized_orders,
+        "constraints": dict(SYSTEM_EXECUTION_CONSTRAINTS),
+    }
+
+
+def _selected_symbols_from_basket_reports(basket_reports: Any) -> set[str]:
+    if not isinstance(basket_reports, list):
+        raise ValueError("basket_reports must be a list.")
+
+    selected_symbols = set()
+    for basket_report in basket_reports:
+        basket_report = _require_dict(basket_report, "basket_report")
+        status = str(basket_report.get("status") or "").strip().lower()
+        selected_symbol = basket_report.get("selected_symbol")
+        if status == "active" and selected_symbol:
+            selected_symbols.add(str(selected_symbol).strip().upper())
+    return selected_symbols
+
+
+def validate_execution_plan_symbols(execution_plan: dict[str, Any], basket_reports: list[dict[str, Any]]) -> None:
+    execution_plan = _require_dict(execution_plan, "execution_plan")
+    if execution_plan.get("intent") == "hold":
+        return
+
+    selected_symbols = _selected_symbols_from_basket_reports(basket_reports)
+    for order in execution_plan.get("orders", []):
+        order = _require_dict(order, "order")
+        if str(order.get("side") or "").strip().lower() != "buy":
+            continue
+        symbol = str(order.get("symbol") or "").strip().upper()
+        if symbol not in selected_symbols:
+            raise ValueError(f"execution_plan buy symbol {symbol} is not selected by any active basket.")
 
 
 class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecutionTestStrategy):

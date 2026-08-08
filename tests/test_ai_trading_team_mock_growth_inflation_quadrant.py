@@ -1,4 +1,5 @@
 import importlib
+import json
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -166,3 +167,194 @@ def test_agent_manager_create_registers_macro_regime_classifier_tool_definition_
 
     assert [tool.name for tool in bound_tools] == ["macro_regime_classifier"]
     assert bound_tools[0].function()["tool"] == "macro_regime_classifier"
+
+
+def test_parse_execution_plan_accepts_multiple_market_buy_orders():
+    module, _strategy_class = load_strategy_module()
+    raw_summary = json.dumps(
+        {
+            "decision": {"type": "rebalance", "reason_brief": "mock portfolio target"},
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 2,
+                        "action": "submit_order",
+                        "symbol": "TIP",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 100,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    },
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "QQQ",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 50,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    },
+                ],
+            },
+        }
+    )
+
+    plan = module.parse_execution_plan_from_portfolio_summary(raw_summary)
+
+    assert plan["intent"] == "rebalance"
+    assert [order["symbol"] for order in plan["orders"]] == ["QQQ", "TIP"]
+    assert [order["quantity"] for order in plan["orders"]] == [50.0, 100.0]
+
+
+@pytest.mark.parametrize(
+    "bad_order, message",
+    [
+        (
+            {
+                "sequence": 1,
+                "symbol": "QQQ",
+                "side": "buy",
+                "quantity_mode": "full_position",
+                "quantity": 1,
+                "order_type": "market",
+            },
+            "semantic quantity_mode",
+        ),
+        (
+            {
+                "sequence": 1,
+                "symbol": "QQQ",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 1.5,
+                "order_type": "market",
+            },
+            "whole-share integer",
+        ),
+        (
+            {
+                "sequence": 1,
+                "symbol": "QQQ",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 1,
+                "order_type": "limit",
+            },
+            "market-only",
+        ),
+        (
+            {
+                "sequence": 1,
+                "symbol": "QQQ",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 1,
+                "order_type": "market",
+                "limit_price": 10,
+            },
+            "must not include limit_price",
+        ),
+    ],
+)
+def test_parse_execution_plan_rejects_non_strict_orders(bad_order, message):
+    module, _strategy_class = load_strategy_module()
+    raw_summary = json.dumps({"execution_plan": {"schema_version": 1, "intent": "rebalance", "orders": [bad_order]}})
+
+    with pytest.raises(ValueError, match=message):
+        module.parse_execution_plan_from_portfolio_summary(raw_summary)
+
+
+def test_parse_execution_plan_rejects_sell_after_buy_sequence():
+    module, _strategy_class = load_strategy_module()
+    raw_summary = json.dumps(
+        {
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "symbol": "QQQ",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 1,
+                        "order_type": "market",
+                    },
+                    {
+                        "sequence": 2,
+                        "symbol": "SPY",
+                        "side": "sell",
+                        "quantity_mode": "shares",
+                        "quantity": 1,
+                        "order_type": "market",
+                    },
+                ],
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="sell orders before buy orders"):
+        module.parse_execution_plan_from_portfolio_summary(raw_summary)
+
+
+def test_validate_plan_symbols_match_selected_basket_reports():
+    module, _strategy_class = load_strategy_module()
+    plan = {
+        "schema_version": 1,
+        "intent": "rebalance",
+        "orders": [
+            {
+                "sequence": 1,
+                "symbol": "QQQ",
+                "side": "buy",
+                "quantity": 10.0,
+                "quantity_mode": "shares",
+                "order_type": "market",
+            },
+            {
+                "sequence": 2,
+                "symbol": "TIP",
+                "side": "buy",
+                "quantity": 10.0,
+                "quantity_mode": "shares",
+                "order_type": "market",
+            },
+        ],
+        "constraints": {"allow_negative_cash": False, "if_any_order_blocked": "stop_remaining_orders"},
+    }
+    basket_reports = [
+        {"basket_id": "equity", "status": "active", "selected_symbol": "QQQ"},
+        {"basket_id": "tips", "status": "active", "selected_symbol": "TIP"},
+        {"basket_id": "commodity", "status": "inactive", "selected_symbol": None},
+    ]
+
+    module.validate_execution_plan_symbols(plan, basket_reports)
+
+
+def test_validate_plan_symbols_rejects_unselected_buy_symbol():
+    module, _strategy_class = load_strategy_module()
+    plan = {
+        "schema_version": 1,
+        "intent": "rebalance",
+        "orders": [
+            {
+                "sequence": 1,
+                "symbol": "FXI",
+                "side": "buy",
+                "quantity": 10.0,
+                "quantity_mode": "shares",
+                "order_type": "market",
+            },
+        ],
+        "constraints": {"allow_negative_cash": False, "if_any_order_blocked": "stop_remaining_orders"},
+    }
+    basket_reports = [{"basket_id": "equity", "status": "active", "selected_symbol": "QQQ"}]
+
+    with pytest.raises(ValueError, match="not selected by any active basket"):
+        module.validate_execution_plan_symbols(plan, basket_reports)
