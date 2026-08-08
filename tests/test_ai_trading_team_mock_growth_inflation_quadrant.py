@@ -9,6 +9,58 @@ from lumibot.components.agents.manager import AgentManager
 from lumibot.components.agents.schemas import ToolDefinition
 
 
+class RecordingAgentManager:
+    def __init__(self):
+        self.created = []
+        self._agents = {}
+        self.summaries = {}
+        self.tool_calls = {}
+
+    def create(self, **kwargs):
+        self.created.append(kwargs)
+        agent = RecordingAgent(kwargs["name"], self.summaries, self.tool_calls)
+        self._agents[kwargs["name"]] = agent
+        return agent
+
+    def __getitem__(self, name):
+        return self._agents[name]
+
+
+class RecordingAgent:
+    def __init__(self, name, summaries=None, tool_calls=None):
+        self.name = name
+        self.summaries = summaries if summaries is not None else {}
+        self.tool_calls = tool_calls if tool_calls is not None else {}
+        self.calls = []
+
+    def run(self, *, task_prompt, context):
+        self.calls.append({"task_prompt": task_prompt, "context": context})
+        summary = self.summaries.get(self.name, f"{self.name} summary")
+        return SimpleNamespace(
+            summary=summary,
+            tool_calls=[
+                SimpleNamespace(tool_name=tool_name)
+                for tool_name in self.tool_calls.get(self.name, [])
+            ],
+        )
+
+
+def make_strategy_with_agent_manager(strategy_class, agent_manager):
+    strategy = object.__new__(strategy_class)
+    strategy.agents = agent_manager
+    strategy.parameters = dict(strategy_class.parameters)
+    strategy.get_datetime = lambda: datetime(2024, 9, 5, 9, 30)
+    strategy.get_cash = lambda: 100000.0
+    strategy.get_portfolio_value = lambda: 100000.0
+    strategy.get_last_price = lambda symbol: 100.0
+    strategy.get_positions = lambda include_cash_positions=False: []
+    return strategy
+
+
+def created_tool_names(created_agent):
+    return {getattr(tool, "name", "") for tool in created_agent.get("tools", [])}
+
+
 def load_strategy_module():
     module = importlib.import_module(
         "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant"
@@ -36,15 +88,108 @@ def test_strategy_initially_subclasses_growth_execution_test_strategy():
     assert issubclass(strategy_class, AITradingTeamGrowthExecutionTestStrategy)
 
 
-def test_strategy_parameters_copy_growth_execution_defaults():
+def test_strategy_parameters_are_mock_quadrant_defaults():
     _module, strategy_class = load_strategy_module()
-    from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
-        AITradingTeamGrowthExecutionTestStrategy,
-    )
 
-    assert strategy_class.parameters == dict(AITradingTeamGrowthExecutionTestStrategy.parameters)
-    assert strategy_class.parameters is not AITradingTeamGrowthExecutionTestStrategy.parameters
-    assert "universe" in strategy_class.parameters
+    assert strategy_class.parameters == {
+        "basket_universes": _module.BASKET_UNIVERSES,
+        "mock_regime_mode": "seeded_random",
+        "mock_regime_seed": 42,
+    }
+    assert strategy_class._execution_agent_base_system_prompt_mode == "execution_minimal"
+
+
+def test_initialize_creates_seven_agent_mock_quadrant_workflow(monkeypatch):
+    _module, strategy_class = load_strategy_module()
+    monkeypatch.setenv("AI_TRADING_TEAM_MODEL", "test-model")
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    assert [agent["name"] for agent in agent_manager.created] == [
+        "macro_allocation_agent",
+        "equity_basket_agent",
+        "commodity_basket_agent",
+        "tips_basket_agent",
+        "nominal_bond_basket_agent",
+        "portfolio_decision_agent",
+        "execution_agent",
+    ]
+    assert [agent["allow_trading"] for agent in agent_manager.created] == [
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert strategy.sleeptime == "1D"
+    assert strategy._mock_regime_mode == "seeded_random"
+    assert strategy._mock_regime_seed == 42
+
+
+def test_agents_receive_distinct_tool_surfaces():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    assert created_tool_names(created["macro_allocation_agent"]) == {"macro_regime_classifier"}
+    for basket_agent in (
+        "equity_basket_agent",
+        "commodity_basket_agent",
+        "tips_basket_agent",
+        "nominal_bond_basket_agent",
+    ):
+        assert created[basket_agent]["include_builtin_tools"] is False
+        assert created_tool_names(created[basket_agent]) == {
+            "market_load_history_tables_summary",
+            "market_last_price",
+        }
+    assert created_tool_names(created["portfolio_decision_agent"]) == {
+        "account_positions",
+        "account_portfolio",
+        "market_last_price",
+    }
+    assert created_tool_names(created["execution_agent"]) == {
+        "account_positions",
+        "account_portfolio",
+        "market_last_price",
+        "orders_open_orders",
+        "orders_submit_order",
+        "orders_confirm_order",
+    }
+    for non_execution_agent in agent_manager.created[:-1]:
+        assert "orders_submit_order" not in created_tool_names(non_execution_agent)
+        assert "orders_confirm_order" not in created_tool_names(non_execution_agent)
+
+
+def test_prompt_boundaries_are_short_and_role_specific():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    serialized = json.dumps(agent_manager.created, default=str).lower()
+    for forbidden_phrase in (
+        "prefer doing nothing",
+        "avoid overtrading",
+        "duckdb",
+        "test turnover",
+        "limit order",
+        "stop loss",
+        "cash_buffer_pct",
+    ):
+        assert forbidden_phrase not in serialized
+    assert "call the mock macro_regime_classifier" in serialized
+    assert "stay inside the assigned basket" in serialized
+    assert "do not redo macro or basket research" in serialized
+    assert "execute only the provided execution_plan" in serialized
 
 
 def test_basket_universes_have_at_least_five_semantically_valid_symbols():

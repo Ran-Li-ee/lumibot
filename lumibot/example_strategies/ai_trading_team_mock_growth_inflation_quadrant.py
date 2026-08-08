@@ -1,10 +1,12 @@
 import hashlib
 import json
 import math
+import os
 from datetime import date as date_type
 from datetime import datetime
 from typing import Any
 
+from lumibot.components.agents.builtins import BuiltinTools
 from lumibot.components.agents.schemas import BoundTool, ToolDefinition
 from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
     AITradingTeamGrowthExecutionTestStrategy,
@@ -22,6 +24,13 @@ BASKET_UNIVERSES = {
     "commodity": ["GLD", "SLV", "DBC", "PDBC", "GSG"],
     "tips": ["TIP", "SCHP", "VTIP", "STIP", "LTPZ"],
     "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
+}
+
+BASKET_AGENT_NAMES = {
+    "equity": "equity_basket_agent",
+    "commodity": "commodity_basket_agent",
+    "tips": "tips_basket_agent",
+    "nominal_bond": "nominal_bond_basket_agent",
 }
 
 MOCK_WEIGHT_BY_REGIME = {
@@ -372,4 +381,84 @@ def validate_execution_plan_symbols(execution_plan: dict[str, Any], basket_repor
 
 
 class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecutionTestStrategy):
-    parameters = dict(AITradingTeamGrowthExecutionTestStrategy.parameters)
+    parameters = {
+        "basket_universes": BASKET_UNIVERSES,
+        "mock_regime_mode": "seeded_random",
+        "mock_regime_seed": 42,
+    }
+    _execution_agent_base_system_prompt_mode = "execution_minimal"
+
+    def initialize(self):
+        self.sleeptime = "1D"
+        self._mock_regime_mode = self.parameters.get("mock_regime_mode", "seeded_random")
+        self._mock_regime_seed = int(self.parameters.get("mock_regime_seed", 42))
+        self._last_mock_regime = None
+        model = os.environ.get("AI_TRADING_TEAM_MODEL", "gemini-3.1-flash-lite")
+
+        self.agents.create(
+            name="macro_allocation_agent",
+            model=model,
+            allow_trading=False,
+            include_builtin_tools=False,
+            tools=[make_macro_regime_classifier_tool()],
+            system_prompt=(
+                "Macro allocation role: call the mock macro_regime_classifier and return the regime, "
+                "basket weights, and a compact allocation note. Do not place orders."
+            ),
+        )
+
+        basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
+        for basket_id, agent_name in BASKET_AGENT_NAMES.items():
+            symbols = ", ".join(basket_universes[basket_id])
+            self.agents.create(
+                name=agent_name,
+                model=model,
+                allow_trading=False,
+                include_builtin_tools=False,
+                tools=[
+                    BuiltinTools.market.load_history_tables_summary(),
+                    BuiltinTools.market.last_price(),
+                ],
+                system_prompt=(
+                    f"{basket_id.replace('_', ' ').title()} basket role: stay inside the assigned basket "
+                    f"({symbols}). Select one symbol when active, or report inactive when its target weight is "
+                    "zero. Return basket_id, selected_symbol, status, and reason_brief. Do not place orders."
+                ),
+            )
+
+        self.agents.create(
+            name="portfolio_decision_agent",
+            model=model,
+            allow_trading=False,
+            include_builtin_tools=False,
+            tools=[
+                BuiltinTools.account.positions(),
+                BuiltinTools.account.portfolio(),
+                BuiltinTools.market.last_price(),
+            ],
+            system_prompt=(
+                "Portfolio decision role: do not redo macro or basket research. Convert provided basket reports "
+                "and account state into one JSON object with decision and execution_plan. Use explicit whole-share "
+                "market orders only. Do not place orders."
+            ),
+        )
+
+        self.agents.create(
+            name="execution_agent",
+            model=model,
+            allow_trading=True,
+            base_system_prompt_mode=self._execution_agent_base_system_prompt_mode,
+            include_builtin_tools=False,
+            tools=[
+                BuiltinTools.account.positions(),
+                BuiltinTools.account.portfolio(),
+                BuiltinTools.market.last_price(),
+                BuiltinTools.orders.open_orders(),
+                BuiltinTools.orders.submit(),
+                BuiltinTools.orders.confirm(),
+            ],
+            system_prompt=(
+                "Execution role: execute only the provided execution_plan using the listed order tools. "
+                "Follow sequence order, confirm each submitted order, stop on blockers, and report outcomes."
+            ),
+        )
