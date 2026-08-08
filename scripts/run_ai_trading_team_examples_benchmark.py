@@ -1,12 +1,14 @@
 """Run paid README-window backtests for the AI trading team examples."""
 
 import argparse
+import importlib
 import json
 import os
 import re
 import sys
 import time
 import traceback
+from collections.abc import Iterator, Mapping, MutableMapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -19,42 +21,79 @@ os.environ.setdefault("BACKTESTING_DATA_SOURCE", "none")
 os.environ.setdefault("LUMIBOT_DISABLE_DOTENV", "1")
 os.environ.setdefault("LUMIBOT_DISABLE_BACKTEST_PERFORMANCE_TRACKING", "1")
 
-from lumibot.example_strategies.ai_trading_team_bill_ackman_concentrated import (  # noqa: E402
-    AITradingTeamBillAckmanConcentratedStrategy,
-)
-from lumibot.example_strategies.ai_trading_team_bull_bear_large_cap_stocks import (  # noqa: E402
-    AITradingTeamBullBearLargeCapStocksStrategy,
-)
-from lumibot.example_strategies.ai_trading_team_bull_bear_leveraged_etf import (  # noqa: E402
-    AITradingTeamBullBearLeveragedETFStrategy,
-)
-from lumibot.example_strategies.ai_trading_team_citadel_sector_pods import (  # noqa: E402
-    AITradingTeamCitadelSectorPodsStrategy,
-)
-from lumibot.example_strategies.ai_trading_team_growth_execution_test import (  # noqa: E402
-    AITradingTeamGrowthExecutionTestStrategy,
-)
-from lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant import (  # noqa: E402
-    AITradingTeamMockGrowthInflationQuadrantStrategy,
-)
-from lumibot.example_strategies.ai_trading_team_ray_dalio_idea_meritocracy import (  # noqa: E402
-    AITradingTeamRayDalioIdeaMeritocracyStrategy,
-)
-from lumibot.example_strategies.ai_trading_team_warren_buffett_value import (  # noqa: E402
-    AITradingTeamWarrenBuffettValueStrategy,
-)
-
 ARTIFACT_ROOT = Path("artifacts") / "ai_trading_team_example_benchmarks"
-STRATEGIES = {
-    "bull-bear-leveraged-etf": AITradingTeamBullBearLeveragedETFStrategy,
-    "bull-bear-large-cap-stocks": AITradingTeamBullBearLargeCapStocksStrategy,
-    "ray-dalio-idea-meritocracy": AITradingTeamRayDalioIdeaMeritocracyStrategy,
-    "warren-buffett-value": AITradingTeamWarrenBuffettValueStrategy,
-    "bill-ackman-concentrated": AITradingTeamBillAckmanConcentratedStrategy,
-    "citadel-sector-pods": AITradingTeamCitadelSectorPodsStrategy,
-    "growth-execution-test": AITradingTeamGrowthExecutionTestStrategy,
-    "mock-growth-inflation-quadrant": AITradingTeamMockGrowthInflationQuadrantStrategy,
-}
+
+
+class _LazyStrategyRegistry(MutableMapping[str, type]):
+    def __init__(self, specs: Mapping[str, tuple[str, str]]):
+        self._specs = dict(specs)
+        self._cache: dict[str, type] = {}
+
+    def __getitem__(self, name: str) -> type:
+        if name not in self._specs:
+            raise KeyError(name)
+        if name not in self._cache:
+            module_path, class_name = self._specs[name]
+            module = importlib.import_module(module_path)
+            self._cache[name] = getattr(module, class_name)
+        return self._cache[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._specs)
+
+    def __len__(self) -> int:
+        return len(self._specs)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._specs
+
+    def __setitem__(self, name: str, strategy_class: type) -> None:
+        self._specs[name] = ("", "")
+        self._cache[name] = strategy_class
+
+    def __delitem__(self, name: str) -> None:
+        if name not in self._specs:
+            raise KeyError(name)
+        del self._specs[name]
+        self._cache.pop(name, None)
+
+
+STRATEGIES = _LazyStrategyRegistry(
+    {
+        "bull-bear-leveraged-etf": (
+            "lumibot.example_strategies.ai_trading_team_bull_bear_leveraged_etf",
+            "AITradingTeamBullBearLeveragedETFStrategy",
+        ),
+        "bull-bear-large-cap-stocks": (
+            "lumibot.example_strategies.ai_trading_team_bull_bear_large_cap_stocks",
+            "AITradingTeamBullBearLargeCapStocksStrategy",
+        ),
+        "ray-dalio-idea-meritocracy": (
+            "lumibot.example_strategies.ai_trading_team_ray_dalio_idea_meritocracy",
+            "AITradingTeamRayDalioIdeaMeritocracyStrategy",
+        ),
+        "warren-buffett-value": (
+            "lumibot.example_strategies.ai_trading_team_warren_buffett_value",
+            "AITradingTeamWarrenBuffettValueStrategy",
+        ),
+        "bill-ackman-concentrated": (
+            "lumibot.example_strategies.ai_trading_team_bill_ackman_concentrated",
+            "AITradingTeamBillAckmanConcentratedStrategy",
+        ),
+        "citadel-sector-pods": (
+            "lumibot.example_strategies.ai_trading_team_citadel_sector_pods",
+            "AITradingTeamCitadelSectorPodsStrategy",
+        ),
+        "growth-execution-test": (
+            "lumibot.example_strategies.ai_trading_team_growth_execution_test",
+            "AITradingTeamGrowthExecutionTestStrategy",
+        ),
+        "mock-growth-inflation-quadrant": (
+            "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant",
+            "AITradingTeamMockGrowthInflationQuadrantStrategy",
+        ),
+    }
+)
 
 
 def _required_key_options(model: str) -> list[str]:

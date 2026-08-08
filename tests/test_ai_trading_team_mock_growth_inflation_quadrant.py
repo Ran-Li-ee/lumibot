@@ -112,6 +112,18 @@ def test_examples_benchmark_main_uses_model_specific_key_gate(monkeypatch):
 def test_examples_benchmark_import_does_not_require_backtesting_stack(monkeypatch):
     sys.modules.pop("scripts.run_ai_trading_team_examples_benchmark", None)
     sys.modules.pop("scripts.run_ai_committee_provider_benchmark", None)
+    strategy_modules = (
+        "lumibot.example_strategies.ai_trading_team_bill_ackman_concentrated",
+        "lumibot.example_strategies.ai_trading_team_bull_bear_large_cap_stocks",
+        "lumibot.example_strategies.ai_trading_team_bull_bear_leveraged_etf",
+        "lumibot.example_strategies.ai_trading_team_citadel_sector_pods",
+        "lumibot.example_strategies.ai_trading_team_growth_execution_test",
+        "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant",
+        "lumibot.example_strategies.ai_trading_team_ray_dalio_idea_meritocracy",
+        "lumibot.example_strategies.ai_trading_team_warren_buffett_value",
+    )
+    for module_name in strategy_modules:
+        sys.modules.pop(module_name, None)
     real_import = __import__
 
     def fail_optional_backtesting_import(name, *args, **kwargs):
@@ -124,6 +136,7 @@ def test_examples_benchmark_import_does_not_require_backtesting_stack(monkeypatc
     benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
 
     assert "mock-growth-inflation-quadrant" in benchmark.STRATEGIES
+    assert all(module_name not in sys.modules for module_name in strategy_modules)
 
 
 def test_regimes_are_exact_growth_inflation_quadrants():
