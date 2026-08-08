@@ -3,7 +3,7 @@ from datetime import date as date_type
 from datetime import datetime
 from typing import Any
 
-from lumibot.components.agents.schemas import BoundTool
+from lumibot.components.agents.schemas import BoundTool, ToolDefinition
 from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
     AITradingTeamGrowthExecutionTestStrategy,
 )
@@ -107,36 +107,43 @@ def mock_macro_regime_classifier(
     }
 
 
-def make_macro_regime_classifier_tool(strategy: Any) -> BoundTool:
-    def macro_regime_classifier(
-        *,
-        date: str | None = None,
-        seed: int | None = None,
-        mode: str | None = None,
-    ) -> dict[str, Any]:
-        resolved_date = date or strategy.get_datetime().date().isoformat()
-        resolved_seed = int(seed if seed is not None else getattr(strategy, "_mock_regime_seed", 42))
-        resolved_mode = mode or getattr(strategy, "_mock_regime_mode", "seeded_random")
-        previous_regime = getattr(strategy, "_last_mock_regime", None)
-        result = mock_macro_regime_classifier(
-            date=resolved_date,
-            seed=resolved_seed,
-            mode=resolved_mode,
-            previous_regime=previous_regime,
-        )
-        strategy._last_mock_regime = result["regime"]
-        return result
-
-    return BoundTool(
-        name="macro_regime_classifier",
-        description=(
-            "Return a deterministic mock Growth / Inflation quadrant and basket weights for workflow testing. "
-            "This tool does not perform real macro analysis."
-        ),
-        function=macro_regime_classifier,
-        source="local",
-        metadata={"kind": "mock_macro", "mock": True},
+def make_macro_regime_classifier_tool() -> ToolDefinition:
+    name = "macro_regime_classifier"
+    description = (
+        "Return a deterministic mock Growth / Inflation quadrant and basket weights for workflow testing. "
+        "This tool does not perform real macro analysis."
     )
+    metadata = {"kind": "mock_macro", "mock": True}
+
+    def binder(strategy: Any, manager: Any) -> BoundTool:
+        def macro_regime_classifier(
+            *,
+            date: str | None = None,
+            seed: int | None = None,
+            mode: str | None = None,
+        ) -> dict[str, Any]:
+            resolved_date = date or strategy.get_datetime().date().isoformat()
+            resolved_seed = int(seed if seed is not None else getattr(strategy, "_mock_regime_seed", 42))
+            resolved_mode = mode or getattr(strategy, "_mock_regime_mode", "seeded_random")
+            previous_regime = getattr(strategy, "_last_mock_regime", None)
+            result = mock_macro_regime_classifier(
+                date=resolved_date,
+                seed=resolved_seed,
+                mode=resolved_mode,
+                previous_regime=previous_regime,
+            )
+            strategy._last_mock_regime = result["regime"]
+            return result
+
+        return BoundTool(
+            name=name,
+            description=description,
+            function=macro_regime_classifier,
+            source="local",
+            metadata=metadata,
+        )
+
+    return ToolDefinition(name=name, description=description, binder=binder, metadata=metadata)
 
 
 class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecutionTestStrategy):

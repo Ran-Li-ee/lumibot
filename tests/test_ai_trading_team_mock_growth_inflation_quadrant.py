@@ -4,6 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from lumibot.components.agents.manager import AgentManager
+from lumibot.components.agents.schemas import ToolDefinition
+
 
 def load_strategy_module():
     module = importlib.import_module(
@@ -111,7 +114,7 @@ def test_mock_regime_classifier_reports_previous_regime_and_change_flag():
     assert result["regime_changed"] == (result["regime"] != "growth_up_inflation_down")
 
 
-def test_make_macro_regime_classifier_tool_returns_bound_tool_and_updates_previous_regime():
+def test_make_macro_regime_classifier_tool_returns_definition_that_binds_stateful_tool():
     module, _strategy_class = load_strategy_module()
     strategy = SimpleNamespace(
         _last_mock_regime=None,
@@ -120,13 +123,46 @@ def test_make_macro_regime_classifier_tool_returns_bound_tool_and_updates_previo
         get_datetime=lambda: datetime(2024, 9, 5, 9, 30),
     )
 
-    tool = module.make_macro_regime_classifier_tool(strategy)
-    first = tool.function()
-    second = tool.function(date="2024-09-06")
+    tool_definition = module.make_macro_regime_classifier_tool()
+    tool = tool_definition.binder(strategy, None)
 
+    assert isinstance(tool_definition, ToolDefinition)
+    assert tool_definition.name == "macro_regime_classifier"
+    assert "deterministic mock Growth / Inflation quadrant" in tool_definition.description
+    assert tool_definition.metadata == {"kind": "mock_macro", "mock": True}
     assert tool.name == "macro_regime_classifier"
     assert "deterministic mock Growth / Inflation quadrant" in tool.description
     assert tool.metadata == {"kind": "mock_macro", "mock": True}
+    assert tool.source == "local"
+
+    first = tool.function()
+    second = tool.function(date="2024-09-06")
+
     assert first["previous_regime"] is None
     assert second["previous_regime"] == first["regime"]
     assert strategy._last_mock_regime == second["regime"]
+
+
+def test_agent_manager_create_registers_macro_regime_classifier_tool_definition_by_name():
+    module, _strategy_class = load_strategy_module()
+    strategy = SimpleNamespace(
+        parameters={},
+        _last_mock_regime=None,
+        _mock_regime_mode="cycle",
+        _mock_regime_seed=7,
+        get_datetime=lambda: datetime(2024, 9, 5, 9, 30),
+    )
+    manager = AgentManager(strategy)
+    tool_definition = module.make_macro_regime_classifier_tool()
+
+    handle = manager.create(
+        name="macro_agent",
+        system_prompt="Use local macro regime classifier.",
+        model="test-model",
+        tools=[tool_definition],
+        include_builtin_tools=False,
+    )
+    bound_tools = handle._ensure_bound_tools()
+
+    assert [tool.name for tool in bound_tools] == ["macro_regime_classifier"]
+    assert bound_tools[0].function()["tool"] == "macro_regime_classifier"
