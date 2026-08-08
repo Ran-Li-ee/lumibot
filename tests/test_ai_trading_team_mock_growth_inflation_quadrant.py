@@ -260,6 +260,8 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "call the mock macro_regime_classifier" in serialized
     assert "stay inside the assigned basket" in serialized
     assert "do not redo macro or basket research" in serialized
+    assert "before any non-hold plan, call account_positions and account_portfolio" in serialized
+    assert "before sizing any buy order, call market_last_price" in serialized
     assert "execute only the provided execution_plan" in serialized
 
 

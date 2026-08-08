@@ -465,8 +465,10 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             ],
             system_prompt=(
                 "Portfolio decision role: do not redo macro or basket research. Convert provided basket reports "
-                "and account state into one JSON object with decision and execution_plan. Use explicit whole-share "
-                "market orders only. Do not place orders."
+                "and current account state into one JSON object with decision and execution_plan. Before any "
+                "non-hold plan, call account_positions and account_portfolio; before sizing any buy order, call "
+                "market_last_price for the symbols being bought. Use explicit whole-share market orders only. "
+                "Do not place orders."
             ),
         )
 
