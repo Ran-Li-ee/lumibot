@@ -380,6 +380,31 @@ def validate_execution_plan_symbols(execution_plan: dict[str, Any], basket_repor
             raise ValueError(f"execution_plan buy symbol {symbol} is not selected by any active basket.")
 
 
+def _parse_json_summary(summary: str, label: str) -> dict[str, Any]:
+    try:
+        return json.loads(_extract_first_json_object(summary))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} JSON is invalid: {exc.msg}") from exc
+
+
+def _agent_result_tool_names(result: Any) -> set[str]:
+    return {event.tool_name for event in getattr(result, "tool_calls", []) if getattr(event, "tool_name", None)}
+
+
+def validate_portfolio_decision_tool_evidence(execution_plan: dict[str, Any], decision_result: Any) -> None:
+    if execution_plan["intent"] == "hold":
+        return
+    tool_names = _agent_result_tool_names(decision_result)
+    missing = sorted({"account_positions", "account_portfolio"} - tool_names)
+    if missing:
+        raise ValueError(
+            "portfolio_decision_agent must call account tools before non-hold plan; "
+            f"missing: {', '.join(missing)}"
+        )
+    if any(order["side"] == "buy" for order in execution_plan["orders"]) and "market_last_price" not in tool_names:
+        raise ValueError("portfolio_decision_agent must call market_last_price before buy sizing.")
+
+
 class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecutionTestStrategy):
     parameters = {
         "basket_universes": BASKET_UNIVERSES,
@@ -461,4 +486,78 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
                 "Execution role: execute only the provided execution_plan using the listed order tools. "
                 "Follow sequence order, confirm each submitted order, stop on blockers, and report outcomes."
             ),
+        )
+
+    def on_trading_iteration(self):
+        current_date = self.get_datetime().date().isoformat()
+        basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
+
+        try:
+            macro_result = self.agents["macro_allocation_agent"].run(
+                task_prompt=(
+                    "Run the mock macro allocation step and return one JSON object with regime, "
+                    "basket_weights, mock flag, regime_changed, and reason_brief."
+                ),
+                context={
+                    "date": current_date,
+                    "mock_regime_mode": self._mock_regime_mode,
+                    "mock_regime_seed": self._mock_regime_seed,
+                    "basket_universes": basket_universes,
+                },
+            )
+            macro_report = _parse_json_summary(macro_result.summary, "macro_allocation_agent")
+
+            basket_reports_by_id = {}
+            basket_weights = _require_dict(macro_report.get("basket_weights", {}), "macro basket_weights")
+            for basket_id, agent_name in BASKET_AGENT_NAMES.items():
+                basket_result = self.agents[agent_name].run(
+                    task_prompt=(
+                        "Review only the assigned basket and return one JSON object with basket_id, "
+                        "target_weight, status, candidate_symbols, selected_symbol, and reason_brief."
+                    ),
+                    context={
+                        "date": current_date,
+                        "basket_id": basket_id,
+                        "basket_symbols": basket_universes[basket_id],
+                        "target_weight": float(basket_weights.get(basket_id, 0.0)),
+                        "macro_allocation_report": macro_report,
+                    },
+                )
+                basket_reports_by_id[basket_id] = _parse_json_summary(basket_result.summary, agent_name)
+
+            portfolio_result = self.agents["portfolio_decision_agent"].run(
+                task_prompt=(
+                    "Create the target portfolio and execution_plan from the provided macro and basket reports. "
+                    "Return one JSON object with decision, target_portfolio, and execution_plan."
+                ),
+                context={
+                    "date": current_date,
+                    "macro_allocation_report": macro_report,
+                    "equity_basket_report": basket_reports_by_id["equity"],
+                    "commodity_basket_report": basket_reports_by_id["commodity"],
+                    "tips_basket_report": basket_reports_by_id["tips"],
+                    "nominal_bond_basket_report": basket_reports_by_id["nominal_bond"],
+                },
+            )
+            execution_plan = parse_execution_plan_from_portfolio_summary(portfolio_result.summary)
+            validate_portfolio_decision_tool_evidence(execution_plan, portfolio_result)
+            validate_execution_plan_symbols(execution_plan, list(basket_reports_by_id.values()))
+        except ValueError as exc:
+            self._last_execution_plan_error = str(exc)
+            print(f"Mock quadrant workflow blocked: {exc}")
+            return
+
+        self._last_execution_plan_error = None
+        if execution_plan["intent"] == "hold" or not execution_plan["orders"]:
+            return
+
+        self.agents["execution_agent"].run(
+            task_prompt=(
+                "Execute only the provided execution_plan. Follow sequence order, use order tools only, "
+                "confirm submitted orders, and stop if any order is blocked."
+            ),
+            context={
+                "date": current_date,
+                "execution_plan": execution_plan,
+            },
         )

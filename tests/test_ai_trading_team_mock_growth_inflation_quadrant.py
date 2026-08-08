@@ -503,3 +503,168 @@ def test_validate_plan_symbols_rejects_unselected_buy_symbol():
 
     with pytest.raises(ValueError, match="not selected by any active basket"):
         module.validate_execution_plan_symbols(plan, basket_reports)
+
+
+def _json_summary(payload):
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def test_on_trading_iteration_runs_macro_four_baskets_portfolio_then_execution():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+
+    macro_report = {
+        "agent": "macro_allocation_agent",
+        "regime": "growth_up_inflation_down",
+        "regime_changed": True,
+        "basket_weights": {"equity": 0.50, "commodity": 0.00, "tips": 0.25, "nominal_bond": 0.25},
+        "mock": True,
+        "reason_brief": "mock",
+    }
+    basket_reports = {
+        "equity_basket_agent": {
+            "basket_id": "equity",
+            "target_weight": 0.50,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["equity"],
+            "selected_symbol": "QQQ",
+            "reason_brief": "selected",
+        },
+        "commodity_basket_agent": {
+            "basket_id": "commodity",
+            "target_weight": 0.00,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["commodity"],
+            "selected_symbol": None,
+            "reason_brief": "inactive",
+        },
+        "tips_basket_agent": {
+            "basket_id": "tips",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["tips"],
+            "selected_symbol": "TIP",
+            "reason_brief": "selected",
+        },
+        "nominal_bond_basket_agent": {
+            "basket_id": "nominal_bond",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["nominal_bond"],
+            "selected_symbol": "IEF",
+            "reason_brief": "selected",
+        },
+    }
+    portfolio_summary = {
+        "decision": {"type": "rebalance", "reason_brief": "mock target"},
+        "target_portfolio": [
+            {"basket_id": "equity", "symbol": "QQQ", "target_weight": 0.50},
+            {"basket_id": "tips", "symbol": "TIP", "target_weight": 0.25},
+            {"basket_id": "nominal_bond", "symbol": "IEF", "target_weight": 0.25},
+        ],
+        "execution_plan": {
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "symbol": "QQQ",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 100,
+                    "order_type": "market",
+                },
+                {
+                    "sequence": 2,
+                    "symbol": "TIP",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 50,
+                    "order_type": "market",
+                },
+                {
+                    "sequence": 3,
+                    "symbol": "IEF",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 50,
+                    "order_type": "market",
+                },
+            ],
+        },
+    }
+
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    for agent_name, report in basket_reports.items():
+        agent_manager.summaries[agent_name] = _json_summary(report)
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary(portfolio_summary)
+    agent_manager.tool_calls["portfolio_decision_agent"] = [
+        "account_positions",
+        "account_portfolio",
+        "market_last_price",
+    ]
+
+    strategy.on_trading_iteration()
+
+    assert [agent_name for agent_name, agent in agent_manager._agents.items() if agent.calls] == [
+        "macro_allocation_agent",
+        "equity_basket_agent",
+        "commodity_basket_agent",
+        "tips_basket_agent",
+        "nominal_bond_basket_agent",
+        "portfolio_decision_agent",
+        "execution_agent",
+    ]
+    macro_context = agent_manager["macro_allocation_agent"].calls[0]["context"]
+    assert macro_context["date"] == "2024-09-05"
+    assert macro_context["mock_regime_mode"] == "seeded_random"
+    assert macro_context["mock_regime_seed"] == 42
+
+    commodity_context = agent_manager["commodity_basket_agent"].calls[0]["context"]
+    assert commodity_context["basket_id"] == "commodity"
+    assert commodity_context["basket_symbols"] == module.BASKET_UNIVERSES["commodity"]
+    assert commodity_context["target_weight"] == 0.0
+    assert commodity_context["macro_allocation_report"] == macro_report
+
+    portfolio_context = agent_manager["portfolio_decision_agent"].calls[0]["context"]
+    assert portfolio_context["macro_allocation_report"] == macro_report
+    assert portfolio_context["equity_basket_report"] == basket_reports["equity_basket_agent"]
+    assert portfolio_context["commodity_basket_report"] == basket_reports["commodity_basket_agent"]
+    assert portfolio_context["tips_basket_report"] == basket_reports["tips_basket_agent"]
+    assert portfolio_context["nominal_bond_basket_report"] == basket_reports["nominal_bond_basket_agent"]
+
+    execution_context = agent_manager["execution_agent"].calls[0]["context"]
+    assert set(execution_context) == {"date", "execution_plan"}
+    assert [order["symbol"] for order in execution_context["execution_plan"]["orders"]] == ["QQQ", "TIP", "IEF"]
+    assert "macro_allocation_report" not in execution_context
+    assert "equity_basket_report" not in execution_context
+
+
+def test_hold_plan_skips_execution_agent():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(
+        {"basket_weights": {"equity": 0.0, "commodity": 0.0, "tips": 0.0, "nominal_bond": 0.0}}
+    )
+    for agent_name, basket_id in {
+        "equity_basket_agent": "equity",
+        "commodity_basket_agent": "commodity",
+        "tips_basket_agent": "tips",
+        "nominal_bond_basket_agent": "nominal_bond",
+    }.items():
+        agent_manager.summaries[agent_name] = _json_summary(
+            {"basket_id": basket_id, "target_weight": 0.0, "status": "inactive", "selected_symbol": None}
+        )
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary(
+        {"execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}}
+    )
+
+    strategy.on_trading_iteration()
+
+    assert agent_manager["portfolio_decision_agent"].calls
+    assert agent_manager["execution_agent"].calls == []
