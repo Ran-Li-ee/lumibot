@@ -407,6 +407,7 @@ def validate_execution_plan_matches_planner_result(strategy: Any, execution_plan
     if not isinstance(planner_result, dict):
         raise ValueError("portfolio_decision_agent must call target_portfolio_to_execution_plan before execution.")
     planner_plan = normalize_execution_plan(planner_result.get("execution_plan"))
+    execution_plan = normalize_execution_plan(execution_plan)
     if execution_plan != planner_plan:
         raise ValueError(
             "portfolio_decision_agent execution_plan differs from target_portfolio_to_execution_plan result."

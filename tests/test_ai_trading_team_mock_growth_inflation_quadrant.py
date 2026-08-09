@@ -518,6 +518,47 @@ def test_validate_execution_plan_matches_planner_result_accepts_exact_tool_plan(
     module.validate_execution_plan_matches_planner_result(strategy, execution_plan)
 
 
+def test_validate_execution_plan_matches_planner_result_accepts_equivalent_unnormalized_plan():
+    module, _strategy_class = load_strategy_module()
+    strategy = SimpleNamespace(
+        _last_target_portfolio_planner_result={
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 10,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            }
+        }
+    )
+    execution_plan = {
+        "schema_version": "1.0",
+        "intent": "REBALANCE",
+        "orders": [
+            {
+                "sequence": 1,
+                "action": "SUBMIT_ORDER",
+                "symbol": " spy ",
+                "side": "BUY",
+                "quantity": 10,
+                "order_type": "MARKET",
+            }
+        ],
+    }
+
+    module.validate_execution_plan_matches_planner_result(strategy, execution_plan)
+
+
 def test_validate_execution_plan_matches_planner_result_rejects_llm_rewrite():
     module, _strategy_class = load_strategy_module()
     strategy = SimpleNamespace(
