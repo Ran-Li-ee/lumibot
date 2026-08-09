@@ -55,7 +55,10 @@ def _get_positions(strategy: Any) -> list[Any]:
 
 
 def _get_cash(strategy: Any) -> Decimal:
-    return _decimal(strategy.get_cash(), "cash")
+    cash = _decimal(strategy.get_cash(), "cash")
+    if cash < 0:
+        raise ValueError("cash must be non-negative.")
+    return cash
 
 
 def _get_portfolio_value(strategy: Any) -> Decimal:
@@ -123,6 +126,8 @@ def _current_positions_by_symbol(strategy: Any) -> dict[str, Decimal]:
         if symbol in QUOTE_SYMBOLS:
             continue
         quantity = _position_quantity(position)
+        if quantity < 0:
+            raise ValueError("negative position quantity is not supported.")
         if quantity == 0:
             continue
         positions[symbol] = positions.get(symbol, Decimal("0")) + quantity
@@ -218,6 +223,9 @@ def target_portfolio_to_execution_plan(
                 reason_code = "exit_removed_symbol"
                 estimated_sell_proceeds += Decimal(planned_quantity) * current_price
                 sell_candidates.append((1, symbol, planned_quantity))
+                residual_quantity = current_quantity - Decimal(planned_quantity)
+                if residual_quantity > 0:
+                    warnings.append(f"{symbol}: full exit leaves fractional residual smaller than one share.")
             else:
                 reason_code = "rounding_no_sell"
                 warnings.append(f"{symbol}: exit quantity is smaller than one share.")
@@ -259,6 +267,7 @@ def target_portfolio_to_execution_plan(
     projected_cash = cash_before + estimated_sell_proceeds
     estimated_buy_cost = Decimal("0")
     planned_buy_quantities: dict[str, int] = {}
+    diagnostics_by_symbol = {row["symbol"]: row for row in diagnostics}
     for _group, symbol, desired_buy_value, _reason_code in sorted(
         buy_candidates, key=lambda item: (item[0], item[1])
     ):
@@ -266,9 +275,14 @@ def target_portfolio_to_execution_plan(
         spendable = min(desired_buy_value, projected_cash)
         quantity = int(math.floor(spendable / current_price))
         if quantity <= 0:
+            diagnostic = diagnostics_by_symbol[symbol]
+            diagnostic["planned_side"] = None
+            diagnostic["planned_quantity"] = 0
             if desired_buy_value < current_price:
+                diagnostic["reason_code"] = "rounding_no_buy"
                 warnings.append(f"{symbol}: underweight delta is smaller than one share.")
             else:
+                diagnostic["reason_code"] = "insufficient_cash_no_buy"
                 warnings.append(f"{symbol}: projected cash is insufficient to buy one share.")
             continue
 

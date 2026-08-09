@@ -1083,6 +1083,10 @@ def test_target_portfolio_to_execution_plan_holds_when_whole_share_rounding_prod
         and ("insufficient to buy one share" in warning or "smaller than one share" in warning)
         for warning in warnings
     )
+    diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
+    assert diagnostics["VGIT"]["reason_code"] == "rounding_no_buy"
+    assert diagnostics["VGIT"]["planned_side"] is None
+    assert diagnostics["VGIT"]["planned_quantity"] == 0
 
 
 def test_target_portfolio_to_execution_plan_warns_instead_of_selling_zero_shares_for_subshare_exit():
@@ -1104,6 +1108,84 @@ def test_target_portfolio_to_execution_plan_warns_instead_of_selling_zero_shares
     assert any("ABC" in warning and "smaller than one share" in warning for warning in result["warnings"])
     diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
     assert diagnostics["ABC"]["reason_code"] == "rounding_no_sell"
+    assert diagnostics["ABC"]["planned_quantity"] == 0
+
+
+def test_target_portfolio_to_execution_plan_rejects_negative_cash():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[],
+        cash=-1,
+        portfolio_value=100000,
+        prices={},
+    )
+
+    with pytest.raises(ValueError, match="cash must be non-negative"):
+        planner.target_portfolio_to_execution_plan(
+            strategy,
+            date="2024-09-06",
+            target_portfolio=[],
+        )
+
+
+def test_target_portfolio_to_execution_plan_rejects_short_positions():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[make_position("ABC", -2)],
+        cash=1000,
+        portfolio_value=100000,
+        prices={"ABC": 100},
+    )
+
+    with pytest.raises(ValueError, match="negative position quantity is not supported"):
+        planner.target_portfolio_to_execution_plan(
+            strategy,
+            date="2024-09-06",
+            target_portfolio=[],
+        )
+
+
+def test_target_portfolio_to_execution_plan_warns_about_fractional_exit_residual():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[make_position("ABC", 1.5)],
+        cash=0,
+        portfolio_value=150,
+        prices={"ABC": 100},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[],
+    )
+
+    assert [(order["side"], order["symbol"], order["quantity"]) for order in result["execution_plan"]["orders"]] == [
+        ("sell", "ABC", 1)
+    ]
+    assert any("ABC" in warning and "fractional residual" in warning for warning in result["warnings"])
+
+
+def test_target_portfolio_to_execution_plan_marks_no_buy_when_cash_is_insufficient():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[],
+        cash=25,
+        portfolio_value=100000,
+        prices={"ABC": 100},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[{"symbol": "ABC", "target_weight": 0.01}],
+    )
+
+    assert result["execution_plan"] == {"schema_version": 1, "intent": "hold", "orders": []}
+    assert any("ABC" in warning and "insufficient to buy one share" in warning for warning in result["warnings"])
+    diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
+    assert diagnostics["ABC"]["reason_code"] == "insufficient_cash_no_buy"
+    assert diagnostics["ABC"]["planned_side"] is None
     assert diagnostics["ABC"]["planned_quantity"] == 0
 
 
