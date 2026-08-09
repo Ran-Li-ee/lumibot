@@ -777,6 +777,17 @@ def test_builtin_order_tools_expose_preflight_definition():
     assert callable(tool.binder)
 
 
+def test_submit_order_description_mentions_preflight_readiness_path():
+    strategy = _Strategy()
+    manager = AgentManager(strategy)
+
+    tool = BuiltinTools.orders.submit().binder(strategy, manager)
+
+    assert "inspect readiness" in tool.description
+    assert "Prefer orders_preflight_check when available" in tool.description
+    assert "ORDER_READINESS_REQUIRED" in tool.description
+
+
 def test_builtin_tools_all_includes_orders_preflight_check():
     assert "orders_preflight_check" in {tool.name for tool in BuiltinTools.all()}
 
@@ -1011,6 +1022,20 @@ def test_orders_preflight_check_does_not_authorize_different_quantity_submit():
 
     preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
     submit_result = tool_map["orders_submit_order"](symbol="SPY", quantity=2, side="buy")
+
+    assert preflight_result["can_submit"] is True
+    assert submit_result["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in submit_result["error"]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_agent_order_tool_rejects_after_preflight_for_different_symbol():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0, "QQQ": 200.0}
+    tool_map = _wrap_preflight_and_submit_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    submit_result = tool_map["orders_submit_order"](symbol="QQQ", quantity=1, side="buy")
 
     assert preflight_result["can_submit"] is True
     assert submit_result["tool_error"] is True
