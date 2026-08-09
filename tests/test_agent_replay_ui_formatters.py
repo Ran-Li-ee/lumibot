@@ -232,6 +232,57 @@ def test_orders_submit_order_formatter_extracts_nested_order_payload():
     assert "{'symbol'" not in text
 
 
+def test_orders_preflight_check_formatter_explains_ready_order():
+    text = explain_tool_result(
+        "orders_preflight_check",
+        {},
+        {
+            "readiness": "ready",
+            "can_submit": True,
+            "order": {"symbol": "SPY", "side": "buy", "quantity": 3},
+            "account": {"cash": 1000.0},
+            "position": {"quantity": 5},
+            "price": {"last_price": 100.0},
+            "estimate": {"estimated_order_value": 300.0, "estimated_cash_after_order": 700.0},
+        },
+        None,
+    )
+
+    assert "Preflight ready" in text
+    assert "buy 3 SPY" in text
+    assert "cash 1000.0" in text
+    assert "last price 100.0" in text
+    assert "estimated value 300.0" in text
+
+
+def test_orders_preflight_check_formatter_explains_blocked_order():
+    text = explain_tool_result(
+        "orders_preflight_check",
+        {},
+        {
+            "readiness": "blocked",
+            "can_submit": False,
+            "order": {"symbol": "VNQ", "side": "sell", "quantity": 20},
+            "account": {"cash": 1000.0},
+            "position": {"quantity": 5},
+            "price": {"last_price": 90.0},
+            "estimate": {"estimated_order_value": 1800.0, "estimated_cash_after_order": 1000.0},
+            "blockers": [
+                {
+                    "code": "INSUFFICIENT_POSITION",
+                    "message": "Position has only 5 shares available.",
+                }
+            ],
+        },
+        None,
+    )
+
+    assert "Preflight blocked" in text
+    assert "sell 20 VNQ" in text
+    assert "INSUFFICIENT_POSITION" in text
+    assert "Position has only 5 shares available." in text
+
+
 def test_orders_confirm_order_formatter_explains_confirmed_fill():
     text = explain_tool_result(
         "orders_confirm_order",

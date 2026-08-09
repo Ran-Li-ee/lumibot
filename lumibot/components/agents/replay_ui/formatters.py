@@ -381,6 +381,56 @@ def _search_filing(args: dict[str, Any], raw_result: Any) -> str:
     return f"Filing search returned {_rows_label(count, 'match', 'matches')}{target}."
 
 
+def _orders_preflight_check(args: dict[str, Any], raw_result: Any) -> str:
+    result = _as_dict(raw_result)
+    order = _nested_dict(result, "order")
+    account = _nested_dict(result, "account")
+    position = _nested_dict(result, "position")
+    price = _nested_dict(result, "price")
+    estimate = _nested_dict(result, "estimate")
+    blockers = result.get("blockers") if isinstance(result.get("blockers"), list) else []
+
+    symbol = _first_present(order, "symbol") or _first_present(result, "symbol") or _first_present(args, "symbol")
+    qty = (
+        _first_present(order, "qty", "quantity", "shares")
+        or _first_present(result, "qty", "quantity", "shares")
+        or _first_present(args, "qty", "quantity", "shares")
+    )
+    side = _first_present(order, "side", "action") or _first_present(result, "side", "action") or _first_present(
+        args,
+        "side",
+        "action",
+    )
+    readiness = _first_present(result, "readiness", "status")
+    if readiness is None:
+        readiness = "ready" if result.get("can_submit") is True else "blocked"
+
+    cash = _first_present(account, "cash", "available_cash")
+    current_qty = _first_present(position, "quantity", "qty", "shares")
+    last_price = _first_present(price, "last", "last_price", "price")
+    estimated_value = _first_present(estimate, "estimated_order_value", "order_value", "estimated_value", "value")
+    estimated_cash_after = _first_present(
+        estimate,
+        "estimated_cash_after_order",
+        "cash_after",
+        "estimated_cash_after",
+    )
+    order_text = f"{_text(side)} {_text(qty)} {_text(symbol)}"
+    summary = (
+        f"Preflight {_text(readiness)} for {order_text}: cash {_text(cash)}, "
+        f"current quantity {_text(current_qty)}, last price {_text(last_price)}, "
+        f"estimated value {_text(estimated_value)}, estimated cash after {_text(estimated_cash_after)}."
+    )
+
+    if blockers:
+        blocker = _as_dict(blockers[0])
+        code = _first_present(blocker, "code", "reason")
+        message = _first_present(blocker, "message", "detail")
+        summary += f" First blocker: {_text(code)} - {_text(message)}."
+
+    return summary
+
+
 def _orders_submit_order(args: dict[str, Any], raw_result: Any) -> str:
     result = _as_dict(raw_result)
     order = _nested_dict(result, "order") or result
@@ -455,6 +505,7 @@ _FORMATTERS = {
     "get_fred_latest": _get_fred_latest,
     "get_filings": _get_filings,
     "search_filing": _search_filing,
+    "orders_preflight_check": _orders_preflight_check,
     "orders_submit_order": _orders_submit_order,
     "orders_confirm_order": _orders_confirm_order,
     "remember_decision": _remember_decision,
