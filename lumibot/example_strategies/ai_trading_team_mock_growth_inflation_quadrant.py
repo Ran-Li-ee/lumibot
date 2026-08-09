@@ -496,16 +496,16 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             base_system_prompt_mode=self._execution_agent_base_system_prompt_mode,
             include_builtin_tools=False,
             tools=[
-                BuiltinTools.account.positions(),
-                BuiltinTools.account.portfolio(),
-                BuiltinTools.market.last_price(),
-                BuiltinTools.orders.open_orders(),
+                BuiltinTools.orders.preflight(),
                 BuiltinTools.orders.submit(),
                 BuiltinTools.orders.confirm(),
             ],
             system_prompt=(
                 "Execution role: execute only the provided execution_plan using the listed order tools. "
-                "Follow sequence order, confirm each submitted order, stop on blockers, and report outcomes."
+                "Call orders_preflight_check before each order. If preflight returns can_submit=true, submit "
+                "that same order with orders_submit_order, then confirm it with orders_confirm_order before "
+                "continuing. If preflight returns can_submit=false, stop execution and report the blocker. "
+                "Follow sequence order, do not perform investment research, and do not change order fields."
             ),
         )
 
@@ -580,8 +580,10 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
 
         self.agents["execution_agent"].run(
             task_prompt=(
-                "Execute only the provided execution_plan. Follow sequence order, use order tools only, "
-                "confirm submitted orders, and stop if any order is blocked."
+                "Execute the provided execution_plan. For each order in sequence, call orders_preflight_check "
+                "with the exact order fields. If can_submit=true, call orders_submit_order with that same order, "
+                "then call orders_confirm_order for the returned identifier before continuing. If can_submit=false "
+                "or confirmation returns can_continue=false, stop remaining orders and report the blocker."
             ),
             context={
                 "date": current_date,

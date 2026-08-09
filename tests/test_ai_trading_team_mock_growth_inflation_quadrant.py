@@ -259,10 +259,7 @@ def test_agents_receive_distinct_tool_surfaces():
         "target_portfolio_to_execution_plan",
     }
     assert created_tool_names(created["execution_agent"]) == {
-        "account_positions",
-        "account_portfolio",
-        "market_last_price",
-        "orders_open_orders",
+        "orders_preflight_check",
         "orders_submit_order",
         "orders_confirm_order",
     }
@@ -287,6 +284,8 @@ def test_prompt_boundaries_are_short_and_role_specific():
         "limit order",
         "stop loss",
         "cash_buffer_pct",
+        "first inspect portfolio, positions, open orders, and latest prices",
+        "manually call account_portfolio",
     ):
         assert forbidden_phrase not in serialized
     assert "call the mock macro_regime_classifier" in serialized
@@ -296,6 +295,8 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "do not manually calculate share quantities" in serialized
     assert "planner tool owns all execution_plan calculations" in serialized
     assert "execute only the provided execution_plan" in serialized
+    assert "call orders_preflight_check before each order" in serialized
+    assert "if preflight returns can_submit=false" in serialized
 
 
 def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
@@ -903,7 +904,7 @@ def _json_summary(payload):
     return json.dumps(payload, separators=(",", ":"))
 
 
-def test_on_trading_iteration_executes_planner_generated_plan():
+def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
     strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
@@ -1031,6 +1032,16 @@ def test_on_trading_iteration_executes_planner_generated_plan():
     assert portfolio_context["nominal_bond_basket_report"] == basket_reports["nominal_bond_basket_agent"]
 
     assert len(agent_manager["execution_agent"].calls) == 1
+    execution_task_prompt = agent_manager["execution_agent"].calls[0]["task_prompt"]
+    for required_phrase in (
+        "orders_preflight_check",
+        "with the exact order fields",
+        "orders_submit_order",
+        "orders_confirm_order",
+        "can_submit=false",
+        "confirmation returns can_continue=false",
+    ):
+        assert required_phrase in execution_task_prompt
     execution_context = agent_manager["execution_agent"].calls[0]["context"]
     assert execution_context == {
         "date": "2024-09-05",
