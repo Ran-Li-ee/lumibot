@@ -58,6 +58,34 @@ def make_strategy_with_agent_manager(strategy_class, agent_manager):
     return strategy
 
 
+def make_position(symbol, quantity):
+    return SimpleNamespace(
+        symbol=symbol,
+        quantity=quantity,
+        asset=SimpleNamespace(symbol=symbol),
+    )
+
+
+def make_planner_strategy(*, positions, prices, cash=0.0, portfolio_value=100000.0):
+    def get_positions(include_cash_positions=False):
+        return list(positions)
+
+    def get_last_price(symbol, quote=None, exchange=None):
+        if not isinstance(symbol, str):
+            symbol = getattr(symbol, "symbol", symbol)
+        symbol = str(symbol).upper()
+        if symbol not in prices:
+            return None
+        return prices[symbol]
+
+    return SimpleNamespace(
+        get_positions=get_positions,
+        get_cash=lambda: cash,
+        get_portfolio_value=lambda: portfolio_value,
+        get_last_price=get_last_price,
+    )
+
+
 def created_tool_names(created_agent):
     return {getattr(tool, "name", "") for tool in created_agent.get("tools", [])}
 
@@ -856,3 +884,248 @@ def test_sell_without_position_blocks_before_execution_agent():
 
     assert "DECISION_SELL_POSITION_REQUIRED" in strategy._last_execution_plan_error
     assert agent_manager["execution_agent"].calls == []
+
+
+def test_target_portfolio_to_execution_plan_deploys_all_cash_to_targets():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[],
+        cash=100000,
+        portfolio_value=100000,
+        prices={"SPY": 100, "GLD": 100, "VGIT": 50},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-05",
+        target_portfolio=[
+            {"basket_id": "equity", "symbol": "SPY", "target_weight": 0.50},
+            {"basket_id": "commodity", "symbol": "GLD", "target_weight": 0.25},
+            {"basket_id": "nominal_bond", "symbol": "VGIT", "target_weight": 0.25},
+        ],
+    )
+
+    assert result["execution_plan"] == {
+        "schema_version": 1,
+        "intent": "rebalance",
+        "orders": [
+            {
+                "sequence": 1,
+                "action": "submit_order",
+                "symbol": "GLD",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 250,
+                "asset_type": "stock",
+                "order_type": "market",
+                "time_in_force": "day",
+            },
+            {
+                "sequence": 2,
+                "action": "submit_order",
+                "symbol": "SPY",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 500,
+                "asset_type": "stock",
+                "order_type": "market",
+                "time_in_force": "day",
+            },
+            {
+                "sequence": 3,
+                "action": "submit_order",
+                "symbol": "VGIT",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 500,
+                "asset_type": "stock",
+                "order_type": "market",
+                "time_in_force": "day",
+            },
+        ],
+    }
+    assert result["cash_projection"]["cash_after_estimate"] == pytest.approx(0)
+    assert {row["reason_code"] for row in result["current_vs_target"]} == {"buy_new_target"}
+
+
+def test_target_portfolio_to_execution_plan_handles_full_rebalance_regression_case():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[
+            make_position("SPY", 500),
+            make_position("GLD", 250),
+            make_position("VGIT", 500),
+        ],
+        cash=0,
+        portfolio_value=100000,
+        prices={"SPY": 100, "GLD": 100, "VGIT": 50, "TIP": 100},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[
+            {"basket_id": "equity", "symbol": "SPY", "target_weight": 0.25},
+            {"basket_id": "commodity", "symbol": "GLD", "target_weight": 0.50},
+            {"basket_id": "tips", "symbol": "TIP", "target_weight": 0.25},
+        ],
+    )
+
+    orders = result["execution_plan"]["orders"]
+    assert [(order["side"], order["symbol"], order["quantity"]) for order in orders] == [
+        ("sell", "VGIT", 500),
+        ("sell", "SPY", 250),
+        ("buy", "TIP", 250),
+        ("buy", "GLD", 250),
+    ]
+    assert result["cash_projection"]["cash_after_estimate"] == pytest.approx(0)
+    diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
+    assert diagnostics["VGIT"]["reason_code"] == "exit_removed_symbol"
+    assert diagnostics["SPY"]["reason_code"] == "reduce_overweight"
+    assert diagnostics["GLD"]["reason_code"] == "increase_underweight"
+    assert diagnostics["TIP"]["reason_code"] == "buy_new_target"
+
+
+def test_target_portfolio_to_execution_plan_handles_basket_internal_symbol_switch():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[
+            make_position("SPY", 500),
+            make_position("GLD", 250),
+            make_position("VGIT", 500),
+        ],
+        cash=0,
+        portfolio_value=100000,
+        prices={"SPY": 100, "QQQ": 200, "GLD": 100, "VGIT": 50},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[
+            {"basket_id": "equity", "symbol": "QQQ", "target_weight": 0.50},
+            {"basket_id": "commodity", "symbol": "GLD", "target_weight": 0.25},
+            {"basket_id": "nominal_bond", "symbol": "VGIT", "target_weight": 0.25},
+        ],
+    )
+
+    assert [
+        (order["side"], order["symbol"], order["quantity"])
+        for order in result["execution_plan"]["orders"]
+    ] == [
+        ("sell", "SPY", 500),
+        ("buy", "QQQ", 250),
+    ]
+
+
+def test_target_portfolio_to_execution_plan_rebalances_price_drift():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[
+            make_position("SPY", 570),
+            make_position("GLD", 280),
+            make_position("VGIT", 300),
+        ],
+        cash=0,
+        portfolio_value=100000,
+        prices={"SPY": 100, "GLD": 100, "VGIT": 50},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[
+            {"basket_id": "equity", "symbol": "SPY", "target_weight": 0.50},
+            {"basket_id": "commodity", "symbol": "GLD", "target_weight": 0.25},
+            {"basket_id": "nominal_bond", "symbol": "VGIT", "target_weight": 0.25},
+        ],
+    )
+
+    assert [
+        (order["side"], order["symbol"], order["quantity"])
+        for order in result["execution_plan"]["orders"]
+    ] == [
+        ("sell", "GLD", 30),
+        ("sell", "SPY", 70),
+        ("buy", "VGIT", 200),
+    ]
+
+
+def test_target_portfolio_to_execution_plan_holds_when_whole_share_rounding_produces_no_orders():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[
+            make_position("SPY", 500),
+            make_position("GLD", 250),
+            make_position("VGIT", 500),
+        ],
+        cash=0,
+        portfolio_value=100000,
+        prices={"SPY": 100, "GLD": 100, "VGIT": 50},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[
+            {"basket_id": "equity", "symbol": "SPY", "target_weight": 0.50},
+            {"basket_id": "commodity", "symbol": "GLD", "target_weight": 0.25},
+            {"basket_id": "nominal_bond", "symbol": "VGIT", "target_weight": 0.25},
+        ],
+    )
+
+    assert result["execution_plan"] == {"schema_version": 1, "intent": "hold", "orders": []}
+
+
+def test_target_portfolio_to_execution_plan_combines_duplicate_targets_and_rejects_overweight_total():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[],
+        cash=100000,
+        portfolio_value=100000,
+        prices={"SPY": 100, "GLD": 100},
+    )
+
+    combined = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[
+            {"basket_id": "equity", "symbol": "SPY", "target_weight": 0.25},
+            {"basket_id": "equity", "symbol": "SPY", "target_weight": 0.25},
+            {"basket_id": "commodity", "symbol": "GLD", "target_weight": 0.25},
+        ],
+    )
+    assert {item["symbol"]: item["target_weight"] for item in combined["target_portfolio"]} == {
+        "GLD": 0.25,
+        "SPY": 0.50,
+    }
+
+    with pytest.raises(ValueError, match="target weights must not exceed 1.0"):
+        planner.target_portfolio_to_execution_plan(
+            strategy,
+            date="2024-09-06",
+            target_portfolio=[
+                {"symbol": "SPY", "target_weight": 0.75},
+                {"symbol": "GLD", "target_weight": 0.50},
+            ],
+        )
+
+
+def test_target_portfolio_to_execution_plan_rejects_missing_price():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[],
+        cash=100000,
+        portfolio_value=100000,
+        prices={"SPY": 100},
+    )
+
+    with pytest.raises(ValueError, match="missing last price for GLD"):
+        planner.target_portfolio_to_execution_plan(
+            strategy,
+            date="2024-09-06",
+            target_portfolio=[
+                {"symbol": "SPY", "target_weight": 0.50},
+                {"symbol": "GLD", "target_weight": 0.25},
+            ],
+        )
