@@ -297,18 +297,8 @@ def _normalize_order(order: Any) -> dict[str, Any]:
     }
 
 
-def parse_execution_plan_from_portfolio_summary(summary: str) -> dict[str, Any]:
-    raw_json = _extract_first_json_object(summary)
-    try:
-        payload = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Portfolio summary JSON is invalid: {exc.msg}.") from exc
-
-    payload = _require_dict(payload, "portfolio summary JSON")
-    if "execution_plan" not in payload:
-        raise ValueError("portfolio summary JSON must include execution_plan.")
-    plan = _require_dict(payload["execution_plan"], "execution_plan")
-
+def normalize_execution_plan(plan: Any) -> dict[str, Any]:
+    plan = _require_dict(plan, "execution_plan")
     if "schema_version" not in plan:
         raise ValueError("execution_plan schema_version is required.")
     schema_version = plan["schema_version"]
@@ -359,6 +349,19 @@ def parse_execution_plan_from_portfolio_summary(summary: str) -> dict[str, Any]:
     }
 
 
+def parse_execution_plan_from_portfolio_summary(summary: str) -> dict[str, Any]:
+    raw_json = _extract_first_json_object(summary)
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Portfolio summary JSON is invalid: {exc.msg}.") from exc
+
+    payload = _require_dict(payload, "portfolio summary JSON")
+    if "execution_plan" not in payload:
+        raise ValueError("portfolio summary JSON must include execution_plan.")
+    return normalize_execution_plan(payload["execution_plan"])
+
+
 def _selected_symbols_from_basket_reports(basket_reports: Any) -> set[str]:
     if not isinstance(basket_reports, list):
         raise ValueError("basket_reports must be a list.")
@@ -399,18 +402,21 @@ def _agent_result_tool_names(result: Any) -> set[str]:
     return {event.tool_name for event in getattr(result, "tool_calls", []) if getattr(event, "tool_name", None)}
 
 
-def validate_portfolio_decision_tool_evidence(execution_plan: dict[str, Any], decision_result: Any) -> None:
-    if execution_plan["intent"] == "hold":
-        return
-    tool_names = _agent_result_tool_names(decision_result)
-    missing = sorted({"account_positions", "account_portfolio"} - tool_names)
-    if missing:
+def validate_execution_plan_matches_planner_result(strategy: Any, execution_plan: dict[str, Any]) -> None:
+    planner_result = getattr(strategy, "_last_target_portfolio_planner_result", None)
+    if not isinstance(planner_result, dict):
+        raise ValueError("portfolio_decision_agent must call target_portfolio_to_execution_plan before execution.")
+    planner_plan = normalize_execution_plan(planner_result.get("execution_plan"))
+    if execution_plan != planner_plan:
         raise ValueError(
-            "portfolio_decision_agent must call account tools before non-hold plan; "
-            f"missing: {', '.join(missing)}"
+            "portfolio_decision_agent execution_plan differs from target_portfolio_to_execution_plan result."
         )
-    if any(order["side"] == "buy" for order in execution_plan["orders"]) and "market_last_price" not in tool_names:
-        raise ValueError("portfolio_decision_agent must call market_last_price before buy sizing.")
+
+
+def validate_portfolio_decision_tool_evidence(execution_plan: dict[str, Any], decision_result: Any) -> None:
+    tool_names = _agent_result_tool_names(decision_result)
+    if TARGET_PORTFOLIO_TO_EXECUTION_PLAN_TOOL_NAME not in tool_names:
+        raise ValueError("portfolio_decision_agent must call target_portfolio_to_execution_plan.")
 
 
 class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecutionTestStrategy):
@@ -555,6 +561,7 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             )
             execution_plan = parse_execution_plan_from_portfolio_summary(portfolio_result.summary)
             validate_portfolio_decision_tool_evidence(execution_plan, portfolio_result)
+            validate_execution_plan_matches_planner_result(self, execution_plan)
             validate_execution_plan_symbols(execution_plan, list(basket_reports_by_id.values()))
             validate_decision_buy_sizing(self, execution_plan)
             validate_execution_plan_cash_safety(self, execution_plan)

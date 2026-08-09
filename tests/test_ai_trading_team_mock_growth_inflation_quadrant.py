@@ -490,6 +490,90 @@ def test_target_portfolio_to_execution_plan_tool_definition_binds_and_stores_res
     assert strategy._last_target_portfolio_planner_result == result
 
 
+def test_validate_execution_plan_matches_planner_result_accepts_exact_tool_plan():
+    module, _strategy_class = load_strategy_module()
+    strategy = SimpleNamespace(
+        _last_target_portfolio_planner_result={
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 10,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            }
+        }
+    )
+    execution_plan = module.normalize_execution_plan(strategy._last_target_portfolio_planner_result["execution_plan"])
+
+    module.validate_execution_plan_matches_planner_result(strategy, execution_plan)
+
+
+def test_validate_execution_plan_matches_planner_result_rejects_llm_rewrite():
+    module, _strategy_class = load_strategy_module()
+    strategy = SimpleNamespace(
+        _last_target_portfolio_planner_result={
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 10,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            }
+        }
+    )
+    rewritten = module.normalize_execution_plan(
+        {
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "SPY",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 11,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="differs from target_portfolio_to_execution_plan"):
+        module.validate_execution_plan_matches_planner_result(strategy, rewritten)
+
+
+def test_validate_portfolio_decision_tool_evidence_requires_planner_tool_even_for_hold():
+    module, _strategy_class = load_strategy_module()
+    execution_plan = {"schema_version": 1, "intent": "hold", "orders": []}
+    decision_result = SimpleNamespace(tool_calls=[])
+
+    with pytest.raises(ValueError, match="must call target_portfolio_to_execution_plan"):
+        module.validate_portfolio_decision_tool_evidence(execution_plan, decision_result)
+
+
 def test_parse_execution_plan_accepts_multiple_market_buy_orders():
     module, _strategy_class = load_strategy_module()
     raw_summary = json.dumps(
@@ -805,11 +889,8 @@ def test_on_trading_iteration_runs_macro_four_baskets_portfolio_then_execution()
     for agent_name, report in basket_reports.items():
         agent_manager.summaries[agent_name] = _json_summary(report)
     agent_manager.summaries["portfolio_decision_agent"] = _json_summary(portfolio_summary)
-    agent_manager.tool_calls["portfolio_decision_agent"] = [
-        "account_positions",
-        "account_portfolio",
-        "market_last_price",
-    ]
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
+    strategy._last_target_portfolio_planner_result = {"execution_plan": portfolio_summary["execution_plan"]}
 
     strategy.on_trading_iteration()
 
@@ -868,11 +949,16 @@ def test_hold_plan_skips_execution_agent():
     agent_manager.summaries["portfolio_decision_agent"] = _json_summary(
         {"execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}}
     )
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}
+    }
 
     strategy.on_trading_iteration()
 
     assert agent_manager["portfolio_decision_agent"].calls
     assert agent_manager["execution_agent"].calls == []
+    assert strategy._last_execution_plan_error is None
 
 
 def _seed_active_equity_workflow(agent_manager, module, execution_plan):
@@ -919,11 +1005,7 @@ def _seed_active_equity_workflow(agent_manager, module, execution_plan):
             "execution_plan": execution_plan,
         }
     )
-    agent_manager.tool_calls["portfolio_decision_agent"] = [
-        "account_positions",
-        "account_portfolio",
-        "market_last_price",
-    ]
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
 
 
 def test_oversized_buy_plan_blocks_before_execution_agent():
@@ -952,6 +1034,9 @@ def test_oversized_buy_plan_blocks_before_execution_agent():
             ],
         },
     )
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": json.loads(agent_manager.summaries["portfolio_decision_agent"])["execution_plan"]
+    }
 
     strategy.on_trading_iteration()
 
@@ -983,6 +1068,9 @@ def test_sell_without_position_blocks_before_execution_agent():
             ],
         },
     )
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": json.loads(agent_manager.summaries["portfolio_decision_agent"])["execution_plan"]
+    }
 
     strategy.on_trading_iteration()
 
