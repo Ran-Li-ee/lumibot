@@ -115,6 +115,18 @@ def _fake_open_order(symbol, quantity=1, side="buy", status="new", identifier="o
     )
 
 
+def _fake_simple_order(symbol, quantity=1, side="buy", status="filled", identifier="simple-order"):
+    return SimpleNamespace(
+        identifier=identifier,
+        status=status,
+        side=side,
+        asset=_fake_asset(symbol),
+        quantity=quantity,
+        order_type="market",
+        time_in_force="day",
+    )
+
+
 def _wrap_preflight_and_submit_tools(strategy):
     return _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight(), BuiltinTools.orders.submit()])
 
@@ -788,6 +800,20 @@ def test_submit_order_description_mentions_preflight_readiness_path():
     assert "ORDER_READINESS_REQUIRED" in tool.description
 
 
+def test_bound_preflight_description_explains_read_only_contract():
+    strategy = _OrderReadinessStrategy()
+    manager = AgentManager(strategy)
+
+    tool = BuiltinTools.orders.preflight().binder(strategy, manager)
+
+    assert "cash" in tool.description
+    assert "portfolio value" in tool.description
+    assert "current position" in tool.description
+    assert "open orders" in tool.description
+    assert "latest price" in tool.description
+    assert "does not submit, cancel, modify, or confirm orders" in tool.description
+
+
 def test_builtin_tools_all_includes_orders_preflight_check():
     assert "orders_preflight_check" in {tool.name for tool in BuiltinTools.all()}
 
@@ -883,6 +909,17 @@ def test_orders_preflight_check_blocks_invalid_quantity():
     assert "INVALID_QUANTITY" in {blocker["code"] for blocker in result["blockers"]}
 
 
+def test_orders_preflight_check_blocks_invalid_side():
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="hold")
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "INVALID_SIDE" in {blocker["code"] for blocker in result["blockers"]}
+
+
 def test_orders_preflight_check_blocks_unsupported_order_type():
     strategy = _OrderReadinessStrategy()
     tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
@@ -910,6 +947,24 @@ def test_orders_preflight_check_blocks_same_symbol_open_order():
     assert result["can_submit"] is False
     assert "OPEN_ORDER_CONFLICT" in {blocker["code"] for blocker in result["blockers"]}
     assert result["open_orders"]["same_symbol_count"] == 1
+
+
+def test_orders_preflight_check_ignores_closed_same_symbol_orders():
+    strategy = _OrderReadinessStrategy()
+    strategy.open_orders = [
+        _fake_open_order("SPY", status="filled", identifier="filled-helper-order"),
+        _fake_simple_order("SPY", status="canceled", identifier="canceled-simple-order"),
+        _fake_simple_order("SPY", status="fill", identifier="filled-simple-order"),
+    ]
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+
+    assert result["readiness"] == "ready"
+    assert result["can_submit"] is True
+    assert result["blockers"] == []
+    assert result["open_orders"]["count"] == 0
+    assert result["open_orders"]["same_symbol_count"] == 0
 
 
 def test_orders_preflight_check_blocks_when_price_unavailable():
@@ -1012,6 +1067,43 @@ def test_orders_preflight_check_authorizes_same_exact_submit_order():
     assert preflight_result["can_submit"] is True
     assert "order" in submit_result
     assert submit_result.get("tool_error") is not True
+    assert len(strategy.submitted_orders) == 1
+
+
+def test_orders_preflight_check_authorizes_only_one_matching_submit_order():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+        time_in_force="day",
+    )
+    first_submit = tool_map["orders_submit_order"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+        time_in_force="day",
+    )
+    second_submit = tool_map["orders_submit_order"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+        time_in_force="day",
+    )
+
+    assert preflight_result["can_submit"] is True
+    assert "order" in first_submit
+    assert second_submit["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in second_submit["error"]["message"]
     assert len(strategy.submitted_orders) == 1
 
 

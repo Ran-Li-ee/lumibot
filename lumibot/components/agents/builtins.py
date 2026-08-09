@@ -27,6 +27,13 @@ OptionRightArg = Literal["call", "put"]
 MultilegPriceStyleArg = Literal["market", "best", "mid", "fastest"]
 NewsSortArg = Literal["asc", "desc"]
 
+ORDERS_PREFLIGHT_CHECK_DESCRIPTION = (
+    "Inspect whether one explicit execution_plan order appears ready to submit. "
+    "Checks cash, portfolio value, current position, open orders, and latest price; "
+    "returns readiness, blockers, warnings, account/position/open-order/price snapshots, and estimates. "
+    "This tool is read-only and does not submit, cancel, modify, or confirm orders."
+)
+
 COMMON_INDICATORS = [
     "sma",
     "ema",
@@ -316,6 +323,8 @@ def _has_successful_order_readiness_for_order(
         if item.get("ok") is not True:
             continue
         if _readiness_signature_matches(item, signature):
+            item["ok"] = False
+            item["consumed"] = True
             return True
     return False
 
@@ -1560,16 +1569,17 @@ def _preflight_open_orders_snapshot(strategy: Any, symbol: str) -> dict[str, Any
             "orders": [],
             "_available": False,
         }
-    order_payloads = [_order_to_dict(order) for order in orders or []]
+    order_payloads = [
+        _order_to_dict(order)
+        for order in orders or []
+        if _preflight_order_appears_open(order)
+    ]
     normalized_symbol = _normalized_symbol(symbol)
     same_symbol_orders = [
         order
         for order in order_payloads
         if isinstance(order.get("asset"), dict)
         and _normalized_symbol(order["asset"].get("symbol")) == normalized_symbol
-        and order.get("is_active") is not False
-        and order.get("is_filled") is not True
-        and order.get("is_canceled") is not True
     ]
     return {
         "count": len(order_payloads),
@@ -1578,6 +1588,28 @@ def _preflight_open_orders_snapshot(strategy: Any, symbol: str) -> dict[str, Any
         "orders": order_payloads,
         "_available": True,
     }
+
+
+_PREFLIGHT_ACTIVE_ORDER_STATUSES = {
+    "unprocessed",
+    "submitted",
+    "open",
+    "new",
+    "partial_fill",
+    "partially_filled",
+}
+
+
+def _preflight_order_appears_open(order: Any) -> bool:
+    is_active = _safe_call(order, "is_active", None)
+    if is_active is not None:
+        return bool(is_active)
+    if _safe_call(order, "is_filled", False):
+        return False
+    if _safe_call(order, "is_canceled", False):
+        return False
+    status = _normalized_order_text(getattr(order, "status", None))
+    return status in _PREFLIGHT_ACTIVE_ORDER_STATUSES
 
 
 def _preflight_price_snapshot(strategy: Any, symbol: str, asset_type: str) -> dict[str, Any]:
@@ -1657,7 +1689,7 @@ def _bind_preflight_check(strategy: Any, manager: Any) -> BoundTool:
         if side_text not in {"buy", "sell"}:
             blockers.append(
                 _preflight_blocker(
-                    "UNSUPPORTED_SIDE",
+                    "INVALID_SIDE",
                     "orders_preflight_check supports side='buy' or side='sell'.",
                 )
             )
@@ -1800,7 +1832,7 @@ def _bind_preflight_check(strategy: Any, manager: Any) -> BoundTool:
 
     return BoundTool(
         name="orders_preflight_check",
-        description="Inspect whether one explicit execution_plan order appears ready to submit.",
+        description=ORDERS_PREFLIGHT_CHECK_DESCRIPTION,
         function=preflight_check,
         metadata={"kind": "builtin", "replay_on_cache": True},
     )
@@ -3208,7 +3240,7 @@ class _OrderTools:
     def preflight(self) -> ToolDefinition:
         return ToolDefinition(
             name="orders_preflight_check",
-            description="Inspect whether one explicit execution_plan order appears ready to submit.",
+            description=ORDERS_PREFLIGHT_CHECK_DESCRIPTION,
             binder=_bind_preflight_check,
         )
 

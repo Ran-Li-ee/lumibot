@@ -283,6 +283,28 @@ def test_orders_preflight_check_formatter_explains_blocked_order():
     assert "Position has only 5 shares available." in text
 
 
+def test_orders_preflight_check_formatter_preserves_zero_quantity():
+    text = explain_tool_result(
+        "orders_preflight_check",
+        {"symbol": "SPY", "side": "buy", "quantity": 0},
+        {
+            "readiness": "blocked",
+            "can_submit": False,
+            "order": {"symbol": "SPY", "side": "buy", "quantity": 0},
+            "account": {"cash": 1000.0},
+            "position": {"quantity": 0},
+            "price": {"last_price": 100.0},
+            "estimate": {"estimated_order_value": None, "estimated_cash_after_order": None},
+            "blockers": [{"code": "INVALID_QUANTITY", "message": "quantity must be greater than 0."}],
+        },
+        None,
+    )
+
+    assert "buy 0 SPY" in text
+    assert "current quantity 0" in text
+    assert "INVALID_QUANTITY" in text
+
+
 def test_orders_confirm_order_formatter_explains_confirmed_fill():
     text = explain_tool_result(
         "orders_confirm_order",
