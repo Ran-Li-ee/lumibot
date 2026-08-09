@@ -845,7 +845,7 @@ def _json_summary(payload):
     return json.dumps(payload, separators=(",", ":"))
 
 
-def test_on_trading_iteration_runs_macro_four_baskets_portfolio_then_execution():
+def test_on_trading_iteration_executes_planner_generated_plan():
     module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
     strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
@@ -893,6 +893,36 @@ def test_on_trading_iteration_runs_macro_four_baskets_portfolio_then_execution()
             "reason_brief": "selected",
         },
     }
+    planner_plan = {
+        "schema_version": 1,
+        "intent": "rebalance",
+        "orders": [
+            {
+                "sequence": 1,
+                "symbol": "QQQ",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 100,
+                "order_type": "market",
+            },
+            {
+                "sequence": 2,
+                "symbol": "TIP",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 50,
+                "order_type": "market",
+            },
+            {
+                "sequence": 3,
+                "symbol": "IEF",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 50,
+                "order_type": "market",
+            },
+        ],
+    }
     portfolio_summary = {
         "decision": {"type": "rebalance", "reason_brief": "mock target"},
         "target_portfolio": [
@@ -900,36 +930,7 @@ def test_on_trading_iteration_runs_macro_four_baskets_portfolio_then_execution()
             {"basket_id": "tips", "symbol": "TIP", "target_weight": 0.25},
             {"basket_id": "nominal_bond", "symbol": "IEF", "target_weight": 0.25},
         ],
-        "execution_plan": {
-            "schema_version": 1,
-            "intent": "rebalance",
-            "orders": [
-                {
-                    "sequence": 1,
-                    "symbol": "QQQ",
-                    "side": "buy",
-                    "quantity_mode": "shares",
-                    "quantity": 100,
-                    "order_type": "market",
-                },
-                {
-                    "sequence": 2,
-                    "symbol": "TIP",
-                    "side": "buy",
-                    "quantity_mode": "shares",
-                    "quantity": 50,
-                    "order_type": "market",
-                },
-                {
-                    "sequence": 3,
-                    "symbol": "IEF",
-                    "side": "buy",
-                    "quantity_mode": "shares",
-                    "quantity": 50,
-                    "order_type": "market",
-                },
-            ],
-        },
+        "execution_plan": planner_plan,
     }
 
     agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
@@ -937,7 +938,10 @@ def test_on_trading_iteration_runs_macro_four_baskets_portfolio_then_execution()
         agent_manager.summaries[agent_name] = _json_summary(report)
     agent_manager.summaries["portfolio_decision_agent"] = _json_summary(portfolio_summary)
     agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
-    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": portfolio_summary["execution_plan"]}
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": planner_plan}
+
+    assert agent_manager.tool_calls["portfolio_decision_agent"] == ["target_portfolio_to_execution_plan"]
+    assert json.loads(agent_manager.summaries["portfolio_decision_agent"])["execution_plan"] == planner_plan
 
     strategy.on_trading_iteration()
 
@@ -968,11 +972,56 @@ def test_on_trading_iteration_runs_macro_four_baskets_portfolio_then_execution()
     assert portfolio_context["tips_basket_report"] == basket_reports["tips_basket_agent"]
     assert portfolio_context["nominal_bond_basket_report"] == basket_reports["nominal_bond_basket_agent"]
 
+    assert len(agent_manager["execution_agent"].calls) == 1
     execution_context = agent_manager["execution_agent"].calls[0]["context"]
-    assert set(execution_context) == {"date", "execution_plan"}
+    assert execution_context == {
+        "date": "2024-09-05",
+        "execution_plan": module.normalize_execution_plan(planner_plan),
+    }
     assert [order["symbol"] for order in execution_context["execution_plan"]["orders"]] == ["QQQ", "TIP", "IEF"]
-    assert "macro_allocation_report" not in execution_context
-    assert "equity_basket_report" not in execution_context
+
+
+def test_on_trading_iteration_blocks_when_portfolio_agent_rewrites_planner_plan():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+
+    planner_plan = {
+        "schema_version": 1,
+        "intent": "rebalance",
+        "orders": [
+            {
+                "sequence": 1,
+                "symbol": "QQQ",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 10,
+                "order_type": "market",
+            },
+        ],
+    }
+    rewritten_plan = {
+        "schema_version": 1,
+        "intent": "rebalance",
+        "orders": [
+            {
+                "sequence": 1,
+                "symbol": "QQQ",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 11,
+                "order_type": "market",
+            },
+        ],
+    }
+    _seed_active_equity_workflow(agent_manager, module, rewritten_plan)
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": planner_plan}
+
+    strategy.on_trading_iteration()
+
+    assert "differs from target_portfolio_to_execution_plan" in strategy._last_execution_plan_error
+    assert agent_manager["execution_agent"].calls == []
 
 
 def test_hold_plan_skips_execution_agent():
