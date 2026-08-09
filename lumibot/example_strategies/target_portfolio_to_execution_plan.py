@@ -323,7 +323,7 @@ def make_target_portfolio_to_execution_plan_tool() -> ToolDefinition:
         "cash, portfolio value, and prices from the strategy, then returns current_vs_target diagnostics "
         "and an execution_plan. Do not manually edit the execution_plan returned by this tool."
     )
-    metadata = {"kind": "portfolio_transition_planner"}
+    metadata = {"kind": "portfolio_transition_planner", "replay_on_cache": True}
 
     def binder(strategy: Any, manager: Any) -> BoundTool:
         def planner_tool(*, date: str | None = None, target_portfolio: list[dict[str, Any]]) -> dict[str, Any]:

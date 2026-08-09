@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from lumibot.components.agents.manager import AgentManager
-from lumibot.components.agents.schemas import ToolDefinition
+from lumibot.components.agents.manager import AgentHandle, AgentManager
+from lumibot.components.agents.schemas import AgentRunResult, AgentTraceEvent, ToolDefinition
 
 
 class RecordingAgentManager:
@@ -491,9 +491,67 @@ def test_target_portfolio_to_execution_plan_tool_definition_binds_and_stores_res
 
     assert tool_definition.name == "target_portfolio_to_execution_plan"
     assert tool.name == "target_portfolio_to_execution_plan"
-    assert tool.metadata == {"kind": "portfolio_transition_planner"}
+    assert tool.metadata == {"kind": "portfolio_transition_planner", "replay_on_cache": True}
     assert result["execution_plan"]["intent"] == "rebalance"
     assert strategy._last_target_portfolio_planner_result == result
+
+
+def test_target_portfolio_to_execution_plan_replays_cache_side_effect():
+    planner_module = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[],
+        cash=100000,
+        portfolio_value=100000,
+        prices={"GLD": 100},
+    )
+    strategy.vars = SimpleNamespace(get=lambda key, default=None: default, set=lambda key, value: None)
+    strategy._last_target_portfolio_planner_result = None
+    tool = planner_module.make_target_portfolio_to_execution_plan_tool().binder(strategy, SimpleNamespace())
+    handle = AgentHandle(
+        manager=SimpleNamespace(strategy=strategy),
+        name="portfolio_decision_agent",
+        system_prompt="test",
+        default_model="test-model",
+        tools=[],
+        include_builtin_tools=False,
+        runtime=object(),
+    )
+    cached_result = AgentRunResult(
+        summary="cached",
+        model="test-model",
+        cache_hit=True,
+        cache_key="cache-key",
+        events=[
+            AgentTraceEvent(
+                kind="tool_call",
+                tool_name="target_portfolio_to_execution_plan",
+                payload={
+                    "date": "2024-09-05",
+                    "target_portfolio": [{"symbol": "GLD", "target_weight": 1.0}],
+                },
+            )
+        ],
+    )
+
+    handle._replay_cached_side_effects(cached_result, [tool])
+
+    assert strategy._last_target_portfolio_planner_result["execution_plan"] == {
+        "schema_version": 1,
+        "intent": "rebalance",
+        "orders": [
+            {
+                "sequence": 1,
+                "action": "submit_order",
+                "symbol": "GLD",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 1000,
+                "asset_type": "stock",
+                "order_type": "market",
+                "time_in_force": "day",
+            }
+        ],
+    }
 
 
 def test_validate_execution_plan_matches_planner_result_accepts_exact_tool_plan():
