@@ -16,9 +16,20 @@ def current_agent_tool_context() -> dict[str, Any]:
     return dict(context or {})
 
 
+def append_agent_tool_context_list_item(key: str, item: Any) -> bool:
+    context = _CURRENT_AGENT_TOOL_CONTEXT.get()
+    if not isinstance(context, dict):
+        return False
+    values = context.setdefault(key, [])
+    if not isinstance(values, list):
+        return False
+    values.append(item)
+    return True
+
+
 @contextmanager
 def agent_tool_context(context: dict[str, Any] | None) -> Iterator[None]:
-    token = _CURRENT_AGENT_TOOL_CONTEXT.set(dict(context or {}))
+    token = _CURRENT_AGENT_TOOL_CONTEXT.set(context if isinstance(context, dict) else {})
     try:
         yield
     finally:

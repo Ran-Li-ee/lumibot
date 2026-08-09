@@ -32,18 +32,26 @@ class _Strategy:
 class _OrderReadinessStrategy(_Strategy):
     def __init__(self):
         self.submitted_orders = []
+        self.positions = []
+        self.open_orders = []
+        self.last_prices = {}
+        self.cash = 100000.0
+        self.portfolio_value = 100000.0
 
     def get_positions(self, include_cash_positions=True):
-        return []
+        return list(self.positions)
+
+    def get_orders(self):
+        return list(self.open_orders)
 
     def get_cash(self):
-        return 100000.0
+        return self.cash
 
     def get_portfolio_value(self):
-        return 100000.0
+        return self.portfolio_value
 
     def get_last_price(self, asset, quote=None, exchange=None):
-        return 100.0
+        return self.last_prices.get(getattr(asset, "symbol", None), 100.0)
 
     def create_order(self, asset, quantity, side, **kwargs):
         return SimpleNamespace(
@@ -75,6 +83,40 @@ def _wrap_builtin_tools(strategy, tool_definitions):
         "tool_calls": [],
     }
     return {tool.name: _wrap_tool_callable(tool, tool_context) for tool in tools}
+
+
+def _fake_asset(symbol, asset_type="stock"):
+    return SimpleNamespace(symbol=symbol, asset_type=asset_type)
+
+
+def _fake_position(symbol, quantity, market_value=None, current_price=None):
+    return SimpleNamespace(
+        asset=_fake_asset(symbol),
+        quantity=quantity,
+        market_value=market_value,
+        current_price=current_price,
+        avg_fill_price=None,
+    )
+
+
+def _fake_open_order(symbol, quantity=1, side="buy", status="new", identifier="open-order"):
+    active = status not in {"filled", "fill", "canceled", "cancelled", "rejected", "expired"}
+    return SimpleNamespace(
+        identifier=identifier,
+        status=status,
+        side=side,
+        asset=_fake_asset(symbol),
+        quantity=quantity,
+        order_type="market",
+        time_in_force="day",
+        is_active=lambda: active,
+        is_filled=lambda: False,
+        is_canceled=lambda: False,
+    )
+
+
+def _wrap_preflight_and_submit_tools(strategy):
+    return _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight(), BuiltinTools.orders.submit()])
 
 
 class _Runtime:
@@ -725,6 +767,321 @@ def test_builtin_order_tools_expose_explicit_confirm_definition():
     assert tool.name == "orders_confirm_order"
     assert "Confirm" in tool.description
     assert callable(tool.binder)
+
+
+def test_builtin_order_tools_expose_preflight_definition():
+    tool = BuiltinTools.orders.preflight()
+
+    assert tool.name == "orders_preflight_check"
+    assert "Inspect whether one explicit execution_plan order appears ready" in tool.description
+    assert callable(tool.binder)
+
+
+def test_builtin_tools_all_includes_orders_preflight_check():
+    assert "orders_preflight_check" in {tool.name for tool in BuiltinTools.all()}
+
+
+def test_orders_preflight_check_ready_buy_returns_structured_snapshot():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 1000.0
+    strategy.portfolio_value = 1200.0
+    strategy.last_prices = {"SPY": 100.0}
+    strategy.positions = [_fake_position("SPY", 2, market_value=200.0, current_price=100.0)]
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](
+        sequence=1,
+        symbol="SPY",
+        quantity=3,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+        time_in_force="day",
+    )
+
+    assert result["readiness"] == "ready"
+    assert result["can_submit"] is True
+    assert result["blockers"] == []
+    assert result["account"]["cash"] == 1000.0
+    assert result["account"]["portfolio_value"] == 1200.0
+    assert result["position"]["quantity"] == 2.0
+    assert result["price"]["last_price"] == 100.0
+    assert result["estimate"]["estimated_order_value"] == 300.0
+    assert result["estimate"]["estimated_cash_after_order"] == 700.0
+    assert result["estimate"]["estimated_position_after_order"] == 5.0
+    assert result["open_orders"]["same_symbol_count"] == 0
+    assert set(result["internal_checks"]) == {
+        "account_portfolio",
+        "account_positions",
+        "orders_open_orders",
+        "market_last_price",
+    }
+    assert strategy.submitted_orders == []
+
+
+def test_orders_preflight_check_blocks_buy_with_insufficient_cash():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 250.0
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](symbol="SPY", quantity=3, side="buy")
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "INSUFFICIENT_CASH_ESTIMATE" in {blocker["code"] for blocker in result["blockers"]}
+    assert result["estimate"]["estimated_order_value"] == 300.0
+    assert strategy.submitted_orders == []
+
+
+def test_orders_preflight_check_ready_sell_with_sufficient_position():
+    strategy = _OrderReadinessStrategy()
+    strategy.positions = [_fake_position("VNQ", 10, market_value=800.0, current_price=80.0)]
+    strategy.last_prices = {"VNQ": 80.0}
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](symbol="VNQ", quantity=4, side="sell")
+
+    assert result["readiness"] == "ready"
+    assert result["can_submit"] is True
+    assert result["estimate"]["estimated_cash_after_order"] == 100320.0
+    assert result["estimate"]["estimated_position_after_order"] == 6.0
+
+
+def test_orders_preflight_check_blocks_sell_with_insufficient_position():
+    strategy = _OrderReadinessStrategy()
+    strategy.positions = [_fake_position("VNQ", 3, market_value=240.0, current_price=80.0)]
+    strategy.last_prices = {"VNQ": 80.0}
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](symbol="VNQ", quantity=4, side="sell")
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "INSUFFICIENT_POSITION" in {blocker["code"] for blocker in result["blockers"]}
+
+
+def test_orders_preflight_check_blocks_invalid_quantity():
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](symbol="SPY", quantity=0, side="buy")
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "INVALID_QUANTITY" in {blocker["code"] for blocker in result["blockers"]}
+
+
+def test_orders_preflight_check_blocks_unsupported_order_type():
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        order_type="limit",
+    )
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "UNSUPPORTED_ORDER_TYPE" in {blocker["code"] for blocker in result["blockers"]}
+
+
+def test_orders_preflight_check_blocks_same_symbol_open_order():
+    strategy = _OrderReadinessStrategy()
+    strategy.open_orders = [_fake_open_order("SPY")]
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "OPEN_ORDER_CONFLICT" in {blocker["code"] for blocker in result["blockers"]}
+    assert result["open_orders"]["same_symbol_count"] == 1
+
+
+def test_orders_preflight_check_blocks_when_price_unavailable():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": None}
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "PRICE_UNAVAILABLE" in {blocker["code"] for blocker in result["blockers"]}
+
+
+def test_orders_preflight_check_blocks_when_account_unavailable_and_does_not_record_readiness():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+
+    def fail_get_cash():
+        raise RuntimeError("cash read failed")
+
+    strategy.get_cash = fail_get_cash
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight(), BuiltinTools.orders.submit()])
+
+    result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    submit_result = tool_map["orders_submit_order"](symbol="SPY", quantity=1, side="buy")
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "ACCOUNT_UNAVAILABLE" in {blocker["code"] for blocker in result["blockers"]}
+    assert submit_result["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in submit_result["error"]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_orders_preflight_check_blocks_when_positions_unavailable_and_does_not_record_readiness():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+
+    def fail_get_positions(include_cash_positions=True):
+        raise RuntimeError("positions read failed")
+
+    strategy.get_positions = fail_get_positions
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight(), BuiltinTools.orders.submit()])
+
+    result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    submit_result = tool_map["orders_submit_order"](symbol="SPY", quantity=1, side="buy")
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "POSITIONS_UNAVAILABLE" in {blocker["code"] for blocker in result["blockers"]}
+    assert submit_result["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in submit_result["error"]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_orders_preflight_check_blocks_when_open_orders_unavailable_and_does_not_record_readiness():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+
+    def fail_get_orders():
+        raise RuntimeError("open orders read failed")
+
+    strategy.get_orders = fail_get_orders
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight(), BuiltinTools.orders.submit()])
+
+    result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    submit_result = tool_map["orders_submit_order"](symbol="SPY", quantity=1, side="buy")
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "OPEN_ORDERS_UNAVAILABLE" in {blocker["code"] for blocker in result["blockers"]}
+    assert submit_result["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in submit_result["error"]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_orders_preflight_check_authorizes_same_exact_submit_order():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+        time_in_force="day",
+    )
+    submit_result = tool_map["orders_submit_order"](
+        symbol="SPY",
+        quantity=1.0,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+        time_in_force="day",
+    )
+
+    assert preflight_result["can_submit"] is True
+    assert "order" in submit_result
+    assert submit_result.get("tool_error") is not True
+    assert len(strategy.submitted_orders) == 1
+
+
+def test_orders_preflight_check_does_not_authorize_different_quantity_submit():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    submit_result = tool_map["orders_submit_order"](symbol="SPY", quantity=2, side="buy")
+
+    assert preflight_result["can_submit"] is True
+    assert submit_result["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in submit_result["error"]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_orders_preflight_check_does_not_authorize_different_side_submit():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    submit_result = tool_map["orders_submit_order"](symbol="SPY", quantity=1, side="sell")
+
+    assert preflight_result["can_submit"] is True
+    assert submit_result["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in submit_result["error"]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_orders_preflight_check_does_not_authorize_different_order_type_or_time_in_force_submit():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        order_type="market",
+        time_in_force="day",
+    )
+    limit_result = tool_map["orders_submit_order"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        order_type="limit",
+        limit_price=101.0,
+        time_in_force="day",
+    )
+    gtc_result = tool_map["orders_submit_order"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        order_type="market",
+        time_in_force="gtc",
+    )
+
+    assert preflight_result["can_submit"] is True
+    assert limit_result["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in limit_result["error"]["message"]
+    assert gtc_result["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in gtc_result["error"]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_orders_preflight_check_blocked_result_does_not_authorize_submit():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 50.0
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    submit_result = tool_map["orders_submit_order"](symbol="SPY", quantity=1, side="buy")
+
+    assert preflight_result["readiness"] == "blocked"
+    assert "INSUFFICIENT_CASH_ESTIMATE" in {blocker["code"] for blocker in preflight_result["blockers"]}
+    assert submit_result["tool_error"] is True
+    assert "ORDER_READINESS_REQUIRED" in submit_result["error"]["message"]
+    assert strategy.submitted_orders == []
 
 
 def test_builtin_order_tools_respect_allow_trading_flag():

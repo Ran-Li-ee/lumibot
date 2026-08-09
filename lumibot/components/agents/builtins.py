@@ -8,7 +8,7 @@ from typing import Any, Literal
 from .asset_resolution import resolve_asset_and_quote
 from .docs_tools import search_lumibot_docs
 from .schemas import BoundTool, ToolDefinition
-from .tool_context import current_agent_tool_context
+from .tool_context import append_agent_tool_context_list_item, current_agent_tool_context
 
 AssetTypeArg = Literal["stock", "option", "future", "cont_future", "forex", "crypto", "index", "multileg", "us_equity"]
 OrderSideArg = Literal[
@@ -200,9 +200,153 @@ def _has_successful_market_last_price_for_symbol(symbol: str) -> bool:
     return False
 
 
-def _require_agent_order_readiness(symbol: str) -> None:
+def _normalized_symbol(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _normalized_order_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalized_order_quantity(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _order_readiness_signature(
+    *,
+    symbol: Any,
+    side: Any,
+    quantity: Any,
+    asset_type: Any,
+    order_type: Any,
+    time_in_force: Any,
+) -> dict[str, Any] | None:
+    normalized_symbol = _normalized_symbol(symbol)
+    normalized_quantity = _normalized_order_quantity(quantity)
+    if not normalized_symbol or normalized_quantity is None:
+        return None
+    return {
+        "symbol": normalized_symbol,
+        "side": _normalized_order_text(side),
+        "quantity": normalized_quantity,
+        "asset_type": _normalized_order_text(asset_type),
+        "order_type": _normalized_order_text(order_type),
+        "time_in_force": _normalized_order_text(time_in_force),
+    }
+
+
+def _record_successful_order_readiness(
+    *,
+    symbol: str,
+    side: str,
+    quantity: Any,
+    asset_type: str,
+    order_type: str,
+    time_in_force: str,
+    source: str,
+) -> None:
+    normalized_symbol = _normalized_symbol(symbol)
+    signature = _order_readiness_signature(
+        symbol=normalized_symbol,
+        side=side,
+        quantity=quantity,
+        asset_type=asset_type,
+        order_type=order_type,
+        time_in_force=time_in_force,
+    )
+    if signature is None:
+        return
+    append_agent_tool_context_list_item(
+        "order_readiness",
+        {
+            **signature,
+            "source": source,
+            "ok": True,
+        },
+    )
+
+
+def _readiness_signature_matches(item: dict[str, Any], signature: dict[str, Any]) -> bool:
+    item_quantity = _normalized_order_quantity(item.get("quantity"))
+    signature_quantity = _normalized_order_quantity(signature.get("quantity"))
+    if item_quantity is None or signature_quantity is None:
+        return False
+    return (
+        _normalized_symbol(item.get("symbol")) == signature["symbol"]
+        and _normalized_order_text(item.get("side")) == signature["side"]
+        and math.isclose(item_quantity, signature_quantity, rel_tol=0.0, abs_tol=1e-12)
+        and _normalized_order_text(item.get("asset_type")) == signature["asset_type"]
+        and _normalized_order_text(item.get("order_type")) == signature["order_type"]
+        and _normalized_order_text(item.get("time_in_force")) == signature["time_in_force"]
+    )
+
+
+def _has_successful_order_readiness_for_order(
+    *,
+    symbol: str,
+    side: Any,
+    quantity: Any,
+    asset_type: Any,
+    order_type: Any,
+    time_in_force: Any,
+) -> bool:
+    signature = _order_readiness_signature(
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        asset_type=asset_type,
+        order_type=order_type,
+        time_in_force=time_in_force,
+    )
+    if signature is None:
+        return False
+    context = current_agent_tool_context()
+    readiness = context.get("order_readiness")
+    if not isinstance(readiness, list):
+        return False
+    for item in readiness:
+        if not isinstance(item, dict):
+            continue
+        if item.get("ok") is not True:
+            continue
+        if _readiness_signature_matches(item, signature):
+            return True
+    return False
+
+
+def _require_agent_order_readiness(
+    symbol: str,
+    *,
+    side: Any | None = None,
+    quantity: Any | None = None,
+    asset_type: Any | None = None,
+    order_type: Any | None = None,
+    time_in_force: Any | None = None,
+) -> None:
     context = current_agent_tool_context()
     if not bool(context.get("enforce_order_readiness")):
+        return
+    if (
+        side is not None
+        and quantity is not None
+        and asset_type is not None
+        and order_type is not None
+        and time_in_force is not None
+        and _has_successful_order_readiness_for_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            asset_type=asset_type,
+            order_type=order_type,
+            time_in_force=time_in_force,
+        )
+    ):
         return
     missing: list[str] = []
     if not _has_successful_tool_call("account_portfolio"):
@@ -213,7 +357,8 @@ def _require_agent_order_readiness(symbol: str) -> None:
         missing.append(f"market_last_price(symbol={symbol!r})")
     if missing:
         raise ValueError(
-            "ORDER_READINESS_REQUIRED: Before submitting an order, call "
+            "ORDER_READINESS_REQUIRED: Before submitting an order, inspect readiness in this same agent run. "
+            "Prefer orders_preflight_check when available; otherwise call "
             f"{', '.join(missing)} in this same agent run. "
             "Agents must inspect cash, portfolio value, positions, and the latest price for the ordered asset before trading."
         )
@@ -1290,6 +1435,315 @@ def _bind_alpaca_news(strategy: Any, manager: Any) -> BoundTool:
     )
 
 
+def _preflight_blocker(code: str, message: str) -> dict[str, str]:
+    return {"code": code, "message": message}
+
+
+def _finite_positive_price(value: Any) -> float | None:
+    try:
+        price = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _preflight_strategy_call(strategy: Any, method_name: str, *args: Any, **kwargs: Any) -> tuple[bool, Any]:
+    method = getattr(strategy, method_name, None)
+    if not callable(method):
+        return False, None
+    try:
+        return True, method(*args, **kwargs)
+    except TypeError:
+        if kwargs:
+            try:
+                return True, method(*args)
+            except Exception:
+                return False, None
+        return False, None
+    except Exception:
+        return False, None
+
+
+def _preflight_account_snapshot(strategy: Any) -> dict[str, Any]:
+    cash_ok, raw_cash = _preflight_strategy_call(strategy, "get_cash")
+    portfolio_ok, raw_portfolio_value = _preflight_strategy_call(strategy, "get_portfolio_value")
+    cash = _finite_float(raw_cash) if cash_ok else None
+    portfolio_value = _finite_float(raw_portfolio_value) if portfolio_ok else None
+    return {
+        "cash": _jsonable(cash),
+        "portfolio_value": _jsonable(portfolio_value),
+        "_available": cash_ok and portfolio_ok and cash is not None and portfolio_value is not None,
+    }
+
+
+def _preflight_positions(strategy: Any) -> tuple[bool, list[Any]]:
+    get_positions = getattr(strategy, "get_positions", None)
+    if not callable(get_positions):
+        return False, []
+    try:
+        return True, list(get_positions(include_cash_positions=True) or [])
+    except TypeError:
+        try:
+            return True, list(get_positions() or [])
+        except Exception:
+            return False, []
+    except Exception:
+        return False, []
+
+
+def _preflight_position_snapshot(strategy: Any, symbol: str) -> dict[str, Any]:
+    normalized_symbol = _normalized_symbol(symbol)
+    positions_available, positions = _preflight_positions(strategy)
+    if not positions_available:
+        return {
+            "asset": {"symbol": normalized_symbol, "asset_type": None, "expiration": None, "strike": None, "right": None, "multiplier": None},
+            "quantity": None,
+            "avg_fill_price": None,
+            "current_price": None,
+            "market_value": None,
+            "pnl": None,
+            "pnl_percent": None,
+            "_available": False,
+        }
+    for position in positions:
+        asset = getattr(position, "asset", None)
+        if _normalized_symbol(getattr(asset, "symbol", None)) == normalized_symbol:
+            snapshot = _position_to_dict(position)
+            snapshot["_available"] = _finite_float(snapshot.get("quantity")) is not None
+            return snapshot
+    return {
+        "asset": {"symbol": normalized_symbol, "asset_type": None, "expiration": None, "strike": None, "right": None, "multiplier": None},
+        "quantity": 0.0,
+        "avg_fill_price": None,
+        "current_price": None,
+        "market_value": None,
+        "pnl": None,
+        "pnl_percent": None,
+        "_available": True,
+    }
+
+
+def _preflight_open_orders_snapshot(strategy: Any, symbol: str) -> dict[str, Any]:
+    orders_ok, orders = _preflight_strategy_call(strategy, "get_orders")
+    if not orders_ok:
+        return {
+            "count": None,
+            "same_symbol_count": None,
+            "same_symbol_orders": [],
+            "orders": [],
+            "_available": False,
+        }
+    order_payloads = [_order_to_dict(order) for order in orders or []]
+    normalized_symbol = _normalized_symbol(symbol)
+    same_symbol_orders = [
+        order
+        for order in order_payloads
+        if isinstance(order.get("asset"), dict)
+        and _normalized_symbol(order["asset"].get("symbol")) == normalized_symbol
+        and order.get("is_active") is not False
+        and order.get("is_filled") is not True
+        and order.get("is_canceled") is not True
+    ]
+    return {
+        "count": len(order_payloads),
+        "same_symbol_count": len(same_symbol_orders),
+        "same_symbol_orders": same_symbol_orders,
+        "orders": order_payloads,
+        "_available": True,
+    }
+
+
+def _preflight_price_snapshot(strategy: Any, symbol: str, asset_type: str) -> dict[str, Any]:
+    price = None
+    if symbol and asset_type in {"stock", "us_equity"}:
+        asset, quote = resolve_asset_and_quote(strategy, symbol=symbol, asset_type=asset_type)
+        price_ok, raw_price = _preflight_strategy_call(strategy, "get_last_price", asset, quote=quote)
+        if price_ok:
+            price = _finite_positive_price(raw_price)
+    return {"last_price": price}
+
+
+def _preflight_blocked_payload(
+    *,
+    blockers: list[dict[str, str]],
+    warnings: list[str],
+    account: dict[str, Any],
+    position: dict[str, Any],
+    price: dict[str, Any],
+    open_orders: dict[str, Any],
+    estimate: dict[str, Any],
+    internal_checks: list[str],
+    sequence: Any,
+    symbol: str,
+    side: str,
+    quantity: float | None,
+    asset_type: str,
+    order_type: str,
+    time_in_force: str,
+) -> dict[str, Any]:
+    return {
+        "readiness": "blocked",
+        "can_submit": False,
+        "blockers": blockers,
+        "warnings": warnings,
+        "account": account,
+        "position": position,
+        "price": price,
+        "open_orders": open_orders,
+        "estimate": estimate,
+        "internal_checks": internal_checks,
+        "sequence": _jsonable(sequence),
+        "order": {
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "asset_type": asset_type,
+            "order_type": order_type,
+            "time_in_force": time_in_force,
+        },
+    }
+
+
+def _bind_preflight_check(strategy: Any, manager: Any) -> BoundTool:
+    def preflight_check(
+        *,
+        symbol: str,
+        side: str,
+        quantity: Any,
+        sequence: Any = None,
+        asset_type: str = "stock",
+        order_type: str = "market",
+        time_in_force: str = "day",
+    ) -> dict[str, Any]:
+        symbol_text = _normalized_symbol(symbol)
+        side_text = str(side or "").strip().lower()
+        asset_type_text = str(asset_type or "").strip().lower()
+        order_type_text = str(order_type or "").strip().lower()
+        time_in_force_text = str(time_in_force or "").strip().lower()
+        blockers: list[dict[str, str]] = []
+        warnings: list[str] = []
+        internal_checks = ["account_portfolio", "account_positions", "orders_open_orders", "market_last_price"]
+
+        parsed_quantity: float | None = None
+        if not symbol_text or "," in str(symbol or ""):
+            blockers.append(_preflight_blocker("INVALID_SYMBOL", "symbol must be one non-empty tradable symbol."))
+        if side_text not in {"buy", "sell"}:
+            blockers.append(_preflight_blocker("UNSUPPORTED_SIDE", "orders_preflight_check supports side='buy' or side='sell'."))
+        try:
+            parsed_quantity = float(quantity)
+        except Exception:
+            parsed_quantity = None
+        if parsed_quantity is None or not math.isfinite(parsed_quantity) or parsed_quantity <= 0:
+            blockers.append(_preflight_blocker("INVALID_QUANTITY", "quantity must be a finite number greater than 0."))
+        if asset_type_text not in {"stock", "us_equity"}:
+            blockers.append(_preflight_blocker("UNSUPPORTED_ASSET_TYPE", "orders_preflight_check supports stock/us_equity orders."))
+        if order_type_text != "market":
+            blockers.append(_preflight_blocker("UNSUPPORTED_ORDER_TYPE", "orders_preflight_check currently supports market orders only."))
+        if time_in_force_text != "day":
+            blockers.append(_preflight_blocker("UNSUPPORTED_TIME_IN_FORCE", "orders_preflight_check currently supports time_in_force='day' only."))
+
+        account = _preflight_account_snapshot(strategy)
+        position = _preflight_position_snapshot(strategy, symbol_text)
+        open_orders = _preflight_open_orders_snapshot(strategy, symbol_text)
+        price = _preflight_price_snapshot(strategy, symbol_text, asset_type_text)
+        position_quantity = _finite_float(position.get("quantity"))
+        last_price = price["last_price"]
+        estimated_order_value = (
+            last_price * parsed_quantity
+            if last_price is not None and parsed_quantity is not None and parsed_quantity > 0
+            else None
+        )
+        cash_value = _finite_float(account.get("cash"))
+        estimated_cash_after_order = None
+        estimated_position_after_order = None
+        if estimated_order_value is not None and cash_value is not None and side_text in {"buy", "sell"}:
+            estimated_cash_after_order = (
+                cash_value - estimated_order_value if side_text == "buy" else cash_value + estimated_order_value
+            )
+        if (
+            parsed_quantity is not None
+            and math.isfinite(parsed_quantity)
+            and position_quantity is not None
+            and side_text in {"buy", "sell"}
+        ):
+            estimated_position_after_order = (
+                position_quantity + parsed_quantity if side_text == "buy" else position_quantity - parsed_quantity
+            )
+        estimate = {
+            "estimated_order_value": _jsonable(estimated_order_value),
+            "estimated_cash_after_order": _jsonable(estimated_cash_after_order),
+            "estimated_position_after_order": _jsonable(estimated_position_after_order),
+        }
+
+        if account.get("_available") is not True:
+            blockers.append(_preflight_blocker("ACCOUNT_UNAVAILABLE", "Cash and portfolio value must be available as finite numbers."))
+        if position.get("_available") is not True:
+            blockers.append(_preflight_blocker("POSITIONS_UNAVAILABLE", "Current positions must be available before preflight can approve an order."))
+        if open_orders.get("_available") is not True:
+            blockers.append(_preflight_blocker("OPEN_ORDERS_UNAVAILABLE", "Open orders must be available before preflight can approve an order."))
+        if last_price is None:
+            blockers.append(_preflight_blocker("PRICE_UNAVAILABLE", "A positive finite latest price is required."))
+        if isinstance(open_orders.get("same_symbol_count"), int) and open_orders["same_symbol_count"] > 0:
+            blockers.append(_preflight_blocker("OPEN_ORDER_CONFLICT", "There is already an active open order for this symbol."))
+        if side_text == "buy" and estimated_order_value is not None and cash_value is not None and estimated_order_value > cash_value:
+            blockers.append(_preflight_blocker("INSUFFICIENT_CASH_ESTIMATE", "Estimated buy value exceeds current cash."))
+        if side_text == "sell" and parsed_quantity is not None and position_quantity is not None and parsed_quantity > position_quantity:
+            blockers.append(_preflight_blocker("INSUFFICIENT_POSITION", "Sell quantity exceeds current long position quantity."))
+
+        payload_kwargs = {
+            "blockers": blockers,
+            "warnings": warnings,
+            "account": account,
+            "position": position,
+            "price": price,
+            "open_orders": open_orders,
+            "estimate": estimate,
+            "internal_checks": internal_checks,
+            "sequence": sequence,
+            "symbol": symbol_text,
+            "side": side_text,
+            "quantity": parsed_quantity,
+            "asset_type": asset_type_text,
+            "order_type": order_type_text,
+            "time_in_force": time_in_force_text,
+        }
+        if blockers:
+            return _preflight_blocked_payload(**payload_kwargs)
+
+        _record_successful_order_readiness(
+            symbol=symbol_text,
+            side=side_text,
+            quantity=parsed_quantity,
+            asset_type=asset_type_text,
+            order_type=order_type_text,
+            time_in_force=time_in_force_text,
+            source="orders_preflight_check",
+        )
+        ready_payload = _preflight_blocked_payload(**payload_kwargs)
+        ready_payload["readiness"] = "ready"
+        ready_payload["can_submit"] = True
+        return ready_payload
+
+    return BoundTool(
+        name="orders_preflight_check",
+        description="Inspect whether one explicit execution_plan order appears ready to submit.",
+        function=preflight_check,
+        metadata={"kind": "builtin", "replay_on_cache": True},
+    )
+
+
 def _bind_open_orders(strategy: Any, manager: Any) -> BoundTool:
     def open_orders() -> dict[str, Any]:
         orders = strategy.get_orders()
@@ -2335,7 +2789,14 @@ def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
     ) -> dict[str, Any]:
         symbol = _require_single_symbol_text("symbol", symbol)
         quantity = _require_positive_number("quantity", quantity)
-        _require_agent_order_readiness(symbol)
+        _require_agent_order_readiness(
+            symbol,
+            side=side,
+            quantity=quantity,
+            asset_type=asset_type,
+            order_type=order_type,
+            time_in_force=time_in_force,
+        )
         if order_type == "limit" and limit_price is None:
             raise ValueError("orders_submit_order with order_type='limit' requires limit_price.")
         if order_type in {"stop", "stop_limit"} and stop_price is None:
@@ -2679,6 +3140,13 @@ class _MemoryTools:
 
 
 class _OrderTools:
+    def preflight(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="orders_preflight_check",
+            description="Inspect whether one explicit execution_plan order appears ready to submit.",
+            binder=_bind_preflight_check,
+        )
+
     def submit(self) -> ToolDefinition:
         return ToolDefinition(
             name="orders_submit_order",
@@ -2780,6 +3248,7 @@ class _BuiltinTools:
             self.memory.open_thesis(),
             self.memory.update_thesis(),
             self.memory.close_thesis(),
+            self.orders.preflight(),
             self.orders.submit(),
             self.orders.confirm(),
             self.orders.submit_multileg(),
