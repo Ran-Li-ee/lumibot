@@ -1513,14 +1513,35 @@ def _preflight_positions(strategy: Any) -> tuple[bool, list[Any]]:
         return False, []
 
 
-def _preflight_position_snapshot(strategy: Any, symbol: str) -> dict[str, Any]:
+_PREFLIGHT_ASSET_TYPE_ALIASES = {
+    "us_equity": "stock",
+}
+
+
+def _preflight_normalized_asset_type(value: Any) -> str:
+    raw_value = getattr(value, "value", value)
+    text = str(raw_value or "").strip().lower()
+    return _PREFLIGHT_ASSET_TYPE_ALIASES.get(text, text)
+
+
+def _preflight_position_matches(position: Any, symbol: str, asset_type: str) -> bool:
+    asset = getattr(position, "asset", None)
+    return (
+        _normalized_symbol(getattr(asset, "symbol", None)) == _normalized_symbol(symbol)
+        and _preflight_normalized_asset_type(getattr(asset, "asset_type", None))
+        == _preflight_normalized_asset_type(asset_type)
+    )
+
+
+def _preflight_position_snapshot(strategy: Any, symbol: str, asset_type: str) -> dict[str, Any]:
     normalized_symbol = _normalized_symbol(symbol)
+    normalized_asset_type = _preflight_normalized_asset_type(asset_type)
     positions_available, positions = _preflight_positions(strategy)
     if not positions_available:
         return {
             "asset": {
                 "symbol": normalized_symbol,
-                "asset_type": None,
+                "asset_type": normalized_asset_type,
                 "expiration": None,
                 "strike": None,
                 "right": None,
@@ -1535,15 +1556,14 @@ def _preflight_position_snapshot(strategy: Any, symbol: str) -> dict[str, Any]:
             "_available": False,
         }
     for position in positions:
-        asset = getattr(position, "asset", None)
-        if _normalized_symbol(getattr(asset, "symbol", None)) == normalized_symbol:
+        if _preflight_position_matches(position, normalized_symbol, normalized_asset_type):
             snapshot = _position_to_dict(position)
             snapshot["_available"] = _finite_float(snapshot.get("quantity")) is not None
             return snapshot
     return {
         "asset": {
             "symbol": normalized_symbol,
-            "asset_type": None,
+            "asset_type": normalized_asset_type,
             "expiration": None,
             "strike": None,
             "right": None,
@@ -1722,7 +1742,7 @@ def _bind_preflight_check(strategy: Any, manager: Any) -> BoundTool:
             )
 
         account = _preflight_account_snapshot(strategy)
-        position = _preflight_position_snapshot(strategy, symbol_text)
+        position = _preflight_position_snapshot(strategy, symbol_text, asset_type_text)
         open_orders = _preflight_open_orders_snapshot(strategy, symbol_text)
         price = _preflight_price_snapshot(strategy, symbol_text, asset_type_text)
         position_quantity = _finite_float(position.get("quantity"))

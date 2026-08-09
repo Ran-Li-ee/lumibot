@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 import pytest
 
+from lumibot.components.agents import BuiltinTools
 from lumibot.components.agents.manager import AgentHandle, AgentManager
 from lumibot.components.agents.runtime import GoogleADKRuntime, RuntimeRequest
 from lumibot.components.agents.schemas import (
@@ -32,6 +35,67 @@ class DummyStrategy:
 
     def log_message(self, *args, **kwargs):
         return None
+
+
+def _fake_asset(symbol, asset_type="stock"):
+    return SimpleNamespace(symbol=symbol, asset_type=asset_type)
+
+
+class ReplayOrderStrategy(DummyStrategy):
+    def __init__(self):
+        super().__init__()
+        self.is_backtesting = True
+        self.cash = 100000.0
+        self.portfolio_value = 100000.0
+        self.positions = []
+        self.open_orders = []
+        self.last_prices = {}
+        self.submitted_orders = []
+
+    def get_cash(self):
+        return self.cash
+
+    def get_portfolio_value(self):
+        return self.portfolio_value
+
+    def get_positions(self, include_cash_positions=True):
+        return list(self.positions)
+
+    def get_orders(self):
+        return list(self.open_orders)
+
+    def get_last_price(self, asset, quote=None, exchange=None):
+        return self.last_prices.get(getattr(asset, "symbol", None), 100.0)
+
+    def create_order(self, asset, quantity, side, **kwargs):
+        return SimpleNamespace(
+            identifier="replayed-order",
+            status="new",
+            side=side,
+            asset=asset,
+            quantity=quantity,
+            order_type=kwargs.get("order_type", "market"),
+            time_in_force=kwargs.get("time_in_force", "day"),
+        )
+
+    def submit_order(self, order):
+        self.submitted_orders.append(order)
+        return order
+
+
+def _fake_open_order(symbol, quantity=1, side="buy", status="new", identifier="open-order"):
+    return SimpleNamespace(
+        identifier=identifier,
+        status=status,
+        side=side,
+        asset=_fake_asset(symbol),
+        quantity=quantity,
+        order_type="market",
+        time_in_force="day",
+        is_active=lambda: True,
+        is_filled=lambda: False,
+        is_canceled=lambda: False,
+    )
 
 
 class DummyManager:
@@ -315,6 +379,63 @@ def test_agent_run_reuses_bound_tools_when_replay_cache_hits(monkeypatch):
 
     assert result.cache_hit is True
     assert bind_calls == 1
+
+
+def test_replay_cache_does_not_submit_after_blocked_preflight(monkeypatch):
+    strategy = ReplayOrderStrategy()
+    strategy.open_orders = [_fake_open_order("SPY")]
+    strategy.last_prices = {"SPY": 100.0}
+    manager = AgentManager(strategy)
+    handle = manager.create(
+        name="execution_agent",
+        system_prompt="Execute cached trace.",
+        model="test-model",
+        tools=[
+            BuiltinTools.orders.preflight(),
+            BuiltinTools.orders.submit(),
+        ],
+        include_builtin_tools=False,
+        _runtime=object(),
+    )
+    monkeypatch.setattr(
+        manager.replay_cache,
+        "load",
+        lambda cache_key: {
+            "summary": "Cached execution trace.",
+            "model": "test-model",
+            "events": [
+                {
+                    "kind": "tool_call",
+                    "tool_name": "orders_preflight_check",
+                    "payload": {"symbol": "SPY", "side": "buy", "quantity": 1},
+                },
+                {
+                    "kind": "tool_result",
+                    "tool_name": "orders_preflight_check",
+                    "payload": {
+                        "readiness": "blocked",
+                        "can_submit": False,
+                        "blockers": [{"code": "OPEN_ORDER_CONFLICT"}],
+                    },
+                },
+                {
+                    "kind": "tool_call",
+                    "tool_name": "orders_submit_order",
+                    "payload": {"symbol": "SPY", "side": "buy", "quantity": 1},
+                },
+            ],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(manager, "_record_agent_observability", lambda **kwargs: None)
+    monkeypatch.setattr(handle, "_append_memory", lambda result: None)
+    monkeypatch.setattr(handle, "_append_run_artifact_summary", lambda result, context: None)
+    monkeypatch.setattr(handle, "_log_run_summary", lambda result, context: None)
+
+    result = handle.run(task_prompt="Replay cached execution.")
+
+    assert result.cache_hit is True
+    assert strategy.submitted_orders == []
 
 
 def test_agent_handle_uses_default_base_prompt_by_default():

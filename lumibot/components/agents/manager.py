@@ -15,7 +15,6 @@ from lumibot import LUMIBOT_CACHE_FOLDER
 
 from .boundary_trace import BoundaryTraceCollector
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer, ToolDefinition
-from .tool_context import agent_tool_context
 from .tools import bind_callable_tool
 from .trace_redaction import redact_sensitive
 
@@ -1475,8 +1474,20 @@ class AgentHandle:
         result: AgentRunResult,
         bound_tools: list[BoundTool] | None = None,
     ) -> None:
+        from .runtime import _wrap_tool_callable
+
         available_tools = bound_tools if bound_tools is not None else self._ensure_bound_tools()
         tools_by_name = {tool.name: tool for tool in available_tools}
+        tool_context = {
+            "agent_name": self.name,
+            "model_call_id": result.cache_key,
+            "enforce_order_readiness": True,
+            "tool_calls": [],
+        }
+        wrapped_tools_by_name = {
+            tool.name: _wrap_tool_callable(tool, tool_context)
+            for tool in available_tools
+        }
         for event in result.tool_calls:
             tool_name = event.tool_name
             if not tool_name:
@@ -1489,8 +1500,7 @@ class AgentHandle:
             if not bool(tool.metadata.get("replay_on_cache")):
                 continue
             payload = event.payload if isinstance(event.payload, dict) else {}
-            with agent_tool_context({"agent_name": self.name, "model_call_id": result.cache_key}):
-                tool.function(**payload)
+            wrapped_tools_by_name[tool.name](**payload)
 
     def _derive_warnings(
         self,

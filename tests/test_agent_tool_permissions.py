@@ -89,9 +89,9 @@ def _fake_asset(symbol, asset_type="stock"):
     return SimpleNamespace(symbol=symbol, asset_type=asset_type)
 
 
-def _fake_position(symbol, quantity, market_value=None, current_price=None):
+def _fake_position(symbol, quantity, market_value=None, current_price=None, asset_type="stock"):
     return SimpleNamespace(
-        asset=_fake_asset(symbol),
+        asset=_fake_asset(symbol, asset_type=asset_type),
         quantity=quantity,
         market_value=market_value,
         current_price=current_price,
@@ -896,6 +896,25 @@ def test_orders_preflight_check_blocks_sell_with_insufficient_position():
     assert result["readiness"] == "blocked"
     assert result["can_submit"] is False
     assert "INSUFFICIENT_POSITION" in {blocker["code"] for blocker in result["blockers"]}
+
+
+def test_orders_preflight_check_does_not_use_option_position_for_stock_sell():
+    strategy = _OrderReadinessStrategy()
+    strategy.positions = [_fake_position("SPY", 10, asset_type="option")]
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight()])
+
+    result = tool_map["orders_preflight_check"](
+        symbol="SPY",
+        quantity=5,
+        side="sell",
+        asset_type="stock",
+    )
+
+    assert result["readiness"] == "blocked"
+    assert result["can_submit"] is False
+    assert "INSUFFICIENT_POSITION" in {blocker["code"] for blocker in result["blockers"]}
+    assert result["position"]["quantity"] == 0.0
 
 
 def test_orders_preflight_check_blocks_invalid_quantity():
