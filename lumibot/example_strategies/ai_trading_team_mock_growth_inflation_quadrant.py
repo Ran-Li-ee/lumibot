@@ -13,6 +13,12 @@ from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
     validate_decision_buy_sizing,
     validate_execution_plan_cash_safety,
 )
+from lumibot.example_strategies.target_portfolio_to_execution_plan import (
+    TOOL_NAME as TARGET_PORTFOLIO_TO_EXECUTION_PLAN_TOOL_NAME,
+)
+from lumibot.example_strategies.target_portfolio_to_execution_plan import (
+    make_target_portfolio_to_execution_plan_tool,
+)
 
 REGIMES = (
     "growth_up_inflation_down",
@@ -420,6 +426,7 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
         self._mock_regime_mode = self.parameters.get("mock_regime_mode", "seeded_random")
         self._mock_regime_seed = int(self.parameters.get("mock_regime_seed", 42))
         self._last_mock_regime = None
+        self._last_target_portfolio_planner_result = None
         model = os.environ.get("AI_TRADING_TEAM_MODEL", "gemini-3.1-flash-lite")
 
         self.agents.create(
@@ -458,28 +465,18 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             model=model,
             allow_trading=False,
             include_builtin_tools=False,
-            tools=[
-                BuiltinTools.account.positions(),
-                BuiltinTools.account.portfolio(),
-                BuiltinTools.market.last_price(),
-            ],
+            tools=[make_target_portfolio_to_execution_plan_tool()],
             system_prompt=(
-                "Portfolio decision role: do not redo macro or basket research. Convert provided basket reports "
-                "and current account state into a concrete portfolio decision and strict execution_plan. Do not "
-                "place orders. Return only one valid JSON object; do not include markdown, RESULT text, or prose "
-                "after the JSON. The top-level fields decision, target_portfolio, and execution_plan are required. "
-                "decision must include type and reason_brief. target_portfolio must list the selected active basket "
-                "targets as symbols and target weights. execution_plan must be an object, not a list. "
-                "execution_plan must include schema_version, intent, and orders (execution_plan.orders). "
-                "intent must be one of hold or rebalance. For hold intent, orders must be an empty list. "
-                "Each executable order must include sequence, action, symbol, side, quantity_mode, quantity, "
-                "asset_type, order_type, and time_in_force. action must be submit_order. quantity_mode must be "
-                'exactly "shares" for every executable order. Use numeric positive whole-share quantities. '
-                'All executable orders must use order_type "market" and time_in_force "day". Do not output '
-                "limit_price, stop_price, stop_limit_price, trail_price, or trail_percent. Before any non-hold "
-                "plan, call account_positions and account_portfolio; before sizing any buy order, call "
-                "market_last_price for the symbols being bought. Sell or reduce orders must come before buy "
-                "orders. Never produce orders that would make cash negative."
+                "Portfolio decision role: do not redo macro or basket research. Merge the macro allocation report "
+                "and basket reports into a target_portfolio, then call "
+                f"{TARGET_PORTFOLIO_TO_EXECUTION_PLAN_TOOL_NAME}. Do not "
+                "place orders. Do not manually calculate share quantities, cash usage, order side, or order sequence. "
+                "The planner tool owns all execution_plan calculations. Return only one valid JSON object; do not "
+                "include markdown, RESULT text, or prose after the JSON. The top-level fields decision, "
+                "target_portfolio, and execution_plan are required. decision must include type and reason_brief. "
+                "target_portfolio must list the selected active basket targets as symbols and target weights. "
+                "The final execution_plan must be copied exactly from the planner tool result. Do not modify "
+                "tool-generated quantities, sides, order_type, time_in_force, or sequence values."
             ),
         )
 
@@ -542,9 +539,10 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
 
             portfolio_result = self.agents["portfolio_decision_agent"].run(
                 task_prompt=(
-                    "Create the target portfolio and execution_plan from the provided macro and basket reports. "
-                    "Return only the strict JSON object with decision, target_portfolio, and execution_plan. "
-                    "execution_plan must be an object with schema_version, intent, and orders."
+                    "Create target_portfolio from the provided macro and basket reports, then call "
+                    f"{TARGET_PORTFOLIO_TO_EXECUTION_PLAN_TOOL_NAME} with date and target_portfolio. "
+                    "Return only the strict JSON object with decision, target_portfolio, and the planner tool's "
+                    "execution_plan copied exactly."
                 ),
                 context={
                     "date": current_date,

@@ -250,9 +250,7 @@ def test_agents_receive_distinct_tool_surfaces():
             "market_last_price",
         }
     assert created_tool_names(created["portfolio_decision_agent"]) == {
-        "account_positions",
-        "account_portfolio",
-        "market_last_price",
+        "target_portfolio_to_execution_plan",
     }
     assert created_tool_names(created["execution_agent"]) == {
         "account_positions",
@@ -288,12 +286,13 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "call the mock macro_regime_classifier" in serialized
     assert "stay inside the assigned basket" in serialized
     assert "do not redo macro or basket research" in serialized
-    assert "before any non-hold plan, call account_positions and account_portfolio" in serialized
-    assert "before sizing any buy order, call market_last_price" in serialized
+    assert "call target_portfolio_to_execution_plan" in serialized
+    assert "do not manually calculate share quantities" in serialized
+    assert "planner tool owns all execution_plan calculations" in serialized
     assert "execute only the provided execution_plan" in serialized
 
 
-def test_portfolio_decision_prompt_declares_strict_execution_plan_contract():
+def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
     _module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
     strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
@@ -303,23 +302,21 @@ def test_portfolio_decision_prompt_declares_strict_execution_plan_contract():
     created = {agent["name"]: agent for agent in agent_manager.created}
     portfolio_prompt = created["portfolio_decision_agent"]["system_prompt"].lower()
     for required_phrase in (
-        "return only one valid json object",
-        "top-level fields decision, target_portfolio, and execution_plan",
-        "execution_plan must be an object",
-        "schema_version",
-        "intent",
-        "execution_plan.orders",
-        "sequence",
-        "action",
-        "quantity_mode",
-        "quantity",
-        "asset_type",
-        "order_type",
-        "time_in_force",
-        'quantity_mode must be exactly "shares"',
-        'order_type "market"',
+        "merge the macro allocation report",
+        "call target_portfolio_to_execution_plan",
+        "do not manually calculate share quantities",
+        "planner tool owns all execution_plan calculations",
+        "execution_plan must be copied exactly from the planner tool result",
+        "do not modify tool-generated quantities",
     ):
         assert required_phrase in portfolio_prompt
+    for forbidden_phrase in (
+        "before sizing any buy order",
+        "call account_positions",
+        "call account_portfolio",
+        "call market_last_price",
+    ):
+        assert forbidden_phrase not in portfolio_prompt
 
 
 def test_basket_universes_have_at_least_five_semantically_valid_symbols():
@@ -467,6 +464,30 @@ def test_agent_manager_create_registers_macro_regime_classifier_tool_definition_
 
     assert [tool.name for tool in bound_tools] == ["macro_regime_classifier"]
     assert bound_tools[0].function()["tool"] == "macro_regime_classifier"
+
+
+def test_target_portfolio_to_execution_plan_tool_definition_binds_and_stores_result():
+    _module, _strategy_class = load_strategy_module()
+    planner_module = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[],
+        cash=100000,
+        portfolio_value=100000,
+        prices={"SPY": 100},
+    )
+
+    tool_definition = planner_module.make_target_portfolio_to_execution_plan_tool()
+    tool = tool_definition.binder(strategy, None)
+    result = tool.function(
+        date="2024-09-05",
+        target_portfolio=[{"basket_id": "equity", "symbol": "SPY", "target_weight": 0.5}],
+    )
+
+    assert tool_definition.name == "target_portfolio_to_execution_plan"
+    assert tool.name == "target_portfolio_to_execution_plan"
+    assert tool.metadata == {"kind": "portfolio_transition_planner"}
+    assert result["execution_plan"]["intent"] == "rebalance"
+    assert strategy._last_target_portfolio_planner_result == result
 
 
 def test_parse_execution_plan_accepts_multiple_market_buy_orders():
