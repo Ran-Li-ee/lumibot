@@ -1057,10 +1057,10 @@ def test_target_portfolio_to_execution_plan_holds_when_whole_share_rounding_prod
         positions=[
             make_position("SPY", 500),
             make_position("GLD", 250),
-            make_position("VGIT", 500),
+            make_position("VGIT", 499),
         ],
         cash=0,
-        portfolio_value=100000,
+        portfolio_value=99950,
         prices={"SPY": 100, "GLD": 100, "VGIT": 50},
     )
 
@@ -1075,6 +1075,14 @@ def test_target_portfolio_to_execution_plan_holds_when_whole_share_rounding_prod
     )
 
     assert result["execution_plan"] == {"schema_version": 1, "intent": "hold", "orders": []}
+    warnings = result["warnings"]
+    assert any("SPY" in warning and "smaller than one share" in warning for warning in warnings)
+    assert any("GLD" in warning and "smaller than one share" in warning for warning in warnings)
+    assert any(
+        "VGIT" in warning
+        and ("insufficient to buy one share" in warning or "smaller than one share" in warning)
+        for warning in warnings
+    )
 
 
 def test_target_portfolio_to_execution_plan_combines_duplicate_targets_and_rejects_overweight_total():
