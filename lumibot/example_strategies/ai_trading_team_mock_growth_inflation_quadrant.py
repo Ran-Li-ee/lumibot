@@ -405,7 +405,9 @@ def _agent_result_tool_names(result: Any) -> set[str]:
 def validate_execution_plan_matches_planner_result(strategy: Any, execution_plan: dict[str, Any]) -> None:
     planner_result = getattr(strategy, "_last_target_portfolio_planner_result", None)
     if not isinstance(planner_result, dict):
-        raise ValueError("portfolio_decision_agent must call target_portfolio_to_execution_plan before execution.")
+        raise ValueError(
+            "portfolio_decision_agent must successfully call target_portfolio_to_execution_plan before execution."
+        )
     planner_plan = normalize_execution_plan(planner_result.get("execution_plan"))
     execution_plan = normalize_execution_plan(execution_plan)
     if execution_plan != planner_plan:
@@ -544,6 +546,7 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
                 )
                 basket_reports_by_id[basket_id] = _parse_json_summary(basket_result.summary, agent_name)
 
+            self._last_target_portfolio_planner_result = None
             portfolio_result = self.agents["portfolio_decision_agent"].run(
                 task_prompt=(
                     "Create target_portfolio from the provided macro and basket reports, then call "

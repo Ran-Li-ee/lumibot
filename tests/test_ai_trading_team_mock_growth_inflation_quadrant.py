@@ -16,10 +16,12 @@ class RecordingAgentManager:
         self._agents = {}
         self.summaries = {}
         self.tool_calls = {}
+        self.planner_results = {}
+        self.strategy = None
 
     def create(self, **kwargs):
         self.created.append(kwargs)
-        agent = RecordingAgent(kwargs["name"], self.summaries, self.tool_calls)
+        agent = RecordingAgent(kwargs["name"], self)
         self._agents[kwargs["name"]] = agent
         return agent
 
@@ -28,20 +30,23 @@ class RecordingAgentManager:
 
 
 class RecordingAgent:
-    def __init__(self, name, summaries=None, tool_calls=None):
+    def __init__(self, name, agent_manager):
         self.name = name
-        self.summaries = summaries if summaries is not None else {}
-        self.tool_calls = tool_calls if tool_calls is not None else {}
+        self.agent_manager = agent_manager
         self.calls = []
 
     def run(self, *, task_prompt, context):
         self.calls.append({"task_prompt": task_prompt, "context": context})
-        summary = self.summaries.get(self.name, f"{self.name} summary")
+        summary = self.agent_manager.summaries.get(self.name, f"{self.name} summary")
+        if self.name in self.agent_manager.planner_results and self.agent_manager.strategy is not None:
+            self.agent_manager.strategy._last_target_portfolio_planner_result = self.agent_manager.planner_results[
+                self.name
+            ]
         return SimpleNamespace(
             summary=summary,
             tool_calls=[
                 SimpleNamespace(tool_name=tool_name)
-                for tool_name in self.tool_calls.get(self.name, [])
+                for tool_name in self.agent_manager.tool_calls.get(self.name, [])
             ],
         )
 
@@ -49,6 +54,7 @@ class RecordingAgent:
 def make_strategy_with_agent_manager(strategy_class, agent_manager):
     strategy = object.__new__(strategy_class)
     strategy.agents = agent_manager
+    agent_manager.strategy = strategy
     strategy.parameters = dict(strategy_class.parameters)
     strategy.get_datetime = lambda: datetime(2024, 9, 5, 9, 30)
     strategy.get_cash = lambda: 100000.0
@@ -931,7 +937,7 @@ def test_on_trading_iteration_runs_macro_four_baskets_portfolio_then_execution()
         agent_manager.summaries[agent_name] = _json_summary(report)
     agent_manager.summaries["portfolio_decision_agent"] = _json_summary(portfolio_summary)
     agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
-    strategy._last_target_portfolio_planner_result = {"execution_plan": portfolio_summary["execution_plan"]}
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": portfolio_summary["execution_plan"]}
 
     strategy.on_trading_iteration()
 
@@ -991,7 +997,7 @@ def test_hold_plan_skips_execution_agent():
         {"execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}}
     )
     agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
-    strategy._last_target_portfolio_planner_result = {
+    agent_manager.planner_results["portfolio_decision_agent"] = {
         "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}
     }
 
@@ -1000,6 +1006,34 @@ def test_hold_plan_skips_execution_agent():
     assert agent_manager["portfolio_decision_agent"].calls
     assert agent_manager["execution_agent"].calls == []
     assert strategy._last_execution_plan_error is None
+
+
+def test_on_trading_iteration_rejects_stale_planner_result_without_fresh_successful_call():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    execution_plan = {
+        "schema_version": 1,
+        "intent": "rebalance",
+        "orders": [
+            {
+                "sequence": 1,
+                "symbol": "QQQ",
+                "side": "buy",
+                "quantity_mode": "shares",
+                "quantity": 1,
+                "order_type": "market",
+            },
+        ],
+    }
+    strategy._last_target_portfolio_planner_result = {"execution_plan": execution_plan}
+    _seed_active_equity_workflow(agent_manager, module, execution_plan)
+
+    strategy.on_trading_iteration()
+
+    assert "successfully call target_portfolio_to_execution_plan" in strategy._last_execution_plan_error
+    assert agent_manager["execution_agent"].calls == []
 
 
 def _seed_active_equity_workflow(agent_manager, module, execution_plan):
@@ -1075,7 +1109,7 @@ def test_oversized_buy_plan_blocks_before_execution_agent():
             ],
         },
     )
-    strategy._last_target_portfolio_planner_result = {
+    agent_manager.planner_results["portfolio_decision_agent"] = {
         "execution_plan": json.loads(agent_manager.summaries["portfolio_decision_agent"])["execution_plan"]
     }
 
@@ -1109,7 +1143,7 @@ def test_sell_without_position_blocks_before_execution_agent():
             ],
         },
     )
-    strategy._last_target_portfolio_planner_result = {
+    agent_manager.planner_results["portfolio_decision_agent"] = {
         "execution_plan": json.loads(agent_manager.summaries["portfolio_decision_agent"])["execution_plan"]
     }
 
