@@ -360,7 +360,8 @@ def _require_agent_order_readiness(
             "ORDER_READINESS_REQUIRED: Before submitting an order, inspect readiness in this same agent run. "
             "Prefer orders_preflight_check when available; otherwise call "
             f"{', '.join(missing)} in this same agent run. "
-            "Agents must inspect cash, portfolio value, positions, and the latest price for the ordered asset before trading."
+            "Agents must inspect cash, portfolio value, positions, and the latest price for the ordered asset "
+            "before trading."
         )
 
 
@@ -1508,7 +1509,14 @@ def _preflight_position_snapshot(strategy: Any, symbol: str) -> dict[str, Any]:
     positions_available, positions = _preflight_positions(strategy)
     if not positions_available:
         return {
-            "asset": {"symbol": normalized_symbol, "asset_type": None, "expiration": None, "strike": None, "right": None, "multiplier": None},
+            "asset": {
+                "symbol": normalized_symbol,
+                "asset_type": None,
+                "expiration": None,
+                "strike": None,
+                "right": None,
+                "multiplier": None,
+            },
             "quantity": None,
             "avg_fill_price": None,
             "current_price": None,
@@ -1524,7 +1532,14 @@ def _preflight_position_snapshot(strategy: Any, symbol: str) -> dict[str, Any]:
             snapshot["_available"] = _finite_float(snapshot.get("quantity")) is not None
             return snapshot
     return {
-        "asset": {"symbol": normalized_symbol, "asset_type": None, "expiration": None, "strike": None, "right": None, "multiplier": None},
+        "asset": {
+            "symbol": normalized_symbol,
+            "asset_type": None,
+            "expiration": None,
+            "strike": None,
+            "right": None,
+            "multiplier": None,
+        },
         "quantity": 0.0,
         "avg_fill_price": None,
         "current_price": None,
@@ -1640,7 +1655,12 @@ def _bind_preflight_check(strategy: Any, manager: Any) -> BoundTool:
         if not symbol_text or "," in str(symbol or ""):
             blockers.append(_preflight_blocker("INVALID_SYMBOL", "symbol must be one non-empty tradable symbol."))
         if side_text not in {"buy", "sell"}:
-            blockers.append(_preflight_blocker("UNSUPPORTED_SIDE", "orders_preflight_check supports side='buy' or side='sell'."))
+            blockers.append(
+                _preflight_blocker(
+                    "UNSUPPORTED_SIDE",
+                    "orders_preflight_check supports side='buy' or side='sell'.",
+                )
+            )
         try:
             parsed_quantity = float(quantity)
         except Exception:
@@ -1648,11 +1668,26 @@ def _bind_preflight_check(strategy: Any, manager: Any) -> BoundTool:
         if parsed_quantity is None or not math.isfinite(parsed_quantity) or parsed_quantity <= 0:
             blockers.append(_preflight_blocker("INVALID_QUANTITY", "quantity must be a finite number greater than 0."))
         if asset_type_text not in {"stock", "us_equity"}:
-            blockers.append(_preflight_blocker("UNSUPPORTED_ASSET_TYPE", "orders_preflight_check supports stock/us_equity orders."))
+            blockers.append(
+                _preflight_blocker(
+                    "UNSUPPORTED_ASSET_TYPE",
+                    "orders_preflight_check supports stock/us_equity orders.",
+                )
+            )
         if order_type_text != "market":
-            blockers.append(_preflight_blocker("UNSUPPORTED_ORDER_TYPE", "orders_preflight_check currently supports market orders only."))
+            blockers.append(
+                _preflight_blocker(
+                    "UNSUPPORTED_ORDER_TYPE",
+                    "orders_preflight_check currently supports market orders only.",
+                )
+            )
         if time_in_force_text != "day":
-            blockers.append(_preflight_blocker("UNSUPPORTED_TIME_IN_FORCE", "orders_preflight_check currently supports time_in_force='day' only."))
+            blockers.append(
+                _preflight_blocker(
+                    "UNSUPPORTED_TIME_IN_FORCE",
+                    "orders_preflight_check currently supports time_in_force='day' only.",
+                )
+            )
 
         account = _preflight_account_snapshot(strategy)
         position = _preflight_position_snapshot(strategy, symbol_text)
@@ -1688,18 +1723,45 @@ def _bind_preflight_check(strategy: Any, manager: Any) -> BoundTool:
         }
 
         if account.get("_available") is not True:
-            blockers.append(_preflight_blocker("ACCOUNT_UNAVAILABLE", "Cash and portfolio value must be available as finite numbers."))
+            blockers.append(
+                _preflight_blocker(
+                    "ACCOUNT_UNAVAILABLE",
+                    "Cash and portfolio value must be available as finite numbers.",
+                )
+            )
         if position.get("_available") is not True:
-            blockers.append(_preflight_blocker("POSITIONS_UNAVAILABLE", "Current positions must be available before preflight can approve an order."))
+            blockers.append(
+                _preflight_blocker(
+                    "POSITIONS_UNAVAILABLE",
+                    "Current positions must be available before preflight can approve an order.",
+                )
+            )
         if open_orders.get("_available") is not True:
-            blockers.append(_preflight_blocker("OPEN_ORDERS_UNAVAILABLE", "Open orders must be available before preflight can approve an order."))
+            blockers.append(
+                _preflight_blocker(
+                    "OPEN_ORDERS_UNAVAILABLE",
+                    "Open orders must be available before preflight can approve an order.",
+                )
+            )
         if last_price is None:
             blockers.append(_preflight_blocker("PRICE_UNAVAILABLE", "A positive finite latest price is required."))
         if isinstance(open_orders.get("same_symbol_count"), int) and open_orders["same_symbol_count"] > 0:
-            blockers.append(_preflight_blocker("OPEN_ORDER_CONFLICT", "There is already an active open order for this symbol."))
-        if side_text == "buy" and estimated_order_value is not None and cash_value is not None and estimated_order_value > cash_value:
+            blockers.append(
+                _preflight_blocker("OPEN_ORDER_CONFLICT", "There is already an active open order for this symbol.")
+            )
+        if (
+            side_text == "buy"
+            and estimated_order_value is not None
+            and cash_value is not None
+            and estimated_order_value > cash_value
+        ):
             blockers.append(_preflight_blocker("INSUFFICIENT_CASH_ESTIMATE", "Estimated buy value exceeds current cash."))
-        if side_text == "sell" and parsed_quantity is not None and position_quantity is not None and parsed_quantity > position_quantity:
+        if (
+            side_text == "sell"
+            and parsed_quantity is not None
+            and position_quantity is not None
+            and parsed_quantity > position_quantity
+        ):
             blockers.append(_preflight_blocker("INSUFFICIENT_POSITION", "Sell quantity exceeds current long position quantity."))
 
         payload_kwargs = {
