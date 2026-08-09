@@ -38,26 +38,26 @@ BASKET_AGENT_NAMES = {
 MOCK_WEIGHT_BY_REGIME = {
     "growth_up_inflation_down": {
         "equity": 0.50,
-        "commodity": 0.00,
-        "tips": 0.25,
+        "commodity": 0.25,
+        "tips": 0.00,
         "nominal_bond": 0.25,
     },
     "growth_up_inflation_up": {
-        "equity": 0.50,
-        "commodity": 0.25,
+        "equity": 0.25,
+        "commodity": 0.50,
         "tips": 0.25,
         "nominal_bond": 0.00,
     },
     "growth_down_inflation_up": {
         "equity": 0.00,
-        "commodity": 0.50,
-        "tips": 0.25,
+        "commodity": 0.25,
+        "tips": 0.50,
         "nominal_bond": 0.25,
     },
     "growth_down_inflation_down": {
         "equity": 0.25,
-        "commodity": 0.00,
-        "tips": 0.25,
+        "commodity": 0.25,
+        "tips": 0.00,
         "nominal_bond": 0.50,
     },
 }
@@ -224,7 +224,7 @@ def _require_dict(value: Any, label: str) -> dict[str, Any]:
 
 def _normalize_order(order: Any) -> dict[str, Any]:
     order = _require_dict(order, "order")
-    for field in ("sequence", "symbol", "side", "quantity_mode"):
+    for field in ("sequence", "symbol", "side"):
         if field not in order:
             raise ValueError(f"missing required order field: {field}")
 
@@ -246,7 +246,7 @@ def _normalize_order(order: Any) -> dict[str, Any]:
     if action not in ALLOWED_ACTIONS:
         raise ValueError(f"unsupported order action: {action}")
 
-    quantity_mode = str(order["quantity_mode"]).strip().lower()
+    quantity_mode = str(order.get("quantity_mode", "shares")).strip().lower()
     if quantity_mode in REJECTED_SEMANTIC_QUANTITY_MODES:
         raise ValueError(
             "executable orders must use explicit shares quantity_mode; "
@@ -465,10 +465,21 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             ],
             system_prompt=(
                 "Portfolio decision role: do not redo macro or basket research. Convert provided basket reports "
-                "and current account state into one JSON object with decision and execution_plan. Before any "
-                "non-hold plan, call account_positions and account_portfolio; before sizing any buy order, call "
-                "market_last_price for the symbols being bought. Use explicit whole-share market orders only. "
-                "Do not place orders."
+                "and current account state into a concrete portfolio decision and strict execution_plan. Do not "
+                "place orders. Return only one valid JSON object; do not include markdown, RESULT text, or prose "
+                "after the JSON. The top-level fields decision, target_portfolio, and execution_plan are required. "
+                "decision must include type and reason_brief. target_portfolio must list the selected active basket "
+                "targets as symbols and target weights. execution_plan must be an object, not a list. "
+                "execution_plan must include schema_version, intent, and orders (execution_plan.orders). "
+                "intent must be one of hold or rebalance. For hold intent, orders must be an empty list. "
+                "Each executable order must include sequence, action, symbol, side, quantity_mode, quantity, "
+                "asset_type, order_type, and time_in_force. action must be submit_order. quantity_mode must be "
+                'exactly "shares" for every executable order. Use numeric positive whole-share quantities. '
+                'All executable orders must use order_type "market" and time_in_force "day". Do not output '
+                "limit_price, stop_price, stop_limit_price, trail_price, or trail_percent. Before any non-hold "
+                "plan, call account_positions and account_portfolio; before sizing any buy order, call "
+                "market_last_price for the symbols being bought. Sell or reduce orders must come before buy "
+                "orders. Never produce orders that would make cash negative."
             ),
         )
 
@@ -532,7 +543,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             portfolio_result = self.agents["portfolio_decision_agent"].run(
                 task_prompt=(
                     "Create the target portfolio and execution_plan from the provided macro and basket reports. "
-                    "Return one JSON object with decision, target_portfolio, and execution_plan."
+                    "Return only the strict JSON object with decision, target_portfolio, and execution_plan. "
+                    "execution_plan must be an object with schema_version, intent, and orders."
                 ),
                 context={
                     "date": current_date,

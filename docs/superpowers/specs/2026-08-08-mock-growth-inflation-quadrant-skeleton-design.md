@@ -170,8 +170,8 @@ Example:
   "regime_changed": true,
   "basket_weights": {
     "equity": 0.50,
-    "commodity": 0.00,
-    "tips": 0.25,
+    "commodity": 0.25,
+    "tips": 0.00,
     "nominal_bond": 0.25
   },
   "reason_brief": "Mock classifier selected this regime from deterministic date and seed logic. This is not real macro evidence."
@@ -192,10 +192,10 @@ Initial mapping:
 
 | Regime | equity | commodity | tips | nominal_bond |
 |---|---:|---:|---:|---:|
-| `growth_up_inflation_down` | 0.50 | 0.00 | 0.25 | 0.25 |
-| `growth_up_inflation_up` | 0.50 | 0.25 | 0.25 | 0.00 |
-| `growth_down_inflation_up` | 0.00 | 0.50 | 0.25 | 0.25 |
-| `growth_down_inflation_down` | 0.25 | 0.00 | 0.25 | 0.50 |
+| `growth_up_inflation_down` | 0.50 | 0.25 | 0.00 | 0.25 |
+| `growth_up_inflation_up` | 0.25 | 0.50 | 0.25 | 0.00 |
+| `growth_down_inflation_up` | 0.00 | 0.25 | 0.50 | 0.25 |
+| `growth_down_inflation_down` | 0.25 | 0.25 | 0.00 | 0.50 |
 
 This mapping is only for workflow testing. It is not a final allocation
 model.

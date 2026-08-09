@@ -173,26 +173,26 @@ BASKET_UNIVERSES = {
 MOCK_WEIGHT_BY_REGIME = {
     "growth_up_inflation_down": {
         "equity": 0.50,
-        "commodity": 0.00,
-        "tips": 0.25,
+        "commodity": 0.25,
+        "tips": 0.00,
         "nominal_bond": 0.25,
     },
     "growth_up_inflation_up": {
-        "equity": 0.50,
-        "commodity": 0.25,
+        "equity": 0.25,
+        "commodity": 0.50,
         "tips": 0.25,
         "nominal_bond": 0.00,
     },
     "growth_down_inflation_up": {
         "equity": 0.00,
-        "commodity": 0.50,
-        "tips": 0.25,
+        "commodity": 0.25,
+        "tips": 0.50,
         "nominal_bond": 0.25,
     },
     "growth_down_inflation_down": {
         "equity": 0.25,
-        "commodity": 0.00,
-        "tips": 0.25,
+        "commodity": 0.25,
+        "tips": 0.00,
         "nominal_bond": 0.50,
     },
 }

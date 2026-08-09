@@ -293,6 +293,35 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "execute only the provided execution_plan" in serialized
 
 
+def test_portfolio_decision_prompt_declares_strict_execution_plan_contract():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    portfolio_prompt = created["portfolio_decision_agent"]["system_prompt"].lower()
+    for required_phrase in (
+        "return only one valid json object",
+        "top-level fields decision, target_portfolio, and execution_plan",
+        "execution_plan must be an object",
+        "schema_version",
+        "intent",
+        "execution_plan.orders",
+        "sequence",
+        "action",
+        "quantity_mode",
+        "quantity",
+        "asset_type",
+        "order_type",
+        "time_in_force",
+        'quantity_mode must be exactly "shares"',
+        'order_type "market"',
+    ):
+        assert required_phrase in portfolio_prompt
+
+
 def test_basket_universes_have_at_least_five_semantically_valid_symbols():
     module, _strategy_class = load_strategy_module()
 
@@ -310,7 +339,32 @@ def test_basket_universes_have_at_least_five_semantically_valid_symbols():
 def test_mock_weight_mapping_uses_50_25_25_0_and_sums_to_one():
     module, _strategy_class = load_strategy_module()
 
-    assert set(module.MOCK_WEIGHT_BY_REGIME) == set(module.REGIMES)
+    assert module.MOCK_WEIGHT_BY_REGIME == {
+        "growth_up_inflation_down": {
+            "equity": 0.50,
+            "commodity": 0.25,
+            "tips": 0.00,
+            "nominal_bond": 0.25,
+        },
+        "growth_up_inflation_up": {
+            "equity": 0.25,
+            "commodity": 0.50,
+            "tips": 0.25,
+            "nominal_bond": 0.00,
+        },
+        "growth_down_inflation_up": {
+            "equity": 0.00,
+            "commodity": 0.25,
+            "tips": 0.50,
+            "nominal_bond": 0.25,
+        },
+        "growth_down_inflation_down": {
+            "equity": 0.25,
+            "commodity": 0.25,
+            "tips": 0.00,
+            "nominal_bond": 0.50,
+        },
+    }
     for regime, weights in module.MOCK_WEIGHT_BY_REGIME.items():
         assert set(weights) == set(module.BASKET_UNIVERSES)
         assert sorted(weights.values()) == [0.0, 0.25, 0.25, 0.5], regime
@@ -514,6 +568,35 @@ def test_parse_execution_plan_rejects_non_strict_orders(bad_order, message):
 
     with pytest.raises(ValueError, match=message):
         module.parse_execution_plan_from_portfolio_summary(raw_summary)
+
+
+def test_parse_execution_plan_defaults_missing_quantity_mode_to_shares_when_quantity_is_explicit():
+    module, _strategy_class = load_strategy_module()
+    raw_summary = json.dumps(
+        {
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "TIP",
+                        "side": "buy",
+                        "quantity": 229,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            }
+        }
+    )
+
+    plan = module.parse_execution_plan_from_portfolio_summary(raw_summary)
+
+    assert plan["orders"][0]["quantity_mode"] == "shares"
+    assert plan["orders"][0]["quantity"] == 229.0
 
 
 def test_parse_execution_plan_rejects_sell_after_buy_sequence():
