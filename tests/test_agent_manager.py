@@ -573,3 +573,40 @@ def test_execution_minimal_mode_skips_memory_thesis_warning_for_position_orders(
         for warning in execution_warnings
         if warning["kind"] == "position_order_without_memory_thesis"
     ]
+
+
+def test_orders_preflight_counts_as_visible_order_data_for_warnings():
+    result = AgentRunResult(
+        summary="RESULT: submitted planned order.",
+        model="test-model",
+        events=[
+            AgentTraceEvent(
+                kind="tool_call",
+                tool_name="orders_preflight_check",
+                payload={"symbol": "SPY", "side": "buy", "quantity": 1},
+            ),
+            AgentTraceEvent(
+                kind="tool_call",
+                tool_name="orders_submit_order",
+                payload={"symbol": "SPY", "side": "buy", "quantity": 1},
+            ),
+        ],
+    )
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="execution_agent",
+        system_prompt="Prompt.",
+        default_model="test-model",
+        tools=[],
+        runtime=object(),
+        include_builtin_tools=False,
+        base_system_prompt_mode="execution_minimal",
+    )
+
+    warnings = handle._derive_warnings(result, {"mode": "backtesting"})
+
+    assert not [
+        warning
+        for warning in warnings
+        if warning["kind"] == "order_without_data"
+    ]

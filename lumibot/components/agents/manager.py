@@ -1514,6 +1514,7 @@ class AgentHandle:
             name.startswith("market_")
             or name.startswith("duckdb_")
             or name.startswith("account_")
+            or name == "orders_preflight_check"
             or name in {
                 "get_news",
                 "alpaca_news",
