@@ -212,11 +212,15 @@ def target_portfolio_to_execution_plan(
         reason_code = "already_at_target"
 
         if current_quantity > 0 and target_weight == 0:
-            planned_side = "sell"
             planned_quantity = int(current_quantity)
-            reason_code = "exit_removed_symbol"
-            estimated_sell_proceeds += Decimal(planned_quantity) * current_price
-            sell_candidates.append((1, symbol, planned_quantity))
+            if planned_quantity > 0:
+                planned_side = "sell"
+                reason_code = "exit_removed_symbol"
+                estimated_sell_proceeds += Decimal(planned_quantity) * current_price
+                sell_candidates.append((1, symbol, planned_quantity))
+            else:
+                reason_code = "rounding_no_sell"
+                warnings.append(f"{symbol}: exit quantity is smaller than one share.")
         elif current_value > target_value:
             reason_code = "reduce_overweight"
             planned_quantity = int(math.floor((current_value - target_value) / current_price))

@@ -1085,6 +1085,28 @@ def test_target_portfolio_to_execution_plan_holds_when_whole_share_rounding_prod
     )
 
 
+def test_target_portfolio_to_execution_plan_warns_instead_of_selling_zero_shares_for_subshare_exit():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[make_position("ABC", 0.5)],
+        cash=0,
+        portfolio_value=50,
+        prices={"ABC": 100},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[],
+    )
+
+    assert result["execution_plan"] == {"schema_version": 1, "intent": "hold", "orders": []}
+    assert any("ABC" in warning and "smaller than one share" in warning for warning in result["warnings"])
+    diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
+    assert diagnostics["ABC"]["reason_code"] == "rounding_no_sell"
+    assert diagnostics["ABC"]["planned_quantity"] == 0
+
+
 def test_target_portfolio_to_execution_plan_combines_duplicate_targets_and_rejects_overweight_total():
     planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
     strategy = make_planner_strategy(
