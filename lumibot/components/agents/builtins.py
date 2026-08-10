@@ -33,6 +33,12 @@ ORDERS_PREFLIGHT_CHECK_DESCRIPTION = (
     "returns readiness, blockers, warnings, account/position/open-order/price snapshots, and estimates. "
     "This tool is read-only and does not submit, cancel, modify, or confirm orders."
 )
+ORDERS_SUBMIT_AND_CONFIRM_ORDER_DESCRIPTION = (
+    "Submit one explicit execution_plan order and confirm that same submitted order before returning. "
+    "Use this after orders_preflight_check returns can_submit=true for the same order. "
+    "This tool mutates trading state. It does not perform research, calculate quantities, change order fields, "
+    "or execute more than one order. If the result has can_continue=false, stop later orders and report the blocker."
+)
 
 COMMON_INDICATORS = [
     "sma",
@@ -2881,6 +2887,212 @@ def _bind_close_thesis(strategy: Any, manager: Any) -> BoundTool:
     return BoundTool(name="close_thesis", description="Close an investment thesis and record its outcome/reflection.", function=close_thesis, source="builtin", metadata={"kind": "memory"})
 
 
+def _order_identifier_from_submit_result(submit_result: dict[str, Any]) -> str | None:
+    order = submit_result.get("order") if isinstance(submit_result, dict) else None
+    if not isinstance(order, dict):
+        return None
+    for key in ("identifier", "id", "order_id"):
+        value = order.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _submit_and_confirm_blocker_from_exception(exc: Exception) -> dict[str, str]:
+    message = str(exc)
+    code = "SUBMIT_FAILED"
+    if message.startswith("ORDER_READINESS_REQUIRED"):
+        code = "ORDER_READINESS_REQUIRED"
+    elif message.startswith("NEGATIVE_CASH_NOT_ALLOWED"):
+        code = "NEGATIVE_CASH_NOT_ALLOWED"
+    elif message.startswith("NEGATIVE_CASH_CHECK_UNAVAILABLE"):
+        code = "NEGATIVE_CASH_CHECK_UNAVAILABLE"
+    elif "requires" in message.lower():
+        code = "INVALID_ORDER_ARGUMENTS"
+    return {"code": code, "message": message}
+
+
+def _submit_and_confirm_blocked_payload(
+    *,
+    sequence: Any,
+    symbol: Any,
+    side: Any,
+    quantity: Any,
+    asset_type: Any,
+    order_type: Any,
+    time_in_force: Any,
+    blockers: list[dict[str, str]],
+    warnings: list[str] | None = None,
+    submit_result: dict[str, Any] | None = None,
+    confirm_result: dict[str, Any] | None = None,
+    identifier: str | None = None,
+    internal_steps: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "sequence": _jsonable(sequence),
+        "symbol": _jsonable(symbol),
+        "side": _jsonable(side),
+        "quantity": _jsonable(quantity),
+        "asset_type": _jsonable(asset_type),
+        "order_type": _jsonable(order_type),
+        "time_in_force": _jsonable(time_in_force),
+        "submitted": submit_result is not None,
+        "confirmed": False,
+        "can_continue": False,
+        "confirmation_status": (
+            confirm_result.get("confirmation_status")
+            if isinstance(confirm_result, dict)
+            else None
+        ),
+        "identifier": identifier,
+        "submit_result": submit_result,
+        "confirm_result": confirm_result,
+        "internal_steps": internal_steps or [],
+        "warnings": list(warnings or []),
+        "blockers": blockers,
+    }
+
+
+def _bind_submit_and_confirm_order(strategy: Any, manager: Any) -> BoundTool:
+    submit_tool = _bind_submit_order(strategy, manager)
+    confirm_tool = _bind_confirm_order(strategy, manager)
+
+    def submit_and_confirm_order(
+        *,
+        symbol: str,
+        quantity: float,
+        side: OrderSideArg,
+        asset_type: AssetTypeArg = "stock",
+        expiration: str | None = None,
+        strike: float | None = None,
+        right: str | None = None,
+        order_type: OrderTypeArg = "market",
+        limit_price: float | None = None,
+        stop_price: float | None = None,
+        stop_limit_price: float | None = None,
+        trail_price: float | None = None,
+        trail_percent: float | None = None,
+        quote_symbol: str | None = None,
+        exchange: str | None = None,
+        time_in_force: TimeInForceArg = "day",
+        sequence: Any = None,
+        confirmation_max_attempts: int = 3,
+        confirmation_wait_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        submit_kwargs = {
+            "symbol": symbol,
+            "quantity": quantity,
+            "side": side,
+            "asset_type": asset_type,
+            "expiration": expiration,
+            "strike": strike,
+            "right": right,
+            "order_type": order_type,
+            "limit_price": limit_price,
+            "stop_price": stop_price,
+            "stop_limit_price": stop_limit_price,
+            "trail_price": trail_price,
+            "trail_percent": trail_percent,
+            "quote_symbol": quote_symbol,
+            "exchange": exchange,
+            "time_in_force": time_in_force,
+        }
+        internal_steps = ["orders_submit_order"]
+        try:
+            submit_result = submit_tool.function(**submit_kwargs)
+        except Exception as exc:
+            return _submit_and_confirm_blocked_payload(
+                sequence=sequence,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                asset_type=asset_type,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                blockers=[_submit_and_confirm_blocker_from_exception(exc)],
+                internal_steps=internal_steps,
+            )
+
+        identifier = _order_identifier_from_submit_result(submit_result)
+        if identifier is None:
+            return _submit_and_confirm_blocked_payload(
+                sequence=sequence,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                asset_type=asset_type,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                blockers=[
+                    {
+                        "code": "ORDER_IDENTIFIER_MISSING",
+                        "message": "Order was submitted but no identifier was returned. Stop later orders.",
+                    }
+                ],
+                submit_result=submit_result,
+                internal_steps=internal_steps,
+            )
+
+        internal_steps.append("orders_confirm_order")
+        confirm_result = confirm_tool.function(
+            identifier=identifier,
+            symbol=symbol,
+            side=side,
+            expected_quantity=quantity,
+            max_attempts=confirmation_max_attempts,
+            wait_seconds=confirmation_wait_seconds,
+        )
+        warnings = list(confirm_result.get("warnings") or []) if isinstance(confirm_result, dict) else []
+        if not isinstance(confirm_result, dict) or confirm_result.get("confirmed") is not True or confirm_result.get("can_continue") is not True:
+            return _submit_and_confirm_blocked_payload(
+                sequence=sequence,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                asset_type=asset_type,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                blockers=[
+                    {
+                        "code": "CONFIRMATION_FAILED",
+                        "message": "Order was submitted but not confirmed. Stop later orders.",
+                    }
+                ],
+                warnings=warnings,
+                submit_result=submit_result,
+                confirm_result=confirm_result,
+                identifier=identifier,
+                internal_steps=internal_steps,
+            )
+
+        return {
+            "sequence": _jsonable(sequence),
+            "symbol": _jsonable(symbol),
+            "side": _jsonable(side),
+            "quantity": _jsonable(quantity),
+            "asset_type": _jsonable(asset_type),
+            "order_type": _jsonable(order_type),
+            "time_in_force": _jsonable(time_in_force),
+            "submitted": True,
+            "confirmed": True,
+            "can_continue": True,
+            "confirmation_status": confirm_result.get("confirmation_status"),
+            "identifier": identifier,
+            "submit_result": submit_result,
+            "confirm_result": confirm_result,
+            "internal_steps": internal_steps,
+            "warnings": warnings,
+            "blockers": [],
+        }
+
+    return BoundTool(
+        name="orders_submit_and_confirm_order",
+        description=ORDERS_SUBMIT_AND_CONFIRM_ORDER_DESCRIPTION,
+        function=submit_and_confirm_order,
+        metadata={"kind": "builtin", "replay_on_cache": True, "mutates_trading": True},
+    )
+
+
 def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
     def submit_order(
         *,
@@ -3264,6 +3476,14 @@ class _OrderTools:
             binder=_bind_preflight_check,
         )
 
+    def submit_and_confirm(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="orders_submit_and_confirm_order",
+            description=ORDERS_SUBMIT_AND_CONFIRM_ORDER_DESCRIPTION,
+            binder=_bind_submit_and_confirm_order,
+            metadata={"mutates_trading": True},
+        )
+
     def submit(self) -> ToolDefinition:
         return ToolDefinition(
             name="orders_submit_order",
@@ -3366,6 +3586,7 @@ class _BuiltinTools:
             self.memory.update_thesis(),
             self.memory.close_thesis(),
             self.orders.preflight(),
+            self.orders.submit_and_confirm(),
             self.orders.submit(),
             self.orders.confirm(),
             self.orders.submit_multileg(),
