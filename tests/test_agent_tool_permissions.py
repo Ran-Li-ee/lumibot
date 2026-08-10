@@ -30,19 +30,34 @@ class _Strategy:
 
 
 class _OrderReadinessOrder:
-    def __init__(self, *, identifier, symbol, quantity, side, asset_type="stock", status="new", order_type="market", time_in_force="day"):
+    def __init__(
+        self,
+        *,
+        identifier,
+        asset,
+        quantity,
+        side,
+        status="new",
+        order_type="market",
+        time_in_force="day",
+        limit_price=None,
+        stop_price=None,
+        stop_limit_price=None,
+        trail_price=None,
+        trail_percent=None,
+    ):
         self.identifier = identifier
         self.status = status
         self.side = side
-        self.asset = SimpleNamespace(symbol=symbol, asset_type=asset_type)
+        self.asset = asset
         self.quantity = quantity
         self.order_type = order_type
         self.time_in_force = time_in_force
-        self.limit_price = None
-        self.stop_price = None
-        self.stop_limit_price = None
-        self.trail_price = None
-        self.trail_percent = None
+        self.limit_price = limit_price
+        self.stop_price = stop_price
+        self.stop_limit_price = stop_limit_price
+        self.trail_price = trail_price
+        self.trail_percent = trail_percent
         self.avg_fill_price = None
         self.transactions = []
 
@@ -91,13 +106,17 @@ class _OrderReadinessStrategy(_Strategy):
         self.created_order_count += 1
         return _OrderReadinessOrder(
             identifier=f"test-order-{self.created_order_count}",
-            symbol=getattr(asset, "symbol", None),
+            asset=asset,
             quantity=quantity,
             side=side,
-            asset_type=getattr(asset, "asset_type", "stock"),
             status="new",
             order_type=kwargs.get("order_type", "market"),
             time_in_force=kwargs.get("time_in_force", "day"),
+            limit_price=kwargs.get("limit_price"),
+            stop_price=kwargs.get("stop_price"),
+            stop_limit_price=kwargs.get("stop_limit_price"),
+            trail_price=kwargs.get("trail_price"),
+            trail_percent=kwargs.get("trail_percent"),
         )
 
     def submit_order(self, order):
