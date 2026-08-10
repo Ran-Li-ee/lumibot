@@ -325,6 +325,9 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "call target_portfolio_to_execution_plan" in serialized
     assert "do not manually calculate share quantities" in serialized
     assert "planner tool owns all execution_plan calculations" in serialized
+    assert "planner tool owns daily backtest buy sizing" in serialized
+    execution_section = serialized.split("execution role:", 1)[-1]
+    assert "2% buy sizing buffer" not in execution_section
     assert "execute only the provided execution_plan" in serialized
     assert "call orders_preflight_check" in serialized
     assert "orders_submit_and_confirm_order" in serialized
@@ -528,6 +531,17 @@ def test_target_portfolio_to_execution_plan_tool_definition_binds_and_stores_res
     assert tool.metadata == {"kind": "portfolio_transition_planner", "replay_on_cache": True}
     assert result["execution_plan"]["intent"] == "rebalance"
     assert strategy._last_target_portfolio_planner_result == result
+
+
+def test_target_portfolio_to_execution_plan_tool_description_explains_sizing_policy():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+
+    tool_definition = planner.make_target_portfolio_to_execution_plan_tool()
+
+    assert "previous completed daily close" in tool_definition.description
+    assert "default 2% buy sizing buffer" in tool_definition.description
+    assert "not a hard execution price cap" in tool_definition.description
+    assert "Do not manually edit the execution_plan" in tool_definition.description
 
 
 def test_target_portfolio_to_execution_plan_replays_cache_side_effect():
