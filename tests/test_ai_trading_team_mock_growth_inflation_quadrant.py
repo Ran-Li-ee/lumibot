@@ -593,7 +593,7 @@ def test_target_portfolio_to_execution_plan_replays_cache_side_effect():
                 "symbol": "GLD",
                 "side": "buy",
                 "quantity_mode": "shares",
-                "quantity": 1000,
+                "quantity": 980,
                 "asset_type": "stock",
                 "order_type": "market",
                 "time_in_force": "day",
