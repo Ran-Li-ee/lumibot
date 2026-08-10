@@ -29,6 +29,36 @@ class _Strategy:
         return None
 
 
+class _OrderReadinessOrder:
+    def __init__(self, *, identifier, symbol, quantity, side, asset_type="stock", status="new", order_type="market", time_in_force="day"):
+        self.identifier = identifier
+        self.status = status
+        self.side = side
+        self.asset = SimpleNamespace(symbol=symbol, asset_type=asset_type)
+        self.quantity = quantity
+        self.order_type = order_type
+        self.time_in_force = time_in_force
+        self.limit_price = None
+        self.stop_price = None
+        self.stop_limit_price = None
+        self.trail_price = None
+        self.trail_percent = None
+        self.avg_fill_price = None
+        self.transactions = []
+
+    def is_filled(self):
+        return str(self.status).lower() in {"fill", "filled", "cash_settled"}
+
+    def is_active(self):
+        return not self.is_filled() and not self.is_canceled()
+
+    def is_canceled(self):
+        return str(self.status).lower() in {"cancel", "canceled", "cancelled", "error", "expired", "rejected"}
+
+    def get_fill_price(self):
+        return self.avg_fill_price
+
+
 class _OrderReadinessStrategy(_Strategy):
     def __init__(self):
         self.submitted_orders = []
@@ -37,6 +67,10 @@ class _OrderReadinessStrategy(_Strategy):
         self.last_prices = {}
         self.cash = 100000.0
         self.portfolio_value = 100000.0
+        self.orders_by_identifier = {}
+        self.created_order_count = 0
+        self.submitted_order_status = "fill"
+        self.get_order_calls = []
 
     def get_positions(self, include_cash_positions=True):
         return list(self.positions)
@@ -54,21 +88,34 @@ class _OrderReadinessStrategy(_Strategy):
         return self.last_prices.get(getattr(asset, "symbol", None), 100.0)
 
     def create_order(self, asset, quantity, side, **kwargs):
-        return SimpleNamespace(
-            identifier="test-order",
-            status="new",
-            side=side,
-            asset=asset,
+        self.created_order_count += 1
+        return _OrderReadinessOrder(
+            identifier=f"test-order-{self.created_order_count}",
+            symbol=getattr(asset, "symbol", None),
             quantity=quantity,
+            side=side,
+            asset_type=getattr(asset, "asset_type", "stock"),
+            status="new",
             order_type=kwargs.get("order_type", "market"),
             time_in_force=kwargs.get("time_in_force", "day"),
-            limit_price=kwargs.get("limit_price"),
-            stop_price=kwargs.get("stop_price"),
         )
 
     def submit_order(self, order):
+        order.status = self.submitted_order_status
+        order.avg_fill_price = self.last_prices.get(getattr(order.asset, "symbol", None), 100.0)
         self.submitted_orders.append(order)
+        self.orders_by_identifier[order.identifier] = order
         return order
+
+    def get_order(self, identifier, broker_refresh=True, broker_refresh_ttl_seconds=0.0):
+        self.get_order_calls.append(
+            {
+                "identifier": identifier,
+                "broker_refresh": broker_refresh,
+                "broker_refresh_ttl_seconds": broker_refresh_ttl_seconds,
+            }
+        )
+        return self.orders_by_identifier.get(identifier)
 
 
 def _wrap_builtin_tools(strategy, tool_definitions):
