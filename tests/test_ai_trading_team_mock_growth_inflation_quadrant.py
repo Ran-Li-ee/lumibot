@@ -4,6 +4,7 @@ import sys
 from datetime import datetime
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from lumibot.components.agents.manager import AgentHandle, AgentManager
@@ -72,23 +73,50 @@ def make_position(symbol, quantity):
     )
 
 
-def make_planner_strategy(*, positions, prices, cash=0.0, portfolio_value=100000.0):
+def make_planner_strategy(
+    *,
+    positions,
+    prices,
+    cash=0.0,
+    portfolio_value=100000.0,
+    historical_closes=None,
+):
+    historical_closes = historical_closes or {}
+
+    def normalize_symbol(symbol):
+        if not isinstance(symbol, str):
+            symbol = getattr(symbol, "symbol", symbol)
+        return str(symbol).upper()
+
     def get_positions(include_cash_positions=False):
         return list(positions)
 
     def get_last_price(symbol, quote=None, exchange=None):
-        if not isinstance(symbol, str):
-            symbol = getattr(symbol, "symbol", symbol)
-        symbol = str(symbol).upper()
+        symbol = normalize_symbol(symbol)
         if symbol not in prices:
             return None
         return prices[symbol]
+
+    def get_historical_prices(symbol, length, timestep="day", **kwargs):
+        symbol = normalize_symbol(symbol)
+        if symbol not in historical_closes:
+            return None
+        rows = historical_closes[symbol]
+        if not rows:
+            return None
+        if isinstance(rows, dict):
+            rows = [rows]
+        frame = pd.DataFrame(rows)
+        if "date" in frame.columns:
+            frame.index = pd.to_datetime(frame["date"])
+        return SimpleNamespace(pandas_df=frame)
 
     return SimpleNamespace(
         get_positions=get_positions,
         get_cash=lambda: cash,
         get_portfolio_value=lambda: portfolio_value,
         get_last_price=get_last_price,
+        get_historical_prices=get_historical_prices,
     )
 
 
@@ -1305,7 +1333,7 @@ def test_target_portfolio_to_execution_plan_deploys_all_cash_to_targets():
                 "symbol": "GLD",
                 "side": "buy",
                 "quantity_mode": "shares",
-                "quantity": 250,
+                "quantity": 245,
                 "asset_type": "stock",
                 "order_type": "market",
                 "time_in_force": "day",
@@ -1316,7 +1344,7 @@ def test_target_portfolio_to_execution_plan_deploys_all_cash_to_targets():
                 "symbol": "SPY",
                 "side": "buy",
                 "quantity_mode": "shares",
-                "quantity": 500,
+                "quantity": 490,
                 "asset_type": "stock",
                 "order_type": "market",
                 "time_in_force": "day",
@@ -1327,15 +1355,68 @@ def test_target_portfolio_to_execution_plan_deploys_all_cash_to_targets():
                 "symbol": "VGIT",
                 "side": "buy",
                 "quantity_mode": "shares",
-                "quantity": 500,
+                "quantity": 490,
                 "asset_type": "stock",
                 "order_type": "market",
                 "time_in_force": "day",
             },
         ],
     }
-    assert result["cash_projection"]["cash_after_estimate"] == pytest.approx(0)
+    assert result["cash_projection"]["cash_after_estimate"] == pytest.approx(2000)
+    assert result["cash_projection"]["buy_sizing_buffer_pct"] == pytest.approx(0.02)
     assert {row["reason_code"] for row in result["current_vs_target"]} == {"buy_new_target"}
+
+
+def test_target_portfolio_to_execution_plan_prefers_previous_completed_daily_close_for_sizing():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[],
+        cash=100000,
+        portfolio_value=100000,
+        prices={"GLD": 229.789993},
+        historical_closes={
+            "GLD": {"date": "2024-09-04", "close": 230.429993},
+        },
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-05",
+        target_portfolio=[{"basket_id": "commodity", "symbol": "GLD", "target_weight": 0.25}],
+    )
+
+    diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
+    gld = diagnostics["GLD"]
+    assert gld["sizing_price"] == pytest.approx(230.429993)
+    assert gld["sizing_price_source"] == "previous_completed_daily_close"
+    assert gld["sizing_price_datetime"] == "2024-09-04"
+    assert gld["buy_sizing_buffer_pct"] == pytest.approx(0.02)
+    assert gld["effective_buy_target_value"] == pytest.approx(24500.0)
+    assert result["execution_plan"]["orders"][0]["quantity"] == 106
+
+
+def test_target_portfolio_to_execution_plan_falls_back_to_last_price_when_daily_close_missing():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[],
+        cash=100000,
+        portfolio_value=100000,
+        prices={"GLD": 229.789993},
+        historical_closes={},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-05",
+        target_portfolio=[{"basket_id": "commodity", "symbol": "GLD", "target_weight": 0.25}],
+    )
+
+    diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
+    gld = diagnostics["GLD"]
+    assert gld["sizing_price"] == pytest.approx(229.789993)
+    assert gld["sizing_price_source"] == "strategy_last_price_fallback"
+    assert gld["sizing_price_datetime"] is None
+    assert result["execution_plan"]["orders"][0]["quantity"] == 106
 
 
 def test_target_portfolio_to_execution_plan_handles_full_rebalance_regression_case():
