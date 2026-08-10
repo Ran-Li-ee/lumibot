@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -6,7 +7,17 @@ from lumibot.components.agents.schemas import BoundTool, ToolDefinition
 
 TOOL_NAME = "target_portfolio_to_execution_plan"
 TARGET_WEIGHT_TOLERANCE = Decimal("0.000001")
+BUY_SIZING_BUFFER_PCT = Decimal("0.02")
+SIZING_PRICE_SOURCE_PREVIOUS_CLOSE = "previous_completed_daily_close"
+SIZING_PRICE_SOURCE_LAST_PRICE_FALLBACK = "strategy_last_price_fallback"
 QUOTE_SYMBOLS = {"USD", "CASH"}
+
+
+@dataclass(frozen=True)
+class SizingPrice:
+    price: Decimal
+    source: str
+    datetime: str | None = None
 
 
 def _decimal(value: Any, label: str) -> Decimal:
@@ -23,6 +34,35 @@ def _decimal(value: Any, label: str) -> Decimal:
 
 def _float(value: Decimal) -> float:
     return float(value)
+
+
+def _bars_dataframe(bars: Any) -> Any | None:
+    if bars is None:
+        return None
+    frame = getattr(bars, "pandas_df", None)
+    if frame is None:
+        frame = getattr(bars, "df", None)
+    if frame is None or not hasattr(frame, "empty") or frame.empty:
+        return None
+    return frame
+
+
+def _last_row_datetime_text(frame: Any) -> str | None:
+    try:
+        row = frame.iloc[-1]
+    except Exception:
+        return None
+    for column in ("date", "Date", "datetime", "Datetime"):
+        if column in frame.columns:
+            value = row[column]
+            return str(value.date() if hasattr(value, "date") else value)
+    try:
+        index_value = frame.index[-1]
+    except Exception:
+        return None
+    if index_value is None:
+        return None
+    return str(index_value.date() if hasattr(index_value, "date") else index_value)
 
 
 def _symbol(value: Any) -> str:
@@ -68,14 +108,57 @@ def _get_portfolio_value(strategy: Any) -> Decimal:
     return value
 
 
-def _get_last_price(strategy: Any, symbol: str) -> Decimal:
+def _finite_positive_price(value: Any, label: str) -> Decimal:
+    price = _decimal(value, label)
+    if price <= 0:
+        raise ValueError(f"{label} must be positive.")
+    return price
+
+
+def _get_previous_completed_daily_close(strategy: Any, symbol: str) -> SizingPrice | None:
+    get_historical_prices = getattr(strategy, "get_historical_prices", None)
+    if get_historical_prices is None:
+        return None
+
+    try:
+        bars = get_historical_prices(symbol, 1, "day")
+    except TypeError:
+        try:
+            bars = get_historical_prices(symbol, 1, timestep="day")
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    frame = _bars_dataframe(bars)
+    if frame is None or "close" not in frame.columns:
+        return None
+
+    close_value = frame["close"].iloc[-1]
+    price = _finite_positive_price(close_value, f"previous completed daily close for {symbol}")
+    return SizingPrice(
+        price=price,
+        source=SIZING_PRICE_SOURCE_PREVIOUS_CLOSE,
+        datetime=_last_row_datetime_text(frame),
+    )
+
+
+def _get_last_price_fallback(strategy: Any, symbol: str) -> SizingPrice:
     raw_price = strategy.get_last_price(symbol)
     if raw_price is None:
-        raise ValueError(f"missing last price for {symbol}")
-    price = _decimal(raw_price, f"last price for {symbol}")
-    if price <= 0:
-        raise ValueError(f"last price for {symbol} must be positive.")
-    return price
+        raise ValueError(f"missing sizing price for {symbol}")
+    return SizingPrice(
+        price=_finite_positive_price(raw_price, f"last price fallback for {symbol}"),
+        source=SIZING_PRICE_SOURCE_LAST_PRICE_FALLBACK,
+        datetime=None,
+    )
+
+
+def _get_sizing_price(strategy: Any, symbol: str) -> SizingPrice:
+    previous_close = _get_previous_completed_daily_close(strategy, symbol)
+    if previous_close is not None:
+        return previous_close
+    return _get_last_price_fallback(strategy, symbol)
 
 
 def normalize_target_portfolio(target_portfolio: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -153,25 +236,38 @@ def _diagnostic_row(
     symbol: str,
     basket_id: str | None,
     current_quantity: Decimal,
-    current_price: Decimal,
+    sizing_price: SizingPrice,
     portfolio_value: Decimal,
     target_weight: Decimal,
     planned_side: str | None,
     planned_quantity: int,
     reason_code: str,
 ) -> dict[str, Any]:
+    current_price = sizing_price.price
     current_value = current_quantity * current_price
     current_weight = current_value / portfolio_value
     target_value = target_weight * portfolio_value
+    desired_buy_value = max(target_value - current_value, Decimal("0"))
+    effective_buy_target_value = (
+        desired_buy_value * (Decimal("1") - BUY_SIZING_BUFFER_PCT)
+        if desired_buy_value > 0
+        else Decimal("0")
+    )
     return {
         "symbol": symbol,
         "basket_id": basket_id,
         "current_quantity": _float(current_quantity),
         "current_price": _float(current_price),
+        "sizing_price": _float(sizing_price.price),
+        "sizing_price_source": sizing_price.source,
+        "sizing_price_datetime": sizing_price.datetime,
         "current_value": _float(current_value),
         "current_weight": _float(current_weight),
         "target_weight": _float(target_weight),
         "target_value": _float(target_value),
+        "desired_buy_value": _float(desired_buy_value),
+        "effective_buy_target_value": _float(effective_buy_target_value),
+        "buy_sizing_buffer_pct": _float(BUY_SIZING_BUFFER_PCT),
         "delta_value": _float(target_value - current_value),
         "planned_side": planned_side,
         "planned_quantity": planned_quantity,
@@ -196,7 +292,7 @@ def target_portfolio_to_execution_plan(
     portfolio_value = _get_portfolio_value(strategy)
     current_positions = _current_positions_by_symbol(strategy)
     relevant_symbols = sorted(set(current_positions) | set(target_by_symbol))
-    prices = {symbol: _get_last_price(strategy, symbol) for symbol in relevant_symbols}
+    sizing_prices = {symbol: _get_sizing_price(strategy, symbol) for symbol in relevant_symbols}
 
     diagnostics: list[dict[str, Any]] = []
     sell_candidates: list[tuple[int, str, int]] = []
@@ -206,7 +302,7 @@ def target_portfolio_to_execution_plan(
 
     for symbol in relevant_symbols:
         current_quantity = current_positions.get(symbol, Decimal("0"))
-        current_price = prices[symbol]
+        current_price = sizing_prices[symbol].price
         target_weight = target_by_symbol.get(symbol, Decimal("0"))
         current_value = current_quantity * current_price
         target_value = target_weight * portfolio_value
@@ -249,7 +345,7 @@ def target_portfolio_to_execution_plan(
                 symbol=symbol,
                 basket_id=basket_by_symbol.get(symbol),
                 current_quantity=current_quantity,
-                current_price=current_price,
+                sizing_price=sizing_prices[symbol],
                 portfolio_value=portfolio_value,
                 target_weight=target_weight,
                 planned_side=planned_side,
@@ -271,8 +367,9 @@ def target_portfolio_to_execution_plan(
     for _group, symbol, desired_buy_value, _reason_code in sorted(
         buy_candidates, key=lambda item: (item[0], item[1])
     ):
-        current_price = prices[symbol]
-        spendable = min(desired_buy_value, projected_cash)
+        current_price = sizing_prices[symbol].price
+        effective_buy_value = desired_buy_value * (Decimal("1") - BUY_SIZING_BUFFER_PCT)
+        spendable = min(effective_buy_value, projected_cash)
         quantity = int(math.floor(spendable / current_price))
         if quantity <= 0:
             diagnostic = diagnostics_by_symbol[symbol]
@@ -309,6 +406,7 @@ def target_portfolio_to_execution_plan(
             "estimated_sell_proceeds": _float(estimated_sell_proceeds),
             "estimated_buy_cost": _float(estimated_buy_cost),
             "cash_after_estimate": _float(projected_cash),
+            "buy_sizing_buffer_pct": _float(BUY_SIZING_BUFFER_PCT),
             "negative_cash_allowed": False,
         },
         "execution_plan": {"schema_version": 1, "intent": intent, "orders": orders},
@@ -320,8 +418,11 @@ def make_target_portfolio_to_execution_plan_tool() -> ToolDefinition:
     description = (
         "Convert a target portfolio into a strict market/day execution_plan. "
         "Use this after choosing target symbols and target weights. The tool reads current positions, "
-        "cash, portfolio value, and prices from the strategy, then returns current_vs_target diagnostics "
-        "and an execution_plan. Do not manually edit the execution_plan returned by this tool."
+        "cash, portfolio value, and deterministic sizing prices from the strategy. In daily backtests, "
+        "buy sizing uses the previous completed daily close when available and applies a default 2% "
+        "buy sizing buffer. The buffer reduces planned buy quantity only; it is not a hard execution "
+        "price cap. The tool returns current_vs_target diagnostics and an execution_plan. Do not "
+        "manually edit the execution_plan returned by this tool."
     )
     metadata = {"kind": "portfolio_transition_planner", "replay_on_cache": True}
 
