@@ -3067,7 +3067,11 @@ def _bind_submit_and_confirm_order(strategy: Any, manager: Any) -> BoundTool:
                 internal_steps=internal_steps,
             )
         warnings = list(confirm_result.get("warnings") or []) if isinstance(confirm_result, dict) else []
-        if not isinstance(confirm_result, dict) or confirm_result.get("confirmed") is not True or confirm_result.get("can_continue") is not True:
+        if (
+            not isinstance(confirm_result, dict)
+            or confirm_result.get("confirmed") is not True
+            or confirm_result.get("can_continue") is not True
+        ):
             return _submit_and_confirm_blocked_payload(
                 sequence=sequence,
                 symbol=symbol,
