@@ -125,9 +125,9 @@ def _get_previous_completed_daily_close(strategy: Any, symbol: str) -> SizingPri
     except TypeError:
         try:
             bars = get_historical_prices(symbol, 1, timestep="day")
-        except Exception:
+        except (IndexError, KeyError, TypeError, ValueError, InvalidOperation):
             return None
-    except Exception:
+    except (IndexError, KeyError, ValueError, InvalidOperation):
         return None
 
     frame = _bars_dataframe(bars)
@@ -136,8 +136,11 @@ def _get_previous_completed_daily_close(strategy: Any, symbol: str) -> SizingPri
 
     try:
         close_value = frame["close"].iloc[-1]
+    except (IndexError, KeyError, TypeError):
+        return None
+    try:
         price = _finite_positive_price(close_value, f"previous completed daily close for {symbol}")
-    except Exception:
+    except (TypeError, ValueError, InvalidOperation):
         return None
     return SizingPrice(
         price=price,
@@ -246,6 +249,7 @@ def _diagnostic_row(
     planned_quantity: int,
     reason_code: str,
 ) -> dict[str, Any]:
+    # current_price is retained as a legacy diagnostics alias for sizing_price.
     current_price = sizing_price.price
     current_value = current_quantity * current_price
     current_weight = current_value / portfolio_value
