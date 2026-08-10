@@ -197,6 +197,16 @@ def _wrap_preflight_and_submit_tools(strategy):
     return _wrap_builtin_tools(strategy, [BuiltinTools.orders.preflight(), BuiltinTools.orders.submit()])
 
 
+def _wrap_preflight_and_submit_confirm_tools(strategy):
+    return _wrap_builtin_tools(
+        strategy,
+        [
+            BuiltinTools.orders.preflight(),
+            BuiltinTools.orders.submit_and_confirm(),
+        ],
+    )
+
+
 class _Runtime:
     last_request = None
 
@@ -855,6 +865,15 @@ def test_builtin_order_tools_expose_preflight_definition():
     assert callable(tool.binder)
 
 
+def test_builtin_order_tools_expose_submit_and_confirm_definition():
+    tool = BuiltinTools.orders.submit_and_confirm()
+
+    assert tool.name == "orders_submit_and_confirm_order"
+    assert "Submit one explicit execution_plan order and confirm" in tool.description
+    assert "orders_preflight_check returns can_submit=true" in tool.description
+    assert callable(tool.binder)
+
+
 def test_submit_order_description_mentions_preflight_readiness_path():
     strategy = _Strategy()
     manager = AgentManager(strategy)
@@ -882,6 +901,21 @@ def test_bound_preflight_description_explains_read_only_contract():
 
 def test_builtin_tools_all_includes_orders_preflight_check():
     assert "orders_preflight_check" in {tool.name for tool in BuiltinTools.all()}
+
+
+def test_builtin_tools_all_includes_orders_submit_and_confirm_order():
+    assert "orders_submit_and_confirm_order" in {tool.name for tool in BuiltinTools.all()}
+
+
+def test_bound_submit_and_confirm_metadata_marks_mutating_and_replayable():
+    strategy = _OrderReadinessStrategy()
+    manager = AgentManager(strategy)
+
+    tool = BuiltinTools.orders.submit_and_confirm().binder(strategy, manager)
+
+    assert tool.metadata["kind"] == "builtin"
+    assert tool.metadata["replay_on_cache"] is True
+    assert tool.metadata["mutates_trading"] is True
 
 
 def test_orders_preflight_check_ready_buy_returns_structured_snapshot():
@@ -1284,6 +1318,171 @@ def test_orders_preflight_check_blocked_result_does_not_authorize_submit():
     assert submit_result["tool_error"] is True
     assert "ORDER_READINESS_REQUIRED" in submit_result["error"]["message"]
     assert strategy.submitted_orders == []
+
+
+def test_orders_submit_and_confirm_order_submits_and_confirms_after_matching_preflight():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_confirm_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](
+        sequence=1,
+        symbol="SPY",
+        quantity=2,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+        time_in_force="day",
+    )
+    result = tool_map["orders_submit_and_confirm_order"](
+        sequence=1,
+        symbol="SPY",
+        quantity=2.0,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+        time_in_force="day",
+    )
+
+    assert preflight_result["can_submit"] is True
+    assert result["submitted"] is True
+    assert result["confirmed"] is True
+    assert result["can_continue"] is True
+    assert result["identifier"] == "test-order-1"
+    assert result["submit_result"]["order"]["identifier"] == "test-order-1"
+    assert result["confirm_result"]["identifier"] == "test-order-1"
+    assert result["confirm_result"]["confirmed"] is True
+    assert result["internal_steps"] == ["orders_submit_order", "orders_confirm_order"]
+    assert len(strategy.submitted_orders) == 1
+    assert strategy.get_order_calls[0]["identifier"] == "test-order-1"
+
+
+def test_orders_submit_and_confirm_order_consumes_preflight_token():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_confirm_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    first_result = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=1, side="buy")
+    second_result = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=1, side="buy")
+
+    assert preflight_result["can_submit"] is True
+    assert first_result["submitted"] is True
+    assert first_result["confirmed"] is True
+    assert second_result["submitted"] is False
+    assert second_result["confirmed"] is False
+    assert second_result["can_continue"] is False
+    assert second_result["blockers"][0]["code"] == "ORDER_READINESS_REQUIRED"
+    assert len(strategy.submitted_orders) == 1
+
+
+def test_orders_submit_and_confirm_order_requires_preflight_before_submit():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_confirm_tools(strategy)
+
+    result = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=1, side="buy")
+
+    assert result["submitted"] is False
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["blockers"][0]["code"] == "ORDER_READINESS_REQUIRED"
+    assert "ORDER_READINESS_REQUIRED" in result["blockers"][0]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_orders_submit_and_confirm_order_rejects_blocked_preflight():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 50.0
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_confirm_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    result = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=1, side="buy")
+
+    assert preflight_result["can_submit"] is False
+    assert result["submitted"] is False
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["blockers"][0]["code"] == "ORDER_READINESS_REQUIRED"
+    assert strategy.submitted_orders == []
+
+
+def test_orders_submit_and_confirm_order_rejects_different_symbol_side_quantity_and_order_style():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0, "QQQ": 200.0}
+    tool_map = _wrap_preflight_and_submit_confirm_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        order_type="market",
+        time_in_force="day",
+    )
+    different_symbol = tool_map["orders_submit_and_confirm_order"](symbol="QQQ", quantity=1, side="buy")
+    different_side = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=1, side="sell")
+    different_quantity = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=2, side="buy")
+    different_order_type = tool_map["orders_submit_and_confirm_order"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        order_type="limit",
+        limit_price=101.0,
+    )
+
+    assert preflight_result["can_submit"] is True
+    for result in (different_symbol, different_side, different_quantity, different_order_type):
+        assert result["submitted"] is False
+        assert result["confirmed"] is False
+        assert result["can_continue"] is False
+        assert result["blockers"][0]["code"] == "ORDER_READINESS_REQUIRED"
+    assert strategy.submitted_orders == []
+
+
+def test_orders_submit_and_confirm_order_blocks_negative_cash_before_confirmation():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 100.0
+    strategy.last_prices = {"SPY": 80.0}
+    tool_map = _wrap_preflight_and_submit_confirm_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    strategy.cash = 50.0
+    result = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=1, side="buy")
+
+    assert preflight_result["can_submit"] is True
+    assert result["submitted"] is False
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["blockers"][0]["code"] == "NEGATIVE_CASH_NOT_ALLOWED"
+    assert "NEGATIVE_CASH_NOT_ALLOWED" in result["blockers"][0]["message"]
+    assert strategy.submitted_orders == []
+    assert strategy.get_order_calls == []
+
+
+def test_orders_submit_and_confirm_order_returns_blocker_when_confirmation_fails():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    strategy.submitted_order_status = "new"
+    tool_map = _wrap_preflight_and_submit_confirm_tools(strategy)
+
+    preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    result = tool_map["orders_submit_and_confirm_order"](
+        symbol="SPY",
+        quantity=1,
+        side="buy",
+        confirmation_max_attempts=1,
+        confirmation_wait_seconds=0,
+    )
+
+    assert preflight_result["can_submit"] is True
+    assert result["submitted"] is True
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["confirmation_status"] == "open_after_retries"
+    assert result["blockers"][0]["code"] == "CONFIRMATION_FAILED"
+    assert result["confirm_result"]["can_continue"] is False
+    assert len(strategy.submitted_orders) == 1
 
 
 def test_builtin_order_tools_respect_allow_trading_flag():
