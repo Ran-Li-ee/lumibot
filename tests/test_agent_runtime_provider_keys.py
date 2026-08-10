@@ -143,7 +143,18 @@ def test_json_serialization_errors_are_not_retried_as_transient():
     assert _classify_agent_error(TypeError("Object of type UUID is not JSON serializable")) == "config"
 
 
-def test_mutating_order_tools_disable_whole_run_retries_by_default(monkeypatch):
+@pytest.mark.parametrize(
+    "bound_tool",
+    [
+        BoundTool(name="orders_submit_order", description="submit", function=lambda: {"ok": True}),
+        BoundTool(
+            name="orders_submit_and_confirm_order",
+            description="submit and confirm",
+            function=lambda: {"ok": True},
+        ),
+    ],
+)
+def test_mutating_order_tools_disable_whole_run_retries_by_default(monkeypatch, bound_tool):
     monkeypatch.delenv("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS", raising=False)
     request = RuntimeRequest(
         agent_name="pm",
@@ -154,9 +165,7 @@ def test_mutating_order_tools_disable_whole_run_retries_by_default(monkeypatch):
         runtime_context={"mode": "live"},
         memory_state=None,
         memory_notes=[],
-        bound_tools=[
-            BoundTool(name="orders_submit_order", description="submit", function=lambda: {"ok": True}),
-        ],
+        bound_tools=[bound_tool],
     )
 
     assert GoogleADKRuntime._max_attempts_for_request(request) == 1

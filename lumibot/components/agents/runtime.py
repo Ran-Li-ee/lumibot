@@ -5080,7 +5080,12 @@ class GoogleADKRuntime:
                 return max(int(raw), 1)
             except Exception:
                 pass
-        mutating_order_tools = {"orders_submit_order", "orders_cancel_order", "orders_modify_order"}
+        mutating_order_tools = {
+            "orders_submit_order",
+            "orders_submit_and_confirm_order",
+            "orders_cancel_order",
+            "orders_modify_order",
+        }
         if any(tool.name in mutating_order_tools for tool in request.bound_tools):
             # Retrying the whole agent run after a broker-side effect can duplicate orders.
             # Research-only agents keep the larger retry budget; trading agents fail fast

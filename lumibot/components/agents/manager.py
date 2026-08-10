@@ -920,6 +920,7 @@ class AgentHandle:
     def _execution_tool_policy_prompt(self, tool_names: set[str]) -> str:
         execution_tools = {
             "orders_submit_order",
+            "orders_submit_and_confirm_order",
             "orders_cancel_order",
             "orders_modify_order",
             "orders_open_orders",
@@ -933,6 +934,10 @@ class AgentHandle:
         ]
         if "orders_submit_order" in tool_names:
             lines.append("orders_submit_order executes explicit order fields from execution_plan.orders.")
+        if "orders_submit_and_confirm_order" in tool_names:
+            lines.append(
+                "orders_submit_and_confirm_order submits and confirms explicit order fields from execution_plan.orders."
+            )
         if "orders_open_orders" in tool_names:
             lines.append("Use orders_open_orders to inspect outstanding orders before submitting new orders.")
         if "orders_cancel_order" in tool_names:

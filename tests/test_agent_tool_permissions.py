@@ -267,6 +267,7 @@ def test_agent_allow_trading_false_removes_only_mutating_order_tools(monkeypatch
     tool_names = {tool.name for tool in agent._ensure_bound_tools()}
 
     assert "orders_submit_order" not in tool_names
+    assert "orders_submit_and_confirm_order" not in tool_names
     assert "orders_cancel_order" not in tool_names
     assert "orders_modify_order" not in tool_names
     assert "remember_decision" not in tool_names
@@ -1568,6 +1569,7 @@ def test_agent_allow_trading_true_keeps_mutating_order_tools():
     tool_names = {tool.name for tool in agent._ensure_bound_tools()}
 
     assert "orders_submit_order" in tool_names
+    assert "orders_submit_and_confirm_order" in tool_names
     assert "orders_cancel_order" in tool_names
     assert "orders_modify_order" in tool_names
     assert "orders_open_orders" in tool_names

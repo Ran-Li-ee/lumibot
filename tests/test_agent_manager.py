@@ -618,6 +618,32 @@ def test_execution_agent_with_order_tools_does_not_receive_history_policy():
         assert forbidden_phrase not in prompt_lower
 
 
+def test_execution_agent_with_submit_and_confirm_tool_receives_execution_policy():
+    def orders_submit_and_confirm_order():
+        return None
+
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="execution_agent",
+        system_prompt="Execution role.",
+        default_model="test-model",
+        runtime=object(),
+        tools=[orders_submit_and_confirm_order],
+        include_builtin_tools=False,
+        base_system_prompt_mode="execution_minimal",
+    )
+
+    prompt = handle._compose_system_prompt(
+        {"mode": "backtesting"},
+        bound_tools=handle._ensure_bound_tools(),
+    )
+    prompt_lower = prompt.lower()
+
+    assert "execution tool policy" in prompt_lower
+    assert "orders_submit_and_confirm_order submits and confirms explicit order fields" in prompt_lower
+    assert "price/history tool policy" not in prompt_lower
+
+
 def test_agent_manager_create_forwards_base_system_prompt_mode():
     manager = AgentManager(DummyStrategy())
 
