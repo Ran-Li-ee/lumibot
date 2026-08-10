@@ -1487,6 +1487,34 @@ def test_orders_submit_and_confirm_order_returns_blocker_when_confirmation_fails
     assert len(strategy.submitted_orders) == 1
 
 
+def test_orders_submit_and_confirm_order_returns_blocker_when_confirmation_raises():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_preflight_and_submit_confirm_tools(strategy)
+
+    def raise_get_order(identifier, broker_refresh=True, broker_refresh_ttl_seconds=0.0):
+        raise RuntimeError("broker confirmation unavailable")
+
+    strategy.get_order = raise_get_order
+
+    preflight_result = tool_map["orders_preflight_check"](symbol="SPY", quantity=1, side="buy")
+    result = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=1, side="buy")
+
+    assert preflight_result["can_submit"] is True
+    assert result["submitted"] is True
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["identifier"] == "test-order-1"
+    assert result["submit_result"]["order"]["identifier"] == "test-order-1"
+    assert result["confirm_result"] is None
+    assert result["internal_steps"] == ["orders_submit_order", "orders_confirm_order"]
+    assert result["blockers"][0]["code"] == "CONFIRMATION_FAILED"
+    assert "broker confirmation unavailable" in result["blockers"][0]["message"]
+    assert "submitted but not confirmed" in result["blockers"][0]["message"]
+    assert "Stop later orders" in result["blockers"][0]["message"]
+    assert len(strategy.submitted_orders) == 1
+
+
 def test_builtin_order_tools_respect_allow_trading_flag():
     strategy = _Strategy()
     manager = AgentManager(strategy)

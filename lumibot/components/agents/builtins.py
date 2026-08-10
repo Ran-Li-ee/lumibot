@@ -3034,14 +3034,38 @@ def _bind_submit_and_confirm_order(strategy: Any, manager: Any) -> BoundTool:
             )
 
         internal_steps.append("orders_confirm_order")
-        confirm_result = confirm_tool.function(
-            identifier=identifier,
-            symbol=symbol,
-            side=side,
-            expected_quantity=quantity,
-            max_attempts=confirmation_max_attempts,
-            wait_seconds=confirmation_wait_seconds,
-        )
+        try:
+            confirm_result = confirm_tool.function(
+                identifier=identifier,
+                symbol=symbol,
+                side=side,
+                expected_quantity=quantity,
+                max_attempts=confirmation_max_attempts,
+                wait_seconds=confirmation_wait_seconds,
+            )
+        except Exception as exc:
+            return _submit_and_confirm_blocked_payload(
+                sequence=sequence,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                asset_type=asset_type,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                blockers=[
+                    {
+                        "code": "CONFIRMATION_FAILED",
+                        "message": (
+                            "Order was submitted but not confirmed. Stop later orders. "
+                            f"Confirmation failed with error: {exc}"
+                        ),
+                    }
+                ],
+                submit_result=submit_result,
+                confirm_result=None,
+                identifier=identifier,
+                internal_steps=internal_steps,
+            )
         warnings = list(confirm_result.get("warnings") or []) if isinstance(confirm_result, dict) else []
         if not isinstance(confirm_result, dict) or confirm_result.get("confirmed") is not True or confirm_result.get("can_continue") is not True:
             return _submit_and_confirm_blocked_payload(
