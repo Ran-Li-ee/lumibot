@@ -911,8 +911,10 @@ def test_bound_submit_and_confirm_metadata_marks_mutating_and_replayable():
     strategy = _OrderReadinessStrategy()
     manager = AgentManager(strategy)
 
-    tool = BuiltinTools.orders.submit_and_confirm().binder(strategy, manager)
+    definition = BuiltinTools.orders.submit_and_confirm()
+    tool = definition.binder(strategy, manager)
 
+    assert definition.metadata["mutates_trading"] is True
     assert tool.metadata["kind"] == "builtin"
     assert tool.metadata["replay_on_cache"] is True
     assert tool.metadata["mutates_trading"] is True
@@ -1408,7 +1410,17 @@ def test_orders_submit_and_confirm_order_rejects_blocked_preflight():
     assert strategy.submitted_orders == []
 
 
-def test_orders_submit_and_confirm_order_rejects_different_symbol_side_quantity_and_order_style():
+@pytest.mark.parametrize(
+    ("submit_kwargs",),
+    [
+        ({"symbol": "QQQ", "quantity": 1, "side": "buy"},),
+        ({"symbol": "SPY", "quantity": 1, "side": "sell"},),
+        ({"symbol": "SPY", "quantity": 2, "side": "buy"},),
+        ({"symbol": "SPY", "quantity": 1, "side": "buy", "order_type": "limit", "limit_price": 101.0},),
+        ({"symbol": "SPY", "quantity": 1, "side": "buy", "time_in_force": "gtc"},),
+    ],
+)
+def test_orders_submit_and_confirm_order_rejects_preflight_mismatches(submit_kwargs):
     strategy = _OrderReadinessStrategy()
     strategy.last_prices = {"SPY": 100.0, "QQQ": 200.0}
     tool_map = _wrap_preflight_and_submit_confirm_tools(strategy)
@@ -1420,23 +1432,13 @@ def test_orders_submit_and_confirm_order_rejects_different_symbol_side_quantity_
         order_type="market",
         time_in_force="day",
     )
-    different_symbol = tool_map["orders_submit_and_confirm_order"](symbol="QQQ", quantity=1, side="buy")
-    different_side = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=1, side="sell")
-    different_quantity = tool_map["orders_submit_and_confirm_order"](symbol="SPY", quantity=2, side="buy")
-    different_order_type = tool_map["orders_submit_and_confirm_order"](
-        symbol="SPY",
-        quantity=1,
-        side="buy",
-        order_type="limit",
-        limit_price=101.0,
-    )
+    result = tool_map["orders_submit_and_confirm_order"](**submit_kwargs)
 
     assert preflight_result["can_submit"] is True
-    for result in (different_symbol, different_side, different_quantity, different_order_type):
-        assert result["submitted"] is False
-        assert result["confirmed"] is False
-        assert result["can_continue"] is False
-        assert result["blockers"][0]["code"] == "ORDER_READINESS_REQUIRED"
+    assert result["submitted"] is False
+    assert result["confirmed"] is False
+    assert result["can_continue"] is False
+    assert result["blockers"][0]["code"] == "ORDER_READINESS_REQUIRED"
     assert strategy.submitted_orders == []
 
 
