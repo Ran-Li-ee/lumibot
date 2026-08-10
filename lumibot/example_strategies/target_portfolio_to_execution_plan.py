@@ -134,8 +134,11 @@ def _get_previous_completed_daily_close(strategy: Any, symbol: str) -> SizingPri
     if frame is None or "close" not in frame.columns:
         return None
 
-    close_value = frame["close"].iloc[-1]
-    price = _finite_positive_price(close_value, f"previous completed daily close for {symbol}")
+    try:
+        close_value = frame["close"].iloc[-1]
+        price = _finite_positive_price(close_value, f"previous completed daily close for {symbol}")
+    except Exception:
+        return None
     return SizingPrice(
         price=price,
         source=SIZING_PRICE_SOURCE_PREVIOUS_CLOSE,
