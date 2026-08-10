@@ -1446,10 +1446,10 @@ def test_target_portfolio_to_execution_plan_handles_full_rebalance_regression_ca
     assert [(order["side"], order["symbol"], order["quantity"]) for order in orders] == [
         ("sell", "VGIT", 500),
         ("sell", "SPY", 250),
-        ("buy", "TIP", 250),
-        ("buy", "GLD", 250),
+        ("buy", "TIP", 245),
+        ("buy", "GLD", 245),
     ]
-    assert result["cash_projection"]["cash_after_estimate"] == pytest.approx(0)
+    assert result["cash_projection"]["cash_after_estimate"] == pytest.approx(1000)
     diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
     assert diagnostics["VGIT"]["reason_code"] == "exit_removed_symbol"
     assert diagnostics["SPY"]["reason_code"] == "reduce_overweight"
@@ -1485,7 +1485,7 @@ def test_target_portfolio_to_execution_plan_handles_basket_internal_symbol_switc
         for order in result["execution_plan"]["orders"]
     ] == [
         ("sell", "SPY", 500),
-        ("buy", "QQQ", 250),
+        ("buy", "QQQ", 245),
     ]
 
 
@@ -1518,8 +1518,31 @@ def test_target_portfolio_to_execution_plan_rebalances_price_drift():
     ] == [
         ("sell", "GLD", 30),
         ("sell", "SPY", 70),
-        ("buy", "VGIT", 200),
+        ("buy", "VGIT", 196),
     ]
+
+
+def test_target_portfolio_to_execution_plan_buy_buffer_does_not_apply_to_sells():
+    planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
+    strategy = make_planner_strategy(
+        positions=[make_position("SPY", 500)],
+        cash=0,
+        portfolio_value=50000,
+        prices={"SPY": 100},
+    )
+
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[],
+    )
+
+    assert [
+        (order["side"], order["symbol"], order["quantity"])
+        for order in result["execution_plan"]["orders"]
+    ] == [("sell", "SPY", 500)]
+    diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
+    assert diagnostics["SPY"]["planned_quantity"] == 500
 
 
 def test_target_portfolio_to_execution_plan_holds_when_whole_share_rounding_produces_no_orders():
@@ -1703,7 +1726,7 @@ def test_target_portfolio_to_execution_plan_rejects_missing_price():
         prices={"SPY": 100},
     )
 
-    with pytest.raises(ValueError, match="missing last price for GLD"):
+    with pytest.raises(ValueError, match="missing sizing price for GLD"):
         planner.target_portfolio_to_execution_plan(
             strategy,
             date="2024-09-06",
