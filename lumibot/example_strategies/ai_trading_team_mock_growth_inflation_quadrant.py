@@ -497,15 +497,16 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             include_builtin_tools=False,
             tools=[
                 BuiltinTools.orders.preflight(),
-                BuiltinTools.orders.submit(),
-                BuiltinTools.orders.confirm(),
+                BuiltinTools.orders.submit_and_confirm(),
             ],
             system_prompt=(
                 "Execution role: execute only the provided execution_plan using the listed order tools. "
-                "Call orders_preflight_check before each order. If preflight returns can_submit=true, submit "
-                "that same order with orders_submit_order, then confirm it with orders_confirm_order before "
-                "continuing. If preflight returns can_submit=false, stop execution and report the blocker. "
-                "Follow sequence order, do not perform investment research, and do not change order fields."
+                "For each order in sequence, call orders_preflight_check with the exact order fields. "
+                "If preflight returns can_submit=true, call orders_submit_and_confirm_order with that same order. "
+                "Continue to the next order only when the combined tool returns can_continue=true. "
+                "If preflight returns can_submit=false or the combined tool returns can_continue=false, stop "
+                "remaining orders and report the blocker. Do not perform investment research, do not change "
+                "order fields, and do not call lower-level submit or confirm tools when the combined tool is available."
             ),
         )
 
@@ -580,10 +581,9 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
 
         self.agents["execution_agent"].run(
             task_prompt=(
-                "Execute the provided execution_plan. For each order in sequence, call orders_preflight_check "
-                "with the exact order fields. If can_submit=true, call orders_submit_order with that same order, "
-                "then call orders_confirm_order for the returned identifier before continuing. If can_submit=false "
-                "or confirmation returns can_continue=false, stop remaining orders and report the blocker."
+                "Execute the provided execution_plan in sequence order. For each order, call orders_preflight_check "
+                "with the exact order fields. If preflight allows it, call orders_submit_and_confirm_order with "
+                "that same order. Stop if any preflight or submit-and-confirm result blocks continuation."
             ),
             context={
                 "date": current_date,

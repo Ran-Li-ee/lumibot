@@ -260,12 +260,12 @@ def test_agents_receive_distinct_tool_surfaces():
     }
     assert created_tool_names(created["execution_agent"]) == {
         "orders_preflight_check",
-        "orders_submit_order",
-        "orders_confirm_order",
+        "orders_submit_and_confirm_order",
     }
     for non_execution_agent in agent_manager.created[:-1]:
         assert "orders_submit_order" not in created_tool_names(non_execution_agent)
         assert "orders_confirm_order" not in created_tool_names(non_execution_agent)
+        assert "orders_submit_and_confirm_order" not in created_tool_names(non_execution_agent)
 
 
 def test_prompt_boundaries_are_short_and_role_specific():
@@ -286,6 +286,9 @@ def test_prompt_boundaries_are_short_and_role_specific():
         "cash_buffer_pct",
         "first inspect portfolio, positions, open orders, and latest prices",
         "manually call account_portfolio",
+        "then confirm it with orders_confirm_order",
+        "then call orders_confirm_order",
+        "call orders_submit_order with that same order",
     ):
         assert forbidden_phrase not in serialized
     assert "call the mock macro_regime_classifier" in serialized
@@ -295,7 +298,9 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "do not manually calculate share quantities" in serialized
     assert "planner tool owns all execution_plan calculations" in serialized
     assert "execute only the provided execution_plan" in serialized
-    assert "call orders_preflight_check before each order" in serialized
+    assert "call orders_preflight_check" in serialized
+    assert "orders_submit_and_confirm_order" in serialized
+    assert "combined tool returns can_continue=true" in serialized
     assert "if preflight returns can_submit=false" in serialized
 
 
@@ -1036,12 +1041,12 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     for required_phrase in (
         "orders_preflight_check",
         "with the exact order fields",
-        "orders_submit_order",
-        "orders_confirm_order",
-        "can_submit=false",
-        "confirmation returns can_continue=false",
+        "orders_submit_and_confirm_order",
+        "blocks continuation",
     ):
         assert required_phrase in execution_task_prompt
+    assert "orders_submit_order" not in execution_task_prompt
+    assert "orders_confirm_order" not in execution_task_prompt
     execution_context = agent_manager["execution_agent"].calls[0]["context"]
     assert execution_context == {
         "date": "2024-09-05",
