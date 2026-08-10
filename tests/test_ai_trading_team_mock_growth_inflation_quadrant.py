@@ -1304,7 +1304,7 @@ def test_sell_without_position_blocks_before_execution_agent():
     assert agent_manager["execution_agent"].calls == []
 
 
-def test_target_portfolio_to_execution_plan_deploys_all_cash_to_targets():
+def test_target_portfolio_to_execution_plan_applies_buy_sizing_buffer_to_new_targets():
     planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
     strategy = make_planner_strategy(
         positions=[],
