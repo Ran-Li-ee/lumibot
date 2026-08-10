@@ -387,6 +387,92 @@ def test_orders_confirm_order_formatter_explains_blocked_confirmation():
     assert "Order remained active" in text
 
 
+def test_orders_submit_and_confirm_order_formatter_explains_success():
+    text = explain_tool_result(
+        "orders_submit_and_confirm_order",
+        {"symbol": "SPY", "side": "buy", "quantity": 2},
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "quantity": 2,
+            "submitted": True,
+            "confirmed": True,
+            "can_continue": True,
+            "confirmation_status": "filled",
+            "identifier": "order-123",
+            "submit_result": {
+                "order": {
+                    "identifier": "order-123",
+                    "status": "fill",
+                    "side": "buy",
+                    "quantity": 2,
+                    "asset": {"symbol": "SPY", "asset_type": "stock"},
+                }
+            },
+            "confirm_result": {"attempt_count": 1, "confirmed": True, "can_continue": True},
+            "warnings": [],
+            "blockers": [],
+        },
+        None,
+    )
+
+    assert "Submitted and confirmed order order-123" in text
+    assert "buy 2 SPY" in text
+    assert "filled" in text
+    assert "1 attempt" in text
+    assert "can_continue=true" in text
+
+
+def test_orders_submit_and_confirm_order_formatter_explains_confirmation_blocker():
+    text = explain_tool_result(
+        "orders_submit_and_confirm_order",
+        {"symbol": "SPY", "side": "buy", "quantity": 2},
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "quantity": 2,
+            "submitted": True,
+            "confirmed": False,
+            "can_continue": False,
+            "confirmation_status": "open_after_retries",
+            "identifier": "order-123",
+            "confirm_result": {"attempt_count": 3, "warnings": ["Order remained active."]},
+            "warnings": ["Order remained active."],
+            "blockers": [{"code": "CONFIRMATION_FAILED", "message": "Order was submitted but not confirmed."}],
+        },
+        None,
+    )
+
+    assert "Submit-and-confirm blocked" in text
+    assert "buy 2 SPY" in text
+    assert "open_after_retries" in text
+    assert "can_continue=false" in text
+    assert "CONFIRMATION_FAILED" in text
+
+
+def test_orders_submit_and_confirm_order_formatter_explains_submit_blocker():
+    text = explain_tool_result(
+        "orders_submit_and_confirm_order",
+        {"symbol": "SPY", "side": "buy", "quantity": 2},
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "quantity": 2,
+            "submitted": False,
+            "confirmed": False,
+            "can_continue": False,
+            "identifier": None,
+            "blockers": [{"code": "ORDER_READINESS_REQUIRED", "message": "Missing matching preflight."}],
+        },
+        None,
+    )
+
+    assert "Submit-and-confirm blocked" in text
+    assert "buy 2 SPY" in text
+    assert "ORDER_READINESS_REQUIRED" in text
+    assert "Missing matching preflight" in text
+
+
 def test_explain_tool_result_does_not_mutate_inputs():
     arguments = {"symbol": "SPY", "nested": {"limit": 1}}
     raw_result = {

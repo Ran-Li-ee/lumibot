@@ -484,6 +484,56 @@ def _orders_confirm_order(args: dict[str, Any], raw_result: Any) -> str:
     )
 
 
+def _orders_submit_and_confirm_order(args: dict[str, Any], raw_result: Any) -> str:
+    result = _as_dict(raw_result)
+    submit_result = _nested_dict(result, "submit_result")
+    submit_order = _nested_dict(submit_result, "order") if submit_result else {}
+    symbol = _asset_symbol(submit_order) or _first_present(result, "symbol") or _first_present(args, "symbol")
+    qty = (
+        _first_present(submit_order, "qty", "quantity", "shares")
+        or _first_present(result, "quantity", "qty", "shares")
+        or _first_present(args, "quantity", "qty", "shares")
+    )
+    side = (
+        _first_present(submit_order, "side", "action")
+        or _first_present(result, "side", "action")
+        or _first_present(args, "side", "action")
+    )
+    order_id = (
+        _first_present(result, "identifier", "id", "order_id")
+        or _first_present(submit_order, "identifier", "id", "order_id")
+    )
+    status = _first_present(result, "confirmation_status", "status")
+    confirm_result = _nested_dict(result, "confirm_result")
+    attempt_count = _first_present(confirm_result, "attempt_count", "attempts_count")
+    blockers = result.get("blockers") if isinstance(result.get("blockers"), list) else []
+    warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+    order_text = f"{_text(side)} {_text(qty)} {_text(symbol)}"
+    attempts_text = ""
+    if attempt_count is not None:
+        attempt_label = "attempt" if attempt_count == 1 else "attempts"
+        attempts_text = f" after {_text(attempt_count)} {attempt_label}"
+    if result.get("submitted") is True and result.get("confirmed") is True and result.get("can_continue") is True:
+        return (
+            f"Submitted and confirmed order {_text(order_id)} for {order_text}{attempts_text}. "
+            f"Status: {_text(status)}. can_continue=true."
+        )
+    blocker_text = ""
+    if blockers:
+        first = _as_dict(blockers[0])
+        code = _first_present(first, "code")
+        message = _first_present(first, "message")
+        blocker_text = f" Blocker: {_text(code)}"
+        if message is not None:
+            blocker_text += f" - {_text(message)}"
+    elif warnings:
+        blocker_text = f" Warning: {_text(warnings[0])}"
+    return (
+        f"Submit-and-confirm blocked for {order_text}{attempts_text}. "
+        f"Status: {_text(status)}. can_continue=false.{blocker_text}"
+    )
+
+
 def _remember_decision(args: dict[str, Any], raw_result: Any) -> str:
     result = _as_dict(raw_result)
     key = _first_present(result, "key", "memory_key", "id") or _first_present(args, "key", "memory_key", "id")
@@ -508,5 +558,6 @@ _FORMATTERS = {
     "orders_preflight_check": _orders_preflight_check,
     "orders_submit_order": _orders_submit_order,
     "orders_confirm_order": _orders_confirm_order,
+    "orders_submit_and_confirm_order": _orders_submit_and_confirm_order,
     "remember_decision": _remember_decision,
 }
