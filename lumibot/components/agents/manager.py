@@ -921,6 +921,7 @@ class AgentHandle:
         execution_tools = {
             "orders_submit_order",
             "orders_submit_and_confirm_order",
+            "orders_execute_order",
             "orders_cancel_order",
             "orders_modify_order",
             "orders_open_orders",
@@ -937,6 +938,12 @@ class AgentHandle:
         if "orders_submit_and_confirm_order" in tool_names:
             lines.append(
                 "orders_submit_and_confirm_order submits and confirms explicit order fields from execution_plan.orders."
+            )
+        if "orders_execute_order" in tool_names:
+            lines.append(
+                "orders_execute_order executes one explicit execution_plan order end to end: readiness check, "
+                "submission, and confirmation. It does not research, calculate quantities, change order fields, "
+                "execute multiple orders, or execute a full plan."
             )
         if "orders_open_orders" in tool_names:
             lines.append("Use orders_open_orders to inspect outstanding orders before submitting new orders.")
@@ -1530,6 +1537,7 @@ class AgentHandle:
             or name.startswith("duckdb_")
             or name.startswith("account_")
             or name == "orders_preflight_check"
+            or name == "orders_execute_order"
             or name in {
                 "get_news",
                 "alpaca_news",

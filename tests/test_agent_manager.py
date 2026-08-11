@@ -644,6 +644,37 @@ def test_execution_agent_with_submit_and_confirm_tool_receives_execution_policy(
     assert "price/history tool policy" not in prompt_lower
 
 
+def test_execution_agent_with_execute_tool_receives_stage_c_execution_policy():
+    def orders_execute_order():
+        return None
+
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="execution_agent",
+        system_prompt="Execution role.",
+        default_model="test-model",
+        runtime=object(),
+        tools=[orders_execute_order],
+        include_builtin_tools=False,
+        base_system_prompt_mode="execution_minimal",
+    )
+
+    prompt = handle._compose_system_prompt(
+        {"mode": "backtesting"},
+        bound_tools=handle._ensure_bound_tools(),
+    )
+    prompt_lower = prompt.lower()
+
+    assert "execution tool policy" in prompt_lower
+    assert (
+        "orders_execute_order executes one explicit execution_plan order end to end: "
+        "readiness check, submission, and confirmation"
+    ) in prompt_lower
+    assert "it does not research, calculate quantities, change order fields" in prompt_lower
+    assert "execute multiple orders, or execute a full plan" in prompt_lower
+    assert "price/history tool policy" not in prompt_lower
+
+
 def test_agent_manager_create_forwards_base_system_prompt_mode():
     manager = AgentManager(DummyStrategy())
 
@@ -735,6 +766,38 @@ def test_orders_preflight_counts_as_visible_order_data_for_warnings():
             AgentTraceEvent(
                 kind="tool_call",
                 tool_name="orders_submit_order",
+                payload={"symbol": "SPY", "side": "buy", "quantity": 1},
+            ),
+        ],
+    )
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="execution_agent",
+        system_prompt="Prompt.",
+        default_model="test-model",
+        tools=[],
+        runtime=object(),
+        include_builtin_tools=False,
+        base_system_prompt_mode="execution_minimal",
+    )
+
+    warnings = handle._derive_warnings(result, {"mode": "backtesting"})
+
+    assert not [
+        warning
+        for warning in warnings
+        if warning["kind"] == "order_without_data"
+    ]
+
+
+def test_orders_execute_counts_as_visible_order_data_for_warnings():
+    result = AgentRunResult(
+        summary="RESULT: executed planned order.",
+        model="test-model",
+        events=[
+            AgentTraceEvent(
+                kind="tool_call",
+                tool_name="orders_execute_order",
                 payload={"symbol": "SPY", "side": "buy", "quantity": 1},
             ),
         ],

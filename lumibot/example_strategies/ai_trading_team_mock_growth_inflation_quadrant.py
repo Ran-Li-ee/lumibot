@@ -497,18 +497,14 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             allow_trading=True,
             base_system_prompt_mode=self._execution_agent_base_system_prompt_mode,
             include_builtin_tools=False,
-            tools=[
-                BuiltinTools.orders.preflight(),
-                BuiltinTools.orders.submit_and_confirm(),
-            ],
+            tools=[BuiltinTools.orders.execute()],
             system_prompt=(
-                "Execution role: execute only the provided execution_plan using the listed order tools. "
-                "For each order in sequence, call orders_preflight_check with the exact order fields. "
-                "If preflight returns can_submit=true, call orders_submit_and_confirm_order with that same order. "
-                "Continue to the next order only when the combined tool returns can_continue=true. "
-                "If preflight returns can_submit=false or the combined tool returns can_continue=false, stop "
-                "remaining orders and report the blocker. Do not perform investment research, do not change "
-                "order fields, and do not call lower-level submit or confirm tools when the combined tool is available."
+                "Execution role: execute only provided execution_plan. "
+                "For each order in ascending sequence order, call orders_execute_order exactly once with exact "
+                "order fields. Do not manually preflight/submit/confirm/query account/open orders/latest prices "
+                "when orders_execute_order is available; the tool performs readiness checks, submission, and "
+                "confirmation internally. Continue only when can_continue=true. Stop remaining orders on "
+                "can_continue=false. Do not research/change fields/call lower-level tools."
             ),
         )
 
@@ -583,9 +579,9 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
 
         self.agents["execution_agent"].run(
             task_prompt=(
-                "Execute the provided execution_plan in sequence order. For each order, call orders_preflight_check "
-                "with the exact order fields. If preflight allows it, call orders_submit_and_confirm_order with "
-                "that same order. Stop if any preflight or submit-and-confirm result blocks continuation."
+                "Execute the provided execution_plan in sequence order. For each order, call orders_execute_order "
+                "exactly once with the exact order fields. Stop if any orders_execute_order result returns "
+                "can_continue=false."
             ),
             context={
                 "date": current_date,

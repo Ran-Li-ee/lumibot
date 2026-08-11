@@ -286,14 +286,12 @@ def test_agents_receive_distinct_tool_surfaces():
     assert created_tool_names(created["portfolio_decision_agent"]) == {
         "target_portfolio_to_execution_plan",
     }
-    assert created_tool_names(created["execution_agent"]) == {
-        "orders_preflight_check",
-        "orders_submit_and_confirm_order",
-    }
+    assert created_tool_names(created["execution_agent"]) == {"orders_execute_order"}
     for non_execution_agent in agent_manager.created[:-1]:
         assert "orders_submit_order" not in created_tool_names(non_execution_agent)
         assert "orders_confirm_order" not in created_tool_names(non_execution_agent)
         assert "orders_submit_and_confirm_order" not in created_tool_names(non_execution_agent)
+        assert "orders_execute_order" not in created_tool_names(non_execution_agent)
 
 
 def test_prompt_boundaries_are_short_and_role_specific():
@@ -317,6 +315,12 @@ def test_prompt_boundaries_are_short_and_role_specific():
         "then confirm it with orders_confirm_order",
         "then call orders_confirm_order",
         "call orders_submit_order with that same order",
+        "call orders_preflight_check",
+        "orders_preflight_check",
+        "orders_submit_and_confirm_order",
+        "preflight returns",
+        "combined tool returns",
+        "submit-and-confirm",
     ):
         assert forbidden_phrase not in serialized
     assert "call the mock macro_regime_classifier" in serialized
@@ -328,11 +332,14 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "planner tool owns daily backtest buy sizing" in serialized
     execution_section = serialized.split("execution role:", 1)[-1]
     assert "2% buy sizing buffer" not in execution_section
-    assert "execute only the provided execution_plan" in serialized
-    assert "call orders_preflight_check" in serialized
-    assert "orders_submit_and_confirm_order" in serialized
-    assert "combined tool returns can_continue=true" in serialized
-    assert "if preflight returns can_submit=false" in serialized
+    assert "execute only provided execution_plan" in serialized
+    assert "for each order in ascending sequence order" in serialized
+    assert "call orders_execute_order exactly once with exact order fields" in serialized
+    assert "do not manually preflight/submit/confirm/query account/open orders/latest prices" in serialized
+    assert "the tool performs readiness checks, submission, and confirmation internally" in serialized
+    assert "continue only when can_continue=true" in serialized
+    assert "stop remaining orders on can_continue=false" in serialized
+    assert "do not research/change fields/call lower-level tools" in serialized
 
 
 def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
@@ -1081,14 +1088,16 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     assert len(agent_manager["execution_agent"].calls) == 1
     execution_task_prompt = agent_manager["execution_agent"].calls[0]["task_prompt"]
     for required_phrase in (
-        "orders_preflight_check",
-        "with the exact order fields",
-        "orders_submit_and_confirm_order",
-        "blocks continuation",
+        "Execute the provided execution_plan in sequence order",
+        "orders_execute_order exactly once",
+        "exact order fields",
+        "can_continue=false",
     ):
         assert required_phrase in execution_task_prompt
+    assert "orders_preflight_check" not in execution_task_prompt
     assert "orders_submit_order" not in execution_task_prompt
     assert "orders_confirm_order" not in execution_task_prompt
+    assert "orders_submit_and_confirm_order" not in execution_task_prompt
     execution_context = agent_manager["execution_agent"].calls[0]["context"]
     assert execution_context == {
         "date": "2024-09-05",
