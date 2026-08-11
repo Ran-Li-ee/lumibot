@@ -349,6 +349,34 @@ def normalize_execution_plan(plan: Any) -> dict[str, Any]:
     }
 
 
+def execution_plan_execute_payload(plan: Any) -> dict[str, Any]:
+    normalized_plan = normalize_execution_plan(plan)
+    strict_orders = []
+    for order in normalized_plan["orders"]:
+        quantity = order["quantity"]
+        if isinstance(quantity, bool) or not float(quantity).is_integer():
+            raise ValueError("execution_plan_execute quantity must be a positive whole-share integer.")
+        strict_orders.append(
+            {
+                "sequence": order["sequence"],
+                "action": order["action"],
+                "symbol": order["symbol"],
+                "side": order["side"],
+                "quantity_mode": order["quantity_mode"],
+                "quantity": int(quantity),
+                "asset_type": order["asset_type"],
+                "order_type": order["order_type"],
+                "time_in_force": order["time_in_force"],
+            }
+        )
+
+    return {
+        "schema_version": normalized_plan["schema_version"],
+        "intent": normalized_plan["intent"],
+        "orders": strict_orders,
+    }
+
+
 def parse_execution_plan_from_portfolio_summary(summary: str) -> dict[str, Any]:
     raw_json = _extract_first_json_object(summary)
     try:
@@ -497,14 +525,15 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             allow_trading=True,
             base_system_prompt_mode=self._execution_agent_base_system_prompt_mode,
             include_builtin_tools=False,
-            tools=[BuiltinTools.orders.execute()],
+            tools=[BuiltinTools.orders.execute_plan()],
             system_prompt=(
                 "Execution role: execute only provided execution_plan. "
-                "For each order in ascending sequence order, call orders_execute_order exactly once with exact "
-                "order fields. Do not manually preflight/submit/confirm/query account/open orders/latest prices "
-                "when orders_execute_order is available; the tool performs readiness checks, submission, and "
-                "confirmation internally. Continue only when can_continue=true. Stop remaining orders on "
-                "can_continue=false. Do not research/change fields/call lower-level tools."
+                "Call execution_plan_execute exactly once with the complete execution_plan. "
+                "Do not manually execute individual orders. "
+                "Do not call lower-level order, account, open-order, or price tools when execution_plan_execute "
+                "is available. Do not research, change fields, reorder orders, split orders, or repair the plan. "
+                "If the tool returns plan_status=completed, summarize completed orders. If it returns "
+                "plan_status=blocked or invalid, summarize where execution stopped and why."
             ),
         )
 
@@ -579,12 +608,11 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
 
         self.agents["execution_agent"].run(
             task_prompt=(
-                "Execute the provided execution_plan in sequence order. For each order, call orders_execute_order "
-                "exactly once with the exact order fields. Stop if any orders_execute_order result returns "
-                "can_continue=false."
+                "Execute the provided execution_plan by calling execution_plan_execute exactly once with the "
+                "complete execution_plan. Summarize the returned plan report. Do not call per-order tools."
             ),
             context={
                 "date": current_date,
-                "execution_plan": execution_plan,
+                "execution_plan": execution_plan_execute_payload(execution_plan),
             },
         )

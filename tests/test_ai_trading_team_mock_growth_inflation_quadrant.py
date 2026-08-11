@@ -286,12 +286,13 @@ def test_agents_receive_distinct_tool_surfaces():
     assert created_tool_names(created["portfolio_decision_agent"]) == {
         "target_portfolio_to_execution_plan",
     }
-    assert created_tool_names(created["execution_agent"]) == {"orders_execute_order"}
+    assert created_tool_names(created["execution_agent"]) == {"execution_plan_execute"}
     for non_execution_agent in agent_manager.created[:-1]:
         assert "orders_submit_order" not in created_tool_names(non_execution_agent)
         assert "orders_confirm_order" not in created_tool_names(non_execution_agent)
         assert "orders_submit_and_confirm_order" not in created_tool_names(non_execution_agent)
         assert "orders_execute_order" not in created_tool_names(non_execution_agent)
+        assert "execution_plan_execute" not in created_tool_names(non_execution_agent)
 
 
 def test_prompt_boundaries_are_short_and_role_specific():
@@ -318,6 +319,10 @@ def test_prompt_boundaries_are_short_and_role_specific():
         "call orders_preflight_check",
         "orders_preflight_check",
         "orders_submit_and_confirm_order",
+        "orders_execute_order",
+        "for each order in ascending sequence order",
+        "exact order fields",
+        "continue only when can_continue=true",
         "preflight returns",
         "combined tool returns",
         "submit-and-confirm",
@@ -333,13 +338,10 @@ def test_prompt_boundaries_are_short_and_role_specific():
     execution_section = serialized.split("execution role:", 1)[-1]
     assert "2% buy sizing buffer" not in execution_section
     assert "execute only provided execution_plan" in serialized
-    assert "for each order in ascending sequence order" in serialized
-    assert "call orders_execute_order exactly once with exact order fields" in serialized
-    assert "do not manually preflight/submit/confirm/query account/open orders/latest prices" in serialized
-    assert "the tool performs readiness checks, submission, and confirmation internally" in serialized
-    assert "continue only when can_continue=true" in serialized
-    assert "stop remaining orders on can_continue=false" in serialized
-    assert "do not research/change fields/call lower-level tools" in serialized
+    assert "call execution_plan_execute exactly once with the complete execution_plan" in serialized
+    assert "do not manually execute individual orders" in serialized
+    assert "do not call lower-level order, account, open-order, or price tools" in serialized
+    assert "do not research, change fields, reorder orders, split orders, or repair the plan" in serialized
 
 
 def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
@@ -1088,12 +1090,13 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     assert len(agent_manager["execution_agent"].calls) == 1
     execution_task_prompt = agent_manager["execution_agent"].calls[0]["task_prompt"]
     for required_phrase in (
-        "Execute the provided execution_plan in sequence order",
-        "orders_execute_order exactly once",
-        "exact order fields",
-        "can_continue=false",
+        "Execute the provided execution_plan by calling execution_plan_execute exactly once",
+        "complete execution_plan",
+        "Summarize the returned plan report",
+        "Do not call per-order tools",
     ):
         assert required_phrase in execution_task_prompt
+    assert "orders_execute_order" not in execution_task_prompt
     assert "orders_preflight_check" not in execution_task_prompt
     assert "orders_submit_order" not in execution_task_prompt
     assert "orders_confirm_order" not in execution_task_prompt
@@ -1101,9 +1104,17 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     execution_context = agent_manager["execution_agent"].calls[0]["context"]
     assert execution_context == {
         "date": "2024-09-05",
-        "execution_plan": module.normalize_execution_plan(planner_plan),
+        "execution_plan": module.execution_plan_execute_payload(planner_plan),
     }
+    assert "constraints" not in execution_context["execution_plan"]
+    assert all(isinstance(order["quantity"], int) for order in execution_context["execution_plan"]["orders"])
     assert [order["symbol"] for order in execution_context["execution_plan"]["orders"]] == ["QQQ", "TIP", "IEF"]
+    from lumibot.components.agents.builtins import _validate_execution_plan
+
+    _intent, _orders, blocker, _orders_requested = _validate_execution_plan(
+        execution_context["execution_plan"]
+    )
+    assert blocker is None
 
 
 def test_on_trading_iteration_blocks_when_portfolio_agent_rewrites_planner_plan():
