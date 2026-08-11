@@ -13,10 +13,13 @@ D:\Lumibot\.venv\Scripts\python.exe -m pytest tests/test_agent_tool_permissions.
 Result:
 
 ```text
-220 passed, 2 warnings in 31.38s
+221 passed, 2 warnings in 66.22s (0:01:06)
 ```
 
 Warnings were the existing `websockets.legacy` deprecation warning and Google ADK experimental JSON schema warning.
+
+The focused suite includes a regression that `orders_execute_order` metadata disables
+whole-agent retries even when `LUMIBOT_AGENT_MAX_RUN_ATTEMPTS` is set above `1`.
 
 ## Ruff
 
@@ -24,6 +27,18 @@ Focused new/Stage C surface command:
 
 ```powershell
 D:\Lumibot\.venv\Scripts\python.exe -m ruff check lumibot/components/agents/replay_ui/formatters.py tests/test_agent_replay_ui_formatters.py tests/test_agent_runtime_provider_keys.py --select E501,B,I
+```
+
+Result:
+
+```text
+All checks passed!
+```
+
+Reviewer fix focused command:
+
+```powershell
+D:\Lumibot\.venv\Scripts\python.exe -m ruff check lumibot\components\agents\runtime.py tests\test_agent_runtime_provider_keys.py --select E501,B,I
 ```
 
 Result:

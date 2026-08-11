@@ -5074,12 +5074,6 @@ class GoogleADKRuntime:
 
     @staticmethod
     def _max_attempts_for_request(request: RuntimeRequest) -> int:
-        raw = os.environ.get("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS")
-        if raw:
-            try:
-                return max(int(raw), 1)
-            except Exception:
-                pass
         mutating_order_tools = {
             "orders_submit_order",
             "orders_submit_and_confirm_order",
@@ -5096,6 +5090,12 @@ class GoogleADKRuntime:
             # Research-only agents keep the larger retry budget; trading agents fail fast
             # and let the next scheduled/bar iteration re-evaluate from current broker state.
             return 1
+        raw = os.environ.get("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS")
+        if raw:
+            try:
+                return max(int(raw), 1)
+            except Exception:
+                pass
         mode = ""
         if isinstance(request.runtime_context, dict):
             mode = str(request.runtime_context.get("mode") or "").strip().lower()
