@@ -473,6 +473,115 @@ def test_orders_submit_and_confirm_order_formatter_explains_submit_blocker():
     assert "Missing matching preflight" in text
 
 
+def test_orders_execute_order_formatter_explains_success():
+    text = explain_tool_result(
+        "orders_execute_order",
+        {"symbol": "SPY", "side": "buy", "quantity": 3},
+        {
+            "sequence": 1,
+            "symbol": "SPY",
+            "side": "buy",
+            "quantity": 3,
+            "execution_status": "completed",
+            "can_continue": True,
+            "preflight_result": {"readiness": "ready", "can_submit": True},
+            "submit_and_confirm_result": {
+                "submitted": True,
+                "confirmed": True,
+                "can_continue": True,
+                "confirmation_status": "filled",
+                "identifier": "order-123",
+            },
+            "blockers": [],
+        },
+        None,
+    )
+
+    assert "sequence 1" in text
+    assert "buy 3 SPY" in text
+    assert "Preflight ready" in text
+    assert "submitted=true" in text
+    assert "confirmed=true" in text
+    assert "order-123" in text
+    assert "can_continue=true" in text
+
+
+def test_orders_execute_order_formatter_explains_preflight_blocker_before_submit():
+    text = explain_tool_result(
+        "orders_execute_order",
+        {"symbol": "SPY", "side": "buy", "quantity": 3},
+        {
+            "sequence": 2,
+            "symbol": "SPY",
+            "side": "buy",
+            "quantity": 3,
+            "execution_status": "blocked",
+            "can_continue": False,
+            "preflight_result": {"readiness": "blocked", "can_submit": False},
+            "submit_and_confirm_result": None,
+            "blockers": [
+                {
+                    "code": "INSUFFICIENT_CASH_ESTIMATE",
+                    "message": "Estimated cost would exceed available cash.",
+                }
+            ],
+        },
+        None,
+    )
+
+    assert "blocked before submit" in text
+    assert "sequence 2" in text
+    assert "buy 3 SPY" in text
+    assert "Preflight blocked" in text
+    assert "can_continue=false" in text
+    assert "INSUFFICIENT_CASH_ESTIMATE" in text
+    assert "Estimated cost would exceed available cash." in text
+
+
+def test_orders_execute_order_formatter_explains_confirmation_blocker_after_submit():
+    text = explain_tool_result(
+        "orders_execute_order",
+        {"symbol": "SPY", "side": "buy", "quantity": 3},
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "quantity": 3,
+            "execution_status": "blocked",
+            "can_continue": False,
+            "preflight_result": {"readiness": "ready", "can_submit": True},
+            "submit_and_confirm_result": {
+                "submitted": True,
+                "confirmed": False,
+                "can_continue": False,
+                "confirmation_status": "open_after_retries",
+                "identifier": "order-123",
+                "blockers": [
+                    {
+                        "code": "CONFIRMATION_FAILED",
+                        "message": "Order was submitted but not confirmed.",
+                    }
+                ],
+            },
+            "blockers": [
+                {
+                    "code": "CONFIRMATION_FAILED",
+                    "message": "Order was submitted but not confirmed.",
+                }
+            ],
+        },
+        None,
+    )
+
+    assert "submitted but not confirmed" in text
+    assert "buy 3 SPY" in text
+    assert "Preflight ready" in text
+    assert "open_after_retries" in text
+    assert "order-123" in text
+    assert "can_continue=false" in text
+    assert "CONFIRMATION_FAILED" in text
+    assert "Order was submitted but not confirmed." in text
+
+
 def test_explain_tool_result_does_not_mutate_inputs():
     arguments = {"symbol": "SPY", "nested": {"limit": 1}}
     raw_result = {

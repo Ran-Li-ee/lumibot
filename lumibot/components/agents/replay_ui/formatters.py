@@ -534,6 +534,91 @@ def _orders_submit_and_confirm_order(args: dict[str, Any], raw_result: Any) -> s
     )
 
 
+def _order_field(args: dict[str, Any], result: dict[str, Any], *keys: str) -> Any:
+    order = _nested_dict(result, "order")
+    for source in (order, result, args):
+        value = _first_present(source, *keys)
+        if value is not None:
+            return value
+    return None
+
+
+def _orders_execute_order_id(result: dict[str, Any]) -> Any:
+    submit_and_confirm_result = _nested_dict(result, "submit_and_confirm_result")
+    submit_result = _nested_dict(submit_and_confirm_result, "submit_result")
+    submit_order = _nested_dict(submit_result, "order")
+    confirm_result = _nested_dict(submit_and_confirm_result, "confirm_result")
+    for source in (result, submit_and_confirm_result, submit_order, confirm_result):
+        value = _first_present(source, "identifier", "id", "order_id")
+        if value is not None:
+            return value
+    return None
+
+
+def _blocker_text(*sources: Any) -> str:
+    for source in sources:
+        source_dict = _as_dict(source)
+        blockers = source_dict.get("blockers") if isinstance(source_dict.get("blockers"), list) else []
+        if not blockers:
+            continue
+        blocker = _as_dict(blockers[0])
+        code = _first_present(blocker, "code", "reason")
+        message = _first_present(blocker, "message", "detail")
+        parts = [str(value) for value in (code, message) if value is not None]
+        if parts:
+            return f" Blocker: {' - '.join(parts)}."
+    return ""
+
+
+def _orders_execute_order(args: dict[str, Any], raw_result: Any) -> str:
+    result = _as_dict(raw_result)
+    preflight_result = _nested_dict(result, "preflight_result")
+    submit_and_confirm_result = _nested_dict(result, "submit_and_confirm_result")
+
+    symbol = _order_field(args, result, "symbol", "ticker")
+    qty = _order_field(args, result, "qty", "quantity", "shares")
+    side = _order_field(args, result, "side", "action")
+    order_text = f"{_text(side)} {_text(qty)} {_text(symbol)}"
+
+    sequence = _first_present(result, "sequence")
+    if sequence is None:
+        sequence = _first_present(args, "sequence")
+    sequence_text = "" if sequence is None else f" sequence {_text(sequence)}"
+
+    readiness = _first_present(preflight_result, "readiness", "status")
+    if readiness is None:
+        readiness = "ready" if preflight_result.get("can_submit") is True else "blocked"
+    preflight_text = f"Preflight {_text(readiness)}"
+
+    order_id = _orders_execute_order_id(result)
+    order_id_text = "" if order_id is None else f" Order id: {_text(order_id)}."
+
+    submitted = submit_and_confirm_result.get("submitted")
+    confirmed = submit_and_confirm_result.get("confirmed")
+    status = _first_present(submit_and_confirm_result, "confirmation_status", "status")
+
+    if result.get("can_continue") is True and submitted is True and confirmed is True:
+        status_text = "" if status is None else f" Status: {_text(status)}."
+        return (
+            f"Executed order{sequence_text}: {order_text}. "
+            f"{preflight_text}; submitted=true; confirmed=true.{order_id_text}{status_text} "
+            "can_continue=true."
+        )
+
+    blocker_text = _blocker_text(result, submit_and_confirm_result, preflight_result)
+    if submitted is True and confirmed is not True:
+        status_text = "" if status is None else f" Status: {_text(status)}."
+        return (
+            f"Execution submitted but not confirmed for order{sequence_text}: {order_text}. "
+            f"{preflight_text}.{order_id_text}{status_text} can_continue=false.{blocker_text}"
+        )
+
+    return (
+        f"Execution blocked before submit for order{sequence_text}: {order_text}. "
+        f"{preflight_text}. can_continue=false.{blocker_text}"
+    )
+
+
 def _remember_decision(args: dict[str, Any], raw_result: Any) -> str:
     result = _as_dict(raw_result)
     key = _first_present(result, "key", "memory_key", "id") or _first_present(args, "key", "memory_key", "id")
@@ -559,5 +644,6 @@ _FORMATTERS = {
     "orders_submit_order": _orders_submit_order,
     "orders_confirm_order": _orders_confirm_order,
     "orders_submit_and_confirm_order": _orders_submit_and_confirm_order,
+    "orders_execute_order": _orders_execute_order,
     "remember_decision": _remember_decision,
 }
