@@ -39,6 +39,13 @@ ORDERS_SUBMIT_AND_CONFIRM_ORDER_DESCRIPTION = (
     "This tool mutates trading state. It does not perform research, calculate quantities, change order fields, "
     "or execute more than one order. If the result has can_continue=false, stop later orders and report the blocker."
 )
+ORDERS_EXECUTE_ORDER_DESCRIPTION = (
+    "Execute exactly one explicit execution_plan order end to end. "
+    "The tool checks readiness, submits the order if ready, confirms the submitted order, "
+    "and returns whether execution can continue. This tool mutates trading state. "
+    "It does not perform research, calculate quantities, change order fields, execute multiple orders, "
+    "or execute a full plan. If can_continue=false, stop later orders and report the blocker."
+)
 
 COMMON_INDICATORS = [
     "sma",
@@ -3121,6 +3128,293 @@ def _bind_submit_and_confirm_order(strategy: Any, manager: Any) -> BoundTool:
     )
 
 
+def _execute_order_blocked_payload(
+    *,
+    sequence: Any = None,
+    symbol: Any = None,
+    side: Any = None,
+    quantity: Any = None,
+    asset_type: Any = "stock",
+    order_type: Any = "market",
+    time_in_force: Any = "day",
+    blockers: list[dict[str, str]] | None = None,
+    warnings: list[str] | None = None,
+    preflight_result: Any = None,
+    submit_and_confirm_result: Any = None,
+    internal_steps: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "sequence": _jsonable(sequence),
+        "symbol": _jsonable(symbol),
+        "side": _jsonable(side),
+        "quantity": _jsonable(quantity),
+        "asset_type": _jsonable(asset_type),
+        "order_type": _jsonable(order_type),
+        "time_in_force": _jsonable(time_in_force),
+        "execution_status": "blocked",
+        "can_continue": False,
+        "blockers": list(blockers or []),
+        "warnings": list(warnings or []),
+        "order": {
+            "symbol": _jsonable(symbol),
+            "side": _jsonable(side),
+            "quantity": _jsonable(quantity),
+            "asset_type": _jsonable(asset_type),
+            "order_type": _jsonable(order_type),
+            "time_in_force": _jsonable(time_in_force),
+        },
+        "preflight_result": preflight_result,
+        "submit_and_confirm_result": submit_and_confirm_result,
+        "internal_steps": list(internal_steps or []),
+    }
+
+
+def _execute_order_payload(
+    *,
+    sequence: Any = None,
+    symbol: Any = None,
+    side: Any = None,
+    quantity: Any = None,
+    asset_type: Any = "stock",
+    order_type: Any = "market",
+    time_in_force: Any = "day",
+    preflight_result: Any = None,
+    submit_and_confirm_result: Any = None,
+    internal_steps: list[dict[str, Any]] | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "sequence": _jsonable(sequence),
+        "symbol": _jsonable(symbol),
+        "side": _jsonable(side),
+        "quantity": _jsonable(quantity),
+        "asset_type": _jsonable(asset_type),
+        "order_type": _jsonable(order_type),
+        "time_in_force": _jsonable(time_in_force),
+        "execution_status": "completed",
+        "can_continue": True,
+        "blockers": [],
+        "warnings": list(warnings or []),
+        "order": {
+            "symbol": _jsonable(symbol),
+            "side": _jsonable(side),
+            "quantity": _jsonable(quantity),
+            "asset_type": _jsonable(asset_type),
+            "order_type": _jsonable(order_type),
+            "time_in_force": _jsonable(time_in_force),
+        },
+        "preflight_result": preflight_result,
+        "submit_and_confirm_result": submit_and_confirm_result,
+        "internal_steps": list(internal_steps or []),
+        "account_after": (
+            submit_and_confirm_result.get("account_after")
+            if isinstance(submit_and_confirm_result, dict)
+            else None
+        ),
+    }
+
+
+def _bind_execute_order(strategy: Any, manager: Any) -> BoundTool:
+    preflight_tool = _bind_preflight_check(strategy, manager)
+    submit_and_confirm_tool = _bind_submit_and_confirm_order(strategy, manager)
+
+    def execute_order(
+        *,
+        symbol: str,
+        quantity: float,
+        side: OrderSideArg,
+        asset_type: AssetTypeArg = "stock",
+        expiration: str | None = None,
+        strike: float | None = None,
+        right: str | None = None,
+        order_type: OrderTypeArg = "market",
+        limit_price: float | None = None,
+        stop_price: float | None = None,
+        stop_limit_price: float | None = None,
+        trail_price: float | None = None,
+        trail_percent: float | None = None,
+        quote_symbol: str | None = None,
+        exchange: str | None = None,
+        time_in_force: TimeInForceArg = "day",
+        sequence: Any = None,
+        confirmation_max_attempts: int = 3,
+        confirmation_wait_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        internal_steps: list[dict[str, Any]] = []
+        try:
+            preflight_result = preflight_tool.function(
+                sequence=sequence,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                asset_type=asset_type,
+                order_type=order_type,
+                time_in_force=time_in_force,
+            )
+        except Exception as exc:
+            return _execute_order_blocked_payload(
+                sequence=sequence,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                asset_type=asset_type,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                blockers=[_submit_and_confirm_blocker_from_exception(exc)],
+                internal_steps=[
+                    {
+                        "step": "preflight",
+                        "tool": "orders_preflight_check",
+                        "status": "blocked",
+                    }
+                ],
+            )
+
+        preflight_ready = isinstance(preflight_result, dict) and preflight_result.get("can_submit") is True
+        preflight_warnings = list(preflight_result.get("warnings") or []) if isinstance(preflight_result, dict) else []
+        internal_steps.append(
+            {
+                "step": "preflight",
+                "tool": "orders_preflight_check",
+                "status": "ready" if preflight_ready else "blocked",
+            }
+        )
+        if not preflight_ready:
+            blockers = (
+                list(preflight_result.get("blockers") or [])
+                if isinstance(preflight_result, dict)
+                else [
+                    {
+                        "code": "PREFLIGHT_FAILED",
+                        "message": "orders_preflight_check did not return a ready result.",
+                    }
+                ]
+            )
+            return _execute_order_blocked_payload(
+                sequence=sequence,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                asset_type=asset_type,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                blockers=blockers,
+                warnings=preflight_warnings,
+                preflight_result=preflight_result,
+                internal_steps=internal_steps,
+            )
+
+        try:
+            submit_and_confirm_result = submit_and_confirm_tool.function(
+                symbol=symbol,
+                quantity=quantity,
+                side=side,
+                asset_type=asset_type,
+                expiration=expiration,
+                strike=strike,
+                right=right,
+                order_type=order_type,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                stop_limit_price=stop_limit_price,
+                trail_price=trail_price,
+                trail_percent=trail_percent,
+                quote_symbol=quote_symbol,
+                exchange=exchange,
+                time_in_force=time_in_force,
+                sequence=sequence,
+                confirmation_max_attempts=confirmation_max_attempts,
+                confirmation_wait_seconds=confirmation_wait_seconds,
+            )
+        except Exception as exc:
+            internal_steps.append(
+                {
+                    "step": "submit_and_confirm",
+                    "tool": "orders_submit_and_confirm_order",
+                    "status": "blocked",
+                }
+            )
+            return _execute_order_blocked_payload(
+                sequence=sequence,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                asset_type=asset_type,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                blockers=[_submit_and_confirm_blocker_from_exception(exc)],
+                warnings=preflight_warnings,
+                preflight_result=preflight_result,
+                submit_and_confirm_result=None,
+                internal_steps=internal_steps,
+            )
+
+        submit_ready = (
+            isinstance(submit_and_confirm_result, dict)
+            and submit_and_confirm_result.get("can_continue") is True
+            and submit_and_confirm_result.get("confirmed") is True
+        )
+        internal_steps.append(
+            {
+                "step": "submit_and_confirm",
+                "tool": "orders_submit_and_confirm_order",
+                "status": "confirmed" if submit_ready else "blocked",
+            }
+        )
+        submit_warnings = (
+            list(submit_and_confirm_result.get("warnings") or [])
+            if isinstance(submit_and_confirm_result, dict)
+            else []
+        )
+        warnings = preflight_warnings + submit_warnings
+        if not submit_ready:
+            blockers = (
+                list(submit_and_confirm_result.get("blockers") or [])
+                if isinstance(submit_and_confirm_result, dict)
+                else [
+                    {
+                        "code": "SUBMIT_AND_CONFIRM_FAILED",
+                        "message": "orders_submit_and_confirm_order did not confirm the order.",
+                    }
+                ]
+            )
+            return _execute_order_blocked_payload(
+                sequence=sequence,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                asset_type=asset_type,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                blockers=blockers,
+                warnings=warnings,
+                preflight_result=preflight_result,
+                submit_and_confirm_result=submit_and_confirm_result,
+                internal_steps=internal_steps,
+            )
+
+        return _execute_order_payload(
+            sequence=sequence,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            asset_type=asset_type,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            preflight_result=preflight_result,
+            submit_and_confirm_result=submit_and_confirm_result,
+            internal_steps=internal_steps,
+            warnings=warnings,
+        )
+
+    return BoundTool(
+        name="orders_execute_order",
+        description=ORDERS_EXECUTE_ORDER_DESCRIPTION,
+        function=execute_order,
+        metadata={"kind": "builtin", "replay_on_cache": True, "mutates_trading": True},
+    )
+
+
 def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
     def submit_order(
         *,
@@ -3512,6 +3806,14 @@ class _OrderTools:
             metadata={"mutates_trading": True},
         )
 
+    def execute(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="orders_execute_order",
+            description=ORDERS_EXECUTE_ORDER_DESCRIPTION,
+            binder=_bind_execute_order,
+            metadata={"mutates_trading": True},
+        )
+
     def submit(self) -> ToolDefinition:
         return ToolDefinition(
             name="orders_submit_order",
@@ -3615,6 +3917,7 @@ class _BuiltinTools:
             self.memory.close_thesis(),
             self.orders.preflight(),
             self.orders.submit_and_confirm(),
+            self.orders.execute(),
             self.orders.submit(),
             self.orders.confirm(),
             self.orders.submit_multileg(),

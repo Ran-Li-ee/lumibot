@@ -86,6 +86,8 @@ class _OrderReadinessStrategy(_Strategy):
         self.created_order_count = 0
         self.submitted_order_status = "fill"
         self.get_order_calls = []
+        self.get_cash_calls = 0
+        self.force_negative_cash_after_submit = False
 
     def get_positions(self, include_cash_positions=True):
         return list(self.positions)
@@ -94,6 +96,9 @@ class _OrderReadinessStrategy(_Strategy):
         return list(self.open_orders)
 
     def get_cash(self):
+        self.get_cash_calls += 1
+        if self.force_negative_cash_after_submit and self.get_cash_calls > 1:
+            return -1.0
         return self.cash
 
     def get_portfolio_value(self):
@@ -205,6 +210,10 @@ def _wrap_preflight_and_submit_confirm_tools(strategy):
             BuiltinTools.orders.submit_and_confirm(),
         ],
     )
+
+
+def _wrap_execute_order_tools(strategy):
+    return _wrap_builtin_tools(strategy, [BuiltinTools.orders.execute()])
 
 
 class _Runtime:
@@ -875,6 +884,17 @@ def test_builtin_order_tools_expose_submit_and_confirm_definition():
     assert callable(tool.binder)
 
 
+def test_builtin_order_tools_expose_execute_order_definition():
+    tool = BuiltinTools.orders.execute()
+
+    assert tool.name == "orders_execute_order"
+    assert "Execute exactly one explicit execution_plan order" in tool.description
+    assert "readiness" in tool.description
+    assert "confirms" in tool.description
+    assert "execute a full plan" in tool.description
+    assert callable(tool.binder)
+
+
 def test_submit_order_description_mentions_preflight_readiness_path():
     strategy = _Strategy()
     manager = AgentManager(strategy)
@@ -908,11 +928,28 @@ def test_builtin_tools_all_includes_orders_submit_and_confirm_order():
     assert "orders_submit_and_confirm_order" in {tool.name for tool in BuiltinTools.all()}
 
 
+def test_builtin_tools_all_includes_orders_execute_order():
+    assert "orders_execute_order" in {tool.name for tool in BuiltinTools.all()}
+
+
 def test_bound_submit_and_confirm_metadata_marks_mutating_and_replayable():
     strategy = _OrderReadinessStrategy()
     manager = AgentManager(strategy)
 
     definition = BuiltinTools.orders.submit_and_confirm()
+    tool = definition.binder(strategy, manager)
+
+    assert definition.metadata["mutates_trading"] is True
+    assert tool.metadata["kind"] == "builtin"
+    assert tool.metadata["replay_on_cache"] is True
+    assert tool.metadata["mutates_trading"] is True
+
+
+def test_bound_execute_order_metadata_marks_mutating_and_replayable():
+    strategy = _OrderReadinessStrategy()
+    manager = AgentManager(strategy)
+
+    definition = BuiltinTools.orders.execute()
     tool = definition.binder(strategy, manager)
 
     assert definition.metadata["mutates_trading"] is True
@@ -1358,6 +1395,93 @@ def test_orders_submit_and_confirm_order_submits_and_confirms_after_matching_pre
     assert result["internal_steps"] == ["orders_submit_order", "orders_confirm_order"]
     assert len(strategy.submitted_orders) == 1
     assert strategy.get_order_calls[0]["identifier"] == "test-order-1"
+
+
+def test_orders_execute_order_preflights_submits_and_confirms_one_order():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 1000.0
+    strategy.portfolio_value = 1200.0
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_execute_order_tools(strategy)
+
+    result = tool_map["orders_execute_order"](
+        sequence=1,
+        symbol="SPY",
+        quantity=3,
+        side="buy",
+        asset_type="stock",
+        order_type="market",
+        time_in_force="day",
+    )
+
+    assert result["execution_status"] == "completed"
+    assert result["can_continue"] is True
+    assert result["blockers"] == []
+    assert result["preflight_result"]["readiness"] == "ready"
+    assert result["preflight_result"]["can_submit"] is True
+    assert result["submit_and_confirm_result"]["submitted"] is True
+    assert result["submit_and_confirm_result"]["confirmed"] is True
+    assert result["submit_and_confirm_result"]["can_continue"] is True
+    assert [step["step"] for step in result["internal_steps"]] == ["preflight", "submit_and_confirm"]
+    assert len(strategy.submitted_orders) == 1
+    assert strategy.submitted_orders[0].asset.symbol == "SPY"
+
+
+def test_orders_execute_order_blocks_before_submit_when_preflight_blocks():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 250.0
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_execute_order_tools(strategy)
+
+    result = tool_map["orders_execute_order"](symbol="SPY", quantity=3, side="buy")
+
+    assert result["execution_status"] == "blocked"
+    assert result["can_continue"] is False
+    assert "INSUFFICIENT_CASH_ESTIMATE" in {blocker["code"] for blocker in result["blockers"]}
+    assert result["preflight_result"]["readiness"] == "blocked"
+    assert result["submit_and_confirm_result"] is None
+    assert [step["step"] for step in result["internal_steps"]] == ["preflight"]
+    assert strategy.submitted_orders == []
+
+
+def test_orders_execute_order_returns_blocker_when_confirmation_fails():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 1000.0
+    strategy.last_prices = {"SPY": 100.0}
+    strategy.submitted_order_status = "new"
+    tool_map = _wrap_execute_order_tools(strategy)
+
+    result = tool_map["orders_execute_order"](
+        symbol="SPY",
+        quantity=3,
+        side="buy",
+        confirmation_max_attempts=1,
+        confirmation_wait_seconds=0,
+    )
+
+    assert result["execution_status"] == "blocked"
+    assert result["can_continue"] is False
+    assert result["preflight_result"]["readiness"] == "ready"
+    assert result["submit_and_confirm_result"]["submitted"] is True
+    assert result["submit_and_confirm_result"]["confirmed"] is False
+    assert "CONFIRMATION_FAILED" in {blocker["code"] for blocker in result["blockers"]}
+    assert [step["step"] for step in result["internal_steps"]] == ["preflight", "submit_and_confirm"]
+    assert len(strategy.submitted_orders) == 1
+
+
+def test_orders_execute_order_preserves_negative_cash_guard():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 1000.0
+    strategy.last_prices = {"SPY": 100.0}
+    strategy.force_negative_cash_after_submit = True
+    tool_map = _wrap_execute_order_tools(strategy)
+
+    result = tool_map["orders_execute_order"](symbol="SPY", quantity=3, side="buy")
+
+    assert result["execution_status"] == "blocked"
+    assert result["can_continue"] is False
+    assert "NEGATIVE_CASH_NOT_ALLOWED" in {blocker["code"] for blocker in result["blockers"]}
+    assert strategy.submitted_orders == []
 
 
 def test_orders_submit_and_confirm_order_consumes_preflight_token():
