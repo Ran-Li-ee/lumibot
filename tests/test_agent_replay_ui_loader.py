@@ -171,6 +171,86 @@ def test_loader_accepts_trace_with_boundary_trace_without_changing_legacy_tool_b
     assert boundary_agent.tool_batches == legacy_agent.tool_batches
 
 
+def test_loader_uses_full_boundary_result_when_legacy_tool_result_is_pruned(tmp_path):
+    trace_path = tmp_path / "traces" / "execution_agent" / "trace.json"
+    pruned_result = {
+        "tool_name": "execution_plan_execute",
+        "lumibot_tool_result_pruned": True,
+        "excerpt": '{"plan_status": "completed"',
+    }
+    full_result = {
+        "schema_version": 1,
+        "plan_status": "completed",
+        "can_continue": True,
+        "intent": "rebalance",
+        "orders_requested": 2,
+        "orders_attempted": 2,
+        "orders_completed": 2,
+        "orders_blocked": 0,
+        "orders_skipped": 0,
+        "completed_orders": [
+            {"sequence": 1, "symbol": "VGIT", "side": "sell", "quantity": 406},
+            {"sequence": 2, "symbol": "GLD", "side": "buy", "quantity": 107},
+        ],
+        "blocked_orders": [],
+        "skipped_orders": [],
+        "order_results": [],
+        "final_account_snapshot": {"cash": 630.15},
+        "blockers": [],
+        "warnings": [],
+    }
+    _write_trace(
+        trace_path,
+        {
+            "agent": "execution_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [
+                {
+                    "kind": "tool_call",
+                    "tool_name": "execution_plan_execute",
+                    "call_id": "call_A",
+                    "payload": {"execution_plan": {"schema_version": 1, "intent": "rebalance", "orders": []}},
+                },
+                {
+                    "kind": "tool_result",
+                    "tool_name": "execution_plan_execute",
+                    "call_id": "call_A",
+                    "payload": pruned_result,
+                },
+            ],
+            "boundary_trace": {
+                "schema_version": 1,
+                "diagnostics": [],
+                "events": [
+                    {
+                        "transition": "B08_FUNCTION_TOOL_TO_ADK",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "call_id": "call_A",
+                        "payload": {
+                            "function_name": "execution_plan_execute",
+                            "function_tool_response": full_result,
+                            "model_facing_response": pruned_result,
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    agent = load_agent_trace(trace_path)
+    call = agent.tool_batches[0].calls[0]
+
+    assert call.raw_result["plan_status"] == "completed"
+    assert call.raw_result["orders_completed"] == 2
+    assert call.human_explanation is not None
+    assert "Execution plan completed" in call.human_explanation
+    assert "sell VGIT 406" in call.human_explanation
+    assert "Final cash: 630.15" in call.human_explanation
+    assert agent.boundary_trace.events[0].payload["model_facing_response"] == pruned_result
+
+
 def test_loader_groups_boundary_trace_by_turn_batch_and_call_id(tmp_path):
     trace_path = tmp_path / "traces" / "growth_agent" / "trace.json"
     _write_trace(

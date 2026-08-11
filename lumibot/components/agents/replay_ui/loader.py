@@ -295,6 +295,7 @@ def load_agent_trace(path: str | Path) -> AgentReplay:
     if not tool_batches:
         tool_batches = _tool_batches_from_flat_lists(trace.get("tool_calls"), trace.get("tool_results"))
     boundary_trace = _load_boundary_trace(trace, trace_path)
+    _restore_pruned_tool_results_from_boundary(tool_batches, boundary_trace)
 
     return AgentReplay(
         id=_agent_id(name, trace_path),
@@ -308,6 +309,96 @@ def load_agent_trace(path: str | Path) -> AgentReplay:
         raw_trace=raw_trace,
         boundary_trace=boundary_trace,
     )
+
+
+def _restore_pruned_tool_results_from_boundary(
+    tool_batches: list[ToolBatch],
+    boundary_trace: BoundaryTraceReplay,
+) -> None:
+    if not boundary_trace.available:
+        return
+
+    full_results = _full_boundary_tool_results(boundary_trace.events)
+    if not full_results:
+        return
+
+    for batch in tool_batches:
+        for call in batch.calls:
+            if not _is_pruned_tool_result(call.raw_result):
+                continue
+            raw_result = _pop_full_boundary_result(full_results, call.tool_name)
+            if raw_result is None:
+                continue
+            call.raw_result = raw_result
+            call.error = _result_error({"payload": raw_result}, raw_result)
+            call.human_explanation = explain_tool_result(call.tool_name, call.arguments, call.raw_result, call.error)
+
+
+def _is_pruned_tool_result(raw_result: Any) -> bool:
+    return isinstance(raw_result, dict) and raw_result.get("lumibot_tool_result_pruned") is True
+
+
+def _full_boundary_tool_results(events: list[BoundaryEventReplay]) -> dict[str, list[Any]]:
+    by_tool: dict[str, list[Any]] = {}
+    names_by_call_id = _boundary_tool_names_by_call_id(events)
+
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        result_key = _boundary_full_result_key(event.transition)
+        if result_key is None or result_key not in payload:
+            continue
+
+        raw_result = payload.get(result_key)
+        if _is_pruned_tool_result(raw_result):
+            continue
+
+        tool_name = _boundary_payload_tool_name(payload) or names_by_call_id.get(event.call_id or "")
+        if tool_name is None:
+            continue
+
+        by_tool.setdefault(tool_name, []).append(raw_result)
+
+    return by_tool
+
+
+def _boundary_full_result_key(transition: str) -> str | None:
+    if transition == "B08_FUNCTION_TOOL_TO_ADK":
+        return "function_tool_response"
+    if transition == "B07_WRAPPER_TO_FUNCTION_TOOL":
+        return "serialized_result"
+    return None
+
+
+def _boundary_tool_names_by_call_id(events: list[BoundaryEventReplay]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for event in events:
+        if not event.call_id:
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        tool_name = _boundary_payload_tool_name(payload)
+        if tool_name:
+            names.setdefault(event.call_id, tool_name)
+    return names
+
+
+def _boundary_payload_tool_name(payload: dict[str, Any]) -> str | None:
+    for key in ("function_name", "tool_name", "name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    function = payload.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def _pop_full_boundary_result(full_results: dict[str, list[Any]], tool_name: str) -> Any:
+    results = full_results.get(tool_name)
+    if not results:
+        return None
+    return results.pop(0)
 
 
 def _load_boundary_trace(trace: dict[str, Any], trace_path: Path) -> BoundaryTraceReplay:
