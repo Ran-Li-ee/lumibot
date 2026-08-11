@@ -630,6 +630,66 @@ def _orders_execute_order(args: dict[str, Any], raw_result: Any) -> str:
     )
 
 
+def _execution_plan_order_phrase(order: dict[str, Any]) -> str:
+    symbol = _first_present(order, "symbol", "ticker")
+    side = _first_present(order, "side", "action")
+    quantity = _first_present(order, "quantity", "qty", "shares")
+    return f"{_text(side)} {_text(symbol)} {_text(quantity)}"
+
+
+def _execution_plan_execute(args: dict[str, Any], raw_result: Any) -> str:
+    result = _as_dict(raw_result)
+    status = _first_present(result, "plan_status", "status")
+    requested = _first_present(result, "orders_requested") or 0
+    attempted = _first_present(result, "orders_attempted") or 0
+    completed = _first_present(result, "orders_completed") or 0
+    blocked = _first_present(result, "orders_blocked") or 0
+    skipped = _first_present(result, "orders_skipped") or 0
+    counts = (
+        f"{_text(requested)} requested, {_text(attempted)} attempted, "
+        f"{_text(completed)} completed, {_text(blocked)} blocked, {_text(skipped)} skipped."
+    )
+
+    if status == "invalid":
+        return (
+            "Execution plan invalid before submission: "
+            f"{counts} No orders were submitted.{_blocker_text(result)}"
+        )
+
+    if status == "blocked":
+        blocked_orders = result.get("blocked_orders") if isinstance(result.get("blocked_orders"), list) else []
+        if blocked_orders:
+            first_blocked = _as_dict(blocked_orders[0])
+            sequence = _first_present(first_blocked, "sequence")
+            order_text = _execution_plan_order_phrase(first_blocked)
+            return (
+                f"Execution plan blocked at sequence {_text(sequence)}: {order_text}. "
+                f"{counts}{_blocker_text(first_blocked, result)}"
+            )
+        return f"Execution plan blocked: {counts}{_blocker_text(result)}"
+
+    if status == "completed":
+        completed_orders = result.get("completed_orders") if isinstance(result.get("completed_orders"), list) else []
+        order_phrases = [_execution_plan_order_phrase(_as_dict(order)) for order in completed_orders[:6]]
+        order_text = ""
+        if order_phrases:
+            more_count = len(completed_orders) - len(order_phrases)
+            more_text = "" if more_count <= 0 else f", and {more_count} more"
+            order_text = " Completed orders: " + ", ".join(order_phrases) + more_text + "."
+        elif requested == 0:
+            order_text = " No orders were submitted."
+
+        account = _nested_dict(result, "final_account_snapshot")
+        cash = _first_present(account, "cash", "cash_balance")
+        cash_text = "" if cash is None else f" Final cash: {_text(cash)}."
+        return f"Execution plan completed: {counts}{order_text}{cash_text}"
+
+    if status is None:
+        return f"Execution plan returned missing status: {counts}{_blocker_text(result)}"
+
+    return f"Execution plan returned unknown status {_text(status)}: {counts}{_blocker_text(result)}"
+
+
 def _remember_decision(args: dict[str, Any], raw_result: Any) -> str:
     result = _as_dict(raw_result)
     key = _first_present(result, "key", "memory_key", "id") or _first_present(args, "key", "memory_key", "id")
@@ -656,5 +716,6 @@ _FORMATTERS = {
     "orders_confirm_order": _orders_confirm_order,
     "orders_submit_and_confirm_order": _orders_submit_and_confirm_order,
     "orders_execute_order": _orders_execute_order,
+    "execution_plan_execute": _execution_plan_execute,
     "remember_decision": _remember_decision,
 }

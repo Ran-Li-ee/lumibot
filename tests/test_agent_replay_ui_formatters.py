@@ -621,6 +621,189 @@ def test_orders_execute_order_formatter_explains_unknown_submit_confirm_after_re
     assert "orders_submit_and_confirm_order did not return a usable result." in text
 
 
+def test_execution_plan_execute_formatter_explains_completed_multi_order_plan():
+    text = explain_tool_result(
+        "execution_plan_execute",
+        {
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {"sequence": 1, "symbol": "VGIT", "side": "sell", "quantity": 406},
+                    {"sequence": 2, "symbol": "GLD", "side": "buy", "quantity": 107},
+                ],
+            }
+        },
+        {
+            "plan_status": "completed",
+            "orders_requested": 2,
+            "orders_attempted": 2,
+            "orders_completed": 2,
+            "orders_blocked": 0,
+            "orders_skipped": 0,
+            "completed_orders": [
+                {"sequence": 1, "symbol": "VGIT", "side": "sell", "quantity": 406},
+                {"sequence": 2, "symbol": "GLD", "side": "buy", "quantity": 107},
+            ],
+            "final_account_snapshot": {"cash": 127.45},
+        },
+        None,
+    )
+
+    assert "Execution plan completed" in text
+    assert "2 requested" in text
+    assert "2 attempted" in text
+    assert "2 completed" in text
+    assert "sell VGIT 406" in text
+    assert "buy GLD 107" in text
+    assert "Final cash: 127.45" in text
+
+
+def test_execution_plan_execute_formatter_shows_more_count_for_long_completed_orders():
+    text = explain_tool_result(
+        "execution_plan_execute",
+        {"execution_plan": {"schema_version": 1, "intent": "rebalance", "orders": []}},
+        {
+            "plan_status": "completed",
+            "orders_requested": 8,
+            "orders_attempted": 8,
+            "orders_completed": 8,
+            "orders_blocked": 0,
+            "orders_skipped": 0,
+            "completed_orders": [
+                {"sequence": 1, "symbol": "AAA", "side": "buy", "quantity": 1},
+                {"sequence": 2, "symbol": "BBB", "side": "buy", "quantity": 2},
+                {"sequence": 3, "symbol": "CCC", "side": "buy", "quantity": 3},
+                {"sequence": 4, "symbol": "DDD", "side": "buy", "quantity": 4},
+                {"sequence": 5, "symbol": "EEE", "side": "buy", "quantity": 5},
+                {"sequence": 6, "symbol": "FFF", "side": "buy", "quantity": 6},
+                {"sequence": 7, "symbol": "GGG", "side": "buy", "quantity": 7},
+                {"sequence": 8, "symbol": "HHH", "side": "buy", "quantity": 8},
+            ],
+        },
+        None,
+    )
+
+    assert "buy AAA 1" in text
+    assert "buy FFF 6" in text
+    assert "buy GGG 7" not in text
+    assert "and 2 more" in text
+
+
+def test_execution_plan_execute_formatter_explains_hold_plan_without_orders():
+    text = explain_tool_result(
+        "execution_plan_execute",
+        {"execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}},
+        {
+            "plan_status": "completed",
+            "orders_requested": 0,
+            "orders_attempted": 0,
+            "orders_completed": 0,
+            "orders_blocked": 0,
+            "orders_skipped": 0,
+            "completed_orders": [],
+            "final_account_snapshot": {"cash": 1000.0},
+        },
+        None,
+    )
+
+    assert "Execution plan completed" in text
+    assert "0 requested" in text
+    assert "No orders were submitted" in text
+
+
+def test_execution_plan_execute_formatter_does_not_claim_unknown_or_missing_status_completed():
+    for raw_result in (
+        {
+            "plan_status": "partially_done",
+            "orders_requested": 3,
+            "orders_attempted": 2,
+            "orders_completed": 1,
+            "orders_blocked": 1,
+            "orders_skipped": 1,
+            "blockers": [{"code": "AMBIGUOUS_STATUS", "message": "Producer returned an unexpected status."}],
+        },
+        {
+            "orders_requested": 1,
+            "orders_attempted": 0,
+            "orders_completed": 0,
+            "orders_blocked": 0,
+            "orders_skipped": 1,
+        },
+    ):
+        text = explain_tool_result(
+            "execution_plan_execute",
+            {"execution_plan": {"schema_version": 1, "intent": "rebalance", "orders": []}},
+            raw_result,
+            None,
+        )
+
+        assert "Execution plan completed" not in text
+        assert "unknown status" in text or "missing status" in text
+        assert "requested" in text
+
+
+def test_execution_plan_execute_formatter_explains_invalid_plan_before_submission():
+    text = explain_tool_result(
+        "execution_plan_execute",
+        {"execution_plan": {"schema_version": 1, "intent": "rebalance", "orders": []}},
+        {
+            "plan_status": "invalid",
+            "orders_requested": 2,
+            "orders_attempted": 0,
+            "orders_completed": 0,
+            "orders_blocked": 0,
+            "orders_skipped": 2,
+            "blockers": [
+                {
+                    "code": "INVALID_ORDER_SEQUENCE",
+                    "message": "execution_plan.orders must already be listed in ascending sequence order.",
+                }
+            ],
+        },
+        None,
+    )
+
+    assert "Execution plan invalid before submission" in text
+    assert "INVALID_ORDER_SEQUENCE" in text
+    assert "execution_plan.orders must already be listed in ascending sequence order." in text
+    assert "No orders were submitted" in text
+
+
+def test_execution_plan_execute_formatter_explains_blocked_plan():
+    text = explain_tool_result(
+        "execution_plan_execute",
+        {"execution_plan": {"schema_version": 1, "intent": "rebalance", "orders": []}},
+        {
+            "plan_status": "blocked",
+            "orders_requested": 3,
+            "orders_attempted": 2,
+            "orders_completed": 1,
+            "orders_blocked": 1,
+            "orders_skipped": 1,
+            "blocked_orders": [
+                {
+                    "sequence": 2,
+                    "symbol": "SPY",
+                    "side": "buy",
+                    "quantity": 999,
+                    "blockers": [
+                        {"code": "NEGATIVE_CASH_NOT_ALLOWED", "message": "Cash would become negative."}
+                    ],
+                }
+            ],
+        },
+        None,
+    )
+
+    assert "Execution plan blocked" in text
+    assert "sequence 2" in text
+    assert "buy SPY 999" in text
+    assert "NEGATIVE_CASH_NOT_ALLOWED" in text
+    assert "Cash would become negative." in text
+    assert "1 skipped" in text
+
+
 def test_explain_tool_result_does_not_mutate_inputs():
     arguments = {"symbol": "SPY", "nested": {"limit": 1}}
     raw_result = {
