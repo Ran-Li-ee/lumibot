@@ -582,6 +582,45 @@ def test_orders_execute_order_formatter_explains_confirmation_blocker_after_subm
     assert "Order was submitted but not confirmed." in text
 
 
+def test_orders_execute_order_formatter_explains_unknown_submit_confirm_after_ready_preflight():
+    text = explain_tool_result(
+        "orders_execute_order",
+        {"symbol": "SPY", "side": "buy", "quantity": 3},
+        {
+            "symbol": "SPY",
+            "side": "buy",
+            "quantity": 3,
+            "execution_status": "blocked",
+            "can_continue": False,
+            "preflight_result": {"readiness": "ready", "can_submit": True},
+            "submit_and_confirm_result": None,
+            "internal_steps": [
+                {"step": "preflight", "tool": "orders_preflight_check", "status": "ready"},
+                {
+                    "step": "submit_and_confirm",
+                    "tool": "orders_submit_and_confirm_order",
+                    "status": "blocked",
+                },
+            ],
+            "blockers": [
+                {
+                    "code": "SUBMIT_AND_CONFIRM_FAILED",
+                    "message": "orders_submit_and_confirm_order did not return a usable result.",
+                }
+            ],
+        },
+        None,
+    )
+
+    assert "blocked before submit" not in text
+    assert "blocked during submit/confirm" in text
+    assert "buy 3 SPY" in text
+    assert "Preflight ready" in text
+    assert "can_continue=false" in text
+    assert "SUBMIT_AND_CONFIRM_FAILED" in text
+    assert "orders_submit_and_confirm_order did not return a usable result." in text
+
+
 def test_explain_tool_result_does_not_mutate_inputs():
     arguments = {"symbol": "SPY", "nested": {"limit": 1}}
     raw_result = {

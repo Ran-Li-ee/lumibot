@@ -588,6 +588,10 @@ def _orders_execute_order(args: dict[str, Any], raw_result: Any) -> str:
     readiness = _first_present(preflight_result, "readiness", "status")
     if readiness is None:
         readiness = "ready" if preflight_result.get("can_submit") is True else "blocked"
+    preflight_ready = (
+        preflight_result.get("can_submit") is True
+        or str(readiness).strip().lower() == "ready"
+    )
     preflight_text = f"Preflight {_text(readiness)}"
 
     order_id = _orders_execute_order_id(result)
@@ -610,6 +614,13 @@ def _orders_execute_order(args: dict[str, Any], raw_result: Any) -> str:
         status_text = "" if status is None else f" Status: {_text(status)}."
         return (
             f"Execution submitted but not confirmed for order{sequence_text}: {order_text}. "
+            f"{preflight_text}.{order_id_text}{status_text} can_continue=false.{blocker_text}"
+        )
+
+    if preflight_ready:
+        status_text = "" if status is None else f" Status: {_text(status)}."
+        return (
+            f"Execution blocked during submit/confirm for order{sequence_text}: {order_text}. "
             f"{preflight_text}.{order_id_text}{status_text} can_continue=false.{blocker_text}"
         )
 
