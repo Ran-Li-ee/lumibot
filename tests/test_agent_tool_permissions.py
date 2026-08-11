@@ -216,6 +216,10 @@ def _wrap_execute_order_tools(strategy):
     return _wrap_builtin_tools(strategy, [BuiltinTools.orders.execute()])
 
 
+def _wrap_execute_plan_tools(strategy):
+    return _wrap_builtin_tools(strategy, [BuiltinTools.orders.execute_plan()])
+
+
 class _Runtime:
     last_request = None
 
@@ -895,6 +899,16 @@ def test_builtin_order_tools_expose_execute_order_definition():
     assert callable(tool.binder)
 
 
+def test_builtin_order_tools_expose_execution_plan_execute_definition():
+    tool = BuiltinTools.orders.execute_plan()
+
+    assert tool.name == "execution_plan_execute"
+    assert "Execute one complete strict execution_plan" in tool.description
+    assert "mutates trading state" in tool.description
+    assert "does not generate, repair, reorder, optimize, or modify the plan" in tool.description
+    assert callable(tool.binder)
+
+
 def test_submit_order_description_mentions_preflight_readiness_path():
     strategy = _Strategy()
     manager = AgentManager(strategy)
@@ -932,6 +946,10 @@ def test_builtin_tools_all_includes_orders_execute_order():
     assert "orders_execute_order" in {tool.name for tool in BuiltinTools.all()}
 
 
+def test_builtin_tools_all_includes_execution_plan_execute():
+    assert "execution_plan_execute" in {tool.name for tool in BuiltinTools.all()}
+
+
 def test_bound_submit_and_confirm_metadata_marks_mutating_and_replayable():
     strategy = _OrderReadinessStrategy()
     manager = AgentManager(strategy)
@@ -953,6 +971,20 @@ def test_bound_execute_order_metadata_marks_mutating_and_replayable():
     tool = definition.binder(strategy, manager)
 
     assert definition.metadata["mutates_trading"] is True
+    assert tool.metadata["kind"] == "builtin"
+    assert tool.metadata["replay_on_cache"] is True
+    assert tool.metadata["mutates_trading"] is True
+
+
+def test_bound_execution_plan_execute_metadata_marks_mutating_and_replayable():
+    strategy = _OrderReadinessStrategy()
+    manager = AgentManager(strategy)
+
+    definition = BuiltinTools.orders.execute_plan()
+    tool = definition.binder(strategy, manager)
+
+    assert definition.metadata["mutates_trading"] is True
+    assert tool.name == "execution_plan_execute"
     assert tool.metadata["kind"] == "builtin"
     assert tool.metadata["replay_on_cache"] is True
     assert tool.metadata["mutates_trading"] is True
@@ -1485,6 +1517,527 @@ def test_orders_execute_order_preserves_negative_cash_guard():
     assert result["execution_status"] == "blocked"
     assert result["can_continue"] is False
     assert "NEGATIVE_CASH_NOT_ALLOWED" in {blocker["code"] for blocker in result["blockers"]}
+    assert strategy.submitted_orders == []
+
+
+def test_execution_plan_execute_completes_hold_plan_without_submitting():
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={"schema_version": 1, "intent": "hold", "orders": []}
+    )
+
+    assert result["plan_status"] == "completed"
+    assert result["can_continue"] is True
+    assert result["intent"] == "hold"
+    assert result["orders_requested"] == 0
+    assert result["orders_attempted"] == 0
+    assert result["orders_completed"] == 0
+    assert result["orders_blocked"] == 0
+    assert result["orders_skipped"] == 0
+    assert result["completed_orders"] == []
+    assert result["blocked_orders"] == []
+    assert result["skipped_orders"] == []
+    assert result["order_results"] == []
+    assert result["blockers"] == []
+    assert strategy.submitted_orders == []
+
+
+def test_execution_plan_execute_completes_valid_multi_order_plan_in_sequence():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 100000.0
+    strategy.portfolio_value = 100000.0
+    strategy.last_prices = {"VGIT": 60.0, "SPY": 100.0, "GLD": 200.0}
+    strategy.positions = [_fake_position("VGIT", 10, market_value=600.0, current_price=60.0)]
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "VGIT",
+                    "side": "sell",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+                {
+                    "sequence": 2,
+                    "action": "submit_order",
+                    "symbol": "SPY",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 3,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+                {
+                    "sequence": 3,
+                    "action": "submit_order",
+                    "symbol": "GLD",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 2,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "completed"
+    assert result["can_continue"] is True
+    assert result["orders_requested"] == 3
+    assert result["orders_attempted"] == 3
+    assert result["orders_completed"] == 3
+    assert result["orders_blocked"] == 0
+    assert result["orders_skipped"] == 0
+    assert [item["sequence"] for item in result["order_results"]] == [1, 2, 3]
+    assert [order.asset.symbol for order in strategy.submitted_orders] == ["VGIT", "SPY", "GLD"]
+    assert [order.side for order in strategy.submitted_orders] == ["sell", "buy", "buy"]
+    assert all(item["execution_status"] == "completed" for item in result["order_results"])
+    assert all(item["can_continue"] is True for item in result["order_results"])
+    assert [item["order_result"]["execution_status"] for item in result["order_results"]] == [
+        "completed",
+        "completed",
+        "completed",
+    ]
+    assert result["final_account_snapshot"] is not None
+    assert result["blockers"] == []
+
+
+@pytest.mark.parametrize(
+    ("orders", "expected_message"),
+    [
+        (
+            [
+                {"sequence": 2, "action": "submit_order", "symbol": "SPY", "side": "buy", "quantity": 1},
+                {"sequence": 1, "action": "submit_order", "symbol": "GLD", "side": "buy", "quantity": 1},
+            ],
+            "ascending sequence order",
+        ),
+        (
+            [
+                {"sequence": 1, "action": "submit_order", "symbol": "SPY", "side": "buy", "quantity": 1},
+                {"sequence": 1, "action": "submit_order", "symbol": "GLD", "side": "buy", "quantity": 1},
+            ],
+            "unique sequence",
+        ),
+        (
+            [
+                {"sequence": 1, "action": "submit_order", "symbol": "SPY", "side": "buy", "quantity": 1},
+                {"sequence": 3, "action": "submit_order", "symbol": "GLD", "side": "buy", "quantity": 1},
+            ],
+            "1..N",
+        ),
+    ],
+)
+def test_execution_plan_execute_rejects_invalid_sequence_before_submit(orders, expected_message):
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={"schema_version": 1, "intent": "rebalance", "orders": orders}
+    )
+
+    assert result["plan_status"] == "invalid"
+    assert result["can_continue"] is False
+    assert result["orders_attempted"] == 0
+    assert result["orders_completed"] == 0
+    assert result["orders_blocked"] == 0
+    assert strategy.submitted_orders == []
+    assert "INVALID_ORDER_SEQUENCE" in {blocker["code"] for blocker in result["blockers"]}
+    assert expected_message in result["blockers"][0]["message"]
+
+
+@pytest.mark.parametrize(
+    ("plan", "blocker_code"),
+    [
+        ({}, "MISSING_EXECUTION_PLAN"),
+        ({"schema_version": 2, "intent": "rebalance", "orders": []}, "UNSUPPORTED_PLAN_SCHEMA_VERSION"),
+        ({"schema_version": 1, "intent": "trade", "orders": []}, "UNSUPPORTED_PLAN_INTENT"),
+        (
+            {
+                "schema_version": 1,
+                "intent": "hold",
+                "orders": [
+                    {"sequence": 1, "action": "submit_order", "symbol": "SPY", "side": "buy", "quantity": 1}
+                ],
+            },
+            "INVALID_EXECUTION_PLAN",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "cancel_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 1,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            },
+            "INVALID_ORDER_ACTION",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [{"sequence": 1, "action": "submit_order", "symbol": "", "side": "buy", "quantity": 1}],
+            },
+            "INVALID_ORDER_FIELDS",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {"sequence": 1, "action": "submit_order", "symbol": "SPY", "side": "hold", "quantity": 1}
+                ],
+            },
+            "INVALID_ORDER_FIELDS",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [{"sequence": 1, "action": "submit_order", "symbol": "SPY", "side": "buy", "quantity": 0}],
+            },
+            "INVALID_ORDER_FIELDS",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {"sequence": 1, "action": "submit_order", "symbol": "SPY", "side": "buy", "quantity": 1.5}
+                ],
+            },
+            "INVALID_ORDER_FIELDS",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity": 1,
+                        "quantity_mode": "dollars",
+                    }
+                ],
+            },
+            "INVALID_ORDER_FIELDS",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity": 1,
+                        "asset_type": "option",
+                    }
+                ],
+            },
+            "INVALID_ORDER_FIELDS",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity": 1,
+                        "order_type": "limit",
+                    }
+                ],
+            },
+            "INVALID_ORDER_FIELDS",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity": 1,
+                        "time_in_force": "gtc",
+                    }
+                ],
+            },
+            "INVALID_ORDER_FIELDS",
+        ),
+        (
+            {"symbol": "SPY", "side": "buy", "quantity": 1},
+            "MISSING_EXECUTION_PLAN",
+        ),
+        (
+            {"schema_version": 1, "intent": "hold", "orders": [], "notes": "extra"},
+            "INVALID_EXECUTION_PLAN",
+        ),
+    ],
+)
+def test_execution_plan_execute_rejects_invalid_plan_before_submit(plan, blocker_code):
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](execution_plan=plan)
+
+    assert result["plan_status"] == "invalid"
+    assert result["can_continue"] is False
+    assert result["orders_attempted"] == 0
+    assert strategy.submitted_orders == []
+    assert blocker_code in {blocker["code"] for blocker in result["blockers"]}
+
+
+@pytest.mark.parametrize(
+    "order_patch",
+    [
+        {"symbol": " SPY "},
+        {"side": "BUY"},
+        {"quantity_mode": "Shares"},
+        {"quantity": 1.0},
+        {"asset_type": "Stock"},
+        {"order_type": "Market"},
+        {"time_in_force": "DAY"},
+    ],
+)
+def test_execution_plan_execute_rejects_non_strict_order_values_before_submit(order_patch):
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_execute_plan_tools(strategy)
+    order = {
+        "sequence": 1,
+        "action": "submit_order",
+        "symbol": "SPY",
+        "side": "buy",
+        "quantity_mode": "shares",
+        "quantity": 1,
+        "asset_type": "stock",
+        "order_type": "market",
+        "time_in_force": "day",
+    }
+    order.update(order_patch)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={"schema_version": 1, "intent": "rebalance", "orders": [order]}
+    )
+
+    assert result["plan_status"] == "invalid"
+    assert result["can_continue"] is False
+    assert result["orders_attempted"] == 0
+    assert strategy.submitted_orders == []
+    assert "INVALID_ORDER_FIELDS" in {blocker["code"] for blocker in result["blockers"]}
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["quantity_mode", "asset_type", "order_type", "time_in_force"],
+)
+def test_execution_plan_execute_rejects_missing_required_order_fields_before_submit(missing_field):
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_execute_plan_tools(strategy)
+    order = {
+        "sequence": 1,
+        "action": "submit_order",
+        "symbol": "SPY",
+        "side": "buy",
+        "quantity_mode": "shares",
+        "quantity": 1,
+        "asset_type": "stock",
+        "order_type": "market",
+        "time_in_force": "day",
+    }
+    order.pop(missing_field)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={"schema_version": 1, "intent": "rebalance", "orders": [order]}
+    )
+
+    assert result["plan_status"] == "invalid"
+    assert result["can_continue"] is False
+    assert result["orders_attempted"] == 0
+    assert strategy.submitted_orders == []
+    assert "INVALID_ORDER_FIELDS" in {blocker["code"] for blocker in result["blockers"]}
+
+
+def test_execution_plan_execute_stops_after_order_blocker_and_skips_remaining_orders():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 250.0
+    strategy.last_prices = {"SPY": 100.0, "GLD": 100.0}
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 3,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                },
+                {
+                        "sequence": 2,
+                        "action": "submit_order",
+                        "symbol": "GLD",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 1,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                },
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "blocked"
+    assert result["can_continue"] is False
+    assert result["orders_requested"] == 2
+    assert result["orders_attempted"] == 1
+    assert result["orders_completed"] == 0
+    assert result["orders_blocked"] == 1
+    assert result["orders_skipped"] == 1
+    assert result["completed_orders"] == []
+    assert result["blocked_orders"][0]["sequence"] == 1
+    assert result["skipped_orders"][0]["sequence"] == 2
+    assert "INSUFFICIENT_CASH_ESTIMATE" in {
+        blocker["code"] for blocker in result["blocked_orders"][0]["blockers"]
+    }
+    assert result["skipped_orders"][0]["skip_reason"] == "stopped_after_sequence_1_blocked"
+    assert strategy.submitted_orders == []
+
+
+def test_execution_plan_execute_reports_completed_orders_before_later_blocker():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 1000.0
+    strategy.last_prices = {"SPY": 100.0, "GLD": 100.0}
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 1,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                },
+                {
+                        "sequence": 2,
+                        "action": "submit_order",
+                        "symbol": "GLD",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 20,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                },
+                {
+                        "sequence": 3,
+                        "action": "submit_order",
+                        "symbol": "VGIT",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 1,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                },
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "blocked"
+    assert result["orders_attempted"] == 2
+    assert result["orders_completed"] == 1
+    assert result["orders_blocked"] == 1
+    assert result["orders_skipped"] == 1
+    assert result["completed_orders"][0]["sequence"] == 1
+    assert result["blocked_orders"][0]["sequence"] == 2
+    assert result["skipped_orders"][0]["sequence"] == 3
+    assert len(strategy.submitted_orders) == 1
+
+
+def test_execution_plan_execute_preserves_negative_cash_guard():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 1000.0
+    strategy.last_prices = {"SPY": 100.0}
+    strategy.force_negative_cash_after_submit = True
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "quantity_mode": "shares",
+                        "quantity": 3,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "blocked"
+    assert result["orders_attempted"] == 1
+    assert result["orders_completed"] == 0
+    assert "NEGATIVE_CASH_NOT_ALLOWED" in {
+        blocker["code"] for blocker in result["blocked_orders"][0]["blockers"]
+    }
     assert strategy.submitted_orders == []
 
 

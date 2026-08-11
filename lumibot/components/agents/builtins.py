@@ -46,6 +46,14 @@ ORDERS_EXECUTE_ORDER_DESCRIPTION = (
     "It does not perform research, calculate quantities, change order fields, execute multiple orders, "
     "or execute a full plan. If can_continue=false, stop later orders and report the blocker."
 )
+EXECUTION_PLAN_EXECUTE_DESCRIPTION = (
+    "Execute one complete strict execution_plan in sequence order. "
+    "This tool validates the plan, executes each order through readiness checks, submission, and confirmation, "
+    "stops on the first blocker, and returns a complete execution report. "
+    "This tool mutates trading state. It does not generate, repair, reorder, optimize, or modify the plan. "
+    "Pass the execution_plan exactly as provided by the upstream planner. "
+    "If plan_status is blocked or invalid, do not call lower-level tools; summarize where execution stopped and why."
+)
 
 COMMON_INDICATORS = [
     "sma",
@@ -3421,6 +3429,595 @@ def _bind_execute_order(strategy: Any, manager: Any) -> BoundTool:
     )
 
 
+def _execution_plan_blocker(
+    code: str,
+    message: str,
+    *,
+    sequence: Any = None,
+    symbol: Any = None,
+) -> dict[str, Any]:
+    blocker: dict[str, Any] = {"code": code, "message": message}
+    if sequence is not None:
+        blocker["sequence"] = _jsonable(sequence)
+    if symbol is not None:
+        blocker["symbol"] = _jsonable(symbol)
+    return blocker
+
+
+def _execution_plan_invalid_payload(
+    blocker: dict[str, Any],
+    *,
+    intent: Any = None,
+    orders_requested: int = 0,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "plan_status": "invalid",
+        "can_continue": False,
+        "intent": _jsonable(intent),
+        "orders_requested": orders_requested,
+        "orders_attempted": 0,
+        "orders_completed": 0,
+        "orders_blocked": 0,
+        "orders_skipped": 0,
+        "completed_orders": [],
+        "blocked_orders": [],
+        "skipped_orders": [],
+        "order_results": [],
+        "initial_account_snapshot": None,
+        "final_account_snapshot": None,
+        "blockers": [blocker],
+        "warnings": [],
+        "summary": "No orders were submitted because the execution plan was invalid.",
+    }
+
+
+def _execution_plan_order_summary(order: dict[str, Any], result: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = result if isinstance(result, dict) else {}
+    submit_and_confirm_result = result.get("submit_and_confirm_result")
+    if not isinstance(submit_and_confirm_result, dict):
+        submit_and_confirm_result = {}
+    identifier = submit_and_confirm_result.get("identifier")
+    summary = {
+        "sequence": _jsonable(order.get("sequence")),
+        "symbol": _jsonable(order.get("symbol")),
+        "side": _jsonable(order.get("side")),
+        "quantity": _jsonable(order.get("quantity")),
+        "asset_type": _jsonable(order.get("asset_type")),
+        "order_type": _jsonable(order.get("order_type")),
+        "time_in_force": _jsonable(order.get("time_in_force")),
+        "execution_status": _jsonable(result.get("execution_status")),
+        "confirmed": submit_and_confirm_result.get("confirmed") is True,
+    }
+    if identifier is not None:
+        summary["order_identifier"] = _jsonable(identifier)
+    return summary
+
+
+def _execution_plan_blocked_order_summary(order: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    summary = _execution_plan_order_summary(order, result)
+    summary["execution_status"] = "blocked"
+    summary["can_continue"] = False
+    summary["blockers"] = list(result.get("blockers") or [])
+    summary["warnings"] = list(result.get("warnings") or [])
+    return summary
+
+
+def _execution_plan_skipped_orders(
+    orders: list[dict[str, Any]],
+    *,
+    stopped_sequence: Any,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "sequence": _jsonable(order.get("sequence")),
+            "symbol": _jsonable(order.get("symbol")),
+            "side": _jsonable(order.get("side")),
+            "quantity": _jsonable(order.get("quantity")),
+            "asset_type": _jsonable(order.get("asset_type")),
+            "order_type": _jsonable(order.get("order_type")),
+            "time_in_force": _jsonable(order.get("time_in_force")),
+            "execution_status": "skipped",
+            "skip_reason": f"stopped_after_sequence_{stopped_sequence}_blocked",
+        }
+        for order in orders
+    ]
+
+
+def _execution_plan_result_item(order: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sequence": _jsonable(order.get("sequence")),
+        "symbol": _jsonable(order.get("symbol")),
+        "side": _jsonable(order.get("side")),
+        "quantity": _jsonable(order.get("quantity")),
+        "execution_status": _jsonable(result.get("execution_status")),
+        "can_continue": result.get("can_continue") is True,
+        "blockers": list(result.get("blockers") or []),
+        "warnings": list(result.get("warnings") or []),
+        "order_result": result,
+    }
+
+
+def _execution_plan_final_account_snapshot(
+    strategy: Any,
+    order_results: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for item in reversed(order_results):
+        result = item.get("order_result")
+        if isinstance(result, dict):
+            account_after = result.get("account_after")
+            if isinstance(account_after, dict):
+                return account_after
+            preflight_result = result.get("preflight_result")
+            if isinstance(preflight_result, dict):
+                account = preflight_result.get("account")
+                if isinstance(account, dict):
+                    return account
+    try:
+        return _account_snapshot(strategy)
+    except Exception:
+        return None
+
+
+def _execution_plan_completed_payload(
+    *,
+    strategy: Any,
+    intent: str,
+    orders_requested: int,
+    completed_orders: list[dict[str, Any]],
+    order_results: list[dict[str, Any]],
+    warnings: list[str],
+) -> dict[str, Any]:
+    if orders_requested == 0:
+        summary = "No planned orders were submitted because the execution plan intent was hold."
+    else:
+        summary = f"All {orders_requested} planned orders were completed and confirmed."
+    return {
+        "schema_version": 1,
+        "plan_status": "completed",
+        "can_continue": True,
+        "intent": intent,
+        "orders_requested": orders_requested,
+        "orders_attempted": len(order_results),
+        "orders_completed": len(completed_orders),
+        "orders_blocked": 0,
+        "orders_skipped": 0,
+        "completed_orders": completed_orders,
+        "blocked_orders": [],
+        "skipped_orders": [],
+        "order_results": order_results,
+        "initial_account_snapshot": None,
+        "final_account_snapshot": _execution_plan_final_account_snapshot(strategy, order_results),
+        "blockers": [],
+        "warnings": warnings,
+        "summary": summary,
+    }
+
+
+def _execution_plan_blocked_payload(
+    *,
+    strategy: Any,
+    intent: str,
+    orders_requested: int,
+    completed_orders: list[dict[str, Any]],
+    blocked_orders: list[dict[str, Any]],
+    skipped_orders: list[dict[str, Any]],
+    order_results: list[dict[str, Any]],
+    warnings: list[str],
+    stopped_sequence: Any,
+    stopped_symbol: Any,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "plan_status": "blocked",
+        "can_continue": False,
+        "intent": intent,
+        "orders_requested": orders_requested,
+        "orders_attempted": len(order_results),
+        "orders_completed": len(completed_orders),
+        "orders_blocked": len(blocked_orders),
+        "orders_skipped": len(skipped_orders),
+        "completed_orders": completed_orders,
+        "blocked_orders": blocked_orders,
+        "skipped_orders": skipped_orders,
+        "order_results": order_results,
+        "initial_account_snapshot": None,
+        "final_account_snapshot": _execution_plan_final_account_snapshot(strategy, order_results),
+        "blockers": [
+            _execution_plan_blocker(
+                "ORDER_BLOCKED",
+                f"Execution stopped at sequence {stopped_sequence}.",
+                sequence=stopped_sequence,
+                symbol=stopped_symbol,
+            )
+        ],
+        "warnings": warnings,
+        "summary": f"Execution stopped at sequence {stopped_sequence} because {stopped_symbol} was blocked.",
+    }
+
+
+def _execution_plan_exception_result(order: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    return {
+        "sequence": _jsonable(order.get("sequence")),
+        "symbol": _jsonable(order.get("symbol")),
+        "side": _jsonable(order.get("side")),
+        "quantity": _jsonable(order.get("quantity")),
+        "asset_type": _jsonable(order.get("asset_type")),
+        "order_type": _jsonable(order.get("order_type")),
+        "time_in_force": _jsonable(order.get("time_in_force")),
+        "execution_status": "blocked",
+        "can_continue": False,
+        "blockers": [
+            _execution_plan_blocker(
+                "EXECUTION_EXCEPTION",
+                str(exc),
+                sequence=order.get("sequence"),
+                symbol=order.get("symbol"),
+            )
+        ],
+        "warnings": [],
+        "order": {
+            "symbol": _jsonable(order.get("symbol")),
+            "side": _jsonable(order.get("side")),
+            "quantity": _jsonable(order.get("quantity")),
+            "asset_type": _jsonable(order.get("asset_type")),
+            "order_type": _jsonable(order.get("order_type")),
+            "time_in_force": _jsonable(order.get("time_in_force")),
+        },
+        "preflight_result": None,
+        "submit_and_confirm_result": None,
+        "internal_steps": [],
+    }
+
+
+def _validate_execution_plan_sequence(orders: list[Any]) -> dict[str, Any] | None:
+    sequences: list[int] = []
+    for index, order in enumerate(orders):
+        if not isinstance(order, dict):
+            return _execution_plan_blocker(
+                "INVALID_ORDER_FIELDS",
+                "execution_plan.orders entries must be objects.",
+            )
+        sequence = order.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            return _execution_plan_blocker(
+                "INVALID_ORDER_SEQUENCE",
+                "execution_plan.orders sequence values must be integers.",
+                sequence=sequence,
+                symbol=order.get("symbol"),
+            )
+        if sequence <= 0:
+            return _execution_plan_blocker(
+                "INVALID_ORDER_SEQUENCE",
+                "execution_plan.orders sequence values must be positive integers.",
+                sequence=sequence,
+                symbol=order.get("symbol"),
+            )
+        sequences.append(sequence)
+        if sequence != index + 1 and sorted(sequences) == list(range(1, len(sequences) + 1)):
+            return _execution_plan_blocker(
+                "INVALID_ORDER_SEQUENCE",
+                "execution_plan.orders must already be listed in ascending sequence order.",
+                sequence=sequence,
+                symbol=order.get("symbol"),
+            )
+
+    if len(set(sequences)) != len(sequences):
+        return _execution_plan_blocker(
+            "INVALID_ORDER_SEQUENCE",
+            "execution_plan.orders must have unique sequence values.",
+        )
+    expected = list(range(1, len(orders) + 1))
+    if sequences != expected:
+        if sorted(sequences) == expected:
+            return _execution_plan_blocker(
+                "INVALID_ORDER_SEQUENCE",
+                "execution_plan.orders must already be listed in ascending sequence order.",
+            )
+        return _execution_plan_blocker(
+            "INVALID_ORDER_SEQUENCE",
+            "execution_plan.orders sequence values must exactly cover 1..N with no gaps.",
+        )
+    return None
+
+
+def _validate_execution_plan_order_fields(order: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    required_fields = {
+        "sequence",
+        "action",
+        "symbol",
+        "side",
+        "quantity_mode",
+        "quantity",
+        "asset_type",
+        "order_type",
+        "time_in_force",
+    }
+    unsupported_fields = sorted(str(field) for field in set(order) - required_fields)
+    if unsupported_fields:
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            f"execution_plan order contains unsupported fields: {', '.join(unsupported_fields)}.",
+            sequence=order.get("sequence"),
+            symbol=order.get("symbol"),
+        )
+    missing_fields = sorted(required_fields - set(order))
+    if missing_fields:
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            f"execution_plan order is missing required fields: {', '.join(missing_fields)}.",
+            sequence=order.get("sequence"),
+            symbol=order.get("symbol"),
+        )
+    if order.get("action") != "submit_order":
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_ACTION",
+            "execution_plan orders must use action='submit_order'.",
+            sequence=order.get("sequence"),
+            symbol=order.get("symbol"),
+        )
+
+    symbol = order.get("symbol")
+    if not isinstance(symbol, str) or not symbol or symbol != symbol.strip():
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            "execution_plan order symbol must be a non-empty string with no surrounding whitespace.",
+            sequence=order.get("sequence"),
+            symbol=symbol,
+        )
+    if "," in symbol:
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            "execution_plan order symbol must be one tradable symbol.",
+            sequence=order.get("sequence"),
+            symbol=symbol,
+        )
+
+    side = order.get("side")
+    if side not in {"buy", "sell"}:
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            "execution_plan order side must be buy or sell.",
+            sequence=order.get("sequence"),
+            symbol=symbol,
+        )
+
+    if order.get("quantity_mode") != "shares":
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            "execution_plan order quantity_mode must be shares.",
+            sequence=order.get("sequence"),
+            symbol=symbol,
+        )
+
+    raw_quantity = order.get("quantity")
+    if isinstance(raw_quantity, bool) or not isinstance(raw_quantity, int) or raw_quantity <= 0:
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            "execution_plan order quantity must be a positive whole-share integer.",
+            sequence=order.get("sequence"),
+            symbol=symbol,
+        )
+
+    asset_type = order.get("asset_type")
+    if asset_type not in {"stock", "us_equity"}:
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            "execution_plan order asset_type must be stock or us_equity.",
+            sequence=order.get("sequence"),
+            symbol=symbol,
+        )
+
+    if order.get("order_type") != "market":
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            "execution_plan order order_type must be market.",
+            sequence=order.get("sequence"),
+            symbol=symbol,
+        )
+
+    if order.get("time_in_force") != "day":
+        return None, _execution_plan_blocker(
+            "INVALID_ORDER_FIELDS",
+            "execution_plan order time_in_force must be day.",
+            sequence=order.get("sequence"),
+            symbol=symbol,
+        )
+
+    return (
+        {
+            "sequence": order["sequence"],
+            "action": order["action"],
+            "symbol": order["symbol"],
+            "side": order["side"],
+            "quantity_mode": order["quantity_mode"],
+            "quantity": raw_quantity,
+            "asset_type": order["asset_type"],
+            "order_type": order["order_type"],
+            "time_in_force": order["time_in_force"],
+        },
+        None,
+    )
+
+
+def _validate_execution_plan(
+    execution_plan: Any,
+) -> tuple[str | None, list[dict[str, Any]], dict[str, Any] | None, int]:
+    if not isinstance(execution_plan, dict) or not {"schema_version", "intent", "orders"}.issubset(execution_plan):
+        return (
+            None,
+            [],
+            _execution_plan_blocker(
+                "MISSING_EXECUTION_PLAN",
+                "execution_plan must be one complete object with schema_version, intent, and orders.",
+            ),
+            0,
+        )
+
+    supported_top_level_fields = {"schema_version", "intent", "orders"}
+    unsupported_top_level_fields = sorted(str(field) for field in set(execution_plan) - supported_top_level_fields)
+    if unsupported_top_level_fields:
+        return (
+            _jsonable(execution_plan.get("intent")),
+            [],
+            _execution_plan_blocker(
+                "INVALID_EXECUTION_PLAN",
+                f"execution_plan contains unsupported top-level fields: {', '.join(unsupported_top_level_fields)}.",
+            ),
+            0,
+        )
+
+    intent = execution_plan.get("intent")
+    raw_orders = execution_plan.get("orders")
+    orders_requested = len(raw_orders) if isinstance(raw_orders, list) else 0
+    if execution_plan.get("schema_version") != 1:
+        return (
+            _jsonable(intent),
+            [],
+            _execution_plan_blocker(
+                "UNSUPPORTED_PLAN_SCHEMA_VERSION",
+                "execution_plan.schema_version must be 1.",
+            ),
+            orders_requested,
+        )
+    if intent not in {"rebalance", "hold"}:
+        return (
+            _jsonable(intent),
+            [],
+            _execution_plan_blocker(
+                "UNSUPPORTED_PLAN_INTENT",
+                "execution_plan.intent must be rebalance or hold.",
+            ),
+            orders_requested,
+        )
+    if not isinstance(raw_orders, list):
+        return (
+            intent,
+            [],
+            _execution_plan_blocker(
+                "INVALID_EXECUTION_PLAN",
+                "execution_plan.orders must be a list.",
+            ),
+            orders_requested,
+        )
+    if intent == "hold" and raw_orders:
+        return (
+            intent,
+            [],
+            _execution_plan_blocker(
+                "INVALID_EXECUTION_PLAN",
+                "execution_plan.orders must be empty when intent is hold.",
+            ),
+            len(raw_orders),
+        )
+
+    sequence_blocker = _validate_execution_plan_sequence(raw_orders)
+    if sequence_blocker is not None:
+        return intent, [], sequence_blocker, len(raw_orders)
+
+    normalized_orders: list[dict[str, Any]] = []
+    for order in raw_orders:
+        normalized_order, blocker = _validate_execution_plan_order_fields(order)
+        if blocker is not None:
+            return intent, [], blocker, len(raw_orders)
+        if normalized_order is not None:
+            normalized_orders.append(normalized_order)
+    return intent, normalized_orders, None, len(raw_orders)
+
+
+def _bind_execute_plan(strategy: Any, manager: Any) -> BoundTool:
+    execute_order_tool = _bind_execute_order(strategy, manager)
+
+    def execute_plan(execution_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+        intent, orders, blocker, orders_requested = _validate_execution_plan(execution_plan)
+        if blocker is not None:
+            return _execution_plan_invalid_payload(
+                blocker,
+                intent=intent,
+                orders_requested=orders_requested,
+            )
+        if intent == "hold":
+            return _execution_plan_completed_payload(
+                strategy=strategy,
+                intent="hold",
+                orders_requested=0,
+                completed_orders=[],
+                order_results=[],
+                warnings=[],
+            )
+
+        completed_orders: list[dict[str, Any]] = []
+        blocked_orders: list[dict[str, Any]] = []
+        order_results: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for index, order in enumerate(orders):
+            try:
+                result = execute_order_tool.function(
+                    sequence=order["sequence"],
+                    symbol=order["symbol"],
+                    quantity=order["quantity"],
+                    side=order["side"],
+                    asset_type=order["asset_type"],
+                    order_type=order["order_type"],
+                    time_in_force=order["time_in_force"],
+                )
+            except Exception as exc:
+                result = _execution_plan_exception_result(order, exc)
+
+            if isinstance(result, dict):
+                result_warnings = [str(warning) for warning in list(result.get("warnings") or [])]
+            else:
+                result = _execution_plan_exception_result(
+                    order,
+                    RuntimeError("orders_execute_order did not return a structured result."),
+                )
+                result_warnings = []
+            warnings.extend(result_warnings)
+            order_results.append(_execution_plan_result_item(order, result))
+
+            execution_completed = (
+                result.get("execution_status") == "completed"
+                and result.get("can_continue") is True
+            )
+            if execution_completed:
+                completed_orders.append(_execution_plan_order_summary(order, result))
+                continue
+
+            blocked_orders.append(_execution_plan_blocked_order_summary(order, result))
+            skipped_orders = _execution_plan_skipped_orders(
+                orders[index + 1 :],
+                stopped_sequence=order["sequence"],
+            )
+            return _execution_plan_blocked_payload(
+                strategy=strategy,
+                intent=str(intent),
+                orders_requested=orders_requested,
+                completed_orders=completed_orders,
+                blocked_orders=blocked_orders,
+                skipped_orders=skipped_orders,
+                order_results=order_results,
+                warnings=warnings,
+                stopped_sequence=order["sequence"],
+                stopped_symbol=order["symbol"],
+            )
+
+        return _execution_plan_completed_payload(
+            strategy=strategy,
+            intent=str(intent),
+            orders_requested=orders_requested,
+            completed_orders=completed_orders,
+            order_results=order_results,
+            warnings=warnings,
+        )
+
+    return BoundTool(
+        name="execution_plan_execute",
+        description=EXECUTION_PLAN_EXECUTE_DESCRIPTION,
+        function=execute_plan,
+        metadata={"kind": "builtin", "replay_on_cache": True, "mutates_trading": True},
+    )
+
+
 def _bind_submit_order(strategy: Any, manager: Any) -> BoundTool:
     def submit_order(
         *,
@@ -3820,6 +4417,14 @@ class _OrderTools:
             metadata={"mutates_trading": True},
         )
 
+    def execute_plan(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="execution_plan_execute",
+            description=EXECUTION_PLAN_EXECUTE_DESCRIPTION,
+            binder=_bind_execute_plan,
+            metadata={"mutates_trading": True},
+        )
+
     def submit(self) -> ToolDefinition:
         return ToolDefinition(
             name="orders_submit_order",
@@ -3924,6 +4529,7 @@ class _BuiltinTools:
             self.orders.preflight(),
             self.orders.submit_and_confirm(),
             self.orders.execute(),
+            self.orders.execute_plan(),
             self.orders.submit(),
             self.orders.confirm(),
             self.orders.submit_multileg(),
