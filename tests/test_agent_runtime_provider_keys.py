@@ -171,6 +171,30 @@ def test_mutating_order_tools_disable_whole_run_retries_by_default(monkeypatch, 
     assert GoogleADKRuntime._max_attempts_for_request(request) == 1
 
 
+def test_mutates_trading_tool_metadata_disables_whole_run_retries_by_default(monkeypatch):
+    monkeypatch.delenv("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS", raising=False)
+    request = RuntimeRequest(
+        agent_name="execution_agent",
+        model="gemini-3.5-flash",
+        system_prompt="trade",
+        task_prompt="",
+        context=None,
+        runtime_context={"mode": "live"},
+        memory_state=None,
+        memory_notes=[],
+        bound_tools=[
+            BoundTool(
+                name="orders_execute_order",
+                description="execute",
+                function=lambda: {"ok": True},
+                metadata={"mutates_trading": True},
+            )
+        ],
+    )
+
+    assert GoogleADKRuntime._max_attempts_for_request(request) == 1
+
+
 def test_aggregate_usage_metadata_sums_multiple_provider_events():
     usage = _aggregate_usage_metadata(
         [

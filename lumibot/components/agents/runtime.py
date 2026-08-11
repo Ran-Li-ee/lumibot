@@ -5086,7 +5086,12 @@ class GoogleADKRuntime:
             "orders_cancel_order",
             "orders_modify_order",
         }
-        if any(tool.name in mutating_order_tools for tool in request.bound_tools):
+        has_mutating_trading_tool = any(
+            bool(getattr(tool, "metadata", {}).get("mutates_trading"))
+            or tool.name in mutating_order_tools
+            for tool in request.bound_tools
+        )
+        if has_mutating_trading_tool:
             # Retrying the whole agent run after a broker-side effect can duplicate orders.
             # Research-only agents keep the larger retry budget; trading agents fail fast
             # and let the next scheduled/bar iteration re-evaluate from current broker state.
