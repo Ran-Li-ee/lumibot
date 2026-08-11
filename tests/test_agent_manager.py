@@ -675,6 +675,37 @@ def test_execution_agent_with_execute_tool_receives_stage_c_execution_policy():
     assert "price/history tool policy" not in prompt_lower
 
 
+def test_execution_agent_with_execution_plan_execute_tool_receives_stage_d_policy():
+    def execution_plan_execute():
+        return None
+
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="execution_agent",
+        system_prompt="Execution role.",
+        default_model="test-model",
+        runtime=object(),
+        tools=[execution_plan_execute],
+        include_builtin_tools=False,
+        base_system_prompt_mode="execution_minimal",
+    )
+
+    prompt = handle._compose_system_prompt(
+        {"mode": "backtesting"},
+        bound_tools=handle._ensure_bound_tools(),
+    )
+    prompt_lower = prompt.lower()
+
+    assert "execution tool policy" in prompt_lower
+    assert "execution_plan_execute executes one complete strict execution_plan" in prompt_lower
+    assert "validates the plan" in prompt_lower
+    assert "executes each order through readiness check, submission, and confirmation" in prompt_lower
+    assert "stops on the first blocker" in prompt_lower
+    assert "does not research, generate, repair, reorder, optimize, or modify the plan" in prompt_lower
+    assert "orders_execute_order executes one explicit execution_plan order end to end" not in prompt_lower
+    assert "price/history tool policy" not in prompt_lower
+
+
 def test_agent_manager_create_forwards_base_system_prompt_mode():
     manager = AgentManager(DummyStrategy())
 
@@ -712,6 +743,70 @@ def test_execution_minimal_mode_skips_memory_thesis_warning_for_position_orders(
                 kind="tool_call",
                 tool_name="orders_submit_order",
                 payload={"symbol": "VNQ", "side": "sell", "quantity": 10},
+            ),
+        ],
+    )
+    runtime_context = {
+        "mode": "backtesting",
+        "positions": [{"symbol": "VNQ", "quantity": 10}],
+    }
+    default_handle = AgentHandle(
+        manager=DummyManager(),
+        name="decision_agent",
+        system_prompt="Prompt.",
+        default_model="test-model",
+        tools=[],
+        runtime=object(),
+        include_builtin_tools=False,
+    )
+    execution_handle = AgentHandle(
+        manager=DummyManager(),
+        name="execution_agent",
+        system_prompt="Prompt.",
+        default_model="test-model",
+        tools=[],
+        runtime=object(),
+        include_builtin_tools=False,
+        base_system_prompt_mode="execution_minimal",
+    )
+
+    default_warnings = default_handle._derive_warnings(result, runtime_context)
+    execution_warnings = execution_handle._derive_warnings(result, runtime_context)
+
+    assert any(
+        warning["kind"] == "position_order_without_memory_thesis"
+        for warning in default_warnings
+    )
+    assert not [
+        warning
+        for warning in execution_warnings
+        if warning["kind"] == "position_order_without_memory_thesis"
+    ]
+
+
+def test_execution_plan_execute_held_symbol_triggers_memory_thesis_warning():
+    result = AgentRunResult(
+        summary="RESULT: executed planned execution_plan.",
+        model="test-model",
+        events=[
+            AgentTraceEvent(
+                kind="tool_call",
+                tool_name="execution_plan_execute",
+                payload={
+                    "execution_plan": {
+                        "schema_version": 1,
+                        "intent": "rebalance",
+                        "orders": [
+                            {
+                                "sequence": 1,
+                                "action": "submit_order",
+                                "symbol": "VNQ",
+                                "side": "sell",
+                                "quantity": 10,
+                            }
+                        ],
+                    }
+                },
             ),
         ],
     )
@@ -798,6 +893,57 @@ def test_orders_execute_counts_as_visible_order_data_for_warnings():
             AgentTraceEvent(
                 kind="tool_call",
                 tool_name="orders_execute_order",
+                payload={"symbol": "SPY", "side": "buy", "quantity": 1},
+            ),
+        ],
+    )
+    handle = AgentHandle(
+        manager=DummyManager(),
+        name="execution_agent",
+        system_prompt="Prompt.",
+        default_model="test-model",
+        tools=[],
+        runtime=object(),
+        include_builtin_tools=False,
+        base_system_prompt_mode="execution_minimal",
+    )
+
+    warnings = handle._derive_warnings(result, {"mode": "backtesting"})
+
+    assert not [
+        warning
+        for warning in warnings
+        if warning["kind"] == "order_without_data"
+    ]
+
+
+def test_execution_plan_execute_counts_as_visible_order_data_for_warnings():
+    result = AgentRunResult(
+        summary="RESULT: executed planned execution_plan.",
+        model="test-model",
+        events=[
+            AgentTraceEvent(
+                kind="tool_call",
+                tool_name="execution_plan_execute",
+                payload={
+                    "execution_plan": {
+                        "schema_version": 1,
+                        "intent": "rebalance",
+                        "orders": [
+                            {
+                                "sequence": 1,
+                                "action": "submit_order",
+                                "symbol": "SPY",
+                                "side": "buy",
+                                "quantity": 1,
+                            }
+                        ],
+                    }
+                },
+            ),
+            AgentTraceEvent(
+                kind="tool_call",
+                tool_name="orders_submit_order",
                 payload={"symbol": "SPY", "side": "buy", "quantity": 1},
             ),
         ],

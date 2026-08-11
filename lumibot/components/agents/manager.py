@@ -417,12 +417,26 @@ def _held_position_symbols(runtime_context: dict[str, Any]) -> set[str]:
 def _order_tool_symbols(result: AgentRunResult) -> set[str]:
     symbols: set[str] = set()
     for event in result.tool_calls:
-        if not str(event.tool_name or "").startswith("orders_"):
-            continue
         payload = event.payload if isinstance(event.payload, dict) else {}
-        symbol = _agent_symbol(payload.get("symbol"))
-        if symbol:
-            symbols.add(symbol)
+        tool_name = str(event.tool_name or "")
+        if tool_name.startswith("orders_"):
+            symbol = _agent_symbol(payload.get("symbol"))
+            if symbol:
+                symbols.add(symbol)
+            continue
+        if tool_name == "execution_plan_execute":
+            execution_plan = payload.get("execution_plan")
+            if not isinstance(execution_plan, dict):
+                continue
+            orders = execution_plan.get("orders")
+            if not isinstance(orders, list):
+                continue
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+                symbol = _agent_symbol(order.get("symbol"))
+                if symbol:
+                    symbols.add(symbol)
     return symbols
 
 
@@ -919,6 +933,7 @@ class AgentHandle:
 
     def _execution_tool_policy_prompt(self, tool_names: set[str]) -> str:
         execution_tools = {
+            "execution_plan_execute",
             "orders_submit_order",
             "orders_submit_and_confirm_order",
             "orders_execute_order",
@@ -944,6 +959,12 @@ class AgentHandle:
                 "orders_execute_order executes one explicit execution_plan order end to end: readiness check, "
                 "submission, and confirmation. It does not research, calculate quantities, change order fields, "
                 "execute multiple orders, or execute a full plan."
+            )
+        if "execution_plan_execute" in tool_names:
+            lines.append(
+                "execution_plan_execute executes one complete strict execution_plan: validates the plan, "
+                "executes each order through readiness check, submission, and confirmation, and stops on the "
+                "first blocker. It does not research, generate, repair, reorder, optimize, or modify the plan."
             )
         if "orders_open_orders" in tool_names:
             lines.append("Use orders_open_orders to inspect outstanding orders before submitting new orders.")
@@ -1538,6 +1559,7 @@ class AgentHandle:
             or name.startswith("account_")
             or name == "orders_preflight_check"
             or name == "orders_execute_order"
+            or name == "execution_plan_execute"
             or name in {
                 "get_news",
                 "alpaca_news",
@@ -1548,7 +1570,10 @@ class AgentHandle:
             }
             for name in tool_names
         )
-        used_order_tool = any(name.startswith("orders_") for name in tool_names)
+        used_order_tool = any(
+            name.startswith("orders_") or name == "execution_plan_execute"
+            for name in tool_names
+        )
         if used_order_tool and not used_data_tool:
             warnings.append(
                 {
