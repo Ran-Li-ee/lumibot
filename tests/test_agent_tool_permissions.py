@@ -1422,6 +1422,10 @@ def test_orders_execute_order_preflights_submits_and_confirms_one_order():
     assert result["submit_and_confirm_result"]["submitted"] is True
     assert result["submit_and_confirm_result"]["confirmed"] is True
     assert result["submit_and_confirm_result"]["can_continue"] is True
+    confirmation_account = result["submit_and_confirm_result"]["confirm_result"]["account_snapshot"]
+    assert result["account_after"] == confirmation_account
+    assert confirmation_account["cash"] == 1000.0
+    assert confirmation_account["portfolio_value"] == 1200.0
     assert [step["step"] for step in result["internal_steps"]] == ["preflight", "submit_and_confirm"]
     assert len(strategy.submitted_orders) == 1
     assert strategy.submitted_orders[0].asset.symbol == "SPY"

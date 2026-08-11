@@ -3183,6 +3183,16 @@ def _execute_order_payload(
     internal_steps: list[dict[str, Any]] | None = None,
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
+    confirm_result = (
+        submit_and_confirm_result.get("confirm_result")
+        if isinstance(submit_and_confirm_result, dict)
+        else None
+    )
+    account_after = (
+        confirm_result.get("account_snapshot")
+        if isinstance(confirm_result, dict)
+        else None
+    )
     return {
         "sequence": _jsonable(sequence),
         "symbol": _jsonable(symbol),
@@ -3206,11 +3216,7 @@ def _execute_order_payload(
         "preflight_result": preflight_result,
         "submit_and_confirm_result": submit_and_confirm_result,
         "internal_steps": list(internal_steps or []),
-        "account_after": (
-            submit_and_confirm_result.get("account_after")
-            if isinstance(submit_and_confirm_result, dict)
-            else None
-        ),
+        "account_after": account_after,
     }
 
 
