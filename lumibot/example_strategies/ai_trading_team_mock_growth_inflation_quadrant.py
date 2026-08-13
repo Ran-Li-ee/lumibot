@@ -59,7 +59,7 @@ BASKET_UNIVERSES = {
         "FTGC",
         "CMDY",
     ],
-    "tips": ["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ", "TIPS"],
+    "tips": ["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ"],
     "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
 }
 

@@ -47,7 +47,7 @@ agent should not treat the TIPS basket like the equity or commodity basket.
 
 This feature includes:
 
-1. Expand `BASKET_UNIVERSES["tips"]` to the approved seven-symbol list.
+1. Expand `BASKET_UNIVERSES["tips"]` to the approved six-symbol list.
 2. Keep the TIPS basket compact and purpose-specific rather than expanding it
    into a large opportunistic universe.
 3. Give `tips_basket_agent` access to `alpaca_news` as conditional secondary
@@ -58,7 +58,7 @@ This feature includes:
    the assigned symbols but should not receive hard category labels that force a
    preselected answer.
 6. Update tests that currently assume the old five-symbol TIPS universe.
-7. Verify that all seven TIPS symbols can be loaded through the current Yahoo
+7. Verify that all six TIPS symbols can be loaded through the current Yahoo
    daily backtest data path for a representative window.
 8. Verify that the strategy still works when Alpaca news credentials are
    missing; rankings alone must remain sufficient.
@@ -95,7 +95,6 @@ This feature does not:
     "TIP",
     "SPIP",
     "LTPZ",
-    "TIPS",
 ]
 ```
 
@@ -111,7 +110,6 @@ The intended role of each symbol is:
 | `TIP` | Broad/full-curve TIPS exposure; liquid standard TIPS allocation. |
 | `SPIP` | Broad/full-curve TIPS exposure; additional standard TIPS candidate. |
 | `LTPZ` | Long-duration TIPS exposure; higher volatility and more real-rate sensitivity. |
-| `TIPS` | Tradable TIPS ETF ticker that must be data-verified before use in tests and backtests. |
 
 These interpretations are for design and prompt intent. The model-facing context
 should still pass `basket_symbols` as a flat symbol list.
@@ -164,7 +162,7 @@ symbol-based scans.
 Recommended symbol groups for news scans:
 
 ```text
-TIPS candidates: VTIP,STIP,SCHP,TIP,SPIP,LTPZ,TIPS
+TIPS candidates: VTIP,STIP,SCHP,TIP,SPIP,LTPZ
 Rate/bond proxies: TLT,IEF,SHY,GOVT
 Broad-market stress proxies: SPY,QQQ,DIA,IWM
 ```
@@ -269,7 +267,7 @@ If `target_weight` is positive, `tips_basket_agent` should:
 
 Unit tests should verify:
 
-1. `BASKET_UNIVERSES["tips"]` equals the approved seven-symbol list.
+1. `BASKET_UNIVERSES["tips"]` equals the approved six-symbol list.
 2. `tips_basket_agent` tool permissions include `alpaca_news`.
 3. `tips_basket_agent` still includes `market_load_history_tables_summary` and
    `market_last_price`.
@@ -285,7 +283,7 @@ Unit tests should verify:
 
 Data/path verification should verify:
 
-1. `VTIP`, `STIP`, `SCHP`, `TIP`, `SPIP`, `LTPZ`, and `TIPS` can load daily
+1. `VTIP`, `STIP`, `SCHP`, `TIP`, `SPIP`, and `LTPZ` can load daily
    Yahoo-style history for a representative 2024 backtest window.
 2. The history summary tool can return model-facing rankings for the expanded
    TIPS basket without raw-data bloat.
@@ -314,7 +312,7 @@ Acceptance requires:
 | The model over-selects short-duration TIPS and never chooses `LTPZ`. | Prompt says short-duration is usually more stable, but allows long-duration when ranking evidence and context clearly support duration risk. |
 | The model treats generic inflation headlines as enough reason to buy long-duration TIPS. | Prompt explicitly says generic inflation headlines alone do not justify long-duration TIPS. |
 | News calls add noise or token usage. | News is secondary and conditional; rank evidence remains sufficient. |
-| `TIPS` ticker has limited or inconsistent data in some backtest windows. | Implementation must include data-path verification and tests should fail loudly if data is unusable. |
+| A ticker can resolve to an unrelated security despite looking relevant. | Keep the approved universe data-verified; remove any symbol that is not a TIPS ETF. |
 | The change accidentally alters commodity/equity/nominal bond behavior. | Tests should assert only TIPS tool surface and TIPS prompt behavior changed. |
 | Alpaca news credentials are absent. | Existing disabled-tool behavior remains acceptable; ranking-only selection must still work. |
 

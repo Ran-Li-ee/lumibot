@@ -165,7 +165,6 @@ def expected_tips_universe():
         "TIP",
         "SPIP",
         "LTPZ",
-        "TIPS",
     ]
 
 
@@ -505,7 +504,7 @@ def test_basket_universes_have_expected_symbols():
         "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
     }
     assert len(module.BASKET_UNIVERSES["commodity"]) == 28
-    assert len(module.BASKET_UNIVERSES["tips"]) == 7
+    assert len(module.BASKET_UNIVERSES["tips"]) == 6
     for symbols in module.BASKET_UNIVERSES.values():
         assert len(symbols) >= 5
         assert len(symbols) == len(set(symbols))

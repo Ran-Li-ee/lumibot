@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Expand the mock growth/inflation quadrant strategy's TIPS basket to seven symbols, give `tips_basket_agent` conditional news access, and make its prompts rank-first, defensive, and duration-aware.
+**Goal:** Expand the mock growth/inflation quadrant strategy's TIPS basket to six symbols, give `tips_basket_agent` conditional news access, and make its prompts rank-first, defensive, and duration-aware.
 
 **Architecture:** Keep the existing strategy structure unchanged: macro allocation agent -> four basket agents -> portfolio decision agent -> execution agent. Modify only the TIPS basket universe, TIPS basket tool surface, TIPS-specific prompt branches, and related tests/verification. Reuse the existing `market_load_history_tables_summary`, `market_last_price`, and `alpaca_news` built-in tools.
 
@@ -79,7 +79,6 @@ def expected_tips_universe():
         "TIP",
         "SPIP",
         "LTPZ",
-        "TIPS",
     ]
 ```
 
@@ -106,7 +105,7 @@ After the existing commodity length assertion:
 add:
 
 ```python
-    assert len(module.BASKET_UNIVERSES["tips"]) == 7
+    assert len(module.BASKET_UNIVERSES["tips"]) == 6
 ```
 
 - [ ] **Step 3: Update the tool surface test to require news for TIPS**
@@ -195,7 +194,7 @@ In `BASKET_UNIVERSES`, replace:
 with:
 
 ```python
-    "tips": ["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ", "TIPS"],
+    "tips": ["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ"],
 ```
 
 - [ ] **Step 2: Give TIPS conditional news access**
@@ -548,7 +547,7 @@ Run:
 @'
 import yfinance as yf
 
-symbols = ["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ", "TIPS"]
+symbols = ["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ"]
 missing = []
 for symbol in symbols:
     df = yf.download(symbol, start="2024-09-05", end="2024-09-10", auto_adjust=True, progress=False, threads=False)
@@ -571,7 +570,6 @@ SCHP: <positive rows> rows
 TIP: <positive rows> rows
 SPIP: <positive rows> rows
 LTPZ: <positive rows> rows
-TIPS: <positive rows> rows
 ```
 
 The command must exit with code `0`.
@@ -646,7 +644,7 @@ Run:
 ```powershell
 $latest = Get-ChildItem artifacts\ai_trading_team_example_benchmarks -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $traceRoot = Join-Path $latest.FullName "mock-growth-inflation-quadrant\agent_traces"
-rg -n '"agent_name": "tips_basket_agent"|"alpaca_news"|"VTIP"|"STIP"|"SCHP"|"TIP"|"SPIP"|"LTPZ"|"TIPS"' $traceRoot
+rg -n '"agent_name": "tips_basket_agent"|"alpaca_news"|"VTIP"|"STIP"|"SCHP"|"TIP"|"SPIP"|"LTPZ"' $traceRoot
 ```
 
 Expected:
@@ -693,7 +691,7 @@ No unstaged or uncommitted files should remain unless the benchmark generated in
 
 ## Final Acceptance Checklist
 
-- [ ] `BASKET_UNIVERSES["tips"]` is exactly `["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ", "TIPS"]`.
+- [ ] `BASKET_UNIVERSES["tips"]` is exactly `["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ"]`.
 - [ ] `tips_basket_agent` receives `market_load_history_tables_summary`, `market_last_price`, and `alpaca_news`.
 - [ ] `commodity_basket_agent` still receives `alpaca_news`.
 - [ ] `equity_basket_agent` and `nominal_bond_basket_agent` tool surfaces are unchanged.
