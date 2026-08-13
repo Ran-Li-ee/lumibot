@@ -431,6 +431,43 @@ def test_commodity_basket_prompt_is_rank_first_and_category_neutral():
         assert forbidden_phrase not in prompt
 
 
+def test_tips_basket_prompt_is_rank_first_defensive_and_duration_aware():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    prompt = created["tips_basket_agent"]["system_prompt"].lower()
+    for required_phrase in (
+        "computed ranking evidence",
+        "primary selection evidence",
+        "inflation-protected defensive exposure",
+        "protects purchasing power",
+        "controlling drawdown",
+        "interest-rate sensitivity",
+        "short-duration tips",
+        "full-curve tips",
+        "long-duration tips",
+        "not as the default safe choice",
+        "news only as secondary evidence",
+        "generic inflation headlines alone",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "always choose vtip",
+        "always choose stip",
+        "default to ltpz",
+        "long-duration tips are safest",
+        "use news first",
+        "keyword search",
+        "real yield tool",
+        "breakeven inflation tool",
+    ):
+        assert forbidden_phrase not in prompt
+
+
 def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
     _module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -1169,6 +1206,16 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     assert commodity_context["target_weight"] == 0.0
     assert commodity_context["macro_allocation_report"] == macro_report
 
+    tips_context = agent_manager["tips_basket_agent"].calls[0]["context"]
+    assert tips_context["basket_id"] == "tips"
+    assert tips_context["basket_symbols"] == module.BASKET_UNIVERSES["tips"]
+    assert tips_context["macro_allocation_report"] == macro_report
+
+    tips_task = agent_manager["tips_basket_agent"].calls[0]["task_prompt"].lower()
+    assert "computed ranking evidence first" in tips_task
+    assert "news only" in tips_task
+    assert "long-duration candidate" in tips_task
+
     portfolio_context = agent_manager["portfolio_decision_agent"].calls[0]["context"]
     assert portfolio_context["macro_allocation_report"] == macro_report
     assert portfolio_context["equity_basket_report"] == basket_reports["equity_basket_agent"]
@@ -1271,6 +1318,30 @@ def test_basket_task_prompt_requires_candidate_symbols_to_copy_assigned_universe
         "candidate_symbols must copy the assigned basket_symbols exactly; "
         "do not replace it with a shortlist"
     ) in prompt
+
+
+def test_tips_basket_task_prompt_is_rank_first_and_news_secondary():
+    module, _strategy_class = load_strategy_module()
+
+    prompt = module.basket_agent_task_prompt("tips").lower()
+
+    for required_phrase in (
+        "for tips",
+        "computed ranking evidence first",
+        "rank evidence clearly favors",
+        "select it directly",
+        "news only",
+        "close, conflicting, incomplete, stale",
+        "long-duration candidate",
+        "candidate_symbols must copy the assigned basket_symbols exactly",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "use news first",
+        "always choose",
+        "keyword search",
+    ):
+        assert forbidden_phrase not in prompt
 
 
 def test_on_trading_iteration_blocks_when_portfolio_agent_rewrites_planner_plan():
