@@ -157,6 +157,18 @@ def expected_commodity_universe():
     ]
 
 
+def expected_tips_universe():
+    return [
+        "VTIP",
+        "STIP",
+        "SCHP",
+        "TIP",
+        "SPIP",
+        "LTPZ",
+        "TIPS",
+    ]
+
+
 def load_strategy_module():
     module = importlib.import_module(
         "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant"
@@ -307,7 +319,6 @@ def test_agents_receive_distinct_tool_surfaces():
     assert created_tool_names(created["macro_allocation_agent"]) == {"macro_regime_classifier"}
     for basket_agent in (
         "equity_basket_agent",
-        "tips_basket_agent",
         "nominal_bond_basket_agent",
     ):
         assert created[basket_agent]["include_builtin_tools"] is False
@@ -315,12 +326,16 @@ def test_agents_receive_distinct_tool_surfaces():
             "market_load_history_tables_summary",
             "market_last_price",
         }
-    assert created["commodity_basket_agent"]["include_builtin_tools"] is False
-    assert created_tool_names(created["commodity_basket_agent"]) == {
-        "market_load_history_tables_summary",
-        "market_last_price",
-        "alpaca_news",
-    }
+    for news_enabled_basket_agent in (
+        "commodity_basket_agent",
+        "tips_basket_agent",
+    ):
+        assert created[news_enabled_basket_agent]["include_builtin_tools"] is False
+        assert created_tool_names(created[news_enabled_basket_agent]) == {
+            "market_load_history_tables_summary",
+            "market_last_price",
+            "alpaca_news",
+        }
     assert created_tool_names(created["portfolio_decision_agent"]) == {
         "target_portfolio_to_execution_plan",
     }
@@ -449,10 +464,11 @@ def test_basket_universes_have_expected_symbols():
     assert module.BASKET_UNIVERSES == {
         "equity": ["SPY", "QQQ", "IWM", "EEM", "FXI"],
         "commodity": expected_commodity_universe(),
-        "tips": ["TIP", "SCHP", "VTIP", "STIP", "LTPZ"],
+        "tips": expected_tips_universe(),
         "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
     }
     assert len(module.BASKET_UNIVERSES["commodity"]) == 28
+    assert len(module.BASKET_UNIVERSES["tips"]) == 7
     for symbols in module.BASKET_UNIVERSES.values():
         assert len(symbols) >= 5
         assert len(symbols) == len(set(symbols))
