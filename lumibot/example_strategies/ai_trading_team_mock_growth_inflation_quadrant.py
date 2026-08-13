@@ -87,16 +87,30 @@ def basket_agent_system_prompt(basket_id: str, symbols: str) -> str:
         f"({symbols}). Select one symbol when active, or report inactive when its target weight is zero. "
         "Return basket_id, selected_symbol, status, and reason_brief. Do not place orders."
     )
-    if basket_id != "commodity":
-        return base
-    return (
-        base
-        + " For commodity selection, use computed ranking evidence as the primary selection evidence. "
-        "If one symbol is clearly stronger across ranking evidence, select it without requiring news. "
-        "Use news only when ranking evidence is close, conflicting, incomplete, or stale. "
-        "Do not prefer broad or diversified commodity symbols merely because they look safer. "
-        "Do not prefer or avoid symbols based on ticker-name intuition."
-    )
+    if basket_id == "commodity":
+        return (
+            base
+            + " For commodity selection, use computed ranking evidence as the primary selection evidence. "
+            "If one symbol is clearly stronger across ranking evidence, select it without requiring news. "
+            "Use news only when ranking evidence is close, conflicting, incomplete, or stale. "
+            "Do not prefer broad or diversified commodity symbols merely because they look safer. "
+            "Do not prefer or avoid symbols based on ticker-name intuition."
+        )
+    if basket_id == "tips":
+        return (
+            base
+            + " For TIPS selection, use computed ranking evidence as the primary selection evidence. "
+            "This basket exists to provide inflation-protected defensive exposure, especially when macro allocation "
+            "gives TIPS a positive target weight. Choose the TIPS exposure that best protects purchasing power while "
+            "controlling drawdown and interest-rate sensitivity. Prefer short-duration TIPS exposure when the evidence "
+            "favors stable inflation defense and lower volatility. Use full-curve TIPS exposure when it offers a better "
+            "balance of inflation protection, liquidity, and ranking evidence. Treat long-duration TIPS as a "
+            "higher-volatility real-rate position, not as the default safe choice. Select long-duration TIPS only when "
+            "ranking evidence and supporting context clearly justify taking duration risk. Use news only as secondary "
+            "evidence when ranking evidence is close, conflicting, incomplete, stale, or when long-duration TIPS looks "
+            "unusually attractive. Do not use generic inflation headlines alone to justify long-duration TIPS."
+        )
+    return base
 
 
 def basket_agent_task_prompt(basket_id: str) -> str:
@@ -106,13 +120,20 @@ def basket_agent_task_prompt(basket_id: str) -> str:
         "candidate_symbols must copy the assigned basket_symbols exactly; "
         "do not replace it with a shortlist."
     )
-    if basket_id != "commodity":
-        return base
-    return (
-        base
-        + " For commodity, use computed ranking evidence first. If rank evidence clearly favors one symbol, "
-        "select it directly. Use news only when leading candidates are close, conflicting, or incomplete."
-    )
+    if basket_id == "commodity":
+        return (
+            base
+            + " For commodity, use computed ranking evidence first. If rank evidence clearly favors one symbol, "
+            "select it directly. Use news only when leading candidates are close, conflicting, or incomplete."
+        )
+    if basket_id == "tips":
+        return (
+            base
+            + " For TIPS, use computed ranking evidence first. If rank evidence clearly favors one defensive TIPS "
+            "candidate, select it directly. Use news only when leading candidates are close, conflicting, incomplete, "
+            "stale, or when a long-duration candidate requires confirmation."
+        )
+    return base
 
 
 MOCK_WEIGHT_BY_REGIME = {
