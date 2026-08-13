@@ -59,7 +59,7 @@ BASKET_UNIVERSES = {
         "FTGC",
         "CMDY",
     ],
-    "tips": ["TIP", "SCHP", "VTIP", "STIP", "LTPZ"],
+    "tips": ["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ", "TIPS"],
     "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
 }
 
@@ -76,7 +76,7 @@ def basket_agent_tools(basket_id: str) -> list[ToolDefinition]:
         BuiltinTools.market.load_history_tables_summary(),
         BuiltinTools.market.last_price(),
     ]
-    if basket_id == "commodity":
+    if basket_id in {"commodity", "tips"}:
         tools.append(BuiltinTools.news.alpaca_news())
     return tools
 
