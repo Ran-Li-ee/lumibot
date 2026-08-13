@@ -291,10 +291,21 @@ def _computed_history_summary(raw_summary: Any) -> str:
 def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -> str:
     result = _as_dict(raw_result)
     count = len(_collection(raw_result, "universe_summary"))
-    parts = [f"Loaded market history summaries for {_rows_label(count, 'symbol')}"]
+    parts = [
+        f"Loaded market history summaries for {_rows_label(count, 'symbol')}",
+        f"{_rows_label(count, 'detailed symbol')} retained",
+    ]
     requested_symbols = args.get("symbols")
     if isinstance(requested_symbols, list):
         parts.append(f"{_rows_label(len(requested_symbols), 'requested symbol')}")
+    ranking_limit = result.get("ranking_limit")
+    if isinstance(ranking_limit, int):
+        parts.append(f"rankings capped at top {ranking_limit}")
+    selection = _as_dict(result.get("universe_summary_selection"))
+    candidate_count = selection.get("candidate_count_before_limit")
+    summary_limit = result.get("universe_summary_limit")
+    if isinstance(candidate_count, int) and isinstance(summary_limit, int):
+        parts.append(f"{candidate_count} ranked candidates before the {summary_limit}-symbol detail limit")
 
     rankings = _as_dict(result.get("rankings"))
     for label, key in (

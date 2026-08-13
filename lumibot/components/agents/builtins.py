@@ -1173,6 +1173,8 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
             "This summary-first tool returns factual rankings, including by_composite_score, plus recent returns, "
             "moving averages, trend alignment, drawdown, volatility, volume context, and range position "
             "for the requested universe. "
+            "Each ranking list is capped at the top 10 symbols, and detailed universe_summary rows are limited "
+            "to a top-ranked candidate subset of at most 15 symbols while the full requested symbols list remains visible. "
             "Prefer this tool before writing DuckDB SQL for common universe ranking. "
             "Caveat: this only loads bars visible at the current LumiBot runtime datetime. "
             "Example: market_load_history_tables_summary("

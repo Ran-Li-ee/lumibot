@@ -130,6 +130,32 @@ def test_market_load_history_tables_summary_formatter_shows_rankings_and_warning
     assert "1 warning" in text
 
 
+def test_market_load_history_tables_summary_formatter_explains_limited_summary_rows():
+    text = explain_tool_result(
+        "market_load_history_tables_summary",
+        {"symbols": [f"S{i:02d}" for i in range(1, 29)]},
+        {
+            "ranking_limit": 10,
+            "universe_summary_limit": 15,
+            "universe_summary": [{"symbol": f"S{i:02d}"} for i in range(1, 16)],
+            "rankings": {
+                "by_return_63": [f"S{i:02d}" for i in range(1, 11)],
+                "by_momentum_composite": [f"S{i:02d}" for i in range(11, 21)],
+                "by_composite_score": [f"S{i:02d}" for i in range(1, 11)],
+            },
+            "universe_summary_selection": {
+                "candidate_count_before_limit": 20,
+            },
+        },
+        None,
+    )
+
+    assert "15 detailed symbols" in text
+    assert "28 requested symbols" in text
+    assert "rankings capped at top 10" in text
+    assert "20 ranked candidates before the 15-symbol detail limit" in text
+
+
 def test_market_load_history_tables_summary_formatter_counts_empty_summary_rows():
     text = explain_tool_result(
         "market_load_history_tables_summary",
