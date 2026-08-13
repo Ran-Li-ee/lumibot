@@ -124,6 +124,39 @@ def created_tool_names(created_agent):
     return {getattr(tool, "name", "") for tool in created_agent.get("tools", [])}
 
 
+def expected_commodity_universe():
+    return [
+        "GLD",
+        "IAU",
+        "SLV",
+        "CPER",
+        "WEAT",
+        "CORN",
+        "SOYB",
+        "CANE",
+        "PPLT",
+        "PALL",
+        "DBB",
+        "USO",
+        "BNO",
+        "UNG",
+        "UGA",
+        "DBE",
+        "DBO",
+        "DBA",
+        "PDBA",
+        "TAGS",
+        "TILL",
+        "DBC",
+        "PDBC",
+        "BCI",
+        "GSG",
+        "COMT",
+        "FTGC",
+        "CMDY",
+    ]
+
+
 def load_strategy_module():
     module = importlib.import_module(
         "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant"
@@ -274,7 +307,6 @@ def test_agents_receive_distinct_tool_surfaces():
     assert created_tool_names(created["macro_allocation_agent"]) == {"macro_regime_classifier"}
     for basket_agent in (
         "equity_basket_agent",
-        "commodity_basket_agent",
         "tips_basket_agent",
         "nominal_bond_basket_agent",
     ):
@@ -283,6 +315,12 @@ def test_agents_receive_distinct_tool_surfaces():
             "market_load_history_tables_summary",
             "market_last_price",
         }
+    assert created["commodity_basket_agent"]["include_builtin_tools"] is False
+    assert created_tool_names(created["commodity_basket_agent"]) == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+        "alpaca_news",
+    }
     assert created_tool_names(created["portfolio_decision_agent"]) == {
         "target_portfolio_to_execution_plan",
     }
@@ -344,6 +382,40 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "do not research, change fields, reorder orders, split orders, or repair the plan" in serialized
 
 
+def test_commodity_basket_prompt_is_rank_first_and_category_neutral():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    prompt = created["commodity_basket_agent"]["system_prompt"].lower()
+    for required_phrase in (
+        "computed ranking evidence",
+        "primary selection evidence",
+        "clearly stronger",
+        "without requiring news",
+        "only when",
+        "ranking evidence is close",
+        "do not prefer broad",
+        "ticker-name intuition",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "default to diversified",
+        "prefer broad commodity etf",
+        "prefer diversified commodity",
+        "broad commodity etfs are safer",
+        "gold is a default",
+        "avoid energy",
+        "single commodities are too risky",
+        "choose pdbc when uncertain",
+        "choose dbc when uncertain",
+    ):
+        assert forbidden_phrase not in prompt
+
+
 def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
     _module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -371,15 +443,16 @@ def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
         assert forbidden_phrase not in portfolio_prompt
 
 
-def test_basket_universes_have_at_least_five_semantically_valid_symbols():
+def test_basket_universes_have_expected_symbols():
     module, _strategy_class = load_strategy_module()
 
     assert module.BASKET_UNIVERSES == {
         "equity": ["SPY", "QQQ", "IWM", "EEM", "FXI"],
-        "commodity": ["GLD", "SLV", "DBC", "PDBC", "GSG"],
+        "commodity": expected_commodity_universe(),
         "tips": ["TIP", "SCHP", "VTIP", "STIP", "LTPZ"],
         "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
     }
+    assert len(module.BASKET_UNIVERSES["commodity"]) == 28
     for symbols in module.BASKET_UNIVERSES.values():
         assert len(symbols) >= 5
         assert len(symbols) == len(set(symbols))
@@ -1115,6 +1188,62 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
         execution_context["execution_plan"]
     )
     assert blocker is None
+
+
+def test_commodity_basket_task_prompt_mentions_rank_first_selection():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+
+    macro_report = {
+        "basket_weights": {"equity": 0.0, "commodity": 1.0, "tips": 0.0, "nominal_bond": 0.0},
+    }
+    basket_reports = {
+        "equity_basket_agent": {
+            "basket_id": "equity",
+            "target_weight": 0.0,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["equity"],
+            "selected_symbol": None,
+        },
+        "commodity_basket_agent": {
+            "basket_id": "commodity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["commodity"],
+            "selected_symbol": "CPER",
+        },
+        "tips_basket_agent": {
+            "basket_id": "tips",
+            "target_weight": 0.0,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["tips"],
+            "selected_symbol": None,
+        },
+        "nominal_bond_basket_agent": {
+            "basket_id": "nominal_bond",
+            "target_weight": 0.0,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["nominal_bond"],
+            "selected_symbol": None,
+        },
+    }
+    execution_plan = {"schema_version": 1, "intent": "hold", "orders": []}
+
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    for agent_name, report in basket_reports.items():
+        agent_manager.summaries[agent_name] = _json_summary(report)
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary({"execution_plan": execution_plan})
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": execution_plan}
+
+    strategy.on_trading_iteration()
+
+    commodity_task = agent_manager["commodity_basket_agent"].calls[0]["task_prompt"].lower()
+    assert "computed ranking evidence" in commodity_task
+    assert "news only" in commodity_task
+    assert "close, conflicting, or incomplete" in commodity_task
 
 
 def test_on_trading_iteration_blocks_when_portfolio_agent_rewrites_planner_plan():

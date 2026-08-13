@@ -29,7 +29,36 @@ REGIMES = (
 
 BASKET_UNIVERSES = {
     "equity": ["SPY", "QQQ", "IWM", "EEM", "FXI"],
-    "commodity": ["GLD", "SLV", "DBC", "PDBC", "GSG"],
+    "commodity": [
+        "GLD",
+        "IAU",
+        "SLV",
+        "CPER",
+        "WEAT",
+        "CORN",
+        "SOYB",
+        "CANE",
+        "PPLT",
+        "PALL",
+        "DBB",
+        "USO",
+        "BNO",
+        "UNG",
+        "UGA",
+        "DBE",
+        "DBO",
+        "DBA",
+        "PDBA",
+        "TAGS",
+        "TILL",
+        "DBC",
+        "PDBC",
+        "BCI",
+        "GSG",
+        "COMT",
+        "FTGC",
+        "CMDY",
+    ],
     "tips": ["TIP", "SCHP", "VTIP", "STIP", "LTPZ"],
     "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
 }
@@ -40,6 +69,49 @@ BASKET_AGENT_NAMES = {
     "tips": "tips_basket_agent",
     "nominal_bond": "nominal_bond_basket_agent",
 }
+
+
+def basket_agent_tools(basket_id: str) -> list[ToolDefinition]:
+    tools = [
+        BuiltinTools.market.load_history_tables_summary(),
+        BuiltinTools.market.last_price(),
+    ]
+    if basket_id == "commodity":
+        tools.append(BuiltinTools.news.alpaca_news())
+    return tools
+
+
+def basket_agent_system_prompt(basket_id: str, symbols: str) -> str:
+    base = (
+        f"{basket_id.replace('_', ' ').title()} basket role: stay inside the assigned basket "
+        f"({symbols}). Select one symbol when active, or report inactive when its target weight is zero. "
+        "Return basket_id, selected_symbol, status, and reason_brief. Do not place orders."
+    )
+    if basket_id != "commodity":
+        return base
+    return (
+        base
+        + " For commodity selection, use computed ranking evidence as the primary selection evidence. "
+        "If one symbol is clearly stronger across ranking evidence, select it without requiring news. "
+        "Use news only when ranking evidence is close, conflicting, incomplete, or stale. "
+        "Do not prefer broad or diversified commodity symbols merely because they look safer. "
+        "Do not prefer or avoid symbols based on ticker-name intuition."
+    )
+
+
+def basket_agent_task_prompt(basket_id: str) -> str:
+    base = (
+        "Review only the assigned basket and return one JSON object with basket_id, "
+        "target_weight, status, candidate_symbols, selected_symbol, and reason_brief."
+    )
+    if basket_id != "commodity":
+        return base
+    return (
+        base
+        + " For commodity, use computed ranking evidence first. If rank evidence clearly favors one symbol, "
+        "select it directly. Use news only when leading candidates are close, conflicting, or incomplete."
+    )
+
 
 MOCK_WEIGHT_BY_REGIME = {
     "growth_up_inflation_down": {
@@ -486,15 +558,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
                 model=model,
                 allow_trading=False,
                 include_builtin_tools=False,
-                tools=[
-                    BuiltinTools.market.load_history_tables_summary(),
-                    BuiltinTools.market.last_price(),
-                ],
-                system_prompt=(
-                    f"{basket_id.replace('_', ' ').title()} basket role: stay inside the assigned basket "
-                    f"({symbols}). Select one symbol when active, or report inactive when its target weight is "
-                    "zero. Return basket_id, selected_symbol, status, and reason_brief. Do not place orders."
-                ),
+                tools=basket_agent_tools(basket_id),
+                system_prompt=basket_agent_system_prompt(basket_id, symbols),
             )
 
         self.agents.create(
@@ -560,10 +625,7 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             basket_weights = _require_dict(macro_report.get("basket_weights", {}), "macro basket_weights")
             for basket_id, agent_name in BASKET_AGENT_NAMES.items():
                 basket_result = self.agents[agent_name].run(
-                    task_prompt=(
-                        "Review only the assigned basket and return one JSON object with basket_id, "
-                        "target_weight, status, candidate_symbols, selected_symbol, and reason_brief."
-                    ),
+                    task_prompt=basket_agent_task_prompt(basket_id),
                     context={
                         "date": current_date,
                         "basket_id": basket_id,
