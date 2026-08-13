@@ -102,7 +102,9 @@ def basket_agent_system_prompt(basket_id: str, symbols: str) -> str:
 def basket_agent_task_prompt(basket_id: str) -> str:
     base = (
         "Review only the assigned basket and return one JSON object with basket_id, "
-        "target_weight, status, candidate_symbols, selected_symbol, and reason_brief."
+        "target_weight, status, candidate_symbols, selected_symbol, and reason_brief. "
+        "candidate_symbols must copy the assigned basket_symbols exactly; "
+        "do not replace it with a shortlist."
     )
     if basket_id != "commodity":
         return base

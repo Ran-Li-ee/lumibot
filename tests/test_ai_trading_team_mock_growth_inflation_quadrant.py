@@ -1246,6 +1246,17 @@ def test_commodity_basket_task_prompt_mentions_rank_first_selection():
     assert "close, conflicting, or incomplete" in commodity_task
 
 
+def test_basket_task_prompt_requires_candidate_symbols_to_copy_assigned_universe():
+    module, _strategy_class = load_strategy_module()
+
+    prompt = module.basket_agent_task_prompt("equity").lower()
+
+    assert (
+        "candidate_symbols must copy the assigned basket_symbols exactly; "
+        "do not replace it with a shortlist"
+    ) in prompt
+
+
 def test_on_trading_iteration_blocks_when_portfolio_agent_rewrites_planner_plan():
     module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
