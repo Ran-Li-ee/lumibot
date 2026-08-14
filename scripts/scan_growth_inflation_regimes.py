@@ -33,6 +33,12 @@ DEFAULT_TREND_YEARS = 5
 DAILY_COLUMNS = (
     "date",
     "status",
+    "mode",
+    "as_of",
+    "requested_as_of",
+    "effective_as_of",
+    "lookahead_clamped",
+    "as_of_policy",
     "regime",
     "growth_direction",
     "inflation_direction",
@@ -46,11 +52,25 @@ DAILY_COLUMNS = (
     "growth_trend_value",
     "growth_margin",
     "growth_latest_observation_date",
+    "growth_comparison_observation_date",
+    "growth_as_of",
+    "growth_latest_realtime_start",
+    "growth_latest_realtime_end",
+    "growth_comparison_realtime_start",
+    "growth_comparison_realtime_end",
+    "growth_observation_lag_days",
     "growth_data_cutoff",
     "inflation_metric_value",
     "inflation_trend_value",
     "inflation_margin",
     "inflation_latest_observation_date",
+    "inflation_comparison_observation_date",
+    "inflation_as_of",
+    "inflation_latest_realtime_start",
+    "inflation_latest_realtime_end",
+    "inflation_comparison_realtime_start",
+    "inflation_comparison_realtime_end",
+    "inflation_observation_lag_days",
     "inflation_data_cutoff",
     "confidence_level",
     "reason_brief",
@@ -301,6 +321,10 @@ def _nested_get(value: Any, *keys: str) -> Any:
     return current
 
 
+def _blank_if_none(value: Any) -> Any:
+    return "" if value is None else value
+
+
 def _weight(result: dict[str, Any], key: str) -> Any:
     return _nested_get(result, "basket_weights", key)
 
@@ -326,6 +350,12 @@ def flatten_classifier_result(
         {
             "date": scan_date.isoformat(),
             "status": status,
+            "mode": result.get("mode") or "",
+            "as_of": result.get("as_of") or "",
+            "requested_as_of": result.get("requested_as_of") or "",
+            "effective_as_of": result.get("effective_as_of") or "",
+            "lookahead_clamped": _blank_if_none(result.get("lookahead_clamped")),
+            "as_of_policy": result.get("as_of_policy") or "",
             "previous_passed_regime": previous_regime,
             "regime_changed": False,
         }
@@ -355,7 +385,26 @@ def flatten_classifier_result(
                 "growth_evidence",
                 "latest_observation_date",
             ),
-            "growth_data_cutoff": _nested_get(result, "growth_evidence", "data_cutoff"),
+            "growth_comparison_observation_date": _blank_if_none(
+                _nested_get(result, "growth_evidence", "comparison_observation_date")
+            ),
+            "growth_as_of": _blank_if_none(_nested_get(result, "growth_evidence", "as_of")),
+            "growth_latest_realtime_start": _blank_if_none(
+                _nested_get(result, "growth_evidence", "latest_realtime_start")
+            ),
+            "growth_latest_realtime_end": _blank_if_none(
+                _nested_get(result, "growth_evidence", "latest_realtime_end")
+            ),
+            "growth_comparison_realtime_start": _blank_if_none(
+                _nested_get(result, "growth_evidence", "comparison_realtime_start")
+            ),
+            "growth_comparison_realtime_end": _blank_if_none(
+                _nested_get(result, "growth_evidence", "comparison_realtime_end")
+            ),
+            "growth_observation_lag_days": _blank_if_none(
+                _nested_get(result, "growth_evidence", "observation_lag_days")
+            ),
+            "growth_data_cutoff": _blank_if_none(_nested_get(result, "growth_evidence", "data_cutoff")),
             "inflation_metric_value": _nested_get(result, "inflation_evidence", "metric_value"),
             "inflation_trend_value": _nested_get(result, "inflation_evidence", "trend_value"),
             "inflation_margin": _nested_get(result, "inflation_evidence", "margin"),
@@ -364,7 +413,26 @@ def flatten_classifier_result(
                 "inflation_evidence",
                 "latest_observation_date",
             ),
-            "inflation_data_cutoff": _nested_get(result, "inflation_evidence", "data_cutoff"),
+            "inflation_comparison_observation_date": _blank_if_none(
+                _nested_get(result, "inflation_evidence", "comparison_observation_date")
+            ),
+            "inflation_as_of": _blank_if_none(_nested_get(result, "inflation_evidence", "as_of")),
+            "inflation_latest_realtime_start": _blank_if_none(
+                _nested_get(result, "inflation_evidence", "latest_realtime_start")
+            ),
+            "inflation_latest_realtime_end": _blank_if_none(
+                _nested_get(result, "inflation_evidence", "latest_realtime_end")
+            ),
+            "inflation_comparison_realtime_start": _blank_if_none(
+                _nested_get(result, "inflation_evidence", "comparison_realtime_start")
+            ),
+            "inflation_comparison_realtime_end": _blank_if_none(
+                _nested_get(result, "inflation_evidence", "comparison_realtime_end")
+            ),
+            "inflation_observation_lag_days": _blank_if_none(
+                _nested_get(result, "inflation_evidence", "observation_lag_days")
+            ),
+            "inflation_data_cutoff": _blank_if_none(_nested_get(result, "inflation_evidence", "data_cutoff")),
             "confidence_level": _nested_get(result, "confidence", "level") or "",
             "reason_brief": result.get("reason_brief") or "",
         }

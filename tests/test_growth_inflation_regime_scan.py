@@ -42,14 +42,26 @@ def passed_result(
             "trend_value": 0.026,
             "margin": 0.005,
             "latest_observation_date": "2024-01-01",
-            "data_cutoff": "2024-03-05",
+            "comparison_observation_date": "2023-01-01",
+            "as_of": "2024-09-05",
+            "latest_realtime_start": "2024-09-05",
+            "latest_realtime_end": "2024-09-05",
+            "comparison_realtime_start": "2024-09-05",
+            "comparison_realtime_end": "2024-09-05",
+            "observation_lag_days": 248,
         },
         "inflation_evidence": {
             "metric_value": 0.021,
             "trend_value": 0.024,
             "margin": -0.003,
             "latest_observation_date": "2024-08-01",
-            "data_cutoff": "2024-08-05",
+            "comparison_observation_date": "2023-08-01",
+            "as_of": "2024-09-05",
+            "latest_realtime_start": "2024-09-05",
+            "latest_realtime_end": "2024-09-05",
+            "comparison_realtime_start": "2024-09-05",
+            "comparison_realtime_end": "2024-09-05",
+            "observation_lag_days": 35,
         },
         "data_quality": {
             "as_of_policy": "same_day_vintage",
@@ -329,6 +341,12 @@ def test_flatten_classifier_result_preserves_success_evidence():
     assert row["date"] == "2024-09-05"
     assert row["status"] == "passed"
     assert row["regime"] == "growth_up_inflation_down"
+    assert row["mode"] == "fred_ra_vintage_asof"
+    assert row["as_of"] == "2024-09-05"
+    assert row["requested_as_of"] == "2024-09-05"
+    assert row["effective_as_of"] == "2024-09-05"
+    assert row["lookahead_clamped"] is False
+    assert row["as_of_policy"] == "same_day_vintage"
     assert row["growth_direction"] == "up"
     assert row["inflation_direction"] == "down"
     assert row["equity_weight"] == 0.5
@@ -341,12 +359,26 @@ def test_flatten_classifier_result_preserves_success_evidence():
     assert row["growth_trend_value"] == 0.026
     assert row["growth_margin"] == 0.005
     assert row["growth_latest_observation_date"] == "2024-01-01"
-    assert row["growth_data_cutoff"] == "2024-03-05"
+    assert row["growth_comparison_observation_date"] == "2023-01-01"
+    assert row["growth_as_of"] == "2024-09-05"
+    assert row["growth_latest_realtime_start"] == "2024-09-05"
+    assert row["growth_latest_realtime_end"] == "2024-09-05"
+    assert row["growth_comparison_realtime_start"] == "2024-09-05"
+    assert row["growth_comparison_realtime_end"] == "2024-09-05"
+    assert row["growth_observation_lag_days"] == 248
+    assert row["growth_data_cutoff"] == ""
     assert row["inflation_metric_value"] == 0.021
     assert row["inflation_trend_value"] == 0.024
     assert row["inflation_margin"] == -0.003
     assert row["inflation_latest_observation_date"] == "2024-08-01"
-    assert row["inflation_data_cutoff"] == "2024-08-05"
+    assert row["inflation_comparison_observation_date"] == "2023-08-01"
+    assert row["inflation_as_of"] == "2024-09-05"
+    assert row["inflation_latest_realtime_start"] == "2024-09-05"
+    assert row["inflation_latest_realtime_end"] == "2024-09-05"
+    assert row["inflation_comparison_realtime_start"] == "2024-09-05"
+    assert row["inflation_comparison_realtime_end"] == "2024-09-05"
+    assert row["inflation_observation_lag_days"] == 35
+    assert row["inflation_data_cutoff"] == ""
     assert row["confidence_level"] == "medium"
     assert row["reason_brief"] == "classifier reason"
     assert row["error_reason"] == ""
