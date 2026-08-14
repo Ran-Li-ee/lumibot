@@ -190,6 +190,32 @@ def _macro_tool_result(payload):
     return ("macro_regime_classifier", payload)
 
 
+def _real_macro_evidence(module, *, axis, series_id, direction, lag_months, frequency):
+    return {
+        "axis": axis,
+        "series_id": series_id,
+        "series_name": (
+            "Real Gross Domestic Product"
+            if axis == "growth"
+            else "Consumer Price Index for All Urban Consumers"
+        ),
+        "frequency": frequency,
+        "lag_months": lag_months,
+        "data_cutoff": "2024-03-05" if axis == "growth" else "2024-08-05",
+        "latest_observation_date": "2024-01-01" if axis == "growth" else "2024-08-01",
+        "comparison_observation_date": "2023-01-01" if axis == "growth" else "2023-08-01",
+        "latest_value": 170.0 if axis == "growth" else 175.0,
+        "comparison_value": 120.0 if axis == "growth" else 165.0,
+        "metric_name": "year_over_year_change",
+        "metric_value": 0.41666666666666674 if axis == "growth" else 0.06060606060606055,
+        "trend_years": module.DEFAULT_TREND_YEARS,
+        "trend_window_observations": 20 if axis == "growth" else 60,
+        "trend_value": 0.12 if axis == "growth" else 0.08,
+        "margin": 0.29666666666666675 if axis == "growth" else -0.01939393939393945,
+        "direction": direction,
+    }
+
+
 def _passed_real_macro_report(module, *, regime="growth_up_inflation_down", reason_brief="real macro"):
     return {
         "status": "passed",
@@ -199,19 +225,23 @@ def _passed_real_macro_report(module, *, regime="growth_up_inflation_down", reas
         "date": "2024-09-05",
         "as_of": "2024-09-05",
         "regime": regime,
-        "basket_weights": {"equity": 0.50, "commodity": 0.25, "tips": 0.00, "nominal_bond": 0.25},
-        "growth_evidence": {
-            "series_id": module.DEFAULT_GROWTH_SERIES_ID,
-            "direction": "up",
-            "lag_months": module.DEFAULT_GROWTH_LAG_MONTHS,
-            "trend_years": module.DEFAULT_TREND_YEARS,
-        },
-        "inflation_evidence": {
-            "series_id": module.DEFAULT_INFLATION_SERIES_ID,
-            "direction": "down",
-            "lag_months": module.DEFAULT_INFLATION_LAG_MONTHS,
-            "trend_years": module.DEFAULT_TREND_YEARS,
-        },
+        "basket_weights": dict(module.WEIGHT_BY_REGIME[regime]),
+        "growth_evidence": _real_macro_evidence(
+            module,
+            axis="growth",
+            series_id=module.DEFAULT_GROWTH_SERIES_ID,
+            direction="up",
+            lag_months=module.DEFAULT_GROWTH_LAG_MONTHS,
+            frequency="quarterly",
+        ),
+        "inflation_evidence": _real_macro_evidence(
+            module,
+            axis="inflation",
+            series_id=module.DEFAULT_INFLATION_SERIES_ID,
+            direction="down",
+            lag_months=module.DEFAULT_INFLATION_LAG_MONTHS,
+            frequency="monthly",
+        ),
         "data_quality": {
             "status": "passed",
             "source": "fred_api",
@@ -682,43 +712,79 @@ def test_real_strategy_blocks_incomplete_passed_classifier_payloads_before_downs
     assert expected_reason in blocked_log
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("unknown_regime", "regime"),
+        ("extra_basket_key", "basket_weights"),
+        ("wrong_regime_weights", "basket_weights"),
+        ("missing_evidence_direction", "direction"),
+        ("missing_evidence_metric_value", "metric_value"),
+    ],
+)
+def test_real_strategy_blocks_noncanonical_classifier_regime_weights_and_evidence_before_downstream(
+    mutation,
+    expected_reason,
+    capsys,
+):
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    existing_regime = "growth_down_inflation_up"
+    strategy._last_real_regime = existing_regime
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}
+    }
+    strategy._last_execution_plan_error = "stale execution error"
+    macro_report = _passed_real_macro_report(module, regime="growth_up_inflation_down")
+    if mutation == "unknown_regime":
+        macro_report["regime"] = "growth_flat_inflation_down"
+    elif mutation == "extra_basket_key":
+        macro_report["basket_weights"]["crypto"] = 0.0
+    elif mutation == "wrong_regime_weights":
+        macro_report["basket_weights"] = {
+            "equity": 0.25,
+            "commodity": 0.50,
+            "tips": 0.25,
+            "nominal_bond": 0.00,
+        }
+    elif mutation == "missing_evidence_direction":
+        del macro_report["growth_evidence"]["direction"]
+    elif mutation == "missing_evidence_metric_value":
+        del macro_report["growth_evidence"]["metric_value"]
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary({"status": "passed"})
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(macro_report)]
+    _install_hold_downstream_summaries(agent_manager, module)
+
+    strategy.on_trading_iteration()
+
+    assert len(agent_manager["macro_allocation_agent"].calls) == 1
+    for agent_name in module.BASKET_AGENT_NAMES.values():
+        assert agent_manager[agent_name].calls == []
+    assert agent_manager["portfolio_decision_agent"].calls == []
+    assert agent_manager["execution_agent"].calls == []
+    assert strategy._last_real_regime == existing_regime
+    assert strategy._last_macro_regime_error["status"] == "failed"
+    assert "non-canonical" in strategy._last_macro_regime_error["reason"]
+    assert expected_reason in strategy._last_macro_regime_error["reason"]
+    assert strategy._last_execution_plan_error is None
+    assert strategy._last_target_portfolio_planner_result is None
+    blocked_log = capsys.readouterr().out
+    assert "Real quadrant macro workflow blocked" in blocked_log
+    assert expected_reason in blocked_log
+
+
 def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
     module, strategy_class = load_real_strategy_module()
     agent_manager = RecordingAgentManager()
     strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
     strategy.initialize()
 
-    macro_report = {
-        "status": "passed",
-        "tool": "macro_regime_classifier",
-        "mock": False,
-        "mode": module.DEFAULT_MODE,
-        "date": "2024-09-05",
-        "as_of": "2024-09-05",
-        "regime": "growth_up_inflation_down",
-        "basket_weights": {"equity": 0.50, "commodity": 0.25, "tips": 0.00, "nominal_bond": 0.25},
-        "growth_evidence": {
-            "series_id": module.DEFAULT_GROWTH_SERIES_ID,
-            "direction": "up",
-            "lag_months": module.DEFAULT_GROWTH_LAG_MONTHS,
-            "trend_years": module.DEFAULT_TREND_YEARS,
-        },
-        "inflation_evidence": {
-            "series_id": module.DEFAULT_INFLATION_SERIES_ID,
-            "direction": "down",
-            "lag_months": module.DEFAULT_INFLATION_LAG_MONTHS,
-            "trend_years": module.DEFAULT_TREND_YEARS,
-        },
-        "data_quality": {
-            "status": "passed",
-            "source": "fred_api",
-            "point_in_time_safe": True,
-            "uses_revised_data": False,
-            "required_series": [module.DEFAULT_GROWTH_SERIES_ID, module.DEFAULT_INFLATION_SERIES_ID],
-        },
-        "confidence": {"growth_margin": 0.01, "inflation_margin": 0.02},
-        "reason_brief": "real macro",
-    }
+    macro_report = _passed_real_macro_report(module, regime="growth_up_inflation_down")
     basket_reports = {
         "equity_basket_agent": {
             "basket_id": "equity",

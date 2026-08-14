@@ -1,3 +1,4 @@
+import math
 import os
 from numbers import Real
 from typing import Any
@@ -14,6 +15,8 @@ from lumibot.example_strategies.fred_growth_inflation_regime_classifier import (
     DEFAULT_INFLATION_SERIES_ID,
     DEFAULT_MODE,
     DEFAULT_TREND_YEARS,
+    REGIMES,
+    WEIGHT_BY_REGIME,
     make_real_macro_regime_classifier_tool,
 )
 
@@ -143,22 +146,44 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             return "configured/default parameters mismatch: mode must match the strategy configuration."
 
         regime = macro_report.get("regime")
-        if not isinstance(regime, str) or not regime.strip():
-            return "regime must be a non-empty string."
+        if regime not in REGIMES:
+            return f"regime must be one of the classifier regimes: {REGIMES}."
 
         if not isinstance(basket_weights, dict):
             return "basket_weights must be an object with all expected basket keys."
-        expected_basket_keys = tuple(BASKET_AGENT_NAMES.keys())
-        missing_basket_keys = [key for key in expected_basket_keys if key not in basket_weights]
-        if missing_basket_keys:
-            return f"basket_weights missing expected basket keys: {missing_basket_keys}."
+        expected_weights = WEIGHT_BY_REGIME[regime]
+        expected_basket_keys = set(expected_weights)
+        strategy_basket_keys = set(BASKET_AGENT_NAMES.keys())
+        if expected_basket_keys != strategy_basket_keys:
+            return (
+                "classifier basket_weights keys must match strategy basket keys; "
+                f"classifier={sorted(expected_basket_keys)}, strategy={sorted(strategy_basket_keys)}."
+            )
+        actual_basket_keys = set(basket_weights)
+        if actual_basket_keys != expected_basket_keys:
+            missing_basket_keys = sorted(expected_basket_keys - actual_basket_keys)
+            extra_basket_keys = sorted(actual_basket_keys - expected_basket_keys)
+            return (
+                "basket_weights keys must exactly match expected basket keys; "
+                f"missing={missing_basket_keys}, extra={extra_basket_keys}."
+            )
         non_numeric_weight_keys = [
             key
             for key, value in basket_weights.items()
-            if isinstance(value, bool) or not isinstance(value, Real)
+            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value))
         ]
         if non_numeric_weight_keys:
-            return f"basket_weights values must be numeric: {non_numeric_weight_keys}."
+            return f"basket_weights values must be finite numeric values: {non_numeric_weight_keys}."
+        mismatched_weight_keys = [
+            key
+            for key, expected_value in expected_weights.items()
+            if abs(float(basket_weights[key]) - float(expected_value)) > REAL_MACRO_BASKET_WEIGHT_TOLERANCE
+        ]
+        if mismatched_weight_keys:
+            return (
+                f"basket_weights must match classifier weights for regime {regime!r}; "
+                f"mismatched={mismatched_weight_keys}."
+            )
         total_weight = sum(float(value) for value in basket_weights.values())
         if abs(total_weight - 1.0) > REAL_MACRO_BASKET_WEIGHT_TOLERANCE:
             return f"basket_weights total must be approximately 1.0; got {total_weight:.12g}."
@@ -205,14 +230,53 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
         series_id: str,
         lag_months: int,
     ) -> str | None:
+        if evidence.get("axis") != axis:
+            return f"axis must be {axis!r}."
         if evidence.get("series_id") != series_id:
             return f"series_id must be {series_id!r}."
         if evidence.get("lag_months") != lag_months:
             return f"lag_months must be {lag_months}."
         if evidence.get("trend_years") != self._trend_years:
             return f"trend_years must be {self._trend_years}."
-        if "axis" in evidence and evidence.get("axis") != axis:
-            return f"axis must be {axis!r} when present."
+        required_string_fields = (
+            "series_name",
+            "frequency",
+            "data_cutoff",
+            "latest_observation_date",
+            "comparison_observation_date",
+            "metric_name",
+            "direction",
+        )
+        missing_string_fields = [
+            field
+            for field in required_string_fields
+            if not isinstance(evidence.get(field), str) or not evidence.get(field).strip()
+        ]
+        if missing_string_fields:
+            return f"must include non-empty string fields: {missing_string_fields}."
+        if evidence.get("direction") not in {"up", "down"}:
+            return "direction must be 'up' or 'down'."
+        required_numeric_fields = (
+            "latest_value",
+            "comparison_value",
+            "metric_value",
+            "trend_window_observations",
+            "trend_value",
+            "margin",
+        )
+        non_numeric_fields = [
+            field
+            for field in required_numeric_fields
+            if (
+                isinstance(evidence.get(field), bool)
+                or not isinstance(evidence.get(field), Real)
+                or not math.isfinite(float(evidence.get(field)))
+            )
+        ]
+        if non_numeric_fields:
+            return f"must include finite numeric fields: {non_numeric_fields}."
+        if float(evidence["trend_window_observations"]) <= 0:
+            return "trend_window_observations must be > 0."
         return None
 
     def _commit_accepted_real_regime_if_canonical(
