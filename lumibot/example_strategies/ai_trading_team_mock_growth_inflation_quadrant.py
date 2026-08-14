@@ -664,6 +664,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
                 "Do not manually execute individual orders. "
                 "Do not call lower-level order, account, open-order, or price tools when execution_plan_execute "
                 "is available. Do not research, change fields, reorder orders, split orders, or repair the plan. "
+                "execution_plan_execute returns a concise execution summary for your final answer; "
+                "full audit details are recorded in trace/replay for developer inspection. "
                 "If the tool returns plan_status=completed, summarize completed orders. If it returns "
                 "plan_status=blocked or invalid, summarize where execution stopped and why."
             ),
@@ -738,7 +740,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
         self.agents["execution_agent"].run(
             task_prompt=(
                 "Execute the provided execution_plan by calling execution_plan_execute exactly once with the "
-                "complete execution_plan. Summarize the returned plan report. Do not call per-order tools."
+                "complete execution_plan. Use the returned concise execution summary to write the final result. "
+                "Do not infer missing order details beyond the tool response. Do not call per-order tools."
             ),
             context={
                 "date": current_date,

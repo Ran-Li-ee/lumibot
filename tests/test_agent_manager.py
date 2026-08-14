@@ -701,6 +701,8 @@ def test_execution_agent_with_execution_plan_execute_tool_receives_stage_d_polic
     assert "validates the plan" in prompt_lower
     assert "executes each order through readiness check, submission, and confirmation" in prompt_lower
     assert "stops on the first blocker" in prompt_lower
+    assert "concise execution summary" in prompt_lower
+    assert "full audit details" in prompt_lower
     assert "does not research, generate, repair, reorder, optimize, or modify the plan" in prompt_lower
     assert "orders_execute_order executes one explicit execution_plan order end to end" not in prompt_lower
     assert "price/history tool policy" not in prompt_lower

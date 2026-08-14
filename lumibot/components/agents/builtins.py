@@ -49,7 +49,8 @@ ORDERS_EXECUTE_ORDER_DESCRIPTION = (
 EXECUTION_PLAN_EXECUTE_DESCRIPTION = (
     "Execute one complete strict execution_plan in sequence order. "
     "This tool validates the plan, executes each order through readiness checks, submission, and confirmation, "
-    "stops on the first blocker, and returns a complete execution report. "
+    "stops on the first blocker, and returns a concise execution summary to the model while full audit details "
+    "are recorded in trace/replay. "
     "This tool mutates trading state. It does not generate, repair, reorder, optimize, or modify the plan. "
     "Pass the execution_plan exactly as provided by the upstream planner. "
     "If plan_status is blocked or invalid, do not call lower-level tools; summarize where execution stopped and why."

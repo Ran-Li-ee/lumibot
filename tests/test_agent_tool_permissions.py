@@ -904,6 +904,8 @@ def test_builtin_order_tools_expose_execution_plan_execute_definition():
 
     assert tool.name == "execution_plan_execute"
     assert "Execute one complete strict execution_plan" in tool.description
+    assert "concise execution summary" in tool.description
+    assert "full audit details" in tool.description
     assert "mutates trading state" in tool.description
     assert "does not generate, repair, reorder, optimize, or modify the plan" in tool.description
     assert callable(tool.binder)
