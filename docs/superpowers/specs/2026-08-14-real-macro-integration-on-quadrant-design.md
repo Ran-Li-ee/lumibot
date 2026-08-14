@@ -76,6 +76,38 @@ mock-growth-inflation-quadrant
 
 for the quadrant workflow.
 
+## Additional Branch Audit Findings
+
+The real macro branch contains two pieces of work that should be treated as
+first-class migration targets:
+
+1. The real FRED-backed macro regime classifier and real strategy entrypoint.
+2. The no-LLM regime scanner for cheaply inspecting historical quadrant
+   changes before running paid LLM backtests.
+
+The scanner is not optional support code. It is the safest way to choose a
+useful real-regime backtest window and to verify FRED data availability before
+the trading workflow spends model tokens.
+
+The real macro branch also contains downstream helper extraction around names
+such as:
+
+```text
+_create_growth_inflation_downstream_agents
+_run_growth_inflation_downstream_workflow
+_log_growth_inflation_workflow_blocked
+```
+
+Those helper names are useful, but their old implementation must not be copied
+blindly. The current branch has newer basket prompts, expanded universes,
+execution tools, trace behavior, weekly cadence, and execution audit handling.
+Any shared helper extraction must therefore be recreated from the current
+branch's latest mock strategy logic.
+
+No other hidden feature work was found on the real macro branch that should
+override current branch behavior. The newer basket, execution, UI, trace, and
+weekly cadence work should remain authoritative.
+
 ## Design Decision
 
 Use the current latest branch as the integration base.
@@ -114,6 +146,10 @@ This integration must not:
 - Add new macro data series beyond the already-developed real classifier.
 - Let the LLM choose GDP/CPI series or write macro formulas.
 - Treat annual performance as final proof of strategy quality.
+- Copy older real-branch basket prompts, tool surfaces, or execution behavior
+  over the current branch.
+- Downgrade the current execution summary/audit split, weekly cadence,
+  expanded basket universes, trace behavior, or replay UI compatibility.
 
 ## Target Strategy Layout
 
@@ -146,7 +182,9 @@ docs/superpowers/specs/2026-08-12-growth-inflation-regime-scan-tool-design.md
 docs/superpowers/plans/2026-08-12-growth-inflation-regime-scan-tool.md
 ```
 
-Bring only what is needed for the real classifier and scanner.
+Bring only what is needed for the real classifier and scanner. The scanner
+files are mandatory because scanner validation is the first low-cost gate before
+real-strategy LLM backtests.
 
 Do not wholesale replace files that have continued evolving on the current
 branch.
@@ -202,6 +240,21 @@ mock macro_regime_classifier
   -> real FRED-backed macro_regime_classifier
 ```
 
+The real strategy may reuse helper names that existed on the real branch, but
+the helper bodies must be adapted from the current branch. In practice, the
+current mock strategy should expose or share current-equivalent helpers for:
+
+- creating current basket agents with current `basket_agent_tools`,
+  `basket_agent_system_prompt`, and `basket_agent_task_prompt`
+- running the current portfolio decision flow with the current target portfolio
+  planner tool
+- running the current execution flow with the current execution plan execute
+  tool
+- preserving current scheduled workflow state, including
+  `_scheduled_workflow_decision`, `_mark_scheduled_workflow_attempted`, and any
+  current skip/block bookkeeping
+- preserving current trace/replay payload shapes
+
 ### Mock Strategy
 
 File:
@@ -214,6 +267,11 @@ Avoid replacing this file with the real macro branch version.
 
 If shared helper extraction is needed, make the smallest safe change while
 preserving the current latest behavior and tests.
+
+Do not run a command that restores the old real-branch mock strategy over this
+file. The mock strategy is currently the best reference implementation for the
+downstream basket, portfolio decision, execution, weekly cadence, and trace
+workflow.
 
 ## Real Macro Classifier Contract
 
@@ -383,9 +441,21 @@ Verify the real classifier:
 - returns structured blocked/failed results when data is not usable
 - does not mutate last regime state on failed/blocked results
 
-### 3. Scanner Validation
+### 3. Downstream Helper Reuse Validation
 
-Run the scanner over a short range first.
+Verify the real strategy:
+
+- uses current basket agent construction behavior
+- uses current basket evidence tools
+- uses current target portfolio planner behavior
+- uses current execution plan execute behavior
+- uses current weekly cadence state handling
+- does not call stale real-branch downstream helper implementations
+
+### 4. Scanner Validation
+
+Run the scanner over a short range first. This is mandatory before any paid
+real-strategy LLM backtest.
 
 Then scan the past two years weekly.
 
@@ -397,7 +467,7 @@ Expected output:
 - visible regime counts
 - visible transition list
 
-### 4. One-Day Real Strategy Backtest
+### 5. One-Day Real Strategy Backtest
 
 Run:
 
@@ -416,7 +486,7 @@ Expected:
 - account curve and performance artifacts generate when trades occur
 - no unexpected negative cash or blocked order errors
 
-### 5. Short Weekly Real Strategy Backtest
+### 6. Short Weekly Real Strategy Backtest
 
 Run a one-month weekly backtest on a window selected by the scanner.
 
@@ -428,7 +498,7 @@ Expected:
   window
 - execution uses current execution plan execute behavior
 
-### 6. Annual Weekly Real Strategy Backtest
+### 7. Annual Weekly Real Strategy Backtest
 
 Only after the above passes, run an annual weekly backtest.
 
@@ -470,6 +540,12 @@ Preferred implementation method:
 
 Do not use a blind full-branch merge unless manual file-by-file integration
 proves unnecessarily difficult.
+
+If cherry-picking a real-branch commit, expect conflicts or stale helper shapes.
+Resolve those conflicts by preserving the current branch's basket, execution,
+weekly cadence, and trace behavior. Do not use `git checkout` or equivalent
+file replacement to overwrite the current mock strategy with the older
+real-branch version.
 
 ## Risks And Mitigations
 
@@ -522,10 +598,14 @@ The integration is complete when:
 4. The real strategy uses current latest basket universes and execution system.
 5. The real strategy supports weekly cadence.
 6. The real scanner can scan the past two years without LLM calls.
-7. Focused tests pass.
-8. A one-day real strategy benchmark passes.
-9. A short weekly real strategy benchmark passes.
-10. The generated traces show real macro evidence, not mock macro evidence.
+7. The scanner writes CSV, JSON, and Markdown artifacts with regime counts and
+   transitions.
+8. The real strategy reuses current downstream helper behavior rather than the
+   stale real-branch downstream implementation.
+9. Focused tests pass.
+10. A one-day real strategy benchmark passes.
+11. A short weekly real strategy benchmark passes.
+12. The generated traces show real macro evidence, not mock macro evidence.
 
 ## Future Work
 
