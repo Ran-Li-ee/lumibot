@@ -328,6 +328,108 @@ def test_initialize_creates_seven_agent_mock_quadrant_workflow(monkeypatch):
     assert strategy._mock_regime_seed == 42
 
 
+def test_weekly_cadence_decision_runs_on_default_monday():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 9).date(),
+        run_frequency="weekly",
+        weekly_run_weekday="MON",
+        attempted_week_keys=set(),
+    )
+
+    assert decision["should_run"] is True
+    assert decision["status"] == "run"
+    assert decision["reason"] == "weekly_run_day"
+    assert decision["week_key"] == "2024-W37"
+
+
+def test_weekly_cadence_decision_runs_on_first_observed_day_after_missing_monday():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 10).date(),
+        run_frequency="weekly",
+        weekly_run_weekday="MON",
+        attempted_week_keys=set(),
+    )
+
+    assert decision["should_run"] is True
+    assert decision["status"] == "run"
+    assert decision["reason"] == "first_observed_after_preferred_weekday"
+    assert decision["week_key"] == "2024-W37"
+
+
+def test_weekly_cadence_decision_skips_before_preferred_weekday():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 9).date(),
+        run_frequency="weekly",
+        weekly_run_weekday="WED",
+        attempted_week_keys=set(),
+    )
+
+    assert decision["should_run"] is False
+    assert decision["status"] == "skipped"
+    assert decision["reason"] == "before_weekly_run_day"
+    assert decision["week_key"] == "2024-W37"
+
+
+def test_weekly_cadence_decision_skips_after_week_attempted():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 10).date(),
+        run_frequency="weekly",
+        weekly_run_weekday="MON",
+        attempted_week_keys={"2024-W37"},
+    )
+
+    assert decision["should_run"] is False
+    assert decision["status"] == "skipped"
+    assert decision["reason"] == "weekly_workflow_already_attempted"
+
+
+def test_daily_cadence_decision_runs_every_day():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 10).date(),
+        run_frequency="daily",
+        weekly_run_weekday="MON",
+        attempted_week_keys={"2024-W37"},
+    )
+
+    assert decision["should_run"] is True
+    assert decision["status"] == "run"
+    assert decision["reason"] == "daily_frequency"
+
+
+def test_weekly_cadence_decision_rejects_invalid_frequency():
+    module, _strategy_class = load_strategy_module()
+
+    with pytest.raises(ValueError, match="run_frequency must be 'daily' or 'weekly'"):
+        module.scheduled_workflow_decision(
+            current_date=datetime(2024, 9, 10).date(),
+            run_frequency="hourly",
+            weekly_run_weekday="MON",
+            attempted_week_keys=set(),
+        )
+
+
+def test_weekly_cadence_decision_rejects_invalid_weekday():
+    module, _strategy_class = load_strategy_module()
+
+    with pytest.raises(ValueError, match="weekly_run_weekday must be one of"):
+        module.scheduled_workflow_decision(
+            current_date=datetime(2024, 9, 10).date(),
+            run_frequency="weekly",
+            weekly_run_weekday="SUN",
+            attempted_week_keys=set(),
+        )
+
+
 def test_agents_receive_distinct_tool_surfaces():
     _module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
