@@ -694,8 +694,10 @@ def make_real_macro_regime_classifier_tool(
     name = "macro_regime_classifier"
     description = (
         "Classify the Growth / Inflation quadrant using FRED point-in-time GDPC1 and CPIAUCSL data. "
-        "The tool applies configured lags, compares year-over-year metrics with five-year rolling trends, "
-        "and returns regime, basket weights, and evidence. "
+        "Default mode fred_ra_vintage_asof uses the strategy simulated trading date as the FRED "
+        "vintage as-of date. An explicit future requested_as_of is clamped to the strategy date and "
+        "reported with requested_as_of, effective_as_of, lookahead_clamped, and as_of_policy. "
+        "Legacy fred_ra_simple_lagged mode is available for comparison. "
         "Do not manually recalculate its output."
     )
     metadata = {"kind": "fred_macro_regime", "mock": False, "replay_on_cache": True}
@@ -725,6 +727,7 @@ def make_real_macro_regime_classifier_tool(
             "inflation_lag_months",
         )
         default_trend_years = configured_default(DEFAULT_TREND_YEARS, "trend_years")
+        default_as_of_policy = configured_default(DEFAULT_AS_OF_POLICY, "as_of_policy")
 
         def macro_regime_classifier(
             *,
@@ -735,6 +738,8 @@ def make_real_macro_regime_classifier_tool(
             growth_lag_months: int | None = None,
             inflation_lag_months: int | None = None,
             trend_years: int | None = None,
+            as_of_policy: str | None = None,
+            requested_as_of: Any | None = None,
         ) -> dict[str, Any]:
             strategy_date = strategy.get_datetime().date().isoformat()
             resolved_date = date if date is not None else strategy_date
@@ -756,6 +761,7 @@ def make_real_macro_regime_classifier_tool(
                 else default_inflation_lag_months
             )
             resolved_trend_years = trend_years if trend_years is not None else default_trend_years
+            resolved_as_of_policy = as_of_policy if as_of_policy is not None else default_as_of_policy
 
             result = classify_growth_inflation_regime(
                 fred,
@@ -767,6 +773,9 @@ def make_real_macro_regime_classifier_tool(
                 inflation_lag_months=resolved_inflation_lag_months,
                 trend_years=resolved_trend_years,
                 previous_regime=getattr(strategy, "_last_real_regime", None),
+                as_of_policy=resolved_as_of_policy,
+                requested_as_of=requested_as_of,
+                max_as_of=strategy_date,
             )
             return result
 

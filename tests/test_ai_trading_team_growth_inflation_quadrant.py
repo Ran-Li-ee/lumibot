@@ -1464,8 +1464,21 @@ def test_make_real_macro_regime_classifier_tool_binds_stateful_tool():
     assert "fred" in description
     assert "gdpc1" in description
     assert "cpiaucsl" in description
-    assert "lag" in description
-    assert "trend" in description
+    assert "default mode" in description
+    assert "fred_ra_vintage_asof" in description
+    assert "simulated trading date" in description
+    assert "vintage" in description
+    assert "as-of" in description
+    assert "future requested_as_of" in description
+    assert "clamped" in description
+    assert "requested_as_of" in description
+    assert "effective_as_of" in description
+    assert "lookahead_clamped" in description
+    assert "as_of_policy" in description
+    assert "legacy" in description
+    assert "fred_ra_simple_lagged" in description
+    assert "do not manually recalculate" in description
+    assert "configured lags" not in description
     assert bound_tool.metadata["kind"] == "fred_macro_regime"
     assert bound_tool.metadata["mock"] is False
     assert bound_tool.metadata["replay_on_cache"] is True
@@ -1535,6 +1548,85 @@ def test_make_real_macro_regime_classifier_tool_hides_previous_regime_argument()
     assert "previous_regime" not in inspect.signature(bound_tool.function).parameters
     with pytest.raises(TypeError, match="previous_regime"):
         bound_tool.function(previous_regime="growth_down_inflation_down")
+
+
+def test_real_macro_tool_defaults_to_strategy_datetime_for_vintage_as_of():
+    module = load_classifier_module()
+    fred = FakeFredClient(
+        {
+            "GDPC1": _payload("GDPC1", _quarterly_observations(values=[100 + i for i in range(25)])),
+            "CPIAUCSL": _payload("CPIAUCSL", _monthly_observations(values=[200 + i for i in range(80)])),
+        }
+    )
+    tool_definition = module.make_real_macro_regime_classifier_tool(
+        fred_factory=lambda _strategy: fred
+    )
+
+    class Strategy:
+        parameters = {}
+
+        def get_datetime(self):
+            return datetime(2024, 9, 5, 9, 30)
+
+    bound_tool = tool_definition.binder(Strategy(), None)
+    result = bound_tool.function()
+
+    assert result["mode"] == "fred_ra_vintage_asof"
+    assert result["requested_as_of"] == "2024-09-05"
+    assert result["effective_as_of"] == "2024-09-05"
+    assert result["as_of_policy"] == "same_day_vintage"
+
+
+def test_real_macro_tool_clamps_requested_as_of_after_strategy_datetime():
+    module = load_classifier_module()
+    fred = FakeFredClient(
+        {
+            "GDPC1": _payload("GDPC1", _quarterly_observations(values=[100 + i for i in range(25)])),
+            "CPIAUCSL": _payload("CPIAUCSL", _monthly_observations(values=[200 + i for i in range(80)])),
+        }
+    )
+    tool_definition = module.make_real_macro_regime_classifier_tool(
+        fred_factory=lambda _strategy: fred
+    )
+
+    class Strategy:
+        parameters = {}
+
+        def get_datetime(self):
+            return datetime(2024, 9, 5, 9, 30)
+
+    bound_tool = tool_definition.binder(Strategy(), None)
+    result = bound_tool.function(requested_as_of="2024-09-07")
+
+    assert result["requested_as_of"] == "2024-09-07"
+    assert result["effective_as_of"] == "2024-09-05"
+    assert result["lookahead_clamped"] is True
+
+
+def test_real_macro_tool_uses_strategy_as_of_policy_default():
+    module = load_classifier_module()
+    fred = FakeFredClient(
+        {
+            "GDPC1": _payload("GDPC1", _quarterly_observations(values=[100 + i for i in range(25)])),
+            "CPIAUCSL": _payload("CPIAUCSL", _monthly_observations(values=[200 + i for i in range(80)])),
+        }
+    )
+    tool_definition = module.make_real_macro_regime_classifier_tool(
+        fred_factory=lambda _strategy: fred
+    )
+
+    class Strategy:
+        parameters = {"as_of_policy": "previous_day_vintage"}
+
+        def get_datetime(self):
+            return datetime(2024, 9, 5, 9, 30)
+
+    bound_tool = tool_definition.binder(Strategy(), None)
+    result = bound_tool.function()
+
+    assert result["requested_as_of"] == "2024-09-04"
+    assert result["effective_as_of"] == "2024-09-04"
+    assert result["as_of_policy"] == "previous_day_vintage"
 
 
 def test_bound_real_macro_regime_classifier_uses_strategy_parameters_as_defaults():
