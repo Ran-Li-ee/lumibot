@@ -293,6 +293,9 @@ def test_strategy_parameters_are_mock_quadrant_defaults():
         "basket_universes": _module.BASKET_UNIVERSES,
         "mock_regime_mode": "seeded_random",
         "mock_regime_seed": 42,
+        "run_frequency": "weekly",
+        "weekly_run_weekday": "MON",
+        "weekly_holiday_policy": "first_open_trading_day",
     }
     assert strategy_class._execution_agent_base_system_prompt_mode == "execution_minimal"
 
@@ -326,6 +329,11 @@ def test_initialize_creates_seven_agent_mock_quadrant_workflow(monkeypatch):
     assert strategy.sleeptime == "1D"
     assert strategy._mock_regime_mode == "seeded_random"
     assert strategy._mock_regime_seed == 42
+    assert strategy._run_frequency == "weekly"
+    assert strategy._weekly_run_weekday == "MON"
+    assert strategy._weekly_holiday_policy == "first_open_trading_day"
+    assert strategy._scheduled_workflow_attempted_week_keys == set()
+    assert strategy._scheduled_workflow_events == []
 
 
 def test_weekly_cadence_decision_runs_on_default_monday():

@@ -87,6 +87,90 @@ BASKET_AGENT_NAMES = {
     "nominal_bond": "nominal_bond_basket_agent",
 }
 
+WEEKDAY_INDEX_BY_CODE = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4}
+ALLOWED_RUN_FREQUENCIES = {"daily", "weekly"}
+
+
+def normalize_run_frequency(value: Any) -> str:
+    if not value:
+        return "weekly"
+    frequency = str(value).strip().lower()
+    if frequency not in ALLOWED_RUN_FREQUENCIES:
+        raise ValueError("run_frequency must be 'daily' or 'weekly'.")
+    return frequency
+
+
+def normalize_weekly_run_weekday(value: Any) -> str:
+    if not value:
+        return "MON"
+    weekday = str(value).strip().upper()
+    if weekday not in WEEKDAY_INDEX_BY_CODE:
+        allowed = ", ".join(WEEKDAY_INDEX_BY_CODE)
+        raise ValueError(f"weekly_run_weekday must be one of: {allowed}.")
+    return weekday
+
+
+def iso_week_key(value: date_type) -> str:
+    iso_year, iso_week, _iso_weekday = value.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+def scheduled_workflow_decision(
+    *,
+    current_date: date_type,
+    run_frequency: Any,
+    weekly_run_weekday: Any,
+    attempted_week_keys: set[str],
+) -> dict[str, Any]:
+    frequency = normalize_run_frequency(run_frequency)
+    weekday = normalize_weekly_run_weekday(weekly_run_weekday)
+    week_key = iso_week_key(current_date)
+    decision = {
+        "date": current_date.isoformat(),
+        "run_frequency": frequency,
+        "weekly_run_weekday": weekday,
+        "week_key": week_key,
+    }
+
+    if frequency == "daily":
+        return {
+            **decision,
+            "should_run": True,
+            "status": "run",
+            "reason": "daily_frequency",
+        }
+
+    if week_key in attempted_week_keys:
+        return {
+            **decision,
+            "should_run": False,
+            "status": "skipped",
+            "reason": "weekly_workflow_already_attempted",
+        }
+
+    current_weekday_index = current_date.weekday()
+    preferred_weekday_index = WEEKDAY_INDEX_BY_CODE[weekday]
+    if current_weekday_index == preferred_weekday_index:
+        return {
+            **decision,
+            "should_run": True,
+            "status": "run",
+            "reason": "weekly_run_day",
+        }
+    if current_weekday_index > preferred_weekday_index:
+        return {
+            **decision,
+            "should_run": True,
+            "status": "run",
+            "reason": "first_observed_after_preferred_weekday",
+        }
+    return {
+        **decision,
+        "should_run": False,
+        "status": "skipped",
+        "reason": "before_weekly_run_day",
+    }
+
 
 def basket_agent_tools(basket_id: str) -> list[ToolDefinition]:
     tools = [
@@ -594,6 +678,9 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
         "basket_universes": BASKET_UNIVERSES,
         "mock_regime_mode": "seeded_random",
         "mock_regime_seed": 42,
+        "run_frequency": "weekly",
+        "weekly_run_weekday": "MON",
+        "weekly_holiday_policy": "first_open_trading_day",
     }
     _execution_agent_base_system_prompt_mode = "execution_minimal"
 
@@ -602,6 +689,16 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
         self._mock_regime_mode = self.parameters.get("mock_regime_mode", "seeded_random")
         self._mock_regime_seed = int(self.parameters.get("mock_regime_seed", 42))
         self._last_mock_regime = None
+        self._run_frequency = normalize_run_frequency(self.parameters.get("run_frequency", "weekly"))
+        self._weekly_run_weekday = normalize_weekly_run_weekday(self.parameters.get("weekly_run_weekday", "MON"))
+        self._weekly_holiday_policy = str(
+            self.parameters.get("weekly_holiday_policy", "first_open_trading_day")
+        ).strip()
+        if self._weekly_holiday_policy != "first_open_trading_day":
+            raise ValueError("weekly_holiday_policy must be 'first_open_trading_day'.")
+        self._scheduled_workflow_attempted_week_keys: set[str] = set()
+        self._scheduled_workflow_events: list[dict[str, Any]] = []
+        self._last_scheduled_workflow_run_date: str | None = None
         self._last_target_portfolio_planner_result = None
         model = os.environ.get("AI_TRADING_TEAM_MODEL", "gemini-3.1-flash-lite")
 
