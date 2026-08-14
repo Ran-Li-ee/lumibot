@@ -41,7 +41,12 @@ WEIGHT_BY_REGIME = {
     },
 }
 
-DEFAULT_MODE = "fred_ra_simple_lagged"
+VINTAGE_ASOF_MODE = "fred_ra_vintage_asof"
+LEGACY_LAGGED_MODE = "fred_ra_simple_lagged"
+DEFAULT_MODE = VINTAGE_ASOF_MODE
+DEFAULT_AS_OF_POLICY = "same_day_vintage"
+SUPPORTED_MODES = {VINTAGE_ASOF_MODE, LEGACY_LAGGED_MODE}
+SUPPORTED_AS_OF_POLICIES = {"same_day_vintage", "previous_day_vintage", "explicit"}
 DEFAULT_GROWTH_SERIES_ID = "GDPC1"
 DEFAULT_INFLATION_SERIES_ID = "CPIAUCSL"
 DEFAULT_GROWTH_LAG_MONTHS = 6
@@ -83,6 +88,43 @@ def subtract_months(value: date, months: int) -> date:
     month = month_zero + 1
     day = min(parsed.day, calendar.monthrange(year, month)[1])
     return date(year, month, day)
+
+
+def previous_calendar_day(value: date) -> date:
+    parsed = parse_date(value)
+    return date.fromordinal(parsed.toordinal() - 1)
+
+
+def resolve_vintage_as_of(
+    *,
+    trading_date: Any,
+    requested_as_of: Any | None = None,
+    as_of_policy: str = DEFAULT_AS_OF_POLICY,
+    max_as_of: Any | None = None,
+) -> dict[str, Any]:
+    parsed_trading_date = parse_date(trading_date)
+    parsed_max_as_of = parse_date(max_as_of) if max_as_of is not None else parsed_trading_date
+    policy = str(as_of_policy or DEFAULT_AS_OF_POLICY).strip()
+    if policy not in SUPPORTED_AS_OF_POLICIES:
+        raise ValueError(
+            f"unsupported as_of_policy {policy!r}; supported policies are "
+            f"{sorted(SUPPORTED_AS_OF_POLICIES)!r}."
+        )
+
+    if requested_as_of is not None:
+        requested = parse_date(requested_as_of)
+    elif policy == "previous_day_vintage":
+        requested = previous_calendar_day(parsed_trading_date)
+    else:
+        requested = parsed_trading_date
+
+    effective = min(requested, parsed_max_as_of)
+    return {
+        "requested_as_of": requested,
+        "effective_as_of": effective,
+        "lookahead_clamped": requested != effective,
+        "as_of_policy": policy,
+    }
 
 
 def history_start_for_date(value: date, years: int = 12) -> str:
@@ -169,25 +211,25 @@ def _observations_from_payload(
     return observations
 
 
-def calculate_axis_evidence(
+def _calculate_axis_evidence_at_cutoff(
     payload: dict[str, Any],
     *,
     axis: str,
     series_name: str,
     frequency: str,
     trading_date: date,
-    lag_months: int,
+    data_cutoff: Any,
     periods_back: int,
     trend_window_observations: int,
     trend_years: int,
+    lag_months: int | None = None,
+    evidence_as_of: Any | None = None,
 ) -> dict[str, Any]:
     parsed_trading_date = parse_date(trading_date)
-    lag_months = int(lag_months)
+    parsed_data_cutoff = parse_date(data_cutoff)
     periods_back = int(periods_back)
     trend_window_observations = int(trend_window_observations)
     trend_years = int(trend_years)
-    if lag_months < 0:
-        raise ValueError("lag_months must be >= 0.")
     if periods_back <= 0:
         raise ValueError("periods_back must be > 0.")
     if trend_window_observations <= 0:
@@ -195,8 +237,7 @@ def calculate_axis_evidence(
     if trend_years <= 0:
         raise ValueError("trend_years must be > 0.")
 
-    data_cutoff = subtract_months(parsed_trading_date, lag_months)
-    observations = _observations_from_payload(payload, parsed_trading_date, data_cutoff)
+    observations = _observations_from_payload(payload, parsed_trading_date, parsed_data_cutoff)
     minimum_observations = periods_back + trend_window_observations
     if len(observations) < minimum_observations:
         message = (
@@ -226,13 +267,11 @@ def calculate_axis_evidence(
     margin = metric_value - trend_value
     direction = "up" if metric_value > trend_value else "down"
 
-    return {
+    evidence = {
         "axis": axis,
         "series_id": payload.get("series_id"),
         "series_name": series_name,
         "frequency": frequency,
-        "lag_months": lag_months,
-        "data_cutoff": data_cutoff.isoformat(),
         "latest_observation_date": latest_metric["observation"]["date"].isoformat(),
         "comparison_observation_date": latest_metric["comparison"]["date"].isoformat(),
         "latest_value": latest_metric["observation"]["value"],
@@ -245,6 +284,85 @@ def calculate_axis_evidence(
         "margin": margin,
         "direction": direction,
     }
+    if lag_months is not None:
+        evidence["lag_months"] = lag_months
+        evidence["data_cutoff"] = parsed_data_cutoff.isoformat()
+        return evidence
+
+    parsed_evidence_as_of = parse_date(evidence_as_of) if evidence_as_of is not None else parsed_data_cutoff
+    latest_observation = latest_metric["observation"]
+    comparison_observation = latest_metric["comparison"]
+    evidence.update(
+        {
+            "as_of": parsed_evidence_as_of.isoformat(),
+            "latest_realtime_start": latest_observation.get("realtime_start"),
+            "latest_realtime_end": latest_observation.get("realtime_end"),
+            "comparison_realtime_start": comparison_observation.get("realtime_start"),
+            "comparison_realtime_end": comparison_observation.get("realtime_end"),
+            "observation_lag_days": (
+                parsed_evidence_as_of.toordinal() - latest_observation["date"].toordinal()
+            ),
+        }
+    )
+    return evidence
+
+
+def calculate_axis_evidence(
+    payload: dict[str, Any],
+    *,
+    axis: str,
+    series_name: str,
+    frequency: str,
+    trading_date: date,
+    lag_months: int,
+    periods_back: int,
+    trend_window_observations: int,
+    trend_years: int,
+) -> dict[str, Any]:
+    parsed_trading_date = parse_date(trading_date)
+    lag_months = int(lag_months)
+    if lag_months < 0:
+        raise ValueError("lag_months must be >= 0.")
+    data_cutoff = subtract_months(parsed_trading_date, lag_months)
+    return _calculate_axis_evidence_at_cutoff(
+        payload,
+        axis=axis,
+        series_name=series_name,
+        frequency=frequency,
+        trading_date=parsed_trading_date,
+        data_cutoff=data_cutoff,
+        periods_back=periods_back,
+        trend_window_observations=trend_window_observations,
+        trend_years=trend_years,
+        lag_months=lag_months,
+    )
+
+
+def calculate_axis_evidence_vintage(
+    payload: dict[str, Any],
+    *,
+    axis: str,
+    series_name: str,
+    frequency: str,
+    trading_date: date,
+    as_of: Any,
+    periods_back: int,
+    trend_window_observations: int,
+    trend_years: int,
+) -> dict[str, Any]:
+    parsed_as_of = parse_date(as_of)
+    return _calculate_axis_evidence_at_cutoff(
+        payload,
+        axis=axis,
+        series_name=series_name,
+        frequency=frequency,
+        trading_date=trading_date,
+        data_cutoff=parsed_as_of,
+        periods_back=periods_back,
+        trend_window_observations=trend_window_observations,
+        trend_years=trend_years,
+        evidence_as_of=parsed_as_of,
+    )
 
 
 def regime_from_directions(growth_direction: str, inflation_direction: str) -> str:
@@ -404,7 +522,11 @@ def classify_growth_inflation_regime(
     inflation_lag_months: int = DEFAULT_INFLATION_LAG_MONTHS,
     trend_years: int = DEFAULT_TREND_YEARS,
     previous_regime: str | None = None,
+    as_of_policy: str = DEFAULT_AS_OF_POLICY,
+    requested_as_of: Any | None = None,
+    max_as_of: Any | None = None,
 ) -> dict[str, Any]:
+    resolved_mode = DEFAULT_MODE if mode is None else str(mode).strip()
     status_series_kwargs = {
         "growth_series_id": growth_series_id,
         "inflation_series_id": inflation_series_id,
@@ -412,72 +534,138 @@ def classify_growth_inflation_regime(
     try:
         trading_date = parse_date(date)
     except ValueError as exc:
-        return _failed_result(date, mode, "data_validation_failed", [exc], **status_series_kwargs)
+        return _failed_result(date, resolved_mode, "data_validation_failed", [exc], **status_series_kwargs)
 
     date_text = trading_date.isoformat()
-    if mode != DEFAULT_MODE:
-        message = f"Unsupported mode {mode!r}; supported mode is {DEFAULT_MODE!r}."
-        return _failed_result(date_text, mode, "unsupported_mode", [message], **status_series_kwargs)
+    if resolved_mode not in SUPPORTED_MODES:
+        message = f"Unsupported mode {resolved_mode!r}; supported modes are {sorted(SUPPORTED_MODES)!r}."
+        return _failed_result(date_text, resolved_mode, "unsupported_mode", [message], **status_series_kwargs)
 
     try:
         trend_years = int(trend_years)
         history_start = history_start_for_date(trading_date)
+        vintage_as_of = None
+        fetch_end_text = date_text
+        fetch_as_of_text = date_text
+        if resolved_mode == VINTAGE_ASOF_MODE:
+            vintage_as_of = resolve_vintage_as_of(
+                trading_date=trading_date,
+                requested_as_of=requested_as_of,
+                as_of_policy=as_of_policy,
+                max_as_of=max_as_of or trading_date,
+            )
+            fetch_end_text = vintage_as_of["effective_as_of"].isoformat()
+            fetch_as_of_text = fetch_end_text
+
         growth_payload = fred.get_series(
             growth_series_id,
             start=history_start,
-            end=date_text,
-            as_of=date_text,
+            end=fetch_end_text,
+            as_of=fetch_as_of_text,
         )
         inflation_payload = fred.get_series(
             inflation_series_id,
             start=history_start,
-            end=date_text,
-            as_of=date_text,
+            end=fetch_end_text,
+            as_of=fetch_as_of_text,
         )
-        growth_evidence = calculate_axis_evidence(
-            growth_payload,
-            axis="growth",
-            series_name="Real Gross Domestic Product",
-            frequency="quarterly",
-            trading_date=trading_date,
-            lag_months=growth_lag_months,
-            periods_back=GROWTH_PERIODS_BACK,
-            trend_window_observations=trend_years * GROWTH_OBSERVATIONS_PER_YEAR,
-            trend_years=trend_years,
-        )
-        inflation_evidence = calculate_axis_evidence(
-            inflation_payload,
-            axis="inflation",
-            series_name="Consumer Price Index for All Urban Consumers",
-            frequency="monthly",
-            trading_date=trading_date,
-            lag_months=inflation_lag_months,
-            periods_back=INFLATION_PERIODS_BACK,
-            trend_window_observations=trend_years * INFLATION_OBSERVATIONS_PER_YEAR,
-            trend_years=trend_years,
-        )
+        if resolved_mode == VINTAGE_ASOF_MODE:
+            growth_evidence = calculate_axis_evidence_vintage(
+                growth_payload,
+                axis="growth",
+                series_name="Real Gross Domestic Product",
+                frequency="quarterly",
+                trading_date=trading_date,
+                as_of=fetch_as_of_text,
+                periods_back=GROWTH_PERIODS_BACK,
+                trend_window_observations=trend_years * GROWTH_OBSERVATIONS_PER_YEAR,
+                trend_years=trend_years,
+            )
+            inflation_evidence = calculate_axis_evidence_vintage(
+                inflation_payload,
+                axis="inflation",
+                series_name="Consumer Price Index for All Urban Consumers",
+                frequency="monthly",
+                trading_date=trading_date,
+                as_of=fetch_as_of_text,
+                periods_back=INFLATION_PERIODS_BACK,
+                trend_window_observations=trend_years * INFLATION_OBSERVATIONS_PER_YEAR,
+                trend_years=trend_years,
+            )
+        else:
+            growth_evidence = calculate_axis_evidence(
+                growth_payload,
+                axis="growth",
+                series_name="Real Gross Domestic Product",
+                frequency="quarterly",
+                trading_date=trading_date,
+                lag_months=growth_lag_months,
+                periods_back=GROWTH_PERIODS_BACK,
+                trend_window_observations=trend_years * GROWTH_OBSERVATIONS_PER_YEAR,
+                trend_years=trend_years,
+            )
+            inflation_evidence = calculate_axis_evidence(
+                inflation_payload,
+                axis="inflation",
+                series_name="Consumer Price Index for All Urban Consumers",
+                frequency="monthly",
+                trading_date=trading_date,
+                lag_months=inflation_lag_months,
+                periods_back=INFLATION_PERIODS_BACK,
+                trend_window_observations=trend_years * INFLATION_OBSERVATIONS_PER_YEAR,
+                trend_years=trend_years,
+            )
         regime = regime_from_directions(growth_evidence["direction"], inflation_evidence["direction"])
     except PROGRAMMER_ERROR_TYPES:
         raise
     except EXPECTED_RUNTIME_DATA_ERROR_TYPES as exc:
         message = _sanitize_reason(exc)
         if "FRED_API_KEY" in message:
-            return _blocked_result(date_text, mode, "missing_fred_api_key", [message], **status_series_kwargs)
+            return _blocked_result(
+                date_text,
+                resolved_mode,
+                "missing_fred_api_key",
+                [message],
+                **status_series_kwargs,
+            )
         return _failed_result(
             date_text,
-            mode,
+            resolved_mode,
             _classification_failure_reason(exc),
             [message],
             **status_series_kwargs,
         )
 
-    return {
+    data_quality = {
+        "status": "passed",
+        "source": "fred_api",
+        "point_in_time_safe": True,
+        "uses_revised_data": False,
+        "required_series": [growth_series_id, inflation_series_id],
+        "warnings": [],
+        "errors": [],
+    }
+    as_of_text = date_text
+    vintage_fields = {}
+    if vintage_as_of is not None:
+        requested_as_of_text = vintage_as_of["requested_as_of"].isoformat()
+        effective_as_of_text = vintage_as_of["effective_as_of"].isoformat()
+        as_of_text = effective_as_of_text
+        vintage_fields = {
+            "requested_as_of": requested_as_of_text,
+            "effective_as_of": effective_as_of_text,
+            "lookahead_clamped": vintage_as_of["lookahead_clamped"],
+            "as_of_policy": vintage_as_of["as_of_policy"],
+        }
+        data_quality.update(vintage_fields)
+
+    result = {
         "tool": "macro_regime_classifier",
         "status": "passed",
         "mock": False,
-        "mode": str(mode),
+        "mode": resolved_mode,
         "date": date_text,
-        "as_of": date_text,
+        "as_of": as_of_text,
         "regime": regime,
         "growth_direction": growth_evidence["direction"],
         "inflation_direction": inflation_evidence["direction"],
@@ -486,15 +674,7 @@ def classify_growth_inflation_regime(
         "basket_weights": dict(WEIGHT_BY_REGIME[regime]),
         "growth_evidence": growth_evidence,
         "inflation_evidence": inflation_evidence,
-        "data_quality": {
-            "status": "passed",
-            "source": "fred_api",
-            "point_in_time_safe": True,
-            "uses_revised_data": False,
-            "required_series": [growth_series_id, inflation_series_id],
-            "warnings": [],
-            "errors": [],
-        },
+        "data_quality": data_quality,
         "confidence": _confidence_from_margins(growth_evidence, inflation_evidence),
         "reason_brief": (
             f"Growth {growth_evidence['direction']}: YoY {growth_evidence['metric_value']:.4f} "
@@ -504,6 +684,8 @@ def classify_growth_inflation_regime(
             f"{inflation_evidence['trend_value']:.4f}. Regime {regime}."
         ),
     }
+    result.update(vintage_fields)
+    return result
 
 
 def make_real_macro_regime_classifier_tool(

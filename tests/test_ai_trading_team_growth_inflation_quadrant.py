@@ -216,6 +216,20 @@ def _real_macro_evidence(module, *, axis, series_id, direction, lag_months, freq
     }
 
 
+def _assert_vintage_evidence_fields(evidence, *, axis, series_id, as_of):
+    assert evidence["axis"] == axis
+    assert evidence["series_id"] == series_id
+    assert evidence["as_of"] == as_of
+    assert "lag_months" not in evidence
+    assert "data_cutoff" not in evidence
+    assert evidence["latest_realtime_start"] == as_of
+    assert evidence["latest_realtime_end"] == as_of
+    assert evidence["comparison_realtime_start"] == as_of
+    assert evidence["comparison_realtime_end"] == as_of
+    assert isinstance(evidence["observation_lag_days"], int)
+    assert evidence["observation_lag_days"] >= 0
+
+
 def _passed_real_macro_report(module, *, regime="growth_up_inflation_down", reason_brief="real macro"):
     return {
         "status": "passed",
@@ -1218,6 +1232,106 @@ def test_axis_evidence_rejects_invalid_numeric_parameters(parameter, invalid_val
         )
 
 
+def test_classify_growth_inflation_regime_defaults_to_same_day_fred_vintage():
+    module = load_classifier_module()
+    fred = FakeFredClient(
+        {
+            "GDPC1": _payload(
+                "GDPC1",
+                _quarterly_observations(
+                    values=[100 + index for index in range(25)],
+                    realtime="2024-09-05",
+                ),
+            ),
+            "CPIAUCSL": _payload(
+                "CPIAUCSL",
+                _monthly_observations(
+                    values=[200 + index for index in range(80)],
+                    realtime="2024-09-05",
+                ),
+            ),
+        }
+    )
+
+    result = module.classify_growth_inflation_regime(fred, date="2024-09-05")
+
+    assert result["status"] == "passed"
+    assert result["mode"] == "fred_ra_vintage_asof"
+    assert result["date"] == "2024-09-05"
+    assert result["as_of"] == "2024-09-05"
+    assert result["requested_as_of"] == "2024-09-05"
+    assert result["effective_as_of"] == "2024-09-05"
+    assert result["lookahead_clamped"] is False
+    assert result["as_of_policy"] == "same_day_vintage"
+    assert result["data_quality"]["as_of_policy"] == "same_day_vintage"
+    assert result["data_quality"]["requested_as_of"] == "2024-09-05"
+    assert result["data_quality"]["effective_as_of"] == "2024-09-05"
+    assert result["data_quality"]["lookahead_clamped"] is False
+    assert result["data_quality"]["point_in_time_safe"] is True
+    assert result["data_quality"]["uses_revised_data"] is False
+    _assert_vintage_evidence_fields(
+        result["growth_evidence"],
+        axis="growth",
+        series_id="GDPC1",
+        as_of="2024-09-05",
+    )
+    _assert_vintage_evidence_fields(
+        result["inflation_evidence"],
+        axis="inflation",
+        series_id="CPIAUCSL",
+        as_of="2024-09-05",
+    )
+    assert [call["series_id"] for call in fred.calls] == ["GDPC1", "CPIAUCSL"]
+    assert all(call["as_of"] == "2024-09-05" for call in fred.calls)
+    assert all(call["end"] == "2024-09-05" for call in fred.calls)
+
+
+def test_classify_growth_inflation_regime_clamps_future_requested_as_of_to_max_as_of():
+    module = load_classifier_module()
+    fred = FakeFredClient(
+        {
+            "GDPC1": _payload("GDPC1", _quarterly_observations(values=[100 + i for i in range(25)])),
+            "CPIAUCSL": _payload("CPIAUCSL", _monthly_observations(values=[200 + i for i in range(80)])),
+        }
+    )
+
+    result = module.classify_growth_inflation_regime(
+        fred,
+        date="2024-09-05",
+        requested_as_of="2024-09-10",
+        max_as_of="2024-09-05",
+    )
+
+    assert result["status"] == "passed"
+    assert result["requested_as_of"] == "2024-09-10"
+    assert result["effective_as_of"] == "2024-09-05"
+    assert result["lookahead_clamped"] is True
+    assert all(call["as_of"] == "2024-09-05" for call in fred.calls)
+    assert all(call["end"] == "2024-09-05" for call in fred.calls)
+
+
+def test_classify_growth_inflation_regime_previous_day_policy_uses_prior_calendar_day():
+    module = load_classifier_module()
+    fred = FakeFredClient(
+        {
+            "GDPC1": _payload("GDPC1", _quarterly_observations(values=[100 + i for i in range(25)])),
+            "CPIAUCSL": _payload("CPIAUCSL", _monthly_observations(values=[200 + i for i in range(80)])),
+        }
+    )
+
+    result = module.classify_growth_inflation_regime(
+        fred,
+        date="2024-09-05",
+        as_of_policy="previous_day_vintage",
+    )
+
+    assert result["status"] == "passed"
+    assert result["requested_as_of"] == "2024-09-04"
+    assert result["effective_as_of"] == "2024-09-04"
+    assert result["as_of_policy"] == "previous_day_vintage"
+    assert all(call["as_of"] == "2024-09-04" for call in fred.calls)
+
+
 @pytest.mark.parametrize(
     ("growth_direction", "inflation_direction", "expected_regime", "expected_weights"),
     [
@@ -1265,6 +1379,7 @@ def test_classify_growth_inflation_regime_maps_all_quadrants(
     result = module.classify_growth_inflation_regime(
         fred,
         date="2024-09-05",
+        mode=module.LEGACY_LAGGED_MODE,
         previous_regime=previous_regime,
     )
 
@@ -1282,8 +1397,13 @@ def test_classify_growth_inflation_regime_maps_all_quadrants(
     assert result["basket_weights"] == expected_weights
     assert result["growth_evidence"]["axis"] == "growth"
     assert result["growth_evidence"]["direction"] == growth_direction
+    assert result["growth_evidence"]["lag_months"] == module.DEFAULT_GROWTH_LAG_MONTHS
+    assert "data_cutoff" in result["growth_evidence"]
     assert result["inflation_evidence"]["axis"] == "inflation"
     assert result["inflation_evidence"]["direction"] == inflation_direction
+    assert result["inflation_evidence"]["lag_months"] == module.DEFAULT_INFLATION_LAG_MONTHS
+    assert "data_cutoff" in result["inflation_evidence"]
+    assert "requested_as_of" not in result
     assert result["data_quality"] == {
         "status": "passed",
         "source": "fred_api",
@@ -1367,7 +1487,7 @@ def test_make_real_macro_regime_classifier_tool_binds_stateful_tool():
 
     explicit_result = bound_tool.function(
         date="2024-09-05",
-        mode=module.DEFAULT_MODE,
+        mode=module.LEGACY_LAGGED_MODE,
         growth_series_id="CUSTOM_GROWTH",
         inflation_series_id="CUSTOM_INFLATION",
         growth_lag_months=3,
@@ -1423,7 +1543,7 @@ def test_bound_real_macro_regime_classifier_uses_strategy_parameters_as_defaults
     class FakeStrategy:
         _last_real_regime = None
         parameters = {
-            "macro_regime_mode": module.DEFAULT_MODE,
+            "macro_regime_mode": module.LEGACY_LAGGED_MODE,
             "mode": "unsupported_mode_should_not_win",
             "growth_series_id": "CUSTOM_GROWTH",
             "inflation_series_id": "CUSTOM_INFLATION",
@@ -1453,7 +1573,7 @@ def test_bound_real_macro_regime_classifier_uses_strategy_parameters_as_defaults
     result = bound_tool.function()
 
     assert result["status"] == "passed"
-    assert result["mode"] == module.DEFAULT_MODE
+    assert result["mode"] == module.LEGACY_LAGGED_MODE
     assert result["date"] == "2024-09-05"
     assert result["previous_regime"] is None
     assert result["data_quality"]["required_series"] == ["CUSTOM_GROWTH", "CUSTOM_INFLATION"]
@@ -1493,8 +1613,6 @@ def test_bound_real_macro_regime_classifier_explicit_defaults_do_not_mutate_stat
         mode=module.DEFAULT_MODE,
         growth_series_id=module.DEFAULT_GROWTH_SERIES_ID,
         inflation_series_id=module.DEFAULT_INFLATION_SERIES_ID,
-        growth_lag_months=module.DEFAULT_GROWTH_LAG_MONTHS,
-        inflation_lag_months=module.DEFAULT_INFLATION_LAG_MONTHS,
         trend_years=module.DEFAULT_TREND_YEARS,
     )
 
@@ -1577,7 +1695,7 @@ def test_bound_real_macro_regime_classifier_custom_call_does_not_mutate_state():
 
     result = bound_tool.function(
         date="2024-09-04",
-        mode=module.DEFAULT_MODE,
+        mode=module.LEGACY_LAGGED_MODE,
         growth_series_id="CUSTOM_GROWTH",
         inflation_series_id="CUSTOM_INFLATION",
         growth_lag_months=3,
@@ -1605,7 +1723,11 @@ def test_classify_growth_inflation_regime_blocks_missing_fred_key_without_throwi
     module = load_classifier_module()
     fred = FakeFredClient({"GDPC1": ValueError("FRED_API_KEY is required to fetch FRED macro data.")})
 
-    result = module.classify_growth_inflation_regime(fred, date="2024-09-05")
+    result = module.classify_growth_inflation_regime(
+        fred,
+        date="2024-09-05",
+        mode=module.LEGACY_LAGGED_MODE,
+    )
 
     assert result["tool"] == "macro_regime_classifier"
     assert result["status"] == "blocked"
