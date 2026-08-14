@@ -127,6 +127,26 @@ def basket_agent_system_prompt(basket_id: str, symbols: str) -> str:
             "evidence when ranking evidence is close, conflicting, incomplete, stale, or when long-duration TIPS looks "
             "unusually attractive. Do not use generic inflation headlines alone to justify long-duration TIPS."
         )
+    if basket_id == "nominal_bond":
+        return (
+            base
+            + " For nominal bond selection, use computed ranking evidence as the primary selection evidence. "
+            "This basket is a U.S. nominal Treasury duration-selection basket, not a corporate-bond or "
+            "credit-risk basket. The main decision is maturity / duration exposure: cash-like or ultra-short, "
+            "short-term, intermediate-term, broad-curve, long-term, or extended-duration / zero-coupon Treasury "
+            "exposure. Maturity / duration metadata: SGOV, BIL, and SHV are cash-like or ultra-short Treasury "
+            "exposure; SHY, VGSH, and SCHO are short-term Treasury exposure; IEI, IEF, VGIT, and SCHR are "
+            "intermediate-term Treasury exposure; GOVT is broad-curve Treasury exposure; TLH, TLT, and VGLT are "
+            "long-term Treasury exposure; EDV and ZROZ are extended-duration or zero-coupon Treasury exposure. "
+            "Use the maturity / duration metadata only to understand what each symbol represents. "
+            "Do not select the lowest-volatility symbol by default. Do not select the longest-duration symbol by "
+            "default. When target_weight is positive, choose the Treasury exposure that best matches the ranking "
+            "evidence. Cash-like or short-term exposure may be appropriate when ranking evidence favors low "
+            "interest-rate sensitivity. Intermediate or broad-curve exposure may be appropriate when ranking "
+            "evidence is balanced. Long or extended-duration exposure should be selected only when ranking evidence "
+            "clearly justifies taking high interest-rate sensitivity. Treat long-duration and zero-coupon Treasury "
+            "ETFs as high-volatility rate-sensitive positions, not as default safe assets."
+        )
     return base
 
 
@@ -149,6 +169,13 @@ def basket_agent_task_prompt(basket_id: str) -> str:
             + " For TIPS, use computed ranking evidence first. If rank evidence clearly favors one defensive TIPS "
             "candidate, select it directly. Use news only when leading candidates are close, conflicting, incomplete, "
             "stale, or when a long-duration candidate requires confirmation."
+        )
+    if basket_id == "nominal_bond":
+        return (
+            base
+            + " For nominal bonds, use computed ranking evidence first. Select one symbol from candidate_symbols "
+            "when target_weight is positive. Explain the selected symbol in terms of ranking evidence, maturity / "
+            "duration exposure, and why that duration choice fits the nominal bond basket role."
         )
     return base
 
