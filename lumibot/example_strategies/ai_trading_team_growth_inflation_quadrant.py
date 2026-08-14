@@ -191,6 +191,14 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             self._clear_real_macro_downstream_state()
             return
 
+        if not self._accepted_real_macro_report_is_canonical(macro_report, current_date):
+            self._block_real_macro_workflow(
+                "macro_regime_classifier returned a non-canonical passed payload; "
+                "blocking real workflow because accepted tool_result must match the current date and "
+                "configured/default parameters (mode, growth/inflation series, lags, trend years)."
+            )
+            return
+
         self._last_macro_regime_error = None
         self._commit_accepted_real_regime_if_canonical(macro_report, current_date)
         self._run_growth_inflation_downstream_workflow(
