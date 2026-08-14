@@ -60,7 +60,24 @@ BASKET_UNIVERSES = {
         "CMDY",
     ],
     "tips": ["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ"],
-    "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
+    "nominal_bond": [
+        "SGOV",
+        "BIL",
+        "SHV",
+        "SHY",
+        "VGSH",
+        "SCHO",
+        "IEI",
+        "IEF",
+        "VGIT",
+        "SCHR",
+        "GOVT",
+        "TLH",
+        "TLT",
+        "VGLT",
+        "EDV",
+        "ZROZ",
+    ],
 }
 
 BASKET_AGENT_NAMES = {
