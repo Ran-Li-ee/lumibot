@@ -224,18 +224,33 @@ def test_real_strategy_creates_expected_agents_and_tool_surfaces(monkeypatch):
     assert macro_tools[0].metadata["kind"] == "fred_macro_regime"
     for basket_agent in (
         "equity_basket_agent",
-        "commodity_basket_agent",
-        "tips_basket_agent",
         "nominal_bond_basket_agent",
     ):
         assert created_tool_names(created[basket_agent]) == {
             "market_load_history_tables_summary",
             "market_last_price",
         }
+    for news_enabled_basket_agent in (
+        "commodity_basket_agent",
+        "tips_basket_agent",
+    ):
+        assert created_tool_names(created[news_enabled_basket_agent]) == {
+            "market_load_history_tables_summary",
+            "market_last_price",
+            "alpaca_news",
+        }
     assert created_tool_names(created["portfolio_decision_agent"]) == {
         "target_portfolio_to_execution_plan",
     }
     assert created_tool_names(created["execution_agent"]) == {"execution_plan_execute"}
+
+
+def test_real_strategy_parameters_include_current_weekly_cadence_defaults():
+    _module, strategy_class = load_real_strategy_module()
+
+    assert strategy_class.parameters["run_frequency"] == "weekly"
+    assert strategy_class.parameters["weekly_run_weekday"] == "MON"
+    assert strategy_class.parameters["weekly_holiday_policy"] == "first_open_trading_day"
 
 
 def test_real_strategy_prompts_do_not_ask_llm_to_classify_macro_or_use_mock_language():
@@ -270,6 +285,19 @@ def test_real_strategy_prompts_do_not_ask_llm_to_classify_macro_or_use_mock_lang
     assert "planner tool owns all execution_plan calculations" in portfolio_prompt
     assert "execute only provided execution_plan" in execution_prompt
     assert "call execution_plan_execute exactly once with the complete execution_plan" in execution_prompt
+
+
+def test_real_strategy_skips_before_weekly_run_day_without_macro_call():
+    _module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.parameters["weekly_run_weekday"] = "FRI"
+    strategy.initialize()
+
+    strategy.on_trading_iteration()
+
+    assert agent_manager["macro_allocation_agent"].calls == []
+    assert strategy._scheduled_workflow_events[-1]["reason"] == "before_weekly_run_day"
 
 
 @pytest.mark.parametrize("status", ["blocked", "failed"])
