@@ -262,6 +262,7 @@ def test_examples_benchmark_import_does_not_require_backtesting_stack(monkeypatc
         "lumibot.example_strategies.ai_trading_team_bull_bear_leveraged_etf",
         "lumibot.example_strategies.ai_trading_team_citadel_sector_pods",
         "lumibot.example_strategies.ai_trading_team_growth_execution_test",
+        "lumibot.example_strategies.ai_trading_team_growth_inflation_quadrant",
         "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant",
         "lumibot.example_strategies.ai_trading_team_ray_dalio_idea_meritocracy",
         "lumibot.example_strategies.ai_trading_team_warren_buffett_value",
