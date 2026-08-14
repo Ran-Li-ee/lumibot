@@ -185,8 +185,9 @@ def basket_agent_tools(basket_id: str) -> list[ToolDefinition]:
 def basket_agent_system_prompt(basket_id: str, symbols: str) -> str:
     base = (
         f"{basket_id.replace('_', ' ').title()} basket role: stay inside the assigned basket "
-        f"({symbols}). Select one symbol when active, or report inactive when its target weight is zero. "
-        "Return basket_id, selected_symbol, status, and reason_brief. Do not place orders."
+        f"({symbols}). For the current scheduled review, select one representative symbol when active, "
+        "or report inactive when its target weight is zero. Return basket_id, selected_symbol, status, "
+        "and reason_brief. Do not place orders."
     )
     if basket_id == "commodity":
         return (
@@ -236,8 +237,8 @@ def basket_agent_system_prompt(basket_id: str, symbols: str) -> str:
 
 def basket_agent_task_prompt(basket_id: str) -> str:
     base = (
-        "Review only the assigned basket and return one JSON object with basket_id, "
-        "target_weight, status, candidate_symbols, selected_symbol, and reason_brief. "
+        "Review only the assigned basket for the current scheduled review and return one JSON object "
+        "with basket_id, target_weight, status, candidate_symbols, selected_symbol, and reason_brief. "
         "candidate_symbols must copy the assigned basket_symbols exactly; "
         "do not replace it with a shortlist."
     )
@@ -709,8 +710,10 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             include_builtin_tools=False,
             tools=[make_macro_regime_classifier_tool()],
             system_prompt=(
-                "Macro allocation role: call the mock macro_regime_classifier and return the regime, "
-                "basket weights, and a compact allocation note. Do not place orders."
+                "Macro allocation role: this is the current scheduled allocation review. Call the mock "
+                "macro_regime_classifier and return the regime, basket weights, mock flag, regime_changed, "
+                "and a compact allocation note. Do not place orders. Do not decide whether today is a run day; "
+                "the strategy code owns cadence."
             ),
         )
 
@@ -733,8 +736,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             include_builtin_tools=False,
             tools=[make_target_portfolio_to_execution_plan_tool()],
             system_prompt=(
-                "Portfolio decision role: do not redo macro or basket research. Merge the macro allocation report "
-                "and basket reports into a target_portfolio, then call "
+                "Portfolio decision role: this is the current scheduled review. Do not redo macro or basket "
+                "research. Merge the macro allocation report and basket reports into a target_portfolio, then call "
                 f"{TARGET_PORTFOLIO_TO_EXECUTION_PLAN_TOOL_NAME}. Do not "
                 "place orders. Do not manually calculate share quantities, cash usage, order side, or order sequence. "
                 "The planner tool owns all execution_plan calculations. "
@@ -801,8 +804,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
         try:
             macro_result = self.agents["macro_allocation_agent"].run(
                 task_prompt=(
-                    "Run the mock macro allocation step and return one JSON object with regime, "
-                    "basket_weights, mock flag, regime_changed, and reason_brief."
+                    "Run the mock macro allocation step for the current scheduled review date and return one JSON "
+                    "object with regime, basket_weights, mock flag, regime_changed, and reason_brief."
                 ),
                 context={
                     "date": current_date,
@@ -831,7 +834,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             self._last_target_portfolio_planner_result = None
             portfolio_result = self.agents["portfolio_decision_agent"].run(
                 task_prompt=(
-                    "Create target_portfolio from the provided macro and basket reports, then call "
+                    "Create target_portfolio for the current scheduled review from the provided macro and basket "
+                    "reports, then call "
                     f"{TARGET_PORTFOLIO_TO_EXECUTION_PLAN_TOOL_NAME} with date and target_portfolio. "
                     "Return only the strict JSON object with decision, target_portfolio, and the planner tool's "
                     "execution_plan copied exactly."

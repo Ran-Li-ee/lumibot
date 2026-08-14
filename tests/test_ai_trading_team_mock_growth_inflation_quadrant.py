@@ -540,6 +540,100 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "do not research, change fields, reorder orders, split orders, or repair the plan" in serialized
 
 
+def test_quadrant_prompts_use_scheduled_review_language():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+
+    runtime_agent_manager = run_seeded_scheduled_review_for_prompt_capture(module, strategy_class)
+
+    system_prompts = [str(agent["system_prompt"]) for agent in agent_manager.created]
+    basket_task_prompts = [module.basket_agent_task_prompt(basket_id) for basket_id in module.BASKET_AGENT_NAMES]
+    runtime_task_prompts = [
+        runtime_agent_manager["macro_allocation_agent"].calls[0]["task_prompt"],
+        runtime_agent_manager["portfolio_decision_agent"].calls[0]["task_prompt"],
+    ]
+    serialized = "\n".join(system_prompts + basket_task_prompts + runtime_task_prompts).lower()
+
+    for required_phrase in ("scheduled allocation review", "scheduled review"):
+        assert required_phrase in serialized
+
+    for forbidden_phrase in (
+        "daily rebalance",
+        "trade every day",
+        "refresh the whole portfolio every session",
+        "today's macro data changed",
+    ):
+        assert forbidden_phrase not in serialized
+
+
+def run_seeded_scheduled_review_for_prompt_capture(module, strategy_class):
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    execution_plan = {"schema_version": 1, "intent": "hold", "orders": []}
+    macro_report = {
+        "agent": "macro_allocation_agent",
+        "regime": "growth_up_inflation_down",
+        "regime_changed": True,
+        "basket_weights": {"equity": 0.50, "commodity": 0.00, "tips": 0.25, "nominal_bond": 0.25},
+        "mock": True,
+        "reason_brief": "mock",
+    }
+    basket_reports = {
+        "equity_basket_agent": {
+            "basket_id": "equity",
+            "target_weight": 0.50,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["equity"],
+            "selected_symbol": "QQQ",
+            "reason_brief": "selected",
+        },
+        "commodity_basket_agent": {
+            "basket_id": "commodity",
+            "target_weight": 0.00,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["commodity"],
+            "selected_symbol": None,
+            "reason_brief": "inactive",
+        },
+        "tips_basket_agent": {
+            "basket_id": "tips",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["tips"],
+            "selected_symbol": "TIP",
+            "reason_brief": "selected",
+        },
+        "nominal_bond_basket_agent": {
+            "basket_id": "nominal_bond",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["nominal_bond"],
+            "selected_symbol": "IEF",
+            "reason_brief": "selected",
+        },
+    }
+
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    for agent_name, report in basket_reports.items():
+        agent_manager.summaries[agent_name] = _json_summary(report)
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary(
+        {
+            "decision": {"type": "hold", "reason_brief": "mock target"},
+            "target_portfolio": [],
+            "execution_plan": execution_plan,
+        }
+    )
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": execution_plan}
+
+    strategy.on_trading_iteration()
+
+    return agent_manager
+
+
 def test_commodity_basket_prompt_is_rank_first_and_category_neutral():
     _module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
