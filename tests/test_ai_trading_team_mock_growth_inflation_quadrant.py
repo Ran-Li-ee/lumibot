@@ -317,6 +317,59 @@ def test_strategy_parameters_are_mock_quadrant_defaults():
     assert strategy_class._execution_agent_base_system_prompt_mode == "execution_minimal"
 
 
+def test_mock_strategy_exposes_current_downstream_helper_methods():
+    _module, strategy_class = load_strategy_module()
+
+    for method_name in (
+        "_initialize_growth_inflation_workflow_state",
+        "_create_growth_inflation_downstream_agents",
+        "_run_growth_inflation_downstream_workflow",
+        "_log_growth_inflation_workflow_blocked",
+    ):
+        assert hasattr(strategy_class, method_name)
+
+
+def test_mock_strategy_downstream_helper_creates_current_agent_surfaces(monkeypatch):
+    _module, strategy_class = load_strategy_module()
+    monkeypatch.setenv("AI_TRADING_TEAM_MODEL", "test-model")
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy._create_growth_inflation_downstream_agents("test-model")
+
+    assert [agent["name"] for agent in agent_manager.created] == [
+        "equity_basket_agent",
+        "commodity_basket_agent",
+        "tips_basket_agent",
+        "nominal_bond_basket_agent",
+        "portfolio_decision_agent",
+        "execution_agent",
+    ]
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    assert created_tool_names(created["equity_basket_agent"]) == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+    }
+    assert created_tool_names(created["commodity_basket_agent"]) == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+        "alpaca_news",
+    }
+    assert created_tool_names(created["tips_basket_agent"]) == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+        "alpaca_news",
+    }
+    assert created_tool_names(created["nominal_bond_basket_agent"]) == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+    }
+    assert created_tool_names(created["portfolio_decision_agent"]) == {
+        "target_portfolio_to_execution_plan",
+    }
+    assert created_tool_names(created["execution_agent"]) == {"execution_plan_execute"}
+
+
 def test_initialize_creates_seven_agent_mock_quadrant_workflow(monkeypatch):
     _module, strategy_class = load_strategy_module()
     monkeypatch.setenv("AI_TRADING_TEAM_MODEL", "test-model")

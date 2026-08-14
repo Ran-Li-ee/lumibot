@@ -685,11 +685,7 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
     }
     _execution_agent_base_system_prompt_mode = "execution_minimal"
 
-    def initialize(self):
-        self.sleeptime = "1D"
-        self._mock_regime_mode = self.parameters.get("mock_regime_mode", "seeded_random")
-        self._mock_regime_seed = int(self.parameters.get("mock_regime_seed", 42))
-        self._last_mock_regime = None
+    def _initialize_growth_inflation_workflow_state(self) -> None:
         self._run_frequency = normalize_run_frequency(self.parameters.get("run_frequency", "weekly"))
         self._weekly_run_weekday = normalize_weekly_run_weekday(self.parameters.get("weekly_run_weekday", "MON"))
         self._weekly_holiday_policy = str(
@@ -701,22 +697,9 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
         self._scheduled_workflow_events: list[dict[str, Any]] = []
         self._last_scheduled_workflow_run_date: str | None = None
         self._last_target_portfolio_planner_result = None
-        model = os.environ.get("AI_TRADING_TEAM_MODEL", "gemini-3.1-flash-lite")
+        self._last_execution_plan_error = None
 
-        self.agents.create(
-            name="macro_allocation_agent",
-            model=model,
-            allow_trading=False,
-            include_builtin_tools=False,
-            tools=[make_macro_regime_classifier_tool()],
-            system_prompt=(
-                "Macro allocation role: this is the current scheduled allocation review. Call the mock "
-                "macro_regime_classifier and return the regime, basket weights, mock flag, regime_changed, "
-                "and a compact allocation note. Do not place orders. Do not decide whether today is a run day; "
-                "the strategy code owns cadence."
-            ),
-        )
-
+    def _create_growth_inflation_downstream_agents(self, model: str) -> None:
         basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
         for basket_id, agent_name in BASKET_AGENT_NAMES.items():
             symbols = ", ".join(basket_universes[basket_id])
@@ -771,6 +754,30 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             ),
         )
 
+    def initialize(self):
+        self.sleeptime = "1D"
+        self._mock_regime_mode = self.parameters.get("mock_regime_mode", "seeded_random")
+        self._mock_regime_seed = int(self.parameters.get("mock_regime_seed", 42))
+        self._last_mock_regime = None
+        self._initialize_growth_inflation_workflow_state()
+        model = os.environ.get("AI_TRADING_TEAM_MODEL", "gemini-3.1-flash-lite")
+
+        self.agents.create(
+            name="macro_allocation_agent",
+            model=model,
+            allow_trading=False,
+            include_builtin_tools=False,
+            tools=[make_macro_regime_classifier_tool()],
+            system_prompt=(
+                "Macro allocation role: this is the current scheduled allocation review. Call the mock "
+                "macro_regime_classifier and return the regime, basket weights, mock flag, regime_changed, "
+                "and a compact allocation note. Do not place orders. Do not decide whether today is a run day; "
+                "the strategy code owns cadence."
+            ),
+        )
+
+        self._create_growth_inflation_downstream_agents(model)
+
     def _scheduled_workflow_decision(self, current_date: date_type) -> dict[str, Any]:
         return scheduled_workflow_decision(
             current_date=current_date,
@@ -790,32 +797,17 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
         self._last_scheduled_workflow_run_date = event["date"]
         self._record_scheduled_workflow_event(event)
 
-    def on_trading_iteration(self):
-        current_datetime = self.get_datetime()
-        current_date_obj = current_datetime.date()
-        current_date = current_date_obj.isoformat()
-        cadence_event = self._scheduled_workflow_decision(current_date_obj)
-        if not cadence_event["should_run"]:
-            self._record_scheduled_workflow_event(cadence_event)
-            return
-        self._mark_scheduled_workflow_attempted(cadence_event)
+    def _log_growth_inflation_workflow_blocked(self, message: str) -> None:
+        print(message)
+
+    def _run_growth_inflation_downstream_workflow(
+        self,
+        current_date: str,
+        macro_report: dict[str, Any],
+        blocked_prefix: str,
+    ) -> None:
         basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
-
         try:
-            macro_result = self.agents["macro_allocation_agent"].run(
-                task_prompt=(
-                    "Run the mock macro allocation step for the current scheduled review date and return one JSON "
-                    "object with regime, basket_weights, mock flag, regime_changed, and reason_brief."
-                ),
-                context={
-                    "date": current_date,
-                    "mock_regime_mode": self._mock_regime_mode,
-                    "mock_regime_seed": self._mock_regime_seed,
-                    "basket_universes": basket_universes,
-                },
-            )
-            macro_report = _parse_json_summary(macro_result.summary, "macro_allocation_agent")
-
             basket_reports_by_id = {}
             basket_weights = _require_dict(macro_report.get("basket_weights", {}), "macro basket_weights")
             for basket_id, agent_name in BASKET_AGENT_NAMES.items():
@@ -857,7 +849,7 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             validate_execution_plan_cash_safety(self, execution_plan)
         except ValueError as exc:
             self._last_execution_plan_error = str(exc)
-            print(f"Mock quadrant workflow blocked: {exc}")
+            self._log_growth_inflation_workflow_blocked(f"{blocked_prefix}: {exc}")
             return
 
         self._last_execution_plan_error = None
@@ -874,4 +866,40 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
                 "date": current_date,
                 "execution_plan": execution_plan_execute_payload(execution_plan),
             },
+        )
+
+    def on_trading_iteration(self):
+        current_datetime = self.get_datetime()
+        current_date_obj = current_datetime.date()
+        current_date = current_date_obj.isoformat()
+        cadence_event = self._scheduled_workflow_decision(current_date_obj)
+        if not cadence_event["should_run"]:
+            self._record_scheduled_workflow_event(cadence_event)
+            return
+        self._mark_scheduled_workflow_attempted(cadence_event)
+        basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
+
+        try:
+            macro_result = self.agents["macro_allocation_agent"].run(
+                task_prompt=(
+                    "Run the mock macro allocation step for the current scheduled review date and return one JSON "
+                    "object with regime, basket_weights, mock flag, regime_changed, and reason_brief."
+                ),
+                context={
+                    "date": current_date,
+                    "mock_regime_mode": self._mock_regime_mode,
+                    "mock_regime_seed": self._mock_regime_seed,
+                    "basket_universes": basket_universes,
+                },
+            )
+            macro_report = _parse_json_summary(macro_result.summary, "macro_allocation_agent")
+        except ValueError as exc:
+            self._last_execution_plan_error = str(exc)
+            self._log_growth_inflation_workflow_blocked(f"Mock quadrant workflow blocked: {exc}")
+            return
+
+        self._run_growth_inflation_downstream_workflow(
+            current_date,
+            macro_report,
+            "Mock quadrant workflow blocked",
         )
