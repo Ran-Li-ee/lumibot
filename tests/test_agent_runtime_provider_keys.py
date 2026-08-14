@@ -412,6 +412,21 @@ def test_openai_luna_tool_calls_force_reasoning_effort_none():
     assert kwargs["reasoning_effort"] == "medium"
 
 
+def test_bare_openai_luna_tool_calls_force_reasoning_effort_none():
+    kwargs = {"reasoning_effort": "medium", "stream": False}
+
+    sanitized = _sanitize_litellm_completion_args_for_model(
+        model="gpt-5.6-luna",
+        tools=[{"type": "function"}],
+        kwargs=kwargs,
+    )
+
+    assert sanitized is not kwargs
+    assert sanitized["reasoning_effort"] == "none"
+    assert sanitized["stream"] is False
+    assert kwargs["reasoning_effort"] == "medium"
+
+
 def test_openai_luna_without_tools_omits_reasoning_effort_for_chat_completions():
     kwargs = {"reasoning_effort": "medium"}
 

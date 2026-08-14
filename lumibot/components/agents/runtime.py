@@ -3594,7 +3594,10 @@ def _sanitize_litellm_completion_args_for_model(
 
     if not isinstance(model, str):
         return kwargs
-    if model.strip().lower() != "openai/gpt-5.6-luna":
+    model_name = model.strip().lower()
+    if "/" in model_name:
+        model_name = model_name.rsplit("/", 1)[-1]
+    if model_name != "gpt-5.6-luna":
         return kwargs
     sanitized = dict(kwargs)
     if tools:
