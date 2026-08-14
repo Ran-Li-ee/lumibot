@@ -1289,6 +1289,118 @@ def _json_summary(payload):
     return json.dumps(payload, separators=(",", ":"))
 
 
+def test_on_trading_iteration_skips_before_weekly_run_day_without_agent_calls():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.parameters["weekly_run_weekday"] = "WED"
+    strategy.get_datetime = lambda: datetime(2024, 9, 9, 9, 30)
+    strategy.initialize()
+
+    strategy.on_trading_iteration()
+
+    assert all(not agent.calls for agent in agent_manager._agents.values())
+    assert strategy._scheduled_workflow_events == [
+        {
+            "date": "2024-09-09",
+            "run_frequency": "weekly",
+            "weekly_run_weekday": "WED",
+            "week_key": "2024-W37",
+            "should_run": False,
+            "status": "skipped",
+            "reason": "before_weekly_run_day",
+            "last_weekly_run_date": None,
+        }
+    ]
+
+
+def test_on_trading_iteration_runs_once_per_observed_week():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    current_datetime = datetime(2024, 9, 9, 9, 30)
+    strategy.get_datetime = lambda: current_datetime
+    strategy.initialize()
+
+    macro_report = {
+        "agent": "macro_allocation_agent",
+        "regime": "growth_up_inflation_down",
+        "regime_changed": True,
+        "basket_weights": {"equity": 0.50, "commodity": 0.00, "tips": 0.25, "nominal_bond": 0.25},
+        "mock": True,
+        "reason_brief": "mock",
+    }
+    basket_reports = {
+        "equity_basket_agent": {
+            "basket_id": "equity",
+            "target_weight": 0.50,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["equity"],
+            "selected_symbol": "QQQ",
+            "reason_brief": "selected",
+        },
+        "commodity_basket_agent": {
+            "basket_id": "commodity",
+            "target_weight": 0.00,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["commodity"],
+            "selected_symbol": None,
+            "reason_brief": "inactive",
+        },
+        "tips_basket_agent": {
+            "basket_id": "tips",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["tips"],
+            "selected_symbol": "TIP",
+            "reason_brief": "selected",
+        },
+        "nominal_bond_basket_agent": {
+            "basket_id": "nominal_bond",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["nominal_bond"],
+            "selected_symbol": "IEF",
+            "reason_brief": "selected",
+        },
+    }
+    planner_plan = {"schema_version": 1, "intent": "hold", "orders": []}
+    portfolio_summary = {
+        "decision": {"type": "hold", "reason_brief": "mock target"},
+        "target_portfolio": [
+            {"basket_id": "equity", "symbol": "QQQ", "target_weight": 0.50},
+            {"basket_id": "tips", "symbol": "TIP", "target_weight": 0.25},
+            {"basket_id": "nominal_bond", "symbol": "IEF", "target_weight": 0.25},
+        ],
+        "execution_plan": planner_plan,
+    }
+
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    for agent_name, report in basket_reports.items():
+        agent_manager.summaries[agent_name] = _json_summary(report)
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary(portfolio_summary)
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": planner_plan}
+
+    strategy.on_trading_iteration()
+    current_datetime = datetime(2024, 9, 10, 9, 30)
+    strategy.on_trading_iteration()
+
+    assert len(agent_manager["macro_allocation_agent"].calls) == 1
+    assert len(agent_manager["portfolio_decision_agent"].calls) == 1
+    assert strategy._scheduled_workflow_attempted_week_keys == {"2024-W37"}
+    assert strategy._scheduled_workflow_events[-1] == {
+        "date": "2024-09-10",
+        "run_frequency": "weekly",
+        "weekly_run_weekday": "MON",
+        "week_key": "2024-W37",
+        "should_run": False,
+        "status": "skipped",
+        "reason": "weekly_workflow_already_attempted",
+        "last_weekly_run_date": "2024-09-09",
+    }
+
+
 def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()

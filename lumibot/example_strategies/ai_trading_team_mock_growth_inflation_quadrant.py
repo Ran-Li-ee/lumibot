@@ -768,8 +768,34 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             ),
         )
 
+    def _scheduled_workflow_decision(self, current_date: date_type) -> dict[str, Any]:
+        return scheduled_workflow_decision(
+            current_date=current_date,
+            run_frequency=self._run_frequency,
+            weekly_run_weekday=self._weekly_run_weekday,
+            attempted_week_keys=self._scheduled_workflow_attempted_week_keys,
+        )
+
+    def _record_scheduled_workflow_event(self, event: dict[str, Any]) -> None:
+        normalized = dict(event)
+        normalized["last_weekly_run_date"] = self._last_scheduled_workflow_run_date
+        self._scheduled_workflow_events.append(normalized)
+
+    def _mark_scheduled_workflow_attempted(self, event: dict[str, Any]) -> None:
+        if event["run_frequency"] == "weekly":
+            self._scheduled_workflow_attempted_week_keys.add(event["week_key"])
+        self._last_scheduled_workflow_run_date = event["date"]
+        self._record_scheduled_workflow_event(event)
+
     def on_trading_iteration(self):
-        current_date = self.get_datetime().date().isoformat()
+        current_datetime = self.get_datetime()
+        current_date_obj = current_datetime.date()
+        current_date = current_date_obj.isoformat()
+        cadence_event = self._scheduled_workflow_decision(current_date_obj)
+        if not cadence_event["should_run"]:
+            self._record_scheduled_workflow_event(cadence_event)
+            return
+        self._mark_scheduled_workflow_attempted(cadence_event)
         basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
 
         try:
