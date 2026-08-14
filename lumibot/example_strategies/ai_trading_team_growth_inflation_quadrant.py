@@ -18,6 +18,7 @@ from lumibot.example_strategies.fred_growth_inflation_regime_classifier import (
     REGIMES,
     WEIGHT_BY_REGIME,
     make_real_macro_regime_classifier_tool,
+    regime_from_directions,
 )
 
 MACRO_REGIME_CLASSIFIER_TOOL_NAME = "macro_regime_classifier"
@@ -220,6 +221,19 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
         if inflation_error is not None:
             return f"inflation_evidence {inflation_error}"
 
+        try:
+            evidence_regime = regime_from_directions(
+                growth_evidence["direction"],
+                inflation_evidence["direction"],
+            )
+        except ValueError as exc:
+            return f"evidence directions must map to a classifier regime: {exc}"
+        if evidence_regime != regime:
+            return (
+                "evidence directions must match reported regime; "
+                f"directions imply {evidence_regime!r}, got {regime!r}."
+            )
+
         return None
 
     def _real_macro_evidence_canonical_error(
@@ -256,6 +270,11 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             return f"must include non-empty string fields: {missing_string_fields}."
         if evidence.get("direction") not in {"up", "down"}:
             return "direction must be 'up' or 'down'."
+        expected_frequency = "quarterly" if axis == "growth" else "monthly"
+        if evidence.get("frequency") != expected_frequency:
+            return f"frequency must be {expected_frequency!r}."
+        if evidence.get("metric_name") != "year_over_year_change":
+            return "metric_name must be 'year_over_year_change'."
         required_numeric_fields = (
             "latest_value",
             "comparison_value",

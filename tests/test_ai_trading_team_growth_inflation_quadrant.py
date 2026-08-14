@@ -778,6 +778,142 @@ def test_real_strategy_blocks_noncanonical_classifier_regime_weights_and_evidenc
     assert expected_reason in blocked_log
 
 
+@pytest.mark.parametrize(
+    ("regime", "growth_direction", "inflation_direction"),
+    [
+        ("growth_up_inflation_down", "down", "down"),
+        ("growth_up_inflation_down", "up", "up"),
+        ("growth_down_inflation_up", "up", "up"),
+    ],
+)
+def test_real_strategy_blocks_evidence_directions_inconsistent_with_regime_before_downstream(
+    regime,
+    growth_direction,
+    inflation_direction,
+    capsys,
+):
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    existing_regime = "growth_down_inflation_down"
+    strategy._last_real_regime = existing_regime
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}
+    }
+    strategy._last_execution_plan_error = "stale execution error"
+    macro_report = _passed_real_macro_report(module, regime=regime)
+    macro_report["growth_evidence"]["direction"] = growth_direction
+    macro_report["inflation_evidence"]["direction"] = inflation_direction
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary({"status": "passed"})
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(macro_report)]
+    _install_hold_downstream_summaries(agent_manager, module)
+
+    strategy.on_trading_iteration()
+
+    assert len(agent_manager["macro_allocation_agent"].calls) == 1
+    for agent_name in module.BASKET_AGENT_NAMES.values():
+        assert agent_manager[agent_name].calls == []
+    assert agent_manager["portfolio_decision_agent"].calls == []
+    assert agent_manager["execution_agent"].calls == []
+    assert strategy._last_real_regime == existing_regime
+    assert strategy._last_macro_regime_error["status"] == "failed"
+    assert "non-canonical" in strategy._last_macro_regime_error["reason"]
+    assert "evidence directions" in strategy._last_macro_regime_error["reason"]
+    assert strategy._last_execution_plan_error is None
+    assert strategy._last_target_portfolio_planner_result is None
+    blocked_log = capsys.readouterr().out
+    assert "Real quadrant macro workflow blocked" in blocked_log
+    assert "evidence directions" in blocked_log
+
+
+@pytest.mark.parametrize(
+    ("axis", "frequency"),
+    [
+        ("growth", "monthly"),
+        ("inflation", "quarterly"),
+        ("growth", "daily"),
+        ("inflation", "daily"),
+    ],
+)
+def test_real_strategy_blocks_wrong_evidence_frequency_before_downstream(
+    axis,
+    frequency,
+    capsys,
+):
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    existing_regime = "growth_down_inflation_up"
+    strategy._last_real_regime = existing_regime
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}
+    }
+    strategy._last_execution_plan_error = "stale execution error"
+    macro_report = _passed_real_macro_report(module, regime="growth_up_inflation_down")
+    macro_report[f"{axis}_evidence"]["frequency"] = frequency
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary({"status": "passed"})
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(macro_report)]
+    _install_hold_downstream_summaries(agent_manager, module)
+
+    strategy.on_trading_iteration()
+
+    assert len(agent_manager["macro_allocation_agent"].calls) == 1
+    for agent_name in module.BASKET_AGENT_NAMES.values():
+        assert agent_manager[agent_name].calls == []
+    assert agent_manager["portfolio_decision_agent"].calls == []
+    assert agent_manager["execution_agent"].calls == []
+    assert strategy._last_real_regime == existing_regime
+    assert strategy._last_macro_regime_error["status"] == "failed"
+    assert "non-canonical" in strategy._last_macro_regime_error["reason"]
+    assert "frequency" in strategy._last_macro_regime_error["reason"]
+    assert strategy._last_execution_plan_error is None
+    assert strategy._last_target_portfolio_planner_result is None
+    blocked_log = capsys.readouterr().out
+    assert "Real quadrant macro workflow blocked" in blocked_log
+    assert "frequency" in blocked_log
+
+
+@pytest.mark.parametrize("axis", ["growth", "inflation"])
+def test_real_strategy_blocks_wrong_evidence_metric_name_before_downstream(axis, capsys):
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    existing_regime = "growth_down_inflation_up"
+    strategy._last_real_regime = existing_regime
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}
+    }
+    strategy._last_execution_plan_error = "stale execution error"
+    macro_report = _passed_real_macro_report(module, regime="growth_up_inflation_down")
+    macro_report[f"{axis}_evidence"]["metric_name"] = "fabricated_metric"
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary({"status": "passed"})
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(macro_report)]
+    _install_hold_downstream_summaries(agent_manager, module)
+
+    strategy.on_trading_iteration()
+
+    assert len(agent_manager["macro_allocation_agent"].calls) == 1
+    for agent_name in module.BASKET_AGENT_NAMES.values():
+        assert agent_manager[agent_name].calls == []
+    assert agent_manager["portfolio_decision_agent"].calls == []
+    assert agent_manager["execution_agent"].calls == []
+    assert strategy._last_real_regime == existing_regime
+    assert strategy._last_macro_regime_error["status"] == "failed"
+    assert "non-canonical" in strategy._last_macro_regime_error["reason"]
+    assert "metric_name" in strategy._last_macro_regime_error["reason"]
+    assert strategy._last_execution_plan_error is None
+    assert strategy._last_target_portfolio_planner_result is None
+    blocked_log = capsys.readouterr().out
+    assert "Real quadrant macro workflow blocked" in blocked_log
+    assert "metric_name" in blocked_log
+
+
 def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
     module, strategy_class = load_real_strategy_module()
     agent_manager = RecordingAgentManager()
