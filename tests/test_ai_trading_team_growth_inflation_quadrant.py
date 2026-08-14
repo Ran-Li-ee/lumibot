@@ -886,6 +886,45 @@ def test_bound_real_macro_regime_classifier_uses_strategy_parameters_as_defaults
     assert strategy._last_real_regime == result["regime"]
 
 
+def test_bound_real_macro_regime_classifier_explicit_defaults_mutate_state():
+    module = load_classifier_module()
+    existing_regime = "growth_down_inflation_up"
+
+    class FakeStrategy:
+        _last_real_regime = existing_regime
+
+        def get_datetime(self):
+            return datetime(2024, 9, 5, 15, 30)
+
+    fred = FakeFredClient(
+        {
+            "GDPC1": _growth_payload_with_latest_direction("up"),
+            "CPIAUCSL": _inflation_payload_with_latest_direction("down"),
+        }
+    )
+    strategy = FakeStrategy()
+    bound_tool = module.make_real_macro_regime_classifier_tool(
+        fred_factory=lambda _strategy: fred
+    ).binder(strategy, manager=None)
+
+    result = bound_tool.function(
+        date="2024-09-05",
+        mode=module.DEFAULT_MODE,
+        growth_series_id=module.DEFAULT_GROWTH_SERIES_ID,
+        inflation_series_id=module.DEFAULT_INFLATION_SERIES_ID,
+        growth_lag_months=module.DEFAULT_GROWTH_LAG_MONTHS,
+        inflation_lag_months=module.DEFAULT_INFLATION_LAG_MONTHS,
+        trend_years=module.DEFAULT_TREND_YEARS,
+    )
+
+    assert result["status"] == "passed"
+    assert result["date"] == "2024-09-05"
+    assert result["previous_regime"] == existing_regime
+    assert result["regime"] != existing_regime
+    assert result["data_quality"]["required_series"] == ["GDPC1", "CPIAUCSL"]
+    assert strategy._last_real_regime == result["regime"]
+
+
 def test_bound_real_macro_regime_classifier_failed_or_blocked_results_do_not_mutate_state():
     module = load_classifier_module()
     existing_regime = "growth_up_inflation_down"

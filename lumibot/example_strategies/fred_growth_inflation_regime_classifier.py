@@ -589,12 +589,12 @@ def make_real_macro_regime_classifier_tool(
             is_canonical_current_regime_call = (
                 result.get("status") == "passed"
                 and result.get("date") == strategy_date
-                and (mode is None or mode == default_mode)
-                and growth_series_id is None
-                and inflation_series_id is None
-                and growth_lag_months is None
-                and inflation_lag_months is None
-                and trend_years is None
+                and resolved_mode == default_mode
+                and resolved_growth_series_id == default_growth_series_id
+                and resolved_inflation_series_id == default_inflation_series_id
+                and resolved_growth_lag_months == default_growth_lag_months
+                and resolved_inflation_lag_months == default_inflation_lag_months
+                and resolved_trend_years == default_trend_years
             )
             if is_canonical_current_regime_call:
                 strategy._last_real_regime = result["regime"]
