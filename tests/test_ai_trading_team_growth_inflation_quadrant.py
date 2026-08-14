@@ -352,6 +352,45 @@ def test_real_strategy_macro_parse_failure_blocks_downstream_and_clears_stale_pl
     assert strategy._last_target_portfolio_planner_result is None
 
 
+def test_real_strategy_passed_macro_without_classifier_tool_evidence_blocks_downstream(capsys):
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}
+    }
+    strategy._last_execution_plan_error = "stale execution error"
+    macro_report = {
+        "status": "passed",
+        "tool": "macro_regime_classifier",
+        "mock": False,
+        "regime": "growth_up_inflation_down",
+        "basket_weights": {"equity": 0.50, "commodity": 0.25, "tips": 0.00, "nominal_bond": 0.25},
+        "growth_evidence": {"direction": "up"},
+        "inflation_evidence": {"direction": "down"},
+        "data_quality": {"status": "passed"},
+        "confidence": {"growth_margin": 0.01, "inflation_margin": 0.02},
+        "reason_brief": "plausible but fabricated macro report",
+    }
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+
+    strategy.on_trading_iteration()
+
+    assert len(agent_manager["macro_allocation_agent"].calls) == 1
+    for agent_name in module.BASKET_AGENT_NAMES.values():
+        assert agent_manager[agent_name].calls == []
+    assert agent_manager["portfolio_decision_agent"].calls == []
+    assert agent_manager["execution_agent"].calls == []
+    assert strategy._last_macro_regime_error["status"] == "failed"
+    assert "macro_regime_classifier" in strategy._last_macro_regime_error["reason"]
+    assert strategy._last_execution_plan_error is None
+    assert strategy._last_target_portfolio_planner_result is None
+    blocked_log = capsys.readouterr().out
+    assert "Real quadrant macro workflow blocked" in blocked_log
+    assert "macro_regime_classifier" in blocked_log
+
+
 def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
     module, strategy_class = load_real_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -440,6 +479,7 @@ def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
         "execution_plan": planner_plan,
     }
     agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
     for agent_name, report in basket_reports.items():
         agent_manager.summaries[agent_name] = _json_summary(report)
     agent_manager.summaries["portfolio_decision_agent"] = _json_summary(portfolio_summary)

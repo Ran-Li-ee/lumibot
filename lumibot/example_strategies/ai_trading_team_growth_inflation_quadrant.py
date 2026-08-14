@@ -4,6 +4,7 @@ from lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant i
     BASKET_AGENT_NAMES,
     BASKET_UNIVERSES,
     AITradingTeamMockGrowthInflationQuadrantStrategy,
+    _agent_result_tool_names,
     _parse_json_summary,
 )
 from lumibot.example_strategies.fred_growth_inflation_regime_classifier import (
@@ -116,6 +117,17 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             self._last_macro_regime_error = macro_report
             self._last_execution_plan_error = None
             self._last_target_portfolio_planner_result = None
+            return
+
+        if "macro_regime_classifier" not in _agent_result_tool_names(macro_result):
+            reason = "macro_allocation_agent must call macro_regime_classifier before a passed macro report is trusted."
+            self._last_macro_regime_error = {
+                "status": "failed",
+                "reason": reason,
+            }
+            self._last_execution_plan_error = None
+            self._last_target_portfolio_planner_result = None
+            self._log_growth_inflation_workflow_blocked(f"Real quadrant macro workflow blocked: {reason}")
             return
 
         self._last_macro_regime_error = None
