@@ -201,17 +201,22 @@ def _passed_real_macro_report(module, *, regime="growth_up_inflation_down", reas
         "regime": regime,
         "basket_weights": {"equity": 0.50, "commodity": 0.25, "tips": 0.00, "nominal_bond": 0.25},
         "growth_evidence": {
+            "series_id": module.DEFAULT_GROWTH_SERIES_ID,
             "direction": "up",
             "lag_months": module.DEFAULT_GROWTH_LAG_MONTHS,
             "trend_years": module.DEFAULT_TREND_YEARS,
         },
         "inflation_evidence": {
+            "series_id": module.DEFAULT_INFLATION_SERIES_ID,
             "direction": "down",
             "lag_months": module.DEFAULT_INFLATION_LAG_MONTHS,
             "trend_years": module.DEFAULT_TREND_YEARS,
         },
         "data_quality": {
             "status": "passed",
+            "source": "fred_api",
+            "point_in_time_safe": True,
+            "uses_revised_data": False,
             "required_series": [module.DEFAULT_GROWTH_SERIES_ID, module.DEFAULT_INFLATION_SERIES_ID],
         },
         "confidence": {"growth_margin": 0.01, "inflation_margin": 0.02},
@@ -619,6 +624,64 @@ def test_real_strategy_blocks_noncanonical_passed_classifier_payloads_before_dow
     assert "non-canonical" in blocked_log
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("missing_regime", "regime"),
+        ("missing_basket_weights", "basket_weights"),
+        ("incomplete_basket_weights", "basket_weights"),
+        ("bad_provenance_flag", "point_in_time_safe"),
+    ],
+)
+def test_real_strategy_blocks_incomplete_passed_classifier_payloads_before_downstream(
+    mutation,
+    expected_reason,
+    capsys,
+):
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    existing_regime = "growth_down_inflation_up"
+    strategy._last_real_regime = existing_regime
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}
+    }
+    strategy._last_execution_plan_error = "stale execution error"
+    macro_report = _passed_real_macro_report(module, regime="growth_up_inflation_down")
+    if mutation == "missing_regime":
+        del macro_report["regime"]
+    elif mutation == "missing_basket_weights":
+        del macro_report["basket_weights"]
+    elif mutation == "incomplete_basket_weights":
+        del macro_report["basket_weights"]["nominal_bond"]
+    elif mutation == "bad_provenance_flag":
+        macro_report["data_quality"]["point_in_time_safe"] = False
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary({"status": "passed"})
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(macro_report)]
+    _install_hold_downstream_summaries(agent_manager, module)
+
+    strategy.on_trading_iteration()
+
+    assert len(agent_manager["macro_allocation_agent"].calls) == 1
+    for agent_name in module.BASKET_AGENT_NAMES.values():
+        assert agent_manager[agent_name].calls == []
+    assert agent_manager["portfolio_decision_agent"].calls == []
+    assert agent_manager["execution_agent"].calls == []
+    assert strategy._last_real_regime == existing_regime
+    assert strategy._last_macro_regime_error["status"] == "failed"
+    assert "non-canonical" in strategy._last_macro_regime_error["reason"]
+    assert expected_reason in strategy._last_macro_regime_error["reason"]
+    assert strategy._last_execution_plan_error is None
+    assert strategy._last_target_portfolio_planner_result is None
+    blocked_log = capsys.readouterr().out
+    assert "Real quadrant macro workflow blocked" in blocked_log
+    assert expected_reason in blocked_log
+
+
 def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
     module, strategy_class = load_real_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -635,17 +698,22 @@ def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
         "regime": "growth_up_inflation_down",
         "basket_weights": {"equity": 0.50, "commodity": 0.25, "tips": 0.00, "nominal_bond": 0.25},
         "growth_evidence": {
+            "series_id": module.DEFAULT_GROWTH_SERIES_ID,
             "direction": "up",
             "lag_months": module.DEFAULT_GROWTH_LAG_MONTHS,
             "trend_years": module.DEFAULT_TREND_YEARS,
         },
         "inflation_evidence": {
+            "series_id": module.DEFAULT_INFLATION_SERIES_ID,
             "direction": "down",
             "lag_months": module.DEFAULT_INFLATION_LAG_MONTHS,
             "trend_years": module.DEFAULT_TREND_YEARS,
         },
         "data_quality": {
             "status": "passed",
+            "source": "fred_api",
+            "point_in_time_safe": True,
+            "uses_revised_data": False,
             "required_series": [module.DEFAULT_GROWTH_SERIES_ID, module.DEFAULT_INFLATION_SERIES_ID],
         },
         "confidence": {"growth_margin": 0.01, "inflation_margin": 0.02},

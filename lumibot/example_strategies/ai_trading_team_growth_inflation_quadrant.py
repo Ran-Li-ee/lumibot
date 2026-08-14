@@ -1,4 +1,5 @@
 import os
+from numbers import Real
 from typing import Any
 
 from lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant import (
@@ -17,6 +18,7 @@ from lumibot.example_strategies.fred_growth_inflation_regime_classifier import (
 )
 
 MACRO_REGIME_CLASSIFIER_TOOL_NAME = "macro_regime_classifier"
+REAL_MACRO_BASKET_WEIGHT_TOLERANCE = 1e-6
 
 
 def _macro_regime_classifier_tool_payload(result: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -111,32 +113,107 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
         macro_report: dict[str, Any],
         current_date: str,
     ) -> bool:
+        return self._real_macro_report_canonical_error(macro_report, current_date) is None
+
+    def _real_macro_report_canonical_error(
+        self,
+        macro_report: dict[str, Any],
+        current_date: str,
+    ) -> str | None:
         growth_evidence = macro_report.get("growth_evidence")
         inflation_evidence = macro_report.get("inflation_evidence")
         data_quality = macro_report.get("data_quality")
+        basket_weights = macro_report.get("basket_weights")
         if not isinstance(growth_evidence, dict):
-            return False
+            return "growth_evidence must be an object."
         if not isinstance(inflation_evidence, dict):
-            return False
+            return "inflation_evidence must be an object."
         if not isinstance(data_quality, dict):
-            return False
+            return "data_quality must be an object."
 
-        return (
-            macro_report.get("status") == "passed"
-            and macro_report.get("tool") == MACRO_REGIME_CLASSIFIER_TOOL_NAME
-            and macro_report.get("mock") is False
-            and macro_report.get("date") == current_date
-            and macro_report.get("as_of") == current_date
-            and macro_report.get("mode") == self._macro_regime_mode
-            and data_quality.get("required_series") == [
-                self._growth_series_id,
-                self._inflation_series_id,
-            ]
-            and growth_evidence.get("lag_months") == self._growth_lag_months
-            and inflation_evidence.get("lag_months") == self._inflation_lag_months
-            and growth_evidence.get("trend_years") == self._trend_years
-            and inflation_evidence.get("trend_years") == self._trend_years
+        if macro_report.get("status") != "passed":
+            return "status must be passed."
+        if macro_report.get("tool") != MACRO_REGIME_CLASSIFIER_TOOL_NAME:
+            return f"tool must be {MACRO_REGIME_CLASSIFIER_TOOL_NAME!r}."
+        if macro_report.get("mock") is not False:
+            return "mock must be false for real macro payloads."
+        if macro_report.get("date") != current_date or macro_report.get("as_of") != current_date:
+            return "current date mismatch: date and as_of must equal the current date."
+        if macro_report.get("mode") != self._macro_regime_mode:
+            return "configured/default parameters mismatch: mode must match the strategy configuration."
+
+        regime = macro_report.get("regime")
+        if not isinstance(regime, str) or not regime.strip():
+            return "regime must be a non-empty string."
+
+        if not isinstance(basket_weights, dict):
+            return "basket_weights must be an object with all expected basket keys."
+        expected_basket_keys = tuple(BASKET_AGENT_NAMES.keys())
+        missing_basket_keys = [key for key in expected_basket_keys if key not in basket_weights]
+        if missing_basket_keys:
+            return f"basket_weights missing expected basket keys: {missing_basket_keys}."
+        non_numeric_weight_keys = [
+            key
+            for key, value in basket_weights.items()
+            if isinstance(value, bool) or not isinstance(value, Real)
+        ]
+        if non_numeric_weight_keys:
+            return f"basket_weights values must be numeric: {non_numeric_weight_keys}."
+        total_weight = sum(float(value) for value in basket_weights.values())
+        if abs(total_weight - 1.0) > REAL_MACRO_BASKET_WEIGHT_TOLERANCE:
+            return f"basket_weights total must be approximately 1.0; got {total_weight:.12g}."
+
+        expected_series = [self._growth_series_id, self._inflation_series_id]
+        if data_quality.get("required_series") != expected_series:
+            return (
+                "configured/default parameters mismatch: data_quality required_series must match "
+                "the strategy growth/inflation series."
+            )
+        if data_quality.get("status") != "passed":
+            return "data_quality status must be passed."
+        if data_quality.get("source") != "fred_api":
+            return "data_quality source must be fred_api."
+        if data_quality.get("point_in_time_safe") is not True:
+            return "data_quality point_in_time_safe must be true."
+        if data_quality.get("uses_revised_data") is not False:
+            return "data_quality uses_revised_data must be false."
+
+        growth_error = self._real_macro_evidence_canonical_error(
+            growth_evidence,
+            axis="growth",
+            series_id=self._growth_series_id,
+            lag_months=self._growth_lag_months,
         )
+        if growth_error is not None:
+            return f"growth_evidence {growth_error}"
+        inflation_error = self._real_macro_evidence_canonical_error(
+            inflation_evidence,
+            axis="inflation",
+            series_id=self._inflation_series_id,
+            lag_months=self._inflation_lag_months,
+        )
+        if inflation_error is not None:
+            return f"inflation_evidence {inflation_error}"
+
+        return None
+
+    def _real_macro_evidence_canonical_error(
+        self,
+        evidence: dict[str, Any],
+        *,
+        axis: str,
+        series_id: str,
+        lag_months: int,
+    ) -> str | None:
+        if evidence.get("series_id") != series_id:
+            return f"series_id must be {series_id!r}."
+        if evidence.get("lag_months") != lag_months:
+            return f"lag_months must be {lag_months}."
+        if evidence.get("trend_years") != self._trend_years:
+            return f"trend_years must be {self._trend_years}."
+        if "axis" in evidence and evidence.get("axis") != axis:
+            return f"axis must be {axis!r} when present."
+        return None
 
     def _commit_accepted_real_regime_if_canonical(
         self,
@@ -191,11 +268,13 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             self._clear_real_macro_downstream_state()
             return
 
-        if not self._accepted_real_macro_report_is_canonical(macro_report, current_date):
+        canonical_error = self._real_macro_report_canonical_error(macro_report, current_date)
+        if canonical_error is not None:
             self._block_real_macro_workflow(
                 "macro_regime_classifier returned a non-canonical passed payload; "
-                "blocking real workflow because accepted tool_result must match the current date and "
-                "configured/default parameters (mode, growth/inflation series, lags, trend years)."
+                f"{canonical_error} Blocking real workflow because accepted tool_result must include "
+                "complete regime, basket_weights, evidence, and trusted FRED provenance for the "
+                "current date and configured/default parameters."
             )
             return
 
