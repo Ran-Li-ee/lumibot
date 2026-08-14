@@ -216,6 +216,36 @@ def _real_macro_evidence(module, *, axis, series_id, direction, lag_months, freq
     }
 
 
+def _real_macro_vintage_evidence(module, *, axis, series_id, direction, frequency, as_of="2024-09-05"):
+    return {
+        "axis": axis,
+        "series_id": series_id,
+        "series_name": (
+            "Real Gross Domestic Product"
+            if axis == "growth"
+            else "Consumer Price Index for All Urban Consumers"
+        ),
+        "frequency": frequency,
+        "as_of": as_of,
+        "latest_realtime_start": as_of,
+        "latest_realtime_end": as_of,
+        "comparison_realtime_start": as_of,
+        "comparison_realtime_end": as_of,
+        "latest_observation_date": "2024-01-01" if axis == "growth" else "2024-08-01",
+        "comparison_observation_date": "2023-01-01" if axis == "growth" else "2023-08-01",
+        "latest_value": 170.0 if axis == "growth" else 175.0,
+        "comparison_value": 120.0 if axis == "growth" else 165.0,
+        "metric_name": "year_over_year_change",
+        "metric_value": 0.41666666666666674 if axis == "growth" else 0.06060606060606055,
+        "trend_years": module.DEFAULT_TREND_YEARS,
+        "trend_window_observations": 20 if axis == "growth" else 60,
+        "trend_value": 0.12 if axis == "growth" else 0.08,
+        "margin": 0.29666666666666675 if axis == "growth" else -0.01939393939393945,
+        "direction": direction,
+        "observation_lag_days": 248 if axis == "growth" else 35,
+    }
+
+
 def _assert_vintage_evidence_fields(evidence, *, axis, series_id, as_of):
     assert evidence["axis"] == axis
     assert evidence["series_id"] == series_id
@@ -236,6 +266,50 @@ def _passed_real_macro_report(module, *, regime="growth_up_inflation_down", reas
         "tool": "macro_regime_classifier",
         "mock": False,
         "mode": module.DEFAULT_MODE,
+        "date": "2024-09-05",
+        "as_of": "2024-09-05",
+        "requested_as_of": "2024-09-05",
+        "effective_as_of": "2024-09-05",
+        "lookahead_clamped": False,
+        "as_of_policy": module.DEFAULT_AS_OF_POLICY,
+        "regime": regime,
+        "basket_weights": dict(module.WEIGHT_BY_REGIME[regime]),
+        "growth_evidence": _real_macro_vintage_evidence(
+            module,
+            axis="growth",
+            series_id=module.DEFAULT_GROWTH_SERIES_ID,
+            direction="up",
+            frequency="quarterly",
+        ),
+        "inflation_evidence": _real_macro_vintage_evidence(
+            module,
+            axis="inflation",
+            series_id=module.DEFAULT_INFLATION_SERIES_ID,
+            direction="down",
+            frequency="monthly",
+        ),
+        "data_quality": {
+            "status": "passed",
+            "source": "fred_api",
+            "point_in_time_safe": True,
+            "uses_revised_data": False,
+            "required_series": [module.DEFAULT_GROWTH_SERIES_ID, module.DEFAULT_INFLATION_SERIES_ID],
+            "requested_as_of": "2024-09-05",
+            "effective_as_of": "2024-09-05",
+            "lookahead_clamped": False,
+            "as_of_policy": module.DEFAULT_AS_OF_POLICY,
+        },
+        "confidence": {"growth_margin": 0.01, "inflation_margin": 0.02},
+        "reason_brief": reason_brief,
+    }
+
+
+def _passed_real_macro_legacy_report(module, *, regime="growth_up_inflation_down", reason_brief="legacy macro"):
+    return {
+        "status": "passed",
+        "tool": "macro_regime_classifier",
+        "mock": False,
+        "mode": module.LEGACY_LAGGED_MODE,
         "date": "2024-09-05",
         "as_of": "2024-09-05",
         "regime": regime,
@@ -394,6 +468,14 @@ def test_real_strategy_parameters_include_current_weekly_cadence_defaults():
     assert strategy_class.parameters["weekly_holiday_policy"] == "first_open_trading_day"
 
 
+def test_real_quadrant_strategy_defaults_to_vintage_asof_policy():
+    module, strategy_class = load_real_strategy_module()
+
+    assert strategy_class.parameters["macro_regime_mode"] == module.VINTAGE_ASOF_MODE
+    assert strategy_class.parameters["as_of_policy"] == module.DEFAULT_AS_OF_POLICY
+    assert module.DEFAULT_AS_OF_POLICY == "same_day_vintage"
+
+
 def test_real_strategy_prompts_do_not_ask_llm_to_classify_macro_or_use_mock_language():
     _module, strategy_class = load_real_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -405,6 +487,10 @@ def test_real_strategy_prompts_do_not_ask_llm_to_classify_macro_or_use_mock_lang
     serialized_prompts = " ".join(agent["system_prompt"] for agent in agent_manager.created).lower()
 
     assert "real fred-backed macro_regime_classifier" in serialized_prompts
+    assert "fred vintage as-of date" in serialized_prompts
+    assert "requested_as_of" in serialized_prompts
+    assert "effective_as_of" in serialized_prompts
+    assert "lookahead_clamped" in serialized_prompts
     assert "do not classify the macro regime yourself" in serialized_prompts
     for forbidden_word in ("mock", "seed", "seeded_random", "random", "fake"):
         assert forbidden_word not in serialized_prompts
@@ -666,6 +752,96 @@ def test_real_strategy_blocks_noncanonical_passed_classifier_payloads_before_dow
     blocked_log = capsys.readouterr().out
     assert "Real quadrant macro workflow blocked" in blocked_log
     assert "non-canonical" in blocked_log
+
+
+def test_real_macro_report_canonical_accepts_vintage_asof_payload():
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+
+    macro_report = _passed_real_macro_report(module)
+
+    assert strategy._real_macro_report_canonical_error(macro_report, "2024-09-05") is None
+
+
+def test_real_macro_report_canonical_rejects_unclamped_future_requested_as_of():
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    macro_report = _passed_real_macro_report(module)
+    macro_report["requested_as_of"] = "2024-09-07"
+    macro_report["effective_as_of"] = "2024-09-05"
+    macro_report["as_of"] = "2024-09-05"
+    macro_report["lookahead_clamped"] = False
+    macro_report["data_quality"]["requested_as_of"] = "2024-09-07"
+    macro_report["data_quality"]["effective_as_of"] = "2024-09-05"
+    macro_report["data_quality"]["lookahead_clamped"] = False
+
+    error = strategy._real_macro_report_canonical_error(macro_report, "2024-09-05")
+
+    assert error is not None
+    assert "lookahead_clamped" in error
+
+
+def test_real_macro_report_canonical_rejects_future_realtime_evidence_date():
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    macro_report = _passed_real_macro_report(module)
+    macro_report["growth_evidence"]["latest_realtime_start"] = "2024-12-01"
+
+    error = strategy._real_macro_report_canonical_error(macro_report, "2024-09-05")
+
+    assert error is not None
+    assert "realtime" in error
+
+
+def test_real_macro_report_canonical_rejects_legacy_evidence_fields_in_vintage_payload():
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    macro_report = _passed_real_macro_report(module)
+    for evidence_name, lag_months in (
+        ("growth_evidence", module.DEFAULT_GROWTH_LAG_MONTHS),
+        ("inflation_evidence", module.DEFAULT_INFLATION_LAG_MONTHS),
+    ):
+        macro_report[evidence_name]["lag_months"] = lag_months
+        macro_report[evidence_name]["data_cutoff"] = "2024-03-05"
+
+    error = strategy._real_macro_report_canonical_error(macro_report, "2024-09-05")
+
+    assert error is not None
+    assert "lag_months" in error or "data_cutoff" in error
+
+
+def test_real_macro_report_canonical_accepts_legacy_lagged_payload_when_configured():
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.parameters["macro_regime_mode"] = module.LEGACY_LAGGED_MODE
+    strategy.initialize()
+    macro_report = _passed_real_macro_legacy_report(module)
+
+    assert strategy._real_macro_report_canonical_error(macro_report, "2024-09-05") is None
+
+
+def test_real_macro_report_canonical_rejects_unsupported_configured_mode():
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.parameters["macro_regime_mode"] = "unsupported_mode"
+    strategy.initialize()
+    macro_report = _passed_real_macro_legacy_report(module)
+    macro_report["mode"] = "unsupported_mode"
+
+    error = strategy._real_macro_report_canonical_error(macro_report, "2024-09-05")
+
+    assert error is not None
+    assert "unsupported" in error or "mode" in error
 
 
 @pytest.mark.parametrize(
@@ -1029,12 +1205,19 @@ def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
     macro_context = agent_manager["macro_allocation_agent"].calls[0]["context"]
     assert macro_context["date"] == "2024-09-05"
     assert macro_context["macro_regime_mode"] == module.DEFAULT_MODE
+    assert macro_context["as_of_policy"] == module.DEFAULT_AS_OF_POLICY
     assert macro_context["growth_series_id"] == module.DEFAULT_GROWTH_SERIES_ID
     assert macro_context["inflation_series_id"] == module.DEFAULT_INFLATION_SERIES_ID
-    assert macro_context["growth_lag_months"] == module.DEFAULT_GROWTH_LAG_MONTHS
-    assert macro_context["inflation_lag_months"] == module.DEFAULT_INFLATION_LAG_MONTHS
+    assert "growth_lag_months" not in macro_context
+    assert "inflation_lag_months" not in macro_context
     assert macro_context["trend_years"] == module.DEFAULT_TREND_YEARS
     assert macro_context["basket_universes"] == module.BASKET_UNIVERSES
+    macro_task_prompt = agent_manager["macro_allocation_agent"].calls[0]["task_prompt"].lower()
+    assert "fred vintage macro allocation step" in macro_task_prompt
+    assert "requested_as_of" in macro_task_prompt
+    assert "effective_as_of" in macro_task_prompt
+    assert "lookahead_clamped" in macro_task_prompt
+    assert "as_of_policy" in macro_task_prompt
 
     commodity_context = agent_manager["commodity_basket_agent"].calls[0]["context"]
     assert commodity_context["target_weight"] == 0.25
@@ -1050,6 +1233,27 @@ def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
         "date": "2024-09-05",
         "execution_plan": execution_plan_execute_payload(planner_plan),
     }
+
+
+def test_real_strategy_legacy_macro_context_includes_lag_months_when_configured():
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.parameters["macro_regime_mode"] = module.LEGACY_LAGGED_MODE
+    strategy.initialize()
+    macro_report = _passed_real_macro_legacy_report(module, regime="growth_up_inflation_down")
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary({"status": "passed"})
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(macro_report)]
+    _install_hold_downstream_summaries(agent_manager, module)
+
+    strategy.on_trading_iteration()
+
+    macro_context = agent_manager["macro_allocation_agent"].calls[0]["context"]
+    assert macro_context["macro_regime_mode"] == module.LEGACY_LAGGED_MODE
+    assert macro_context["as_of_policy"] == module.DEFAULT_AS_OF_POLICY
+    assert macro_context["growth_lag_months"] == module.DEFAULT_GROWTH_LAG_MONTHS
+    assert macro_context["inflation_lag_months"] == module.DEFAULT_INFLATION_LAG_MONTHS
 
 
 def test_subtract_months_handles_quarter_and_year_boundaries():

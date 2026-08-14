@@ -9,15 +9,19 @@ from lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant i
     AITradingTeamMockGrowthInflationQuadrantStrategy,
 )
 from lumibot.example_strategies.fred_growth_inflation_regime_classifier import (
+    DEFAULT_AS_OF_POLICY,
     DEFAULT_GROWTH_LAG_MONTHS,
     DEFAULT_GROWTH_SERIES_ID,
     DEFAULT_INFLATION_LAG_MONTHS,
     DEFAULT_INFLATION_SERIES_ID,
     DEFAULT_MODE,
     DEFAULT_TREND_YEARS,
+    LEGACY_LAGGED_MODE,
     REGIMES,
+    VINTAGE_ASOF_MODE,
     WEIGHT_BY_REGIME,
     make_real_macro_regime_classifier_tool,
+    parse_date,
     regime_from_directions,
 )
 
@@ -51,6 +55,7 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
     parameters = {
         "basket_universes": BASKET_UNIVERSES,
         "macro_regime_mode": DEFAULT_MODE,
+        "as_of_policy": DEFAULT_AS_OF_POLICY,
         "growth_series_id": DEFAULT_GROWTH_SERIES_ID,
         "inflation_series_id": DEFAULT_INFLATION_SERIES_ID,
         "growth_lag_months": DEFAULT_GROWTH_LAG_MONTHS,
@@ -66,6 +71,7 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
     def initialize(self):
         self.sleeptime = "1D"
         self._macro_regime_mode = self.parameters.get("macro_regime_mode", DEFAULT_MODE)
+        self._as_of_policy = self.parameters.get("as_of_policy", DEFAULT_AS_OF_POLICY)
         self._growth_series_id = self.parameters.get("growth_series_id", DEFAULT_GROWTH_SERIES_ID)
         self._inflation_series_id = self.parameters.get(
             "inflation_series_id",
@@ -91,10 +97,12 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             tools=[make_real_macro_regime_classifier_tool()],
             system_prompt=(
                 "Macro allocation role: call the real FRED-backed macro_regime_classifier. "
-                "Do not classify the macro regime yourself. Preserve the classifier's structured "
-                "status, regime, basket_weights, growth_evidence, inflation_evidence, data_quality, "
-                "confidence, and reason fields. If the classifier returns status=blocked or status=failed, "
-                "return that plainly. Do not place orders."
+                "The default vintage mode uses the simulated trading date as the FRED vintage as-of date, "
+                "so backtests only use macro data known by that date. Preserve the classifier's structured "
+                "status, regime, basket_weights, requested_as_of, effective_as_of, lookahead_clamped, "
+                "as_of_policy, growth_evidence, inflation_evidence, data_quality, confidence, and reason "
+                "fields. If the classifier returns status=blocked or status=failed, return that plainly. "
+                "Do not classify the macro regime yourself. Do not place orders."
             ),
         )
 
@@ -141,10 +149,49 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             return f"tool must be {MACRO_REGIME_CLASSIFIER_TOOL_NAME!r}."
         if macro_report.get("mock") is not False:
             return "mock must be false for real macro payloads."
-        if macro_report.get("date") != current_date or macro_report.get("as_of") != current_date:
-            return "current date mismatch: date and as_of must equal the current date."
+        if macro_report.get("date") != current_date:
+            return "current date mismatch: date must equal the current date."
         if macro_report.get("mode") != self._macro_regime_mode:
             return "configured/default parameters mismatch: mode must match the strategy configuration."
+        if self._macro_regime_mode not in {VINTAGE_ASOF_MODE, LEGACY_LAGGED_MODE}:
+            return f"unsupported configured macro_regime_mode: {self._macro_regime_mode!r}."
+
+        if self._macro_regime_mode == VINTAGE_ASOF_MODE:
+            if macro_report.get("as_of_policy") != self._as_of_policy:
+                return "configured/default parameters mismatch: as_of_policy must match the strategy configuration."
+            effective_as_of = macro_report.get("effective_as_of")
+            if not isinstance(effective_as_of, str) or not effective_as_of.strip():
+                return "effective_as_of must be present in vintage mode."
+            try:
+                parsed_effective_as_of = parse_date(effective_as_of)
+                parsed_current_date = parse_date(current_date)
+            except ValueError as exc:
+                return f"effective_as_of must be a valid date not after the current date: {exc}"
+            if parsed_effective_as_of > parsed_current_date:
+                return "effective_as_of must not be after the current date."
+            if macro_report.get("as_of") != effective_as_of:
+                return "as_of must equal effective_as_of in vintage mode."
+            requested_as_of = macro_report.get("requested_as_of")
+            if not isinstance(requested_as_of, str) or not requested_as_of.strip():
+                return "requested_as_of must be present in vintage mode."
+            try:
+                parsed_requested_as_of = parse_date(requested_as_of)
+            except ValueError as exc:
+                return f"requested_as_of must be a valid date in vintage mode: {exc}"
+            expected_effective_as_of = min(parsed_requested_as_of, parsed_current_date)
+            if parsed_effective_as_of != expected_effective_as_of:
+                return (
+                    "effective_as_of must equal the requested_as_of clamped to the current date "
+                    "in vintage mode."
+                )
+            if not isinstance(macro_report.get("lookahead_clamped"), bool):
+                return "lookahead_clamped must be boolean in vintage mode."
+            expected_lookahead_clamped = parsed_requested_as_of != parsed_effective_as_of
+            if macro_report["lookahead_clamped"] != expected_lookahead_clamped:
+                return "lookahead_clamped must match whether requested_as_of was clamped."
+        elif self._macro_regime_mode == LEGACY_LAGGED_MODE:
+            if macro_report.get("as_of") != current_date:
+                return "current date mismatch: as_of must equal the current date in legacy mode."
 
         regime = macro_report.get("regime")
         if regime not in REGIMES:
@@ -203,12 +250,30 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             return "data_quality point_in_time_safe must be true."
         if data_quality.get("uses_revised_data") is not False:
             return "data_quality uses_revised_data must be false."
+        if self._macro_regime_mode == VINTAGE_ASOF_MODE:
+            vintage_quality_fields = (
+                "as_of_policy",
+                "effective_as_of",
+                "requested_as_of",
+                "lookahead_clamped",
+            )
+            mismatched_quality_fields = [
+                field
+                for field in vintage_quality_fields
+                if data_quality.get(field) != macro_report.get(field)
+            ]
+            if mismatched_quality_fields:
+                return (
+                    "data_quality vintage fields must match top-level fields: "
+                    f"{mismatched_quality_fields}."
+                )
 
         growth_error = self._real_macro_evidence_canonical_error(
             growth_evidence,
             axis="growth",
             series_id=self._growth_series_id,
             lag_months=self._growth_lag_months,
+            as_of=macro_report.get("as_of"),
         )
         if growth_error is not None:
             return f"growth_evidence {growth_error}"
@@ -217,6 +282,7 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             axis="inflation",
             series_id=self._inflation_series_id,
             lag_months=self._inflation_lag_months,
+            as_of=macro_report.get("as_of"),
         )
         if inflation_error is not None:
             return f"inflation_evidence {inflation_error}"
@@ -243,24 +309,45 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
         axis: str,
         series_id: str,
         lag_months: int,
+        as_of: Any,
     ) -> str | None:
         if evidence.get("axis") != axis:
             return f"axis must be {axis!r}."
         if evidence.get("series_id") != series_id:
             return f"series_id must be {series_id!r}."
-        if evidence.get("lag_months") != lag_months:
-            return f"lag_months must be {lag_months}."
         if evidence.get("trend_years") != self._trend_years:
             return f"trend_years must be {self._trend_years}."
-        required_string_fields = (
-            "series_name",
-            "frequency",
-            "data_cutoff",
-            "latest_observation_date",
-            "comparison_observation_date",
-            "metric_name",
-            "direction",
-        )
+        if self._macro_regime_mode == VINTAGE_ASOF_MODE:
+            legacy_fields = [field for field in ("lag_months", "data_cutoff") if field in evidence]
+            if legacy_fields:
+                return f"must not include legacy fields in vintage mode: {legacy_fields}."
+            required_string_fields = (
+                "as_of",
+                "latest_realtime_start",
+                "latest_realtime_end",
+                "comparison_realtime_start",
+                "comparison_realtime_end",
+                "latest_observation_date",
+                "comparison_observation_date",
+                "series_name",
+                "frequency",
+                "metric_name",
+                "direction",
+            )
+        elif self._macro_regime_mode == LEGACY_LAGGED_MODE:
+            if evidence.get("lag_months") != lag_months:
+                return f"lag_months must be {lag_months}."
+            required_string_fields = (
+                "series_name",
+                "frequency",
+                "data_cutoff",
+                "latest_observation_date",
+                "comparison_observation_date",
+                "metric_name",
+                "direction",
+            )
+        else:
+            return f"unsupported configured macro_regime_mode: {self._macro_regime_mode!r}."
         missing_string_fields = [
             field
             for field in required_string_fields
@@ -268,6 +355,32 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
         ]
         if missing_string_fields:
             return f"must include non-empty string fields: {missing_string_fields}."
+        if self._macro_regime_mode == VINTAGE_ASOF_MODE and evidence.get("as_of") != as_of:
+            return "as_of must match the report as_of in vintage mode."
+        if self._macro_regime_mode == VINTAGE_ASOF_MODE:
+            try:
+                parsed_evidence_as_of = parse_date(evidence["as_of"])
+                parsed_realtime_dates = {
+                    field: parse_date(evidence[field])
+                    for field in (
+                        "latest_realtime_start",
+                        "latest_realtime_end",
+                        "comparison_realtime_start",
+                        "comparison_realtime_end",
+                    )
+                }
+            except ValueError as exc:
+                return f"realtime provenance fields must be valid dates in vintage mode: {exc}"
+            future_realtime_fields = [
+                field
+                for field, value in parsed_realtime_dates.items()
+                if value > parsed_evidence_as_of
+            ]
+            if future_realtime_fields:
+                return (
+                    "realtime provenance fields must not be after evidence as_of in vintage mode: "
+                    f"{future_realtime_fields}."
+                )
         if evidence.get("direction") not in {"up", "down"}:
             return "direction must be 'up' or 'down'."
         expected_frequency = "quarterly" if axis == "growth" else "monthly"
@@ -283,6 +396,8 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             "trend_value",
             "margin",
         )
+        if self._macro_regime_mode == VINTAGE_ASOF_MODE:
+            required_numeric_fields = required_numeric_fields + ("observation_lag_days",)
         non_numeric_fields = [
             field
             for field in required_numeric_fields
@@ -296,6 +411,8 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
             return f"must include finite numeric fields: {non_numeric_fields}."
         if float(evidence["trend_window_observations"]) <= 0:
             return "trend_window_observations must be > 0."
+        if self._macro_regime_mode == VINTAGE_ASOF_MODE and float(evidence["observation_lag_days"]) < 0:
+            return "observation_lag_days must be >= 0."
         return None
 
     def _commit_accepted_real_regime_if_canonical(
@@ -320,22 +437,26 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
         basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
 
         try:
+            macro_context = {
+                "date": current_date,
+                "macro_regime_mode": self._macro_regime_mode,
+                "as_of_policy": self._as_of_policy,
+                "growth_series_id": self._growth_series_id,
+                "inflation_series_id": self._inflation_series_id,
+                "trend_years": self._trend_years,
+                "basket_universes": basket_universes,
+            }
+            if self._macro_regime_mode == LEGACY_LAGGED_MODE:
+                macro_context["growth_lag_months"] = self._growth_lag_months
+                macro_context["inflation_lag_months"] = self._inflation_lag_months
             macro_result = self.agents["macro_allocation_agent"].run(
                 task_prompt=(
-                    "Run the real FRED-backed macro allocation step by calling macro_regime_classifier. "
-                    "Return one JSON object preserving status, regime, basket_weights, growth_evidence, "
-                    "inflation_evidence, data_quality, confidence, and reason fields."
+                    "Run the real FRED vintage macro allocation step by calling macro_regime_classifier. "
+                    "Return one JSON object preserving status, regime, basket_weights, requested_as_of, "
+                    "effective_as_of, lookahead_clamped, as_of_policy, growth_evidence, inflation_evidence, "
+                    "data_quality, confidence, and reason fields."
                 ),
-                context={
-                    "date": current_date,
-                    "macro_regime_mode": self._macro_regime_mode,
-                    "growth_series_id": self._growth_series_id,
-                    "inflation_series_id": self._inflation_series_id,
-                    "growth_lag_months": self._growth_lag_months,
-                    "inflation_lag_months": self._inflation_lag_months,
-                    "trend_years": self._trend_years,
-                    "basket_universes": basket_universes,
-                },
+                context=macro_context,
             )
         except ValueError as exc:
             self._block_real_macro_workflow(str(exc))
