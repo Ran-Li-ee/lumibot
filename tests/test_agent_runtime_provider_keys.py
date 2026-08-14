@@ -291,6 +291,44 @@ def test_execution_plan_execute_pruning_uses_generic_excerpt_when_summary_missin
     assert "excerpt" in projected
 
 
+def test_after_tool_context_pruning_callback_projects_execution_plan_summary_without_original_chars():
+    summary = {
+        "schema_version": 1,
+        "tool_name": "execution_plan_execute",
+        "response_type": "model_facing_summary",
+        "plan_status": "completed",
+        "orders_completed": 1,
+        "audit_details_available": True,
+    }
+    full_result = {
+        "schema_version": 1,
+        "plan_status": "completed",
+        "order_results": [{"order_result": {"preflight_result": {"large": "raw audit"}}}],
+        "model_facing_summary": summary,
+    }
+    request = RuntimeRequest(
+        agent_name="execution_agent",
+        model="openai/gpt-4.1-mini",
+        system_prompt="trade",
+        task_prompt="",
+        context=None,
+        runtime_context={"mode": "live"},
+        memory_state=None,
+        memory_notes=[],
+        bound_tools=[],
+    )
+    callback = GoogleADKRuntime()._after_tool_context_pruning_callback(request)
+
+    projected = callback(
+        tool=types.SimpleNamespace(name="execution_plan_execute"),
+        tool_response=full_result,
+    )
+
+    assert projected == summary
+    assert "original_chars" not in projected
+    assert "lumibot_tool_result_pruned" not in projected
+
+
 def test_aggregate_usage_metadata_sums_multiple_provider_events():
     usage = _aggregate_usage_metadata(
         [

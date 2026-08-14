@@ -2771,6 +2771,13 @@ def _model_facing_summary_for_tool_response(
     return summary
 
 
+def _is_pruned_tool_response_envelope(tool_response: Any) -> bool:
+    return (
+        isinstance(tool_response, dict)
+        and tool_response.get("lumibot_tool_result_pruned") is True
+    )
+
+
 def _prune_tool_response_for_context_window(
     tool_response: Any,
     *,
@@ -4597,7 +4604,7 @@ class GoogleADKRuntime:
                 tool_response = args[3]
             tool_name = str(getattr(tool, "name", None) or "")
             pruned = _prune_tool_response_for_context_window(tool_response, tool_name=tool_name)
-            if pruned is not None:
+            if _is_pruned_tool_response_envelope(pruned):
                 logging.getLogger(__name__).warning(
                     "Pruned oversized tool response for model=%s tool=%s original_chars=%s.",
                     request.model,
