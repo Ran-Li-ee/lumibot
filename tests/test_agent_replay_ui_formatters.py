@@ -685,6 +685,36 @@ def test_execution_plan_execute_formatter_explains_completed_multi_order_plan():
     assert "Final cash: 127.45" in text
 
 
+def test_execution_plan_execute_formatter_explains_model_facing_summary():
+    text = explain_tool_result(
+        "execution_plan_execute",
+        {"execution_plan": {"schema_version": 1, "intent": "rebalance", "orders": []}},
+        {
+            "schema_version": 1,
+            "tool_name": "execution_plan_execute",
+            "response_type": "model_facing_summary",
+            "plan_status": "completed",
+            "orders_requested": 2,
+            "orders_attempted": 2,
+            "orders_completed": 2,
+            "orders_blocked": 0,
+            "orders_skipped": 0,
+            "completed_orders": [
+                {"sequence": 1, "symbol": "VGIT", "side": "sell", "quantity": 406, "confirmed": True},
+                {"sequence": 2, "symbol": "GLD", "side": "buy", "quantity": 107, "confirmed": True},
+            ],
+            "final_account": {"cash": 630.15, "positions": [{"symbol": "GLD", "quantity": 107.0}]},
+            "audit_details_available": True,
+        },
+        None,
+    )
+
+    assert "Execution plan completed" in text
+    assert "sell VGIT 406" in text
+    assert "buy GLD 107" in text
+    assert "Final cash: 630.15" in text
+
+
 def test_execution_plan_execute_formatter_shows_more_count_for_long_completed_orders():
     text = explain_tool_result(
         "execution_plan_execute",

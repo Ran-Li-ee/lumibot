@@ -690,7 +690,7 @@ def _execution_plan_execute(args: dict[str, Any], raw_result: Any) -> str:
         elif requested == 0:
             order_text = " No orders were submitted."
 
-        account = _nested_dict(result, "final_account_snapshot")
+        account = _nested_dict(result, "final_account") or _nested_dict(result, "final_account_snapshot")
         cash = _first_present(account, "cash", "cash_balance")
         cash_text = "" if cash is None else f" Final cash: {_text(cash)}."
         return f"Execution plan completed: {counts}{order_text}{cash_text}"
