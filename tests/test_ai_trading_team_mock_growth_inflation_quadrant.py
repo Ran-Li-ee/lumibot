@@ -501,6 +501,65 @@ def test_tips_basket_prompt_is_rank_first_defensive_and_duration_aware():
         assert forbidden_phrase not in prompt
 
 
+def test_nominal_bond_basket_prompt_is_rank_first_and_duration_aware():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    prompt = created["nominal_bond_basket_agent"]["system_prompt"].lower()
+    for required_phrase in (
+        "computed ranking evidence",
+        "primary selection evidence",
+        "u.s. nominal treasury duration-selection basket",
+        "not a corporate-bond or credit-risk basket",
+        "cash-like",
+        "ultra-short",
+        "short-term",
+        "intermediate-term",
+        "broad-curve",
+        "long-term",
+        "extended-duration",
+        "zero-coupon",
+        "sgov, bil, and shv are cash-like or ultra-short treasury exposure",
+        "shy, vgsh, and scho are short-term treasury exposure",
+        "iei, ief, vgit, and schr are intermediate-term treasury exposure",
+        "govt is broad-curve treasury exposure",
+        "tlh, tlt, and vglt are long-term treasury exposure",
+        "edv and zroz are extended-duration or zero-coupon treasury exposure",
+        "maturity / duration metadata",
+        "do not select the lowest-volatility symbol by default",
+        "do not select the longest-duration symbol by default",
+        "not as default safe assets",
+        "high interest-rate sensitivity",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "always choose sgov",
+        "always choose bil",
+        "always choose shy",
+        "always choose tlt",
+        "default to sgov",
+        "default to bil",
+        "default to tlt",
+        "default to zroz",
+        "long duration is always correct",
+        "weak growth automatically means long bonds",
+        "capital preservation overrides ranking evidence",
+        "news",
+        "news is required",
+        "fred",
+        "use fred",
+        "macro regime",
+        "macro classification",
+        "classify macro",
+        "classify the macro regime",
+    ):
+        assert forbidden_phrase not in prompt
+
+
 def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
     _module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -1250,6 +1309,17 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     assert "news only" in tips_task
     assert "long-duration candidate" in tips_task
 
+    nominal_bond_context = agent_manager["nominal_bond_basket_agent"].calls[0]["context"]
+    assert nominal_bond_context["basket_id"] == "nominal_bond"
+    assert nominal_bond_context["basket_symbols"] == module.BASKET_UNIVERSES["nominal_bond"]
+    assert nominal_bond_context["target_weight"] == 0.25
+    assert nominal_bond_context["macro_allocation_report"] == macro_report
+
+    nominal_bond_task = agent_manager["nominal_bond_basket_agent"].calls[0]["task_prompt"].lower()
+    assert "computed ranking evidence first" in nominal_bond_task
+    assert "maturity / duration exposure" in nominal_bond_task
+    assert "fits the nominal bond basket role" in nominal_bond_task
+
     portfolio_context = agent_manager["portfolio_decision_agent"].calls[0]["context"]
     assert portfolio_context["macro_allocation_report"] == macro_report
     assert portfolio_context["equity_basket_report"] == basket_reports["equity_basket_agent"]
@@ -1374,6 +1444,32 @@ def test_tips_basket_task_prompt_is_rank_first_and_news_secondary():
         "use news first",
         "always choose",
         "keyword search",
+    ):
+        assert forbidden_phrase not in prompt
+
+
+def test_nominal_bond_basket_task_prompt_is_rank_first_and_duration_aware():
+    module, _strategy_class = load_strategy_module()
+
+    prompt = module.basket_agent_task_prompt("nominal_bond").lower()
+
+    for required_phrase in (
+        "for nominal bonds",
+        "computed ranking evidence first",
+        "select one symbol from candidate_symbols",
+        "target_weight is positive",
+        "ranking evidence",
+        "maturity / duration exposure",
+        "fits the nominal bond basket role",
+        "candidate_symbols must copy the assigned basket_symbols exactly",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "use news first",
+        "use fred",
+        "always choose",
+        "default to",
+        "classify the macro regime",
     ):
         assert forbidden_phrase not in prompt
 
