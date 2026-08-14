@@ -2162,6 +2162,49 @@ def test_execution_plan_execute_blocked_result_includes_model_facing_summary_wit
     assert "order_results" not in summary
 
 
+def test_execution_plan_execute_unconfirmed_blocked_summary_does_not_report_fill_details():
+    strategy = _OrderReadinessStrategy()
+    strategy.submitted_order_status = "new"
+    strategy.cash = 100000.0
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "SPY",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 3,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    summary_order = result["model_facing_summary"]["blocked_orders"][0]
+    raw_order_result = result["order_results"][0]["order_result"]
+    confirm_result = raw_order_result["submit_and_confirm_result"]["confirm_result"]
+
+    assert result["plan_status"] == "blocked"
+    assert summary_order["confirmed"] is False
+    assert summary_order["confirmation_status"] == "open_after_retries"
+    assert "filled_quantity" not in summary_order
+    assert "fill_price" not in summary_order
+    assert confirm_result["confirmed"] is False
+    assert confirm_result["confirmation_status"] == "open_after_retries"
+    assert confirm_result["order"]["filled_quantity"] is None
+    assert confirm_result["order"]["quantity"] == 3.0
+    assert confirm_result["order"]["avg_fill_price"] == 100.0
+
+
 def test_execution_plan_execute_invalid_result_includes_model_facing_summary():
     strategy = _OrderReadinessStrategy()
     tool_map = _wrap_execute_plan_tools(strategy)

@@ -3580,10 +3580,15 @@ def _execution_plan_model_order_summary(
     if confirmation_status is not None:
         summary["confirmation_status"] = _jsonable(confirmation_status)
 
-    filled_quantity = _first_non_null_value(
-        confirmation_order.get("filled_quantity"),
-        confirmation_order.get("quantity"),
+    confirmed_or_filled = (
+        submit_and_confirm_result.get("confirmed") is True
+        or confirmation_status == "filled"
+        or confirmation_order.get("is_filled") is True
     )
+    explicit_filled_quantity = confirmation_order.get("filled_quantity")
+    filled_quantity = explicit_filled_quantity
+    if filled_quantity is None and confirmed_or_filled:
+        filled_quantity = confirmation_order.get("quantity")
     if filled_quantity is not None:
         summary["filled_quantity"] = _jsonable(filled_quantity)
 
@@ -3592,7 +3597,7 @@ def _execution_plan_model_order_summary(
         confirmation_order.get("fill_price"),
         confirmation_order.get("average_fill_price"),
     )
-    if fill_price is not None:
+    if fill_price is not None and (confirmed_or_filled or explicit_filled_quantity is not None):
         summary["fill_price"] = _jsonable(fill_price)
 
     return summary
