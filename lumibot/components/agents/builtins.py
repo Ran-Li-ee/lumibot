@@ -49,7 +49,8 @@ ORDERS_EXECUTE_ORDER_DESCRIPTION = (
 EXECUTION_PLAN_EXECUTE_DESCRIPTION = (
     "Execute one complete strict execution_plan in sequence order. "
     "This tool validates the plan, executes each order through readiness checks, submission, and confirmation, "
-    "stops on the first blocker, and returns a complete execution report. "
+    "stops on the first blocker, and returns a concise execution summary to the model while full audit details "
+    "are recorded in trace/replay. "
     "This tool mutates trading state. It does not generate, repair, reorder, optimize, or modify the plan. "
     "Pass the execution_plan exactly as provided by the upstream planner. "
     "If plan_status is blocked or invalid, do not call lower-level tools; summarize where execution stopped and why."
@@ -1173,6 +1174,8 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
             "This summary-first tool returns factual rankings, including by_composite_score, plus recent returns, "
             "moving averages, trend alignment, drawdown, volatility, volume context, and range position "
             "for the requested universe. "
+            "Each ranking list is capped at the top 10 symbols, and detailed universe_summary rows are limited "
+            "to a top-ranked candidate subset of at most 15 symbols while the full requested symbols list remains visible. "
             "Prefer this tool before writing DuckDB SQL for common universe ranking. "
             "Caveat: this only loads bars visible at the current LumiBot runtime datetime. "
             "Example: market_load_history_tables_summary("
@@ -3450,7 +3453,7 @@ def _execution_plan_invalid_payload(
     intent: Any = None,
     orders_requested: int = 0,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": 1,
         "plan_status": "invalid",
         "can_continue": False,
@@ -3470,6 +3473,7 @@ def _execution_plan_invalid_payload(
         "warnings": [],
         "summary": "No orders were submitted because the execution plan was invalid.",
     }
+    return _with_execution_plan_model_facing_summary(payload)
 
 
 def _execution_plan_order_summary(order: dict[str, Any], result: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3538,6 +3542,183 @@ def _execution_plan_result_item(order: dict[str, Any], result: dict[str, Any]) -
     }
 
 
+def _first_non_null_value(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _execution_plan_confirmation_order_payload(result: dict[str, Any]) -> dict[str, Any]:
+    submit_and_confirm_result = result.get("submit_and_confirm_result")
+    if not isinstance(submit_and_confirm_result, dict):
+        return {}
+    confirm_result = submit_and_confirm_result.get("confirm_result")
+    if isinstance(confirm_result, dict):
+        confirm_order = confirm_result.get("order")
+        if isinstance(confirm_order, dict):
+            return confirm_order
+    submit_result = submit_and_confirm_result.get("submit_result")
+    if isinstance(submit_result, dict):
+        submit_order = submit_result.get("order")
+        if isinstance(submit_order, dict):
+            return submit_order
+    return {}
+
+
+def _execution_plan_model_order_summary(
+    order: dict[str, Any],
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    summary = _execution_plan_order_summary(order, result)
+    result = result if isinstance(result, dict) else {}
+    submit_and_confirm_result = result.get("submit_and_confirm_result")
+    if not isinstance(submit_and_confirm_result, dict):
+        submit_and_confirm_result = {}
+    confirmation_order = _execution_plan_confirmation_order_payload(result)
+
+    confirmation_status = submit_and_confirm_result.get("confirmation_status")
+    if confirmation_status is not None:
+        summary["confirmation_status"] = _jsonable(confirmation_status)
+
+    confirmed_or_filled = (
+        submit_and_confirm_result.get("confirmed") is True
+        or confirmation_status == "filled"
+        or confirmation_order.get("is_filled") is True
+    )
+    explicit_filled_quantity = confirmation_order.get("filled_quantity")
+    filled_quantity = explicit_filled_quantity
+    if filled_quantity is None and confirmed_or_filled:
+        filled_quantity = confirmation_order.get("quantity")
+    if filled_quantity is not None:
+        summary["filled_quantity"] = _jsonable(filled_quantity)
+
+    fill_price = _first_non_null_value(
+        confirmation_order.get("avg_fill_price"),
+        confirmation_order.get("fill_price"),
+        confirmation_order.get("average_fill_price"),
+    )
+    if fill_price is not None and (confirmed_or_filled or explicit_filled_quantity is not None):
+        summary["fill_price"] = _jsonable(fill_price)
+
+    return summary
+
+
+def _execution_plan_model_position_summary(position: Any) -> dict[str, Any]:
+    if not isinstance(position, dict):
+        return {"symbol": _jsonable(position)}
+    summary: dict[str, Any] = {}
+    for source_key, target_key in (
+        ("symbol", "symbol"),
+        ("asset_type", "asset_type"),
+        ("quantity", "quantity"),
+        ("avg_fill_price", "avg_fill_price"),
+        ("current_price", "current_price"),
+        ("market_value", "market_value"),
+    ):
+        value = position.get(source_key)
+        if value is not None:
+            summary[target_key] = _jsonable(value)
+    asset = position.get("asset")
+    if "symbol" not in summary and isinstance(asset, dict):
+        symbol = asset.get("symbol")
+        if symbol is not None:
+            summary["symbol"] = _jsonable(symbol)
+        asset_type = asset.get("asset_type")
+        if asset_type is not None:
+            summary.setdefault("asset_type", _jsonable(asset_type))
+    return summary
+
+
+def _execution_plan_model_account_summary(account: Any) -> dict[str, Any] | None:
+    if not isinstance(account, dict):
+        return None
+    summary: dict[str, Any] = {}
+    for source_key, target_key in (
+        ("cash", "cash"),
+        ("cash_balance", "cash"),
+        ("portfolio_value", "portfolio_value"),
+        ("account_value", "portfolio_value"),
+    ):
+        value = account.get(source_key)
+        if value is not None and target_key not in summary:
+            summary[target_key] = _jsonable(value)
+    positions = account.get("positions")
+    if isinstance(positions, list):
+        summary["positions"] = [_execution_plan_model_position_summary(position) for position in positions]
+    return summary
+
+
+def _execution_plan_model_facing_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    result_by_sequence = {
+        item.get("sequence"): item.get("order_result")
+        for item in list(payload.get("order_results") or [])
+        if isinstance(item, dict) and isinstance(item.get("order_result"), dict)
+    }
+    completed_orders = [
+        _execution_plan_model_order_summary(order, result_by_sequence.get(order.get("sequence")))
+        for order in list(payload.get("completed_orders") or [])
+        if isinstance(order, dict)
+    ]
+    blocked_orders = []
+    for order in list(payload.get("blocked_orders") or []):
+        if isinstance(order, dict):
+            blocked_orders.append(
+                {
+                    **_execution_plan_model_order_summary(
+                        order,
+                        result_by_sequence.get(order.get("sequence")),
+                    ),
+                    "execution_status": _jsonable(order.get("execution_status") or "blocked"),
+                    "can_continue": order.get("can_continue") is True,
+                    "blockers": list(order.get("blockers") or []),
+                    "warnings": list(order.get("warnings") or []),
+                }
+            )
+    skipped_orders = [
+        {
+            "sequence": _jsonable(order.get("sequence")),
+            "symbol": _jsonable(order.get("symbol")),
+            "side": _jsonable(order.get("side")),
+            "quantity": _jsonable(order.get("quantity")),
+            "asset_type": _jsonable(order.get("asset_type")),
+            "order_type": _jsonable(order.get("order_type")),
+            "time_in_force": _jsonable(order.get("time_in_force")),
+            "execution_status": _jsonable(order.get("execution_status") or "skipped"),
+            "skip_reason": _jsonable(order.get("skip_reason")),
+        }
+        for order in list(payload.get("skipped_orders") or [])
+        if isinstance(order, dict)
+    ]
+    final_account = _execution_plan_model_account_summary(payload.get("final_account_snapshot"))
+    return {
+        "schema_version": 1,
+        "tool_name": "execution_plan_execute",
+        "response_type": "model_facing_summary",
+        "plan_status": _jsonable(payload.get("plan_status")),
+        "can_continue": payload.get("can_continue") is True,
+        "intent": _jsonable(payload.get("intent")),
+        "orders_requested": int(payload.get("orders_requested") or 0),
+        "orders_attempted": int(payload.get("orders_attempted") or 0),
+        "orders_completed": int(payload.get("orders_completed") or 0),
+        "orders_blocked": int(payload.get("orders_blocked") or 0),
+        "orders_skipped": int(payload.get("orders_skipped") or 0),
+        "completed_orders": completed_orders,
+        "blocked_orders": blocked_orders,
+        "skipped_orders": skipped_orders,
+        "final_account": final_account,
+        "warnings": list(payload.get("warnings") or []),
+        "blockers": list(payload.get("blockers") or []),
+        "summary": _jsonable(payload.get("summary")),
+        "audit_details_available": True,
+    }
+
+
+def _with_execution_plan_model_facing_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    payload["model_facing_summary"] = _execution_plan_model_facing_summary(payload)
+    return payload
+
+
 def _execution_plan_final_account_snapshot(
     strategy: Any,
     order_results: list[dict[str, Any]],
@@ -3572,7 +3753,7 @@ def _execution_plan_completed_payload(
         summary = "No planned orders were submitted because the execution plan intent was hold."
     else:
         summary = f"All {orders_requested} planned orders were completed and confirmed."
-    return {
+    payload = {
         "schema_version": 1,
         "plan_status": "completed",
         "can_continue": True,
@@ -3592,6 +3773,7 @@ def _execution_plan_completed_payload(
         "warnings": warnings,
         "summary": summary,
     }
+    return _with_execution_plan_model_facing_summary(payload)
 
 
 def _execution_plan_blocked_payload(
@@ -3607,7 +3789,7 @@ def _execution_plan_blocked_payload(
     stopped_sequence: Any,
     stopped_symbol: Any,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": 1,
         "plan_status": "blocked",
         "can_continue": False,
@@ -3634,6 +3816,7 @@ def _execution_plan_blocked_payload(
         "warnings": warnings,
         "summary": f"Execution stopped at sequence {stopped_sequence} because {stopped_symbol} was blocked.",
     }
+    return _with_execution_plan_model_facing_summary(payload)
 
 
 def _execution_plan_exception_result(order: dict[str, Any], exc: Exception) -> dict[str, Any]:

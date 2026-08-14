@@ -963,8 +963,10 @@ class AgentHandle:
         if "execution_plan_execute" in tool_names:
             lines.append(
                 "execution_plan_execute executes one complete strict execution_plan: validates the plan, "
-                "executes each order through readiness check, submission, and confirmation, and stops on the "
-                "first blocker. It does not research, generate, repair, reorder, optimize, or modify the plan."
+                "executes each order through readiness check, submission, and confirmation, stops on the first "
+                "blocker, and returns a concise execution summary to the model while full audit details are "
+                "recorded in trace/replay. It does not research, generate, repair, reorder, optimize, or modify "
+                "the plan."
             )
         if "orders_open_orders" in tool_names:
             lines.append("Use orders_open_orders to inspect outstanding orders before submitting new orders.")

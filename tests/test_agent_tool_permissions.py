@@ -904,6 +904,8 @@ def test_builtin_order_tools_expose_execution_plan_execute_definition():
 
     assert tool.name == "execution_plan_execute"
     assert "Execute one complete strict execution_plan" in tool.description
+    assert "concise execution summary" in tool.description
+    assert "full audit details" in tool.description
     assert "mutates trading state" in tool.description
     assert "does not generate, repair, reorder, optimize, or modify the plan" in tool.description
     assert callable(tool.binder)
@@ -1615,6 +1617,92 @@ def test_execution_plan_execute_completes_valid_multi_order_plan_in_sequence():
     assert result["blockers"] == []
 
 
+def test_execution_plan_execute_completed_result_includes_model_facing_summary():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 100000.0
+    strategy.portfolio_value = 100000.0
+    strategy.last_prices = {"VGIT": 60.0, "SPY": 100.0}
+    strategy.positions = [_fake_position("VGIT", 10, market_value=600.0, current_price=60.0)]
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "VGIT",
+                    "side": "sell",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+                {
+                    "sequence": 2,
+                    "action": "submit_order",
+                    "symbol": "SPY",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 3,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+            ],
+        }
+    )
+
+    summary = result["model_facing_summary"]
+
+    assert result["order_results"][0]["order_result"]["preflight_result"] is not None
+    assert result["order_results"][0]["order_result"]["submit_and_confirm_result"] is not None
+    assert summary["schema_version"] == 1
+    assert summary["tool_name"] == "execution_plan_execute"
+    assert summary["response_type"] == "model_facing_summary"
+    assert summary["plan_status"] == "completed"
+    assert summary["can_continue"] is True
+    assert summary["intent"] == "rebalance"
+    assert summary["orders_requested"] == 2
+    assert summary["orders_attempted"] == 2
+    assert summary["orders_completed"] == 2
+    assert summary["orders_blocked"] == 0
+    assert summary["orders_skipped"] == 0
+    assert [order["sequence"] for order in summary["completed_orders"]] == [1, 2]
+    assert [order["symbol"] for order in summary["completed_orders"]] == ["VGIT", "SPY"]
+    assert all(order["confirmed"] is True for order in summary["completed_orders"])
+    assert all("order_result" not in order for order in summary["completed_orders"])
+    assert summary["final_account"]["cash"] == result["final_account_snapshot"]["cash"]
+    assert isinstance(summary["final_account"]["positions"], list)
+    assert summary["audit_details_available"] is True
+    assert "order_results" not in summary
+
+
+def test_execution_plan_execute_hold_result_includes_model_facing_summary():
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={"schema_version": 1, "intent": "hold", "orders": []}
+    )
+
+    summary = result["model_facing_summary"]
+
+    assert summary["response_type"] == "model_facing_summary"
+    assert summary["plan_status"] == "completed"
+    assert summary["intent"] == "hold"
+    assert summary["orders_requested"] == 0
+    assert summary["orders_attempted"] == 0
+    assert summary["completed_orders"] == []
+    assert summary["blocked_orders"] == []
+    assert summary["skipped_orders"] == []
+    assert summary["audit_details_available"] is True
+    assert "No planned orders were submitted" in summary["summary"]
+
+
 @pytest.mark.parametrize(
     ("orders", "expected_message"),
     [
@@ -2003,6 +2091,142 @@ def test_execution_plan_execute_reports_completed_orders_before_later_blocker():
     assert result["blocked_orders"][0]["sequence"] == 2
     assert result["skipped_orders"][0]["sequence"] == 3
     assert len(strategy.submitted_orders) == 1
+
+
+def test_execution_plan_execute_blocked_result_includes_model_facing_summary_with_root_cause():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 1000.0
+    strategy.last_prices = {"SPY": 100.0, "GLD": 100.0, "VGIT": 60.0}
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "SPY",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 1,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+                {
+                    "sequence": 2,
+                    "action": "submit_order",
+                    "symbol": "GLD",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 20,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+                {
+                    "sequence": 3,
+                    "action": "submit_order",
+                    "symbol": "VGIT",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 1,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+            ],
+        }
+    )
+
+    summary = result["model_facing_summary"]
+
+    assert result["plan_status"] == "blocked"
+    assert summary["plan_status"] == "blocked"
+    assert summary["can_continue"] is False
+    assert summary["orders_requested"] == 3
+    assert summary["orders_attempted"] == 2
+    assert summary["orders_completed"] == 1
+    assert summary["orders_blocked"] == 1
+    assert summary["orders_skipped"] == 1
+    assert summary["completed_orders"][0]["symbol"] == "SPY"
+    assert summary["blocked_orders"][0]["sequence"] == 2
+    assert summary["blocked_orders"][0]["symbol"] == "GLD"
+    assert summary["skipped_orders"][0]["sequence"] == 3
+    assert summary["blockers"][0]["code"] == "ORDER_BLOCKED"
+    assert any(
+        blocker["code"] == "INSUFFICIENT_CASH_ESTIMATE"
+        for blocker in summary["blocked_orders"][0]["blockers"]
+    )
+    assert summary["audit_details_available"] is True
+    assert "order_results" not in summary
+
+
+def test_execution_plan_execute_unconfirmed_blocked_summary_does_not_report_fill_details():
+    strategy = _OrderReadinessStrategy()
+    strategy.submitted_order_status = "new"
+    strategy.cash = 100000.0
+    strategy.last_prices = {"SPY": 100.0}
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "SPY",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 3,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    summary_order = result["model_facing_summary"]["blocked_orders"][0]
+    raw_order_result = result["order_results"][0]["order_result"]
+    confirm_result = raw_order_result["submit_and_confirm_result"]["confirm_result"]
+
+    assert result["plan_status"] == "blocked"
+    assert summary_order["confirmed"] is False
+    assert summary_order["confirmation_status"] == "open_after_retries"
+    assert "filled_quantity" not in summary_order
+    assert "fill_price" not in summary_order
+    assert confirm_result["confirmed"] is False
+    assert confirm_result["confirmation_status"] == "open_after_retries"
+    assert confirm_result["order"]["filled_quantity"] is None
+    assert confirm_result["order"]["quantity"] == 3.0
+    assert confirm_result["order"]["avg_fill_price"] == 100.0
+
+
+def test_execution_plan_execute_invalid_result_includes_model_facing_summary():
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={"schema_version": 2, "intent": "rebalance", "orders": []}
+    )
+
+    summary = result["model_facing_summary"]
+
+    assert result["plan_status"] == "invalid"
+    assert summary["plan_status"] == "invalid"
+    assert summary["can_continue"] is False
+    assert summary["orders_attempted"] == 0
+    assert summary["completed_orders"] == []
+    assert summary["blocked_orders"] == []
+    assert summary["skipped_orders"] == []
+    assert summary["blockers"][0]["code"] == "UNSUPPORTED_PLAN_SCHEMA_VERSION"
+    assert summary["audit_details_available"] is True
+    assert "No orders were submitted" in summary["summary"]
 
 
 def test_execution_plan_execute_preserves_negative_cash_guard():

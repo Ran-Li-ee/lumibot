@@ -24,6 +24,36 @@ def _frame(length: int = 260) -> pd.DataFrame:
     )
 
 
+def _rankable_summary(
+    symbol: str,
+    *,
+    composite_score: float,
+    momentum_composite: float,
+    return_21: float,
+    return_63: float,
+    return_126: float,
+    trend_alignment: float,
+) -> dict:
+    return {
+        "symbol": symbol,
+        "price": {"latest_close": 100.0},
+        "momentum": {
+            "return_5": 0.0,
+            "return_21": return_21,
+            "return_63": return_63,
+            "return_126": return_126,
+        },
+        "scores": {
+            "composite_score": composite_score,
+            "momentum_composite": momentum_composite,
+            "trend_alignment": trend_alignment,
+        },
+        "volume": {"volume_vs_avg_20": 0.0},
+        "risk": {"volatility_20": 0.01},
+        "range": {"drawdown_from_high_60": -0.01},
+    }
+
+
 def test_history_tool_descriptions_are_summary_first():
     tool_names = {
         "market_load_history_table",
@@ -48,6 +78,8 @@ def test_history_tool_descriptions_are_summary_first():
     assert "targeted follow-up" in duckdb
     assert "computed summaries or rankings are insufficient" in duckdb
     assert "load a table first with market_load_history_table, then analyze it here" not in duckdb
+    assert "top 10" in multi
+    assert "top-ranked candidate subset" in multi
 
 
 def test_compute_history_summary_returns_core_groups():
@@ -343,6 +375,52 @@ def test_build_universe_history_summary_flattens_rows_and_rankings():
     assert summary["rankings"]["by_momentum_composite"] == ["SPY", "QQQ"]
     assert set(summary["rankings"]["by_composite_score"]) == {"QQQ", "SPY"}
     assert summary["rankings"]["by_trend_alignment"] == ["QQQ", "SPY"]
+
+
+def test_build_universe_history_summary_limits_rankings_and_detail_rows():
+    symbols = [f"S{i:02d}" for i in range(1, 21)]
+    history_summaries = {}
+    for index, symbol in enumerate(symbols):
+        history_summaries[symbol] = _rankable_summary(
+            symbol,
+            composite_score=20 - index,
+            momentum_composite=index + 1,
+            return_21=(index % 10) + 1,
+            return_63=(20 - index) / 2,
+            return_126=index / 3,
+            trend_alignment=index % 4,
+        )
+
+    summary = build_universe_history_summary(
+        history_summaries,
+        symbols=symbols,
+        timestep="day",
+        length=260,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+    )
+
+    assert summary["ranking_limit"] == 10
+    assert summary["universe_summary_limit"] == 15
+    assert summary["symbols"] == symbols
+    assert summary["rankings"]["by_composite_score"] == symbols[:10]
+    assert summary["rankings"]["by_momentum_composite"] == list(reversed(symbols[-10:]))
+    assert all(len(ranking) <= 10 for ranking in summary["rankings"].values())
+
+    detail_symbols = [row["symbol"] for row in summary["universe_summary"]]
+    assert len(detail_symbols) == 15
+    assert detail_symbols == symbols[:10] + list(reversed(symbols[-5:]))
+    assert summary["universe_summary_selection"] == {
+        "mode": "top_rank_union",
+        "candidate_count_before_limit": 20,
+        "included_symbols": detail_symbols,
+        "priority": [
+            "by_composite_score",
+            "by_momentum_composite",
+            "multi_ranking_overlap",
+        ],
+    }
 
 
 def test_build_universe_history_summary_skips_unavailable_ranking_values():

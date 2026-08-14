@@ -7,6 +7,17 @@ from typing import Any
 import pandas as pd
 
 SCHEMA_VERSION = "1.0"
+RANKING_LIMIT = 10
+UNIVERSE_SUMMARY_LIMIT = 15
+UNIVERSE_SUMMARY_SELECTION_PRIORITY = [
+    "by_composite_score",
+    "by_momentum_composite",
+    "multi_ranking_overlap",
+]
+_DETAIL_SELECTION_RANKING_PRIORITY = [
+    "by_composite_score",
+    "by_momentum_composite",
+]
 
 
 def compute_history_summary(
@@ -177,10 +188,29 @@ def build_universe_history_summary(
     warnings: list[str] | None,
 ) -> dict[str, Any]:
     """Return a compact, model-facing batch summary for a symbol universe."""
-    universe_summary = [
+    all_universe_rows = [
         _summary_to_universe_row(history_summaries[symbol])
         for symbol in symbols
         if symbol in history_summaries
+    ]
+    full_rankings = _rankings(all_universe_rows)
+    rankings = _limit_rankings(full_rankings, RANKING_LIMIT)
+    selected_symbols = _select_universe_summary_symbols(rankings, limit=UNIVERSE_SUMMARY_LIMIT)
+    if not selected_symbols:
+        selected_symbols = [
+            str(row["symbol"])
+            for row in all_universe_rows
+            if row.get("symbol")
+        ][:UNIVERSE_SUMMARY_LIMIT]
+    rows_by_symbol = {
+        str(row["symbol"]): row
+        for row in all_universe_rows
+        if row.get("symbol")
+    }
+    universe_summary = [
+        rows_by_symbol[symbol]
+        for symbol in selected_symbols
+        if symbol in rows_by_symbol
     ]
     return {
         "schema_version": SCHEMA_VERSION,
@@ -188,7 +218,15 @@ def build_universe_history_summary(
         "timestep": timestep,
         "length": length,
         "as_of": as_of,
-        "rankings": _rankings(universe_summary),
+        "ranking_limit": RANKING_LIMIT,
+        "rankings": rankings,
+        "universe_summary_limit": UNIVERSE_SUMMARY_LIMIT,
+        "universe_summary_selection": {
+            "mode": "top_rank_union",
+            "candidate_count_before_limit": len(_unique_ranked_symbols(rankings)),
+            "included_symbols": selected_symbols,
+            "priority": UNIVERSE_SUMMARY_SELECTION_PRIORITY,
+        },
         "universe_summary": universe_summary,
         "loaded_tables": loaded_tables or {},
         "warnings": warnings or [],
@@ -228,6 +266,71 @@ def _rankings(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
         "by_composite_score": _rank_symbols(rows, "composite_score"),
         "by_trend_alignment": _rank_symbols(rows, "trend_alignment"),
     }
+
+
+def _limit_rankings(rankings: dict[str, list[str]], limit: int) -> dict[str, list[str]]:
+    return {
+        name: symbols[:limit]
+        for name, symbols in rankings.items()
+    }
+
+
+def _select_universe_summary_symbols(rankings: dict[str, list[str]], *, limit: int) -> list[str]:
+    candidates = _unique_ranked_symbols(rankings)
+    if len(candidates) <= limit:
+        return candidates
+
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    def add(symbol: str) -> None:
+        if len(selected) >= limit or symbol in seen:
+            return
+        selected.append(symbol)
+        seen.add(symbol)
+
+    for ranking_name in _DETAIL_SELECTION_RANKING_PRIORITY:
+        for symbol in rankings.get(ranking_name, []):
+            add(symbol)
+
+    if len(selected) >= limit:
+        return selected
+
+    first_seen_order = {symbol: index for index, symbol in enumerate(candidates)}
+    appearance_counts: dict[str, int] = {}
+    best_rank: dict[str, int] = {}
+    for ranking in rankings.values():
+        for index, symbol in enumerate(ranking):
+            appearance_counts[symbol] = appearance_counts.get(symbol, 0) + 1
+            best_rank[symbol] = min(best_rank.get(symbol, index), index)
+
+    remaining = [symbol for symbol in candidates if symbol not in seen]
+    remaining.sort(
+        key=lambda symbol: (
+            -appearance_counts.get(symbol, 0),
+            best_rank.get(symbol, len(candidates)),
+            first_seen_order.get(symbol, len(candidates)),
+        )
+    )
+    for symbol in remaining:
+        add(symbol)
+    return selected
+
+
+def _unique_ranked_symbols(rankings: dict[str, list[str]]) -> list[str]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for ranking_name in _DETAIL_SELECTION_RANKING_PRIORITY:
+        for symbol in rankings.get(ranking_name, []):
+            if symbol not in seen:
+                symbols.append(symbol)
+                seen.add(symbol)
+    for ranking in rankings.values():
+        for symbol in ranking:
+            if symbol not in seen:
+                symbols.append(symbol)
+                seen.add(symbol)
+    return symbols
 
 
 def _rank_symbols(rows: list[dict[str, Any]], key: str) -> list[str]:

@@ -29,9 +29,55 @@ REGIMES = (
 
 BASKET_UNIVERSES = {
     "equity": ["SPY", "QQQ", "IWM", "EEM", "FXI"],
-    "commodity": ["GLD", "SLV", "DBC", "PDBC", "GSG"],
-    "tips": ["TIP", "SCHP", "VTIP", "STIP", "LTPZ"],
-    "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
+    "commodity": [
+        "GLD",
+        "IAU",
+        "SLV",
+        "CPER",
+        "WEAT",
+        "CORN",
+        "SOYB",
+        "CANE",
+        "PPLT",
+        "PALL",
+        "DBB",
+        "USO",
+        "BNO",
+        "UNG",
+        "UGA",
+        "DBE",
+        "DBO",
+        "DBA",
+        "PDBA",
+        "TAGS",
+        "TILL",
+        "DBC",
+        "PDBC",
+        "BCI",
+        "GSG",
+        "COMT",
+        "FTGC",
+        "CMDY",
+    ],
+    "tips": ["VTIP", "STIP", "SCHP", "TIP", "SPIP", "LTPZ"],
+    "nominal_bond": [
+        "SGOV",
+        "BIL",
+        "SHV",
+        "SHY",
+        "VGSH",
+        "SCHO",
+        "IEI",
+        "IEF",
+        "VGIT",
+        "SCHR",
+        "GOVT",
+        "TLH",
+        "TLT",
+        "VGLT",
+        "EDV",
+        "ZROZ",
+    ],
 }
 
 BASKET_AGENT_NAMES = {
@@ -40,6 +86,184 @@ BASKET_AGENT_NAMES = {
     "tips": "tips_basket_agent",
     "nominal_bond": "nominal_bond_basket_agent",
 }
+
+WEEKDAY_INDEX_BY_CODE = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4}
+ALLOWED_RUN_FREQUENCIES = {"daily", "weekly"}
+
+
+def normalize_run_frequency(value: Any) -> str:
+    if not value:
+        return "weekly"
+    frequency = str(value).strip().lower()
+    if frequency not in ALLOWED_RUN_FREQUENCIES:
+        raise ValueError("run_frequency must be 'daily' or 'weekly'.")
+    return frequency
+
+
+def normalize_weekly_run_weekday(value: Any) -> str:
+    if not value:
+        return "MON"
+    weekday = str(value).strip().upper()
+    if weekday not in WEEKDAY_INDEX_BY_CODE:
+        allowed = ", ".join(WEEKDAY_INDEX_BY_CODE)
+        raise ValueError(f"weekly_run_weekday must be one of: {allowed}.")
+    return weekday
+
+
+def iso_week_key(value: date_type) -> str:
+    iso_year, iso_week, _iso_weekday = value.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+def scheduled_workflow_decision(
+    *,
+    current_date: date_type,
+    run_frequency: Any,
+    weekly_run_weekday: Any,
+    attempted_week_keys: set[str],
+) -> dict[str, Any]:
+    frequency = normalize_run_frequency(run_frequency)
+    weekday = normalize_weekly_run_weekday(weekly_run_weekday)
+    week_key = iso_week_key(current_date)
+    decision = {
+        "date": current_date.isoformat(),
+        "run_frequency": frequency,
+        "weekly_run_weekday": weekday,
+        "week_key": week_key,
+    }
+
+    if frequency == "daily":
+        return {
+            **decision,
+            "should_run": True,
+            "status": "run",
+            "reason": "daily_frequency",
+        }
+
+    if week_key in attempted_week_keys:
+        return {
+            **decision,
+            "should_run": False,
+            "status": "skipped",
+            "reason": "weekly_workflow_already_attempted",
+        }
+
+    current_weekday_index = current_date.weekday()
+    preferred_weekday_index = WEEKDAY_INDEX_BY_CODE[weekday]
+    if current_weekday_index == preferred_weekday_index:
+        return {
+            **decision,
+            "should_run": True,
+            "status": "run",
+            "reason": "weekly_run_day",
+        }
+    if current_weekday_index > preferred_weekday_index:
+        return {
+            **decision,
+            "should_run": True,
+            "status": "run",
+            "reason": "first_observed_after_preferred_weekday",
+        }
+    return {
+        **decision,
+        "should_run": False,
+        "status": "skipped",
+        "reason": "before_weekly_run_day",
+    }
+
+
+def basket_agent_tools(basket_id: str) -> list[ToolDefinition]:
+    tools = [
+        BuiltinTools.market.load_history_tables_summary(),
+        BuiltinTools.market.last_price(),
+    ]
+    if basket_id in {"commodity", "tips"}:
+        tools.append(BuiltinTools.news.alpaca_news())
+    return tools
+
+
+def basket_agent_system_prompt(basket_id: str, symbols: str) -> str:
+    base = (
+        f"{basket_id.replace('_', ' ').title()} basket role: stay inside the assigned basket "
+        f"({symbols}). For the current scheduled review, select one representative symbol when active, "
+        "or report inactive when its target weight is zero. Return basket_id, selected_symbol, status, "
+        "and reason_brief. Do not place orders."
+    )
+    if basket_id == "commodity":
+        return (
+            base
+            + " For commodity selection, use computed ranking evidence as the primary selection evidence. "
+            "If one symbol is clearly stronger across ranking evidence, select it without requiring news. "
+            "Use news only when ranking evidence is close, conflicting, incomplete, or stale. "
+            "Do not prefer broad or diversified commodity symbols merely because they look safer. "
+            "Do not prefer or avoid symbols based on ticker-name intuition."
+        )
+    if basket_id == "tips":
+        return (
+            base
+            + " For TIPS selection, use computed ranking evidence as the primary selection evidence. "
+            "This basket exists to provide inflation-protected defensive exposure, especially when macro allocation "
+            "gives TIPS a positive target weight. Choose the TIPS exposure that best protects purchasing power while "
+            "controlling drawdown and interest-rate sensitivity. Prefer short-duration TIPS exposure when the evidence "
+            "favors stable inflation defense and lower volatility. Use full-curve TIPS exposure when it offers a "
+            "better balance of inflation protection, liquidity, and ranking evidence. Treat long-duration TIPS as a "
+            "higher-volatility real-rate position, not as the default safe choice. Select long-duration TIPS only when "
+            "ranking evidence and supporting context clearly justify taking duration risk. Use news only as secondary "
+            "evidence when ranking evidence is close, conflicting, incomplete, stale, or when long-duration TIPS looks "
+            "unusually attractive. Do not use generic inflation headlines alone to justify long-duration TIPS."
+        )
+    if basket_id == "nominal_bond":
+        return (
+            base
+            + " For nominal bond selection, use computed ranking evidence as the primary selection evidence. "
+            "This basket is a U.S. nominal Treasury duration-selection basket, not a corporate-bond or "
+            "credit-risk basket. The main decision is maturity / duration exposure: cash-like or ultra-short, "
+            "short-term, intermediate-term, broad-curve, long-term, or extended-duration / zero-coupon Treasury "
+            "exposure. Maturity / duration metadata: SGOV, BIL, and SHV are cash-like or ultra-short Treasury "
+            "exposure; SHY, VGSH, and SCHO are short-term Treasury exposure; IEI, IEF, VGIT, and SCHR are "
+            "intermediate-term Treasury exposure; GOVT is broad-curve Treasury exposure; TLH, TLT, and VGLT are "
+            "long-term Treasury exposure; EDV and ZROZ are extended-duration or zero-coupon Treasury exposure. "
+            "Use the maturity / duration metadata only to understand what each symbol represents. "
+            "Do not select the lowest-volatility symbol by default. Do not select the longest-duration symbol by "
+            "default. When target_weight is positive, choose the Treasury exposure that best matches the ranking "
+            "evidence. Cash-like or short-term exposure may be appropriate when ranking evidence favors low "
+            "interest-rate sensitivity. Intermediate or broad-curve exposure may be appropriate when ranking "
+            "evidence is balanced. Long or extended-duration exposure should be selected only when ranking evidence "
+            "clearly justifies taking high interest-rate sensitivity. Treat long-duration and zero-coupon Treasury "
+            "ETFs as high-volatility rate-sensitive positions, not as default safe assets."
+        )
+    return base
+
+
+def basket_agent_task_prompt(basket_id: str) -> str:
+    base = (
+        "Review only the assigned basket for the current scheduled review and return one JSON object "
+        "with basket_id, target_weight, status, candidate_symbols, selected_symbol, and reason_brief. "
+        "candidate_symbols must copy the assigned basket_symbols exactly; "
+        "do not replace it with a shortlist."
+    )
+    if basket_id == "commodity":
+        return (
+            base
+            + " For commodity, use computed ranking evidence first. If rank evidence clearly favors one symbol, "
+            "select it directly. Use news only when leading candidates are close, conflicting, or incomplete."
+        )
+    if basket_id == "tips":
+        return (
+            base
+            + " For TIPS, use computed ranking evidence first. If rank evidence clearly favors one defensive TIPS "
+            "candidate, select it directly. Use news only when leading candidates are close, conflicting, incomplete, "
+            "stale, or when a long-duration candidate requires confirmation."
+        )
+    if basket_id == "nominal_bond":
+        return (
+            base
+            + " For nominal bonds, use computed ranking evidence first. Select one symbol from candidate_symbols "
+            "when target_weight is positive. Explain the selected symbol in terms of ranking evidence, maturity / "
+            "duration exposure, and why that duration choice fits the nominal bond basket role."
+        )
+    return base
+
 
 MOCK_WEIGHT_BY_REGIME = {
     "growth_up_inflation_down": {
@@ -455,29 +679,27 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
         "basket_universes": BASKET_UNIVERSES,
         "mock_regime_mode": "seeded_random",
         "mock_regime_seed": 42,
+        "run_frequency": "weekly",
+        "weekly_run_weekday": "MON",
+        "weekly_holiday_policy": "first_open_trading_day",
     }
     _execution_agent_base_system_prompt_mode = "execution_minimal"
 
-    def initialize(self):
-        self.sleeptime = "1D"
-        self._mock_regime_mode = self.parameters.get("mock_regime_mode", "seeded_random")
-        self._mock_regime_seed = int(self.parameters.get("mock_regime_seed", 42))
-        self._last_mock_regime = None
+    def _initialize_growth_inflation_workflow_state(self) -> None:
+        self._run_frequency = normalize_run_frequency(self.parameters.get("run_frequency", "weekly"))
+        self._weekly_run_weekday = normalize_weekly_run_weekday(self.parameters.get("weekly_run_weekday", "MON"))
+        self._weekly_holiday_policy = str(
+            self.parameters.get("weekly_holiday_policy", "first_open_trading_day")
+        ).strip()
+        if self._weekly_holiday_policy != "first_open_trading_day":
+            raise ValueError("weekly_holiday_policy must be 'first_open_trading_day'.")
+        self._scheduled_workflow_attempted_week_keys: set[str] = set()
+        self._scheduled_workflow_events: list[dict[str, Any]] = []
+        self._last_scheduled_workflow_run_date: str | None = None
         self._last_target_portfolio_planner_result = None
-        model = os.environ.get("AI_TRADING_TEAM_MODEL", "gemini-3.1-flash-lite")
+        self._last_execution_plan_error = None
 
-        self.agents.create(
-            name="macro_allocation_agent",
-            model=model,
-            allow_trading=False,
-            include_builtin_tools=False,
-            tools=[make_macro_regime_classifier_tool()],
-            system_prompt=(
-                "Macro allocation role: call the mock macro_regime_classifier and return the regime, "
-                "basket weights, and a compact allocation note. Do not place orders."
-            ),
-        )
-
+    def _create_growth_inflation_downstream_agents(self, model: str) -> None:
         basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
         for basket_id, agent_name in BASKET_AGENT_NAMES.items():
             symbols = ", ".join(basket_universes[basket_id])
@@ -486,15 +708,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
                 model=model,
                 allow_trading=False,
                 include_builtin_tools=False,
-                tools=[
-                    BuiltinTools.market.load_history_tables_summary(),
-                    BuiltinTools.market.last_price(),
-                ],
-                system_prompt=(
-                    f"{basket_id.replace('_', ' ').title()} basket role: stay inside the assigned basket "
-                    f"({symbols}). Select one symbol when active, or report inactive when its target weight is "
-                    "zero. Return basket_id, selected_symbol, status, and reason_brief. Do not place orders."
-                ),
+                tools=basket_agent_tools(basket_id),
+                system_prompt=basket_agent_system_prompt(basket_id, symbols),
             )
 
         self.agents.create(
@@ -504,8 +719,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             include_builtin_tools=False,
             tools=[make_target_portfolio_to_execution_plan_tool()],
             system_prompt=(
-                "Portfolio decision role: do not redo macro or basket research. Merge the macro allocation report "
-                "and basket reports into a target_portfolio, then call "
+                "Portfolio decision role: this is the current scheduled review. Do not redo macro or basket "
+                "research. Merge the macro allocation report and basket reports into a target_portfolio, then call "
                 f"{TARGET_PORTFOLIO_TO_EXECUTION_PLAN_TOOL_NAME}. Do not "
                 "place orders. Do not manually calculate share quantities, cash usage, order side, or order sequence. "
                 "The planner tool owns all execution_plan calculations. "
@@ -532,38 +747,72 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
                 "Do not manually execute individual orders. "
                 "Do not call lower-level order, account, open-order, or price tools when execution_plan_execute "
                 "is available. Do not research, change fields, reorder orders, split orders, or repair the plan. "
+                "execution_plan_execute returns a concise execution summary for your final answer; "
+                "full audit details are recorded in trace/replay for developer inspection. "
                 "If the tool returns plan_status=completed, summarize completed orders. If it returns "
                 "plan_status=blocked or invalid, summarize where execution stopped and why."
             ),
         )
 
-    def on_trading_iteration(self):
-        current_date = self.get_datetime().date().isoformat()
+    def initialize(self):
+        self.sleeptime = "1D"
+        self._mock_regime_mode = self.parameters.get("mock_regime_mode", "seeded_random")
+        self._mock_regime_seed = int(self.parameters.get("mock_regime_seed", 42))
+        self._last_mock_regime = None
+        self._initialize_growth_inflation_workflow_state()
+        model = os.environ.get("AI_TRADING_TEAM_MODEL", "gemini-3.1-flash-lite")
+
+        self.agents.create(
+            name="macro_allocation_agent",
+            model=model,
+            allow_trading=False,
+            include_builtin_tools=False,
+            tools=[make_macro_regime_classifier_tool()],
+            system_prompt=(
+                "Macro allocation role: this is the current scheduled allocation review. Call the mock "
+                "macro_regime_classifier and return the regime, basket weights, mock flag, regime_changed, "
+                "and a compact allocation note. Do not place orders. Do not decide whether today is a run day; "
+                "the strategy code owns cadence."
+            ),
+        )
+
+        self._create_growth_inflation_downstream_agents(model)
+
+    def _scheduled_workflow_decision(self, current_date: date_type) -> dict[str, Any]:
+        return scheduled_workflow_decision(
+            current_date=current_date,
+            run_frequency=self._run_frequency,
+            weekly_run_weekday=self._weekly_run_weekday,
+            attempted_week_keys=self._scheduled_workflow_attempted_week_keys,
+        )
+
+    def _record_scheduled_workflow_event(self, event: dict[str, Any]) -> None:
+        normalized = dict(event)
+        normalized["last_weekly_run_date"] = self._last_scheduled_workflow_run_date
+        self._scheduled_workflow_events.append(normalized)
+
+    def _mark_scheduled_workflow_attempted(self, event: dict[str, Any]) -> None:
+        if event["run_frequency"] == "weekly":
+            self._scheduled_workflow_attempted_week_keys.add(event["week_key"])
+        self._last_scheduled_workflow_run_date = event["date"]
+        self._record_scheduled_workflow_event(event)
+
+    def _log_growth_inflation_workflow_blocked(self, message: str) -> None:
+        print(message)
+
+    def _run_growth_inflation_downstream_workflow(
+        self,
+        current_date: str,
+        macro_report: dict[str, Any],
+        blocked_prefix: str,
+    ) -> None:
         basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
-
         try:
-            macro_result = self.agents["macro_allocation_agent"].run(
-                task_prompt=(
-                    "Run the mock macro allocation step and return one JSON object with regime, "
-                    "basket_weights, mock flag, regime_changed, and reason_brief."
-                ),
-                context={
-                    "date": current_date,
-                    "mock_regime_mode": self._mock_regime_mode,
-                    "mock_regime_seed": self._mock_regime_seed,
-                    "basket_universes": basket_universes,
-                },
-            )
-            macro_report = _parse_json_summary(macro_result.summary, "macro_allocation_agent")
-
             basket_reports_by_id = {}
             basket_weights = _require_dict(macro_report.get("basket_weights", {}), "macro basket_weights")
             for basket_id, agent_name in BASKET_AGENT_NAMES.items():
                 basket_result = self.agents[agent_name].run(
-                    task_prompt=(
-                        "Review only the assigned basket and return one JSON object with basket_id, "
-                        "target_weight, status, candidate_symbols, selected_symbol, and reason_brief."
-                    ),
+                    task_prompt=basket_agent_task_prompt(basket_id),
                     context={
                         "date": current_date,
                         "basket_id": basket_id,
@@ -577,7 +826,8 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             self._last_target_portfolio_planner_result = None
             portfolio_result = self.agents["portfolio_decision_agent"].run(
                 task_prompt=(
-                    "Create target_portfolio from the provided macro and basket reports, then call "
+                    "Create target_portfolio for the current scheduled review from the provided macro and basket "
+                    "reports, then call "
                     f"{TARGET_PORTFOLIO_TO_EXECUTION_PLAN_TOOL_NAME} with date and target_portfolio. "
                     "Return only the strict JSON object with decision, target_portfolio, and the planner tool's "
                     "execution_plan copied exactly."
@@ -599,7 +849,7 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
             validate_execution_plan_cash_safety(self, execution_plan)
         except ValueError as exc:
             self._last_execution_plan_error = str(exc)
-            print(f"Mock quadrant workflow blocked: {exc}")
+            self._log_growth_inflation_workflow_blocked(f"{blocked_prefix}: {exc}")
             return
 
         self._last_execution_plan_error = None
@@ -609,10 +859,47 @@ class AITradingTeamMockGrowthInflationQuadrantStrategy(AITradingTeamGrowthExecut
         self.agents["execution_agent"].run(
             task_prompt=(
                 "Execute the provided execution_plan by calling execution_plan_execute exactly once with the "
-                "complete execution_plan. Summarize the returned plan report. Do not call per-order tools."
+                "complete execution_plan. Use the returned concise execution summary to write the final result. "
+                "Do not infer missing order details beyond the tool response. Do not call per-order tools."
             ),
             context={
                 "date": current_date,
                 "execution_plan": execution_plan_execute_payload(execution_plan),
             },
+        )
+
+    def on_trading_iteration(self):
+        current_datetime = self.get_datetime()
+        current_date_obj = current_datetime.date()
+        current_date = current_date_obj.isoformat()
+        cadence_event = self._scheduled_workflow_decision(current_date_obj)
+        if not cadence_event["should_run"]:
+            self._record_scheduled_workflow_event(cadence_event)
+            return
+        self._mark_scheduled_workflow_attempted(cadence_event)
+        basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
+
+        try:
+            macro_result = self.agents["macro_allocation_agent"].run(
+                task_prompt=(
+                    "Run the mock macro allocation step for the current scheduled review date and return one JSON "
+                    "object with regime, basket_weights, mock flag, regime_changed, and reason_brief."
+                ),
+                context={
+                    "date": current_date,
+                    "mock_regime_mode": self._mock_regime_mode,
+                    "mock_regime_seed": self._mock_regime_seed,
+                    "basket_universes": basket_universes,
+                },
+            )
+            macro_report = _parse_json_summary(macro_result.summary, "macro_allocation_agent")
+        except ValueError as exc:
+            self._last_execution_plan_error = str(exc)
+            self._log_growth_inflation_workflow_blocked(f"Mock quadrant workflow blocked: {exc}")
+            return
+
+        self._run_growth_inflation_downstream_workflow(
+            current_date,
+            macro_report,
+            "Mock quadrant workflow blocked",
         )

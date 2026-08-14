@@ -251,6 +251,113 @@ def test_loader_uses_full_boundary_result_when_legacy_tool_result_is_pruned(tmp_
     assert agent.boundary_trace.events[0].payload["model_facing_response"] == pruned_result
 
 
+def test_loader_keeps_execution_plan_model_facing_summary_and_boundary_audit(tmp_path):
+    trace_path = tmp_path / "traces" / "execution_agent" / "trace.json"
+    summary = {
+        "schema_version": 1,
+        "tool_name": "execution_plan_execute",
+        "response_type": "model_facing_summary",
+        "plan_status": "completed",
+        "orders_requested": 1,
+        "orders_attempted": 1,
+        "orders_completed": 1,
+        "orders_blocked": 0,
+        "orders_skipped": 0,
+        "completed_orders": [{"sequence": 1, "symbol": "GLD", "side": "buy", "quantity": 107}],
+        "final_account": {"cash": 630.15},
+        "blockers": [],
+        "warnings": [],
+        "audit_details_available": True,
+    }
+    full_result = {
+        "schema_version": 1,
+        "plan_status": "completed",
+        "orders_requested": 1,
+        "orders_attempted": 1,
+        "orders_completed": 1,
+        "orders_blocked": 0,
+        "orders_skipped": 0,
+        "completed_orders": [{"sequence": 1, "symbol": "GLD", "side": "buy", "quantity": 107}],
+        "blocked_orders": [],
+        "skipped_orders": [],
+        "order_results": [
+            {
+                "sequence": 1,
+                "symbol": "GLD",
+                "side": "buy",
+                "quantity": 107,
+                "order_result": {
+                    "preflight_result": {"readiness": "ready"},
+                    "submit_and_confirm_result": {"confirmed": True},
+                },
+            }
+        ],
+        "final_account_snapshot": {"cash": 630.15},
+        "blockers": [],
+        "warnings": [],
+        "model_facing_summary": summary,
+    }
+    _write_trace(
+        trace_path,
+        {
+            "agent": "execution_agent",
+            "model": "openai/test",
+            "request": {"context": {}, "runtime_context": {}},
+            "events": [
+                {
+                    "kind": "tool_call",
+                    "tool_name": "execution_plan_execute",
+                    "call_id": "call_A",
+                    "payload": {"execution_plan": {"schema_version": 1, "intent": "rebalance", "orders": []}},
+                },
+                {
+                    "kind": "tool_result",
+                    "tool_name": "execution_plan_execute",
+                    "call_id": "call_A",
+                    "payload": summary,
+                },
+            ],
+            "boundary_trace": {
+                "schema_version": 1,
+                "diagnostics": [],
+                "events": [
+                    {
+                        "transition": "B06_PYTHON_TOOL_TO_WRAPPER",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "call_id": "call_A",
+                        "payload": {
+                            "function_name": "execution_plan_execute",
+                            "raw_result": {"semantic_value": full_result},
+                        },
+                    },
+                    {
+                        "transition": "B08_FUNCTION_TOOL_TO_ADK",
+                        "model_turn_id": "turn-1",
+                        "tool_batch_id": "turn-1:batch:0001",
+                        "call_id": "call_A",
+                        "payload": {
+                            "function_name": "execution_plan_execute",
+                            "function_tool_response": full_result,
+                            "model_facing_response": summary,
+                        },
+                    },
+                ],
+            },
+        },
+    )
+
+    agent = load_agent_trace(trace_path)
+    call = agent.tool_batches[0].calls[0]
+
+    assert call.raw_result == summary
+    assert "Execution plan completed" in call.human_explanation
+    assert agent.boundary_trace.events[0].payload["raw_result"]["semantic_value"]["order_results"][0][
+        "order_result"
+    ]["preflight_result"]["readiness"] == "ready"
+    assert agent.boundary_trace.events[1].payload["model_facing_response"] == summary
+
+
 def test_loader_groups_boundary_trace_by_turn_batch_and_call_id(tmp_path):
     trace_path = tmp_path / "traces" / "growth_agent" / "trace.json"
     _write_trace(

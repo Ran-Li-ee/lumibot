@@ -124,6 +124,71 @@ def created_tool_names(created_agent):
     return {getattr(tool, "name", "") for tool in created_agent.get("tools", [])}
 
 
+def expected_commodity_universe():
+    return [
+        "GLD",
+        "IAU",
+        "SLV",
+        "CPER",
+        "WEAT",
+        "CORN",
+        "SOYB",
+        "CANE",
+        "PPLT",
+        "PALL",
+        "DBB",
+        "USO",
+        "BNO",
+        "UNG",
+        "UGA",
+        "DBE",
+        "DBO",
+        "DBA",
+        "PDBA",
+        "TAGS",
+        "TILL",
+        "DBC",
+        "PDBC",
+        "BCI",
+        "GSG",
+        "COMT",
+        "FTGC",
+        "CMDY",
+    ]
+
+
+def expected_tips_universe():
+    return [
+        "VTIP",
+        "STIP",
+        "SCHP",
+        "TIP",
+        "SPIP",
+        "LTPZ",
+    ]
+
+
+def expected_nominal_bond_universe():
+    return [
+        "SGOV",
+        "BIL",
+        "SHV",
+        "SHY",
+        "VGSH",
+        "SCHO",
+        "IEI",
+        "IEF",
+        "VGIT",
+        "SCHR",
+        "GOVT",
+        "TLH",
+        "TLT",
+        "VGLT",
+        "EDV",
+        "ZROZ",
+    ]
+
+
 def load_strategy_module():
     module = importlib.import_module(
         "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant"
@@ -149,6 +214,23 @@ def test_examples_benchmark_uses_model_specific_key_check(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
     assert benchmark._missing_key_label("openai/gpt-5.6-luna") is None
+
+
+def test_examples_benchmark_builds_strategy_parameters_for_cadence_overrides():
+    benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
+    args = SimpleNamespace(run_frequency="daily", weekly_run_weekday="TUE")
+
+    assert benchmark._strategy_parameters_from_args(args) == {
+        "run_frequency": "daily",
+        "weekly_run_weekday": "TUE",
+    }
+
+
+def test_examples_benchmark_omits_empty_strategy_parameter_overrides():
+    benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
+    args = SimpleNamespace(run_frequency=None, weekly_run_weekday=None)
+
+    assert benchmark._strategy_parameters_from_args(args) == {}
 
 
 def test_examples_benchmark_main_uses_model_specific_key_gate(monkeypatch):
@@ -180,6 +262,7 @@ def test_examples_benchmark_import_does_not_require_backtesting_stack(monkeypatc
         "lumibot.example_strategies.ai_trading_team_bull_bear_leveraged_etf",
         "lumibot.example_strategies.ai_trading_team_citadel_sector_pods",
         "lumibot.example_strategies.ai_trading_team_growth_execution_test",
+        "lumibot.example_strategies.ai_trading_team_growth_inflation_quadrant",
         "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant",
         "lumibot.example_strategies.ai_trading_team_ray_dalio_idea_meritocracy",
         "lumibot.example_strategies.ai_trading_team_warren_buffett_value",
@@ -228,8 +311,64 @@ def test_strategy_parameters_are_mock_quadrant_defaults():
         "basket_universes": _module.BASKET_UNIVERSES,
         "mock_regime_mode": "seeded_random",
         "mock_regime_seed": 42,
+        "run_frequency": "weekly",
+        "weekly_run_weekday": "MON",
+        "weekly_holiday_policy": "first_open_trading_day",
     }
     assert strategy_class._execution_agent_base_system_prompt_mode == "execution_minimal"
+
+
+def test_mock_strategy_exposes_current_downstream_helper_methods():
+    _module, strategy_class = load_strategy_module()
+
+    for method_name in (
+        "_initialize_growth_inflation_workflow_state",
+        "_create_growth_inflation_downstream_agents",
+        "_run_growth_inflation_downstream_workflow",
+        "_log_growth_inflation_workflow_blocked",
+    ):
+        assert hasattr(strategy_class, method_name)
+
+
+def test_mock_strategy_downstream_helper_creates_current_agent_surfaces(monkeypatch):
+    _module, strategy_class = load_strategy_module()
+    monkeypatch.setenv("AI_TRADING_TEAM_MODEL", "test-model")
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy._create_growth_inflation_downstream_agents("test-model")
+
+    assert [agent["name"] for agent in agent_manager.created] == [
+        "equity_basket_agent",
+        "commodity_basket_agent",
+        "tips_basket_agent",
+        "nominal_bond_basket_agent",
+        "portfolio_decision_agent",
+        "execution_agent",
+    ]
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    assert created_tool_names(created["equity_basket_agent"]) == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+    }
+    assert created_tool_names(created["commodity_basket_agent"]) == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+        "alpaca_news",
+    }
+    assert created_tool_names(created["tips_basket_agent"]) == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+        "alpaca_news",
+    }
+    assert created_tool_names(created["nominal_bond_basket_agent"]) == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+    }
+    assert created_tool_names(created["portfolio_decision_agent"]) == {
+        "target_portfolio_to_execution_plan",
+    }
+    assert created_tool_names(created["execution_agent"]) == {"execution_plan_execute"}
 
 
 def test_initialize_creates_seven_agent_mock_quadrant_workflow(monkeypatch):
@@ -261,6 +400,113 @@ def test_initialize_creates_seven_agent_mock_quadrant_workflow(monkeypatch):
     assert strategy.sleeptime == "1D"
     assert strategy._mock_regime_mode == "seeded_random"
     assert strategy._mock_regime_seed == 42
+    assert strategy._run_frequency == "weekly"
+    assert strategy._weekly_run_weekday == "MON"
+    assert strategy._weekly_holiday_policy == "first_open_trading_day"
+    assert strategy._scheduled_workflow_attempted_week_keys == set()
+    assert strategy._scheduled_workflow_events == []
+
+
+def test_weekly_cadence_decision_runs_on_default_monday():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 9).date(),
+        run_frequency="weekly",
+        weekly_run_weekday="MON",
+        attempted_week_keys=set(),
+    )
+
+    assert decision["should_run"] is True
+    assert decision["status"] == "run"
+    assert decision["reason"] == "weekly_run_day"
+    assert decision["week_key"] == "2024-W37"
+
+
+def test_weekly_cadence_decision_runs_on_first_observed_day_after_missing_monday():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 10).date(),
+        run_frequency="weekly",
+        weekly_run_weekday="MON",
+        attempted_week_keys=set(),
+    )
+
+    assert decision["should_run"] is True
+    assert decision["status"] == "run"
+    assert decision["reason"] == "first_observed_after_preferred_weekday"
+    assert decision["week_key"] == "2024-W37"
+
+
+def test_weekly_cadence_decision_skips_before_preferred_weekday():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 9).date(),
+        run_frequency="weekly",
+        weekly_run_weekday="WED",
+        attempted_week_keys=set(),
+    )
+
+    assert decision["should_run"] is False
+    assert decision["status"] == "skipped"
+    assert decision["reason"] == "before_weekly_run_day"
+    assert decision["week_key"] == "2024-W37"
+
+
+def test_weekly_cadence_decision_skips_after_week_attempted():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 10).date(),
+        run_frequency="weekly",
+        weekly_run_weekday="MON",
+        attempted_week_keys={"2024-W37"},
+    )
+
+    assert decision["should_run"] is False
+    assert decision["status"] == "skipped"
+    assert decision["reason"] == "weekly_workflow_already_attempted"
+
+
+def test_daily_cadence_decision_runs_every_day():
+    module, _strategy_class = load_strategy_module()
+
+    decision = module.scheduled_workflow_decision(
+        current_date=datetime(2024, 9, 10).date(),
+        run_frequency="daily",
+        weekly_run_weekday="MON",
+        attempted_week_keys={"2024-W37"},
+    )
+
+    assert decision["should_run"] is True
+    assert decision["status"] == "run"
+    assert decision["reason"] == "daily_frequency"
+
+
+def test_weekly_cadence_decision_rejects_invalid_frequency():
+    module, _strategy_class = load_strategy_module()
+
+    with pytest.raises(ValueError, match="run_frequency must be 'daily' or 'weekly'"):
+        module.scheduled_workflow_decision(
+            current_date=datetime(2024, 9, 10).date(),
+            run_frequency="hourly",
+            weekly_run_weekday="MON",
+            attempted_week_keys=set(),
+        )
+
+
+def test_weekly_cadence_decision_rejects_invalid_weekday():
+    module, _strategy_class = load_strategy_module()
+
+    with pytest.raises(ValueError, match="weekly_run_weekday must be one of"):
+        module.scheduled_workflow_decision(
+            current_date=datetime(2024, 9, 10).date(),
+            run_frequency="weekly",
+            weekly_run_weekday="SUN",
+            attempted_week_keys=set(),
+        )
 
 
 def test_agents_receive_distinct_tool_surfaces():
@@ -274,8 +520,6 @@ def test_agents_receive_distinct_tool_surfaces():
     assert created_tool_names(created["macro_allocation_agent"]) == {"macro_regime_classifier"}
     for basket_agent in (
         "equity_basket_agent",
-        "commodity_basket_agent",
-        "tips_basket_agent",
         "nominal_bond_basket_agent",
     ):
         assert created[basket_agent]["include_builtin_tools"] is False
@@ -283,6 +527,29 @@ def test_agents_receive_distinct_tool_surfaces():
             "market_load_history_tables_summary",
             "market_last_price",
         }
+    for news_enabled_basket_agent in (
+        "commodity_basket_agent",
+        "tips_basket_agent",
+    ):
+        assert created[news_enabled_basket_agent]["include_builtin_tools"] is False
+        assert created_tool_names(created[news_enabled_basket_agent]) == {
+            "market_load_history_tables_summary",
+            "market_last_price",
+            "alpaca_news",
+        }
+    nominal_bond_tools = created_tool_names(created["nominal_bond_basket_agent"])
+    assert nominal_bond_tools == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+    }
+    assert "alpaca_news" not in nominal_bond_tools
+    assert "list_fred_series" not in nominal_bond_tools
+    assert "get_fred_series" not in nominal_bond_tools
+    assert "get_fred_latest" not in nominal_bond_tools
+    assert "get_fred_snapshot" not in nominal_bond_tools
+    assert "orders_submit_order" not in nominal_bond_tools
+    assert "orders_execute_order" not in nominal_bond_tools
+    assert "orders_confirm_order" not in nominal_bond_tools
     assert created_tool_names(created["portfolio_decision_agent"]) == {
         "target_portfolio_to_execution_plan",
     }
@@ -344,6 +611,230 @@ def test_prompt_boundaries_are_short_and_role_specific():
     assert "do not research, change fields, reorder orders, split orders, or repair the plan" in serialized
 
 
+def test_quadrant_prompts_use_scheduled_review_language():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+
+    runtime_agent_manager = run_seeded_scheduled_review_for_prompt_capture(module, strategy_class)
+
+    system_prompts = [str(agent["system_prompt"]) for agent in agent_manager.created]
+    basket_task_prompts = [module.basket_agent_task_prompt(basket_id) for basket_id in module.BASKET_AGENT_NAMES]
+    runtime_task_prompts = [
+        runtime_agent_manager["macro_allocation_agent"].calls[0]["task_prompt"],
+        runtime_agent_manager["portfolio_decision_agent"].calls[0]["task_prompt"],
+    ]
+    serialized = "\n".join(system_prompts + basket_task_prompts + runtime_task_prompts).lower()
+
+    for required_phrase in ("scheduled allocation review", "scheduled review"):
+        assert required_phrase in serialized
+
+    for forbidden_phrase in (
+        "daily rebalance",
+        "trade every day",
+        "refresh the whole portfolio every session",
+        "today's macro data changed",
+    ):
+        assert forbidden_phrase not in serialized
+
+
+def run_seeded_scheduled_review_for_prompt_capture(module, strategy_class):
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    execution_plan = {"schema_version": 1, "intent": "hold", "orders": []}
+    macro_report = {
+        "agent": "macro_allocation_agent",
+        "regime": "growth_up_inflation_down",
+        "regime_changed": True,
+        "basket_weights": {"equity": 0.50, "commodity": 0.00, "tips": 0.25, "nominal_bond": 0.25},
+        "mock": True,
+        "reason_brief": "mock",
+    }
+    basket_reports = {
+        "equity_basket_agent": {
+            "basket_id": "equity",
+            "target_weight": 0.50,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["equity"],
+            "selected_symbol": "QQQ",
+            "reason_brief": "selected",
+        },
+        "commodity_basket_agent": {
+            "basket_id": "commodity",
+            "target_weight": 0.00,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["commodity"],
+            "selected_symbol": None,
+            "reason_brief": "inactive",
+        },
+        "tips_basket_agent": {
+            "basket_id": "tips",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["tips"],
+            "selected_symbol": "TIP",
+            "reason_brief": "selected",
+        },
+        "nominal_bond_basket_agent": {
+            "basket_id": "nominal_bond",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["nominal_bond"],
+            "selected_symbol": "IEF",
+            "reason_brief": "selected",
+        },
+    }
+
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    for agent_name, report in basket_reports.items():
+        agent_manager.summaries[agent_name] = _json_summary(report)
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary(
+        {
+            "decision": {"type": "hold", "reason_brief": "mock target"},
+            "target_portfolio": [],
+            "execution_plan": execution_plan,
+        }
+    )
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": execution_plan}
+
+    strategy.on_trading_iteration()
+
+    return agent_manager
+
+
+def test_commodity_basket_prompt_is_rank_first_and_category_neutral():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    prompt = created["commodity_basket_agent"]["system_prompt"].lower()
+    for required_phrase in (
+        "computed ranking evidence",
+        "primary selection evidence",
+        "clearly stronger",
+        "without requiring news",
+        "only when",
+        "ranking evidence is close",
+        "do not prefer broad",
+        "ticker-name intuition",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "default to diversified",
+        "prefer broad commodity etf",
+        "prefer diversified commodity",
+        "broad commodity etfs are safer",
+        "gold is a default",
+        "avoid energy",
+        "single commodities are too risky",
+        "choose pdbc when uncertain",
+        "choose dbc when uncertain",
+    ):
+        assert forbidden_phrase not in prompt
+
+
+def test_tips_basket_prompt_is_rank_first_defensive_and_duration_aware():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    prompt = created["tips_basket_agent"]["system_prompt"].lower()
+    for required_phrase in (
+        "computed ranking evidence",
+        "primary selection evidence",
+        "inflation-protected defensive exposure",
+        "protects purchasing power",
+        "controlling drawdown",
+        "interest-rate sensitivity",
+        "short-duration tips",
+        "full-curve tips",
+        "long-duration tips",
+        "not as the default safe choice",
+        "news only as secondary evidence",
+        "generic inflation headlines alone",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "always choose vtip",
+        "always choose stip",
+        "default to ltpz",
+        "long-duration tips are safest",
+        "use news first",
+        "keyword search",
+        "real yield tool",
+        "breakeven inflation tool",
+    ):
+        assert forbidden_phrase not in prompt
+
+
+def test_nominal_bond_basket_prompt_is_rank_first_and_duration_aware():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+
+    strategy.initialize()
+
+    created = {agent["name"]: agent for agent in agent_manager.created}
+    prompt = created["nominal_bond_basket_agent"]["system_prompt"].lower()
+    for required_phrase in (
+        "computed ranking evidence",
+        "primary selection evidence",
+        "u.s. nominal treasury duration-selection basket",
+        "not a corporate-bond or credit-risk basket",
+        "cash-like",
+        "ultra-short",
+        "short-term",
+        "intermediate-term",
+        "broad-curve",
+        "long-term",
+        "extended-duration",
+        "zero-coupon",
+        "sgov, bil, and shv are cash-like or ultra-short treasury exposure",
+        "shy, vgsh, and scho are short-term treasury exposure",
+        "iei, ief, vgit, and schr are intermediate-term treasury exposure",
+        "govt is broad-curve treasury exposure",
+        "tlh, tlt, and vglt are long-term treasury exposure",
+        "edv and zroz are extended-duration or zero-coupon treasury exposure",
+        "maturity / duration metadata",
+        "do not select the lowest-volatility symbol by default",
+        "do not select the longest-duration symbol by default",
+        "not as default safe assets",
+        "high interest-rate sensitivity",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "always choose sgov",
+        "always choose bil",
+        "always choose shy",
+        "always choose tlt",
+        "default to sgov",
+        "default to bil",
+        "default to tlt",
+        "default to zroz",
+        "long duration is always correct",
+        "weak growth automatically means long bonds",
+        "capital preservation overrides ranking evidence",
+        "news",
+        "news is required",
+        "fred",
+        "use fred",
+        "macro regime",
+        "macro classification",
+        "classify macro",
+        "classify the macro regime",
+    ):
+        assert forbidden_phrase not in prompt
+
+
 def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
     _module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -371,15 +862,18 @@ def test_portfolio_decision_prompt_delegates_execution_plan_to_planner_tool():
         assert forbidden_phrase not in portfolio_prompt
 
 
-def test_basket_universes_have_at_least_five_semantically_valid_symbols():
+def test_basket_universes_have_expected_symbols():
     module, _strategy_class = load_strategy_module()
 
     assert module.BASKET_UNIVERSES == {
         "equity": ["SPY", "QQQ", "IWM", "EEM", "FXI"],
-        "commodity": ["GLD", "SLV", "DBC", "PDBC", "GSG"],
-        "tips": ["TIP", "SCHP", "VTIP", "STIP", "LTPZ"],
-        "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
+        "commodity": expected_commodity_universe(),
+        "tips": expected_tips_universe(),
+        "nominal_bond": expected_nominal_bond_universe(),
     }
+    assert len(module.BASKET_UNIVERSES["commodity"]) == 28
+    assert len(module.BASKET_UNIVERSES["tips"]) == 6
+    assert len(module.BASKET_UNIVERSES["nominal_bond"]) == 16
     for symbols in module.BASKET_UNIVERSES.values():
         assert len(symbols) >= 5
         assert len(symbols) == len(set(symbols))
@@ -960,6 +1454,118 @@ def _json_summary(payload):
     return json.dumps(payload, separators=(",", ":"))
 
 
+def test_on_trading_iteration_skips_before_weekly_run_day_without_agent_calls():
+    _module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.parameters["weekly_run_weekday"] = "WED"
+    strategy.get_datetime = lambda: datetime(2024, 9, 9, 9, 30)
+    strategy.initialize()
+
+    strategy.on_trading_iteration()
+
+    assert all(not agent.calls for agent in agent_manager._agents.values())
+    assert strategy._scheduled_workflow_events == [
+        {
+            "date": "2024-09-09",
+            "run_frequency": "weekly",
+            "weekly_run_weekday": "WED",
+            "week_key": "2024-W37",
+            "should_run": False,
+            "status": "skipped",
+            "reason": "before_weekly_run_day",
+            "last_weekly_run_date": None,
+        }
+    ]
+
+
+def test_on_trading_iteration_runs_once_per_observed_week():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    current_datetime = datetime(2024, 9, 9, 9, 30)
+    strategy.get_datetime = lambda: current_datetime
+    strategy.initialize()
+
+    macro_report = {
+        "agent": "macro_allocation_agent",
+        "regime": "growth_up_inflation_down",
+        "regime_changed": True,
+        "basket_weights": {"equity": 0.50, "commodity": 0.00, "tips": 0.25, "nominal_bond": 0.25},
+        "mock": True,
+        "reason_brief": "mock",
+    }
+    basket_reports = {
+        "equity_basket_agent": {
+            "basket_id": "equity",
+            "target_weight": 0.50,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["equity"],
+            "selected_symbol": "QQQ",
+            "reason_brief": "selected",
+        },
+        "commodity_basket_agent": {
+            "basket_id": "commodity",
+            "target_weight": 0.00,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["commodity"],
+            "selected_symbol": None,
+            "reason_brief": "inactive",
+        },
+        "tips_basket_agent": {
+            "basket_id": "tips",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["tips"],
+            "selected_symbol": "TIP",
+            "reason_brief": "selected",
+        },
+        "nominal_bond_basket_agent": {
+            "basket_id": "nominal_bond",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["nominal_bond"],
+            "selected_symbol": "IEF",
+            "reason_brief": "selected",
+        },
+    }
+    planner_plan = {"schema_version": 1, "intent": "hold", "orders": []}
+    portfolio_summary = {
+        "decision": {"type": "hold", "reason_brief": "mock target"},
+        "target_portfolio": [
+            {"basket_id": "equity", "symbol": "QQQ", "target_weight": 0.50},
+            {"basket_id": "tips", "symbol": "TIP", "target_weight": 0.25},
+            {"basket_id": "nominal_bond", "symbol": "IEF", "target_weight": 0.25},
+        ],
+        "execution_plan": planner_plan,
+    }
+
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    for agent_name, report in basket_reports.items():
+        agent_manager.summaries[agent_name] = _json_summary(report)
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary(portfolio_summary)
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": planner_plan}
+
+    strategy.on_trading_iteration()
+    current_datetime = datetime(2024, 9, 10, 9, 30)
+    strategy.on_trading_iteration()
+
+    assert len(agent_manager["macro_allocation_agent"].calls) == 1
+    assert len(agent_manager["portfolio_decision_agent"].calls) == 1
+    assert strategy._scheduled_workflow_attempted_week_keys == {"2024-W37"}
+    assert strategy._scheduled_workflow_events[-1] == {
+        "date": "2024-09-10",
+        "run_frequency": "weekly",
+        "weekly_run_weekday": "MON",
+        "week_key": "2024-W37",
+        "should_run": False,
+        "status": "skipped",
+        "reason": "weekly_workflow_already_attempted",
+        "last_weekly_run_date": "2024-09-09",
+    }
+
+
 def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     module, strategy_class = load_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -1080,6 +1686,27 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     assert commodity_context["target_weight"] == 0.0
     assert commodity_context["macro_allocation_report"] == macro_report
 
+    tips_context = agent_manager["tips_basket_agent"].calls[0]["context"]
+    assert tips_context["basket_id"] == "tips"
+    assert tips_context["basket_symbols"] == module.BASKET_UNIVERSES["tips"]
+    assert tips_context["macro_allocation_report"] == macro_report
+
+    tips_task = agent_manager["tips_basket_agent"].calls[0]["task_prompt"].lower()
+    assert "computed ranking evidence first" in tips_task
+    assert "news only" in tips_task
+    assert "long-duration candidate" in tips_task
+
+    nominal_bond_context = agent_manager["nominal_bond_basket_agent"].calls[0]["context"]
+    assert nominal_bond_context["basket_id"] == "nominal_bond"
+    assert nominal_bond_context["basket_symbols"] == module.BASKET_UNIVERSES["nominal_bond"]
+    assert nominal_bond_context["target_weight"] == 0.25
+    assert nominal_bond_context["macro_allocation_report"] == macro_report
+
+    nominal_bond_task = agent_manager["nominal_bond_basket_agent"].calls[0]["task_prompt"].lower()
+    assert "computed ranking evidence first" in nominal_bond_task
+    assert "maturity / duration exposure" in nominal_bond_task
+    assert "fits the nominal bond basket role" in nominal_bond_task
+
     portfolio_context = agent_manager["portfolio_decision_agent"].calls[0]["context"]
     assert portfolio_context["macro_allocation_report"] == macro_report
     assert portfolio_context["equity_basket_report"] == basket_reports["equity_basket_agent"]
@@ -1092,7 +1719,8 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     for required_phrase in (
         "Execute the provided execution_plan by calling execution_plan_execute exactly once",
         "complete execution_plan",
-        "Summarize the returned plan report",
+        "Use the returned concise execution summary to write the final result",
+        "Do not infer missing order details beyond the tool response",
         "Do not call per-order tools",
     ):
         assert required_phrase in execution_task_prompt
@@ -1115,6 +1743,123 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
         execution_context["execution_plan"]
     )
     assert blocker is None
+
+
+def test_commodity_basket_task_prompt_mentions_rank_first_selection():
+    module, strategy_class = load_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+
+    macro_report = {
+        "basket_weights": {"equity": 0.0, "commodity": 1.0, "tips": 0.0, "nominal_bond": 0.0},
+    }
+    basket_reports = {
+        "equity_basket_agent": {
+            "basket_id": "equity",
+            "target_weight": 0.0,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["equity"],
+            "selected_symbol": None,
+        },
+        "commodity_basket_agent": {
+            "basket_id": "commodity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["commodity"],
+            "selected_symbol": "CPER",
+        },
+        "tips_basket_agent": {
+            "basket_id": "tips",
+            "target_weight": 0.0,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["tips"],
+            "selected_symbol": None,
+        },
+        "nominal_bond_basket_agent": {
+            "basket_id": "nominal_bond",
+            "target_weight": 0.0,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["nominal_bond"],
+            "selected_symbol": None,
+        },
+    }
+    execution_plan = {"schema_version": 1, "intent": "hold", "orders": []}
+
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    for agent_name, report in basket_reports.items():
+        agent_manager.summaries[agent_name] = _json_summary(report)
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary({"execution_plan": execution_plan})
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": execution_plan}
+
+    strategy.on_trading_iteration()
+
+    commodity_task = agent_manager["commodity_basket_agent"].calls[0]["task_prompt"].lower()
+    assert "computed ranking evidence" in commodity_task
+    assert "news only" in commodity_task
+    assert "close, conflicting, or incomplete" in commodity_task
+
+
+def test_basket_task_prompt_requires_candidate_symbols_to_copy_assigned_universe():
+    module, _strategy_class = load_strategy_module()
+
+    prompt = module.basket_agent_task_prompt("equity").lower()
+
+    assert (
+        "candidate_symbols must copy the assigned basket_symbols exactly; "
+        "do not replace it with a shortlist"
+    ) in prompt
+
+
+def test_tips_basket_task_prompt_is_rank_first_and_news_secondary():
+    module, _strategy_class = load_strategy_module()
+
+    prompt = module.basket_agent_task_prompt("tips").lower()
+
+    for required_phrase in (
+        "for tips",
+        "computed ranking evidence first",
+        "rank evidence clearly favors",
+        "select it directly",
+        "news only",
+        "close, conflicting, incomplete, stale",
+        "long-duration candidate",
+        "candidate_symbols must copy the assigned basket_symbols exactly",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "use news first",
+        "always choose",
+        "keyword search",
+    ):
+        assert forbidden_phrase not in prompt
+
+
+def test_nominal_bond_basket_task_prompt_is_rank_first_and_duration_aware():
+    module, _strategy_class = load_strategy_module()
+
+    prompt = module.basket_agent_task_prompt("nominal_bond").lower()
+
+    for required_phrase in (
+        "for nominal bonds",
+        "computed ranking evidence first",
+        "select one symbol from candidate_symbols",
+        "target_weight is positive",
+        "ranking evidence",
+        "maturity / duration exposure",
+        "fits the nominal bond basket role",
+        "candidate_symbols must copy the assigned basket_symbols exactly",
+    ):
+        assert required_phrase in prompt
+    for forbidden_phrase in (
+        "use news first",
+        "use fred",
+        "always choose",
+        "default to",
+        "classify the macro regime",
+    ):
+        assert forbidden_phrase not in prompt
 
 
 def test_on_trading_iteration_blocks_when_portfolio_agent_rewrites_planner_plan():

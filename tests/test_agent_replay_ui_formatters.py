@@ -130,6 +130,32 @@ def test_market_load_history_tables_summary_formatter_shows_rankings_and_warning
     assert "1 warning" in text
 
 
+def test_market_load_history_tables_summary_formatter_explains_limited_summary_rows():
+    text = explain_tool_result(
+        "market_load_history_tables_summary",
+        {"symbols": [f"S{i:02d}" for i in range(1, 29)]},
+        {
+            "ranking_limit": 10,
+            "universe_summary_limit": 15,
+            "universe_summary": [{"symbol": f"S{i:02d}"} for i in range(1, 16)],
+            "rankings": {
+                "by_return_63": [f"S{i:02d}" for i in range(1, 11)],
+                "by_momentum_composite": [f"S{i:02d}" for i in range(11, 21)],
+                "by_composite_score": [f"S{i:02d}" for i in range(1, 11)],
+            },
+            "universe_summary_selection": {
+                "candidate_count_before_limit": 20,
+            },
+        },
+        None,
+    )
+
+    assert "15 detailed symbols" in text
+    assert "28 requested symbols" in text
+    assert "rankings capped at top 10" in text
+    assert "20 ranked candidates before the 15-symbol detail limit" in text
+
+
 def test_market_load_history_tables_summary_formatter_counts_empty_summary_rows():
     text = explain_tool_result(
         "market_load_history_tables_summary",
@@ -657,6 +683,36 @@ def test_execution_plan_execute_formatter_explains_completed_multi_order_plan():
     assert "sell VGIT 406" in text
     assert "buy GLD 107" in text
     assert "Final cash: 127.45" in text
+
+
+def test_execution_plan_execute_formatter_explains_model_facing_summary():
+    text = explain_tool_result(
+        "execution_plan_execute",
+        {"execution_plan": {"schema_version": 1, "intent": "rebalance", "orders": []}},
+        {
+            "schema_version": 1,
+            "tool_name": "execution_plan_execute",
+            "response_type": "model_facing_summary",
+            "plan_status": "completed",
+            "orders_requested": 2,
+            "orders_attempted": 2,
+            "orders_completed": 2,
+            "orders_blocked": 0,
+            "orders_skipped": 0,
+            "completed_orders": [
+                {"sequence": 1, "symbol": "VGIT", "side": "sell", "quantity": 406, "confirmed": True},
+                {"sequence": 2, "symbol": "GLD", "side": "buy", "quantity": 107, "confirmed": True},
+            ],
+            "final_account": {"cash": 630.15, "positions": [{"symbol": "GLD", "quantity": 107.0}]},
+            "audit_details_available": True,
+        },
+        None,
+    )
+
+    assert "Execution plan completed" in text
+    assert "sell VGIT 406" in text
+    assert "buy GLD 107" in text
+    assert "Final cash: 630.15" in text
 
 
 def test_execution_plan_execute_formatter_shows_more_count_for_long_completed_orders():
