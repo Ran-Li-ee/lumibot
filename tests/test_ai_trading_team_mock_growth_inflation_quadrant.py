@@ -168,6 +168,27 @@ def expected_tips_universe():
     ]
 
 
+def expected_nominal_bond_universe():
+    return [
+        "SGOV",
+        "BIL",
+        "SHV",
+        "SHY",
+        "VGSH",
+        "SCHO",
+        "IEI",
+        "IEF",
+        "VGIT",
+        "SCHR",
+        "GOVT",
+        "TLH",
+        "TLT",
+        "VGLT",
+        "EDV",
+        "ZROZ",
+    ]
+
+
 def load_strategy_module():
     module = importlib.import_module(
         "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant"
@@ -335,6 +356,19 @@ def test_agents_receive_distinct_tool_surfaces():
             "market_last_price",
             "alpaca_news",
         }
+    nominal_bond_tools = created_tool_names(created["nominal_bond_basket_agent"])
+    assert nominal_bond_tools == {
+        "market_load_history_tables_summary",
+        "market_last_price",
+    }
+    assert "alpaca_news" not in nominal_bond_tools
+    assert "list_fred_series" not in nominal_bond_tools
+    assert "get_fred_series" not in nominal_bond_tools
+    assert "get_fred_latest" not in nominal_bond_tools
+    assert "get_fred_snapshot" not in nominal_bond_tools
+    assert "orders_submit_order" not in nominal_bond_tools
+    assert "orders_execute_order" not in nominal_bond_tools
+    assert "orders_confirm_order" not in nominal_bond_tools
     assert created_tool_names(created["portfolio_decision_agent"]) == {
         "target_portfolio_to_execution_plan",
     }
@@ -501,10 +535,11 @@ def test_basket_universes_have_expected_symbols():
         "equity": ["SPY", "QQQ", "IWM", "EEM", "FXI"],
         "commodity": expected_commodity_universe(),
         "tips": expected_tips_universe(),
-        "nominal_bond": ["SHY", "IEF", "TLT", "GOVT", "VGIT"],
+        "nominal_bond": expected_nominal_bond_universe(),
     }
     assert len(module.BASKET_UNIVERSES["commodity"]) == 28
     assert len(module.BASKET_UNIVERSES["tips"]) == 6
+    assert len(module.BASKET_UNIVERSES["nominal_bond"]) == 16
     for symbols in module.BASKET_UNIVERSES.values():
         assert len(symbols) >= 5
         assert len(symbols) == len(set(symbols))
