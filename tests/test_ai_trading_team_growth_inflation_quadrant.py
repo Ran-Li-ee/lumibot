@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lumibot.components.agents.schemas import ToolDefinition
+from lumibot.components.agents.schemas import AgentTraceEvent, ToolDefinition
 from lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant import (
     execution_plan_execute_payload,
 )
@@ -119,6 +119,7 @@ class RecordingAgentManager:
         self._agents = {}
         self.summaries = {}
         self.tool_calls = {}
+        self.tool_results = {}
         self.planner_results = {}
         self.strategy = None
 
@@ -151,6 +152,16 @@ class RecordingAgent:
                 SimpleNamespace(tool_name=tool_name)
                 for tool_name in self.agent_manager.tool_calls.get(self.name, [])
             ],
+            tool_results=[
+                result
+                if isinstance(result, AgentTraceEvent)
+                else AgentTraceEvent(
+                    kind="tool_result",
+                    tool_name=result[0],
+                    payload=result[1],
+                )
+                for result in self.agent_manager.tool_results.get(self.name, [])
+            ],
         )
 
 
@@ -173,6 +184,87 @@ def created_tool_names(created_agent):
 
 def _json_summary(payload):
     return json.dumps(payload, separators=(",", ":"))
+
+
+def _macro_tool_result(payload):
+    return ("macro_regime_classifier", payload)
+
+
+def _passed_real_macro_report(module, *, regime="growth_up_inflation_down", reason_brief="real macro"):
+    return {
+        "status": "passed",
+        "tool": "macro_regime_classifier",
+        "mock": False,
+        "mode": module.DEFAULT_MODE,
+        "date": "2024-09-05",
+        "as_of": "2024-09-05",
+        "regime": regime,
+        "basket_weights": {"equity": 0.50, "commodity": 0.25, "tips": 0.00, "nominal_bond": 0.25},
+        "growth_evidence": {
+            "direction": "up",
+            "lag_months": module.DEFAULT_GROWTH_LAG_MONTHS,
+            "trend_years": module.DEFAULT_TREND_YEARS,
+        },
+        "inflation_evidence": {
+            "direction": "down",
+            "lag_months": module.DEFAULT_INFLATION_LAG_MONTHS,
+            "trend_years": module.DEFAULT_TREND_YEARS,
+        },
+        "data_quality": {
+            "status": "passed",
+            "required_series": [module.DEFAULT_GROWTH_SERIES_ID, module.DEFAULT_INFLATION_SERIES_ID],
+        },
+        "confidence": {"growth_margin": 0.01, "inflation_margin": 0.02},
+        "reason_brief": reason_brief,
+    }
+
+
+def _install_hold_downstream_summaries(agent_manager, module):
+    basket_reports = {
+        "equity_basket_agent": {
+            "basket_id": "equity",
+            "target_weight": 0.50,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["equity"],
+            "selected_symbol": "SPY",
+        },
+        "commodity_basket_agent": {
+            "basket_id": "commodity",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["commodity"],
+            "selected_symbol": "GLD",
+        },
+        "tips_basket_agent": {
+            "basket_id": "tips",
+            "target_weight": 0.00,
+            "status": "inactive",
+            "candidate_symbols": module.BASKET_UNIVERSES["tips"],
+            "selected_symbol": None,
+        },
+        "nominal_bond_basket_agent": {
+            "basket_id": "nominal_bond",
+            "target_weight": 0.25,
+            "status": "active",
+            "candidate_symbols": module.BASKET_UNIVERSES["nominal_bond"],
+            "selected_symbol": "IEF",
+        },
+    }
+    planner_plan = {"schema_version": 1, "intent": "hold", "orders": []}
+    portfolio_summary = {
+        "decision": {"type": "hold", "reason_brief": "hold target"},
+        "target_portfolio": [
+            {"basket_id": "equity", "symbol": "SPY", "target_weight": 0.50},
+            {"basket_id": "commodity", "symbol": "GLD", "target_weight": 0.25},
+            {"basket_id": "nominal_bond", "symbol": "IEF", "target_weight": 0.25},
+        ],
+        "execution_plan": planner_plan,
+    }
+    for agent_name, report in basket_reports.items():
+        agent_manager.summaries[agent_name] = _json_summary(report)
+    agent_manager.summaries["portfolio_decision_agent"] = _json_summary(portfolio_summary)
+    agent_manager.tool_calls["portfolio_decision_agent"] = ["target_portfolio_to_execution_plan"]
+    agent_manager.planner_results["portfolio_decision_agent"] = {"execution_plan": planner_plan}
 
 
 def _growth_payload_with_latest_direction(direction):
@@ -314,7 +406,8 @@ def test_real_strategy_macro_not_passed_blocks_downstream_and_clears_stale_plann
         "reason": f"macro {status}",
         "data_quality": {"status": status, "errors": [f"macro {status}"]},
     }
-    agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary({"status": "passed"})
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(macro_report)]
 
     strategy.on_trading_iteration()
 
@@ -328,7 +421,7 @@ def test_real_strategy_macro_not_passed_blocks_downstream_and_clears_stale_plann
     assert strategy._last_target_portfolio_planner_result is None
 
 
-def test_real_strategy_macro_parse_failure_blocks_downstream_and_clears_stale_planner():
+def test_real_strategy_missing_classifier_tool_result_blocks_downstream_and_clears_stale_planner():
     module, strategy_class = load_real_strategy_module()
     agent_manager = RecordingAgentManager()
     strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
@@ -347,7 +440,8 @@ def test_real_strategy_macro_parse_failure_blocks_downstream_and_clears_stale_pl
     assert agent_manager["portfolio_decision_agent"].calls == []
     assert agent_manager["execution_agent"].calls == []
     assert strategy._last_macro_regime_error["status"] == "failed"
-    assert "No JSON object found" in strategy._last_macro_regime_error["reason"]
+    assert "macro_regime_classifier" in strategy._last_macro_regime_error["reason"]
+    assert "tool result payload" in strategy._last_macro_regime_error["reason"]
     assert strategy._last_execution_plan_error is None
     assert strategy._last_target_portfolio_planner_result is None
 
@@ -374,6 +468,7 @@ def test_real_strategy_passed_macro_without_classifier_tool_evidence_blocks_down
         "reason_brief": "plausible but fabricated macro report",
     }
     agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
 
     strategy.on_trading_iteration()
 
@@ -391,6 +486,83 @@ def test_real_strategy_passed_macro_without_classifier_tool_evidence_blocks_down
     assert "macro_regime_classifier" in blocked_log
 
 
+def test_real_strategy_trusts_tool_result_when_summary_fabricates_different_macro_report():
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    tool_report = _passed_real_macro_report(module, reason_brief="authoritative tool result")
+    fabricated_summary = dict(tool_report)
+    fabricated_summary["regime"] = "growth_down_inflation_up"
+    fabricated_summary["basket_weights"] = {
+        "equity": 0.00,
+        "commodity": 0.25,
+        "tips": 0.50,
+        "nominal_bond": 0.25,
+    }
+    fabricated_summary["reason_brief"] = "fabricated summary"
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary(fabricated_summary)
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(tool_report)]
+    _install_hold_downstream_summaries(agent_manager, module)
+
+    strategy.on_trading_iteration()
+
+    assert strategy._last_macro_regime_error is None
+    commodity_context = agent_manager["commodity_basket_agent"].calls[0]["context"]
+    portfolio_context = agent_manager["portfolio_decision_agent"].calls[0]["context"]
+    assert commodity_context["macro_allocation_report"] == tool_report
+    assert portfolio_context["macro_allocation_report"] == tool_report
+    assert strategy._last_real_regime == tool_report["regime"]
+
+
+def test_real_strategy_allows_malformed_summary_when_classifier_tool_result_passed():
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    tool_report = _passed_real_macro_report(module, reason_brief="authoritative despite prose")
+    agent_manager.summaries["macro_allocation_agent"] = "RESULT: no JSON here"
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(tool_report)]
+    _install_hold_downstream_summaries(agent_manager, module)
+
+    strategy.on_trading_iteration()
+
+    assert strategy._last_macro_regime_error is None
+    assert agent_manager["portfolio_decision_agent"].calls
+    assert agent_manager["portfolio_decision_agent"].calls[0]["context"]["macro_allocation_report"] == tool_report
+    assert strategy._last_real_regime == tool_report["regime"]
+
+
+def test_real_strategy_blocks_classifier_tool_result_without_dict_payload(capsys):
+    module, strategy_class = load_real_strategy_module()
+    agent_manager = RecordingAgentManager()
+    strategy = make_strategy_with_agent_manager(strategy_class, agent_manager)
+    strategy.initialize()
+    strategy._last_target_portfolio_planner_result = {
+        "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []}
+    }
+    strategy._last_execution_plan_error = "stale execution error"
+    agent_manager.summaries["macro_allocation_agent"] = _json_summary({"status": "passed"})
+    agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(["not", "a", "dict"])]
+
+    strategy.on_trading_iteration()
+
+    for agent_name in module.BASKET_AGENT_NAMES.values():
+        assert agent_manager[agent_name].calls == []
+    assert agent_manager["portfolio_decision_agent"].calls == []
+    assert agent_manager["execution_agent"].calls == []
+    assert strategy._last_macro_regime_error["status"] == "failed"
+    assert "tool result payload" in strategy._last_macro_regime_error["reason"]
+    assert strategy._last_execution_plan_error is None
+    assert strategy._last_target_portfolio_planner_result is None
+    blocked_log = capsys.readouterr().out
+    assert "Real quadrant macro workflow blocked" in blocked_log
+    assert "tool result payload" in blocked_log
+
+
 def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
     module, strategy_class = load_real_strategy_module()
     agent_manager = RecordingAgentManager()
@@ -401,11 +573,25 @@ def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
         "status": "passed",
         "tool": "macro_regime_classifier",
         "mock": False,
+        "mode": module.DEFAULT_MODE,
+        "date": "2024-09-05",
+        "as_of": "2024-09-05",
         "regime": "growth_up_inflation_down",
         "basket_weights": {"equity": 0.50, "commodity": 0.25, "tips": 0.00, "nominal_bond": 0.25},
-        "growth_evidence": {"direction": "up"},
-        "inflation_evidence": {"direction": "down"},
-        "data_quality": {"status": "passed"},
+        "growth_evidence": {
+            "direction": "up",
+            "lag_months": module.DEFAULT_GROWTH_LAG_MONTHS,
+            "trend_years": module.DEFAULT_TREND_YEARS,
+        },
+        "inflation_evidence": {
+            "direction": "down",
+            "lag_months": module.DEFAULT_INFLATION_LAG_MONTHS,
+            "trend_years": module.DEFAULT_TREND_YEARS,
+        },
+        "data_quality": {
+            "status": "passed",
+            "required_series": [module.DEFAULT_GROWTH_SERIES_ID, module.DEFAULT_INFLATION_SERIES_ID],
+        },
         "confidence": {"growth_margin": 0.01, "inflation_margin": 0.02},
         "reason_brief": "real macro",
     }
@@ -480,6 +666,7 @@ def test_real_strategy_passed_macro_runs_downstream_with_real_macro_context():
     }
     agent_manager.summaries["macro_allocation_agent"] = _json_summary(macro_report)
     agent_manager.tool_calls["macro_allocation_agent"] = ["macro_regime_classifier"]
+    agent_manager.tool_results["macro_allocation_agent"] = [_macro_tool_result(macro_report)]
     for agent_name, report in basket_reports.items():
         agent_manager.summaries[agent_name] = _json_summary(report)
     agent_manager.summaries["portfolio_decision_agent"] = _json_summary(portfolio_summary)
@@ -844,13 +1031,13 @@ def test_make_real_macro_regime_classifier_tool_binds_stateful_tool():
     assert default_result["mock"] is False
     assert default_result["date"] == "2024-09-05"
     assert default_result["previous_regime"] is None
-    assert strategy._last_real_regime == default_result["regime"]
+    assert strategy._last_real_regime is None
 
     stateful_result = bound_tool.function(date="2024-09-05")
 
     assert stateful_result["status"] == "passed"
-    assert stateful_result["previous_regime"] == default_result["regime"]
-    assert strategy._last_real_regime == stateful_result["regime"]
+    assert stateful_result["previous_regime"] is None
+    assert strategy._last_real_regime is None
 
     explicit_result = bound_tool.function(
         date="2024-09-05",
@@ -951,10 +1138,10 @@ def test_bound_real_macro_regime_classifier_uses_strategy_parameters_as_defaults
     assert result["growth_evidence"]["trend_window_observations"] == 16
     assert result["inflation_evidence"]["trend_window_observations"] == 48
     assert [call["series_id"] for call in fred.calls] == ["CUSTOM_GROWTH", "CUSTOM_INFLATION"]
-    assert strategy._last_real_regime == result["regime"]
+    assert strategy._last_real_regime is None
 
 
-def test_bound_real_macro_regime_classifier_explicit_defaults_mutate_state():
+def test_bound_real_macro_regime_classifier_explicit_defaults_do_not_mutate_state():
     module = load_classifier_module()
     existing_regime = "growth_down_inflation_up"
 
@@ -990,7 +1177,7 @@ def test_bound_real_macro_regime_classifier_explicit_defaults_mutate_state():
     assert result["previous_regime"] == existing_regime
     assert result["regime"] != existing_regime
     assert result["data_quality"]["required_series"] == ["GDPC1", "CPIAUCSL"]
-    assert strategy._last_real_regime == result["regime"]
+    assert strategy._last_real_regime == existing_regime
 
 
 def test_bound_real_macro_regime_classifier_failed_or_blocked_results_do_not_mutate_state():

@@ -1,11 +1,10 @@
 import os
+from typing import Any
 
 from lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant import (
     BASKET_AGENT_NAMES,
     BASKET_UNIVERSES,
     AITradingTeamMockGrowthInflationQuadrantStrategy,
-    _agent_result_tool_names,
-    _parse_json_summary,
 )
 from lumibot.example_strategies.fred_growth_inflation_regime_classifier import (
     DEFAULT_GROWTH_LAG_MONTHS,
@@ -16,6 +15,28 @@ from lumibot.example_strategies.fred_growth_inflation_regime_classifier import (
     DEFAULT_TREND_YEARS,
     make_real_macro_regime_classifier_tool,
 )
+
+MACRO_REGIME_CLASSIFIER_TOOL_NAME = "macro_regime_classifier"
+
+
+def _macro_regime_classifier_tool_payload(result: Any) -> tuple[dict[str, Any] | None, str | None]:
+    for event in reversed(list(getattr(result, "tool_results", []) or [])):
+        if getattr(event, "tool_name", None) != MACRO_REGIME_CLASSIFIER_TOOL_NAME:
+            continue
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict) or not payload:
+            return (
+                None,
+                "macro_allocation_agent macro_regime_classifier tool result payload must be a non-empty object "
+                "before a macro report is trusted.",
+            )
+        return payload, None
+
+    return (
+        None,
+        "macro_allocation_agent must produce a macro_regime_classifier tool result payload before a macro "
+        "report is trusted.",
+    )
 
 
 class AITradingTeamGrowthInflationQuadrantStrategy(
@@ -73,6 +94,60 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
 
         self._create_growth_inflation_downstream_agents(model)
 
+    def _clear_real_macro_downstream_state(self) -> None:
+        self._last_execution_plan_error = None
+        self._last_target_portfolio_planner_result = None
+
+    def _block_real_macro_workflow(self, reason: str) -> None:
+        self._last_macro_regime_error = {
+            "status": "failed",
+            "reason": reason,
+        }
+        self._clear_real_macro_downstream_state()
+        self._log_growth_inflation_workflow_blocked(f"Real quadrant macro workflow blocked: {reason}")
+
+    def _accepted_real_macro_report_is_canonical(
+        self,
+        macro_report: dict[str, Any],
+        current_date: str,
+    ) -> bool:
+        growth_evidence = macro_report.get("growth_evidence")
+        inflation_evidence = macro_report.get("inflation_evidence")
+        data_quality = macro_report.get("data_quality")
+        if not isinstance(growth_evidence, dict):
+            return False
+        if not isinstance(inflation_evidence, dict):
+            return False
+        if not isinstance(data_quality, dict):
+            return False
+
+        return (
+            macro_report.get("status") == "passed"
+            and macro_report.get("tool") == MACRO_REGIME_CLASSIFIER_TOOL_NAME
+            and macro_report.get("mock") is False
+            and macro_report.get("date") == current_date
+            and macro_report.get("as_of") == current_date
+            and macro_report.get("mode") == self._macro_regime_mode
+            and data_quality.get("required_series") == [
+                self._growth_series_id,
+                self._inflation_series_id,
+            ]
+            and growth_evidence.get("lag_months") == self._growth_lag_months
+            and inflation_evidence.get("lag_months") == self._inflation_lag_months
+            and growth_evidence.get("trend_years") == self._trend_years
+            and inflation_evidence.get("trend_years") == self._trend_years
+        )
+
+    def _commit_accepted_real_regime_if_canonical(
+        self,
+        macro_report: dict[str, Any],
+        current_date: str,
+    ) -> None:
+        if self._accepted_real_macro_report_is_canonical(macro_report, current_date):
+            regime = macro_report.get("regime")
+            if isinstance(regime, str) and regime.strip():
+                self._last_real_regime = regime
+
     def on_trading_iteration(self):
         current_datetime = self.get_datetime()
         current_date_obj = current_datetime.date()
@@ -102,35 +177,22 @@ class AITradingTeamGrowthInflationQuadrantStrategy(
                     "basket_universes": basket_universes,
                 },
             )
-            macro_report = _parse_json_summary(macro_result.summary, "macro_allocation_agent")
         except ValueError as exc:
-            self._last_macro_regime_error = {
-                "status": "failed",
-                "reason": str(exc),
-            }
-            self._last_execution_plan_error = None
-            self._last_target_portfolio_planner_result = None
-            self._log_growth_inflation_workflow_blocked(f"Real quadrant macro workflow blocked: {exc}")
+            self._block_real_macro_workflow(str(exc))
+            return
+
+        macro_report, payload_error = _macro_regime_classifier_tool_payload(macro_result)
+        if payload_error is not None:
+            self._block_real_macro_workflow(payload_error)
             return
 
         if str(macro_report.get("status") or "").strip().lower() != "passed":
             self._last_macro_regime_error = macro_report
-            self._last_execution_plan_error = None
-            self._last_target_portfolio_planner_result = None
-            return
-
-        if "macro_regime_classifier" not in _agent_result_tool_names(macro_result):
-            reason = "macro_allocation_agent must call macro_regime_classifier before a passed macro report is trusted."
-            self._last_macro_regime_error = {
-                "status": "failed",
-                "reason": reason,
-            }
-            self._last_execution_plan_error = None
-            self._last_target_portfolio_planner_result = None
-            self._log_growth_inflation_workflow_blocked(f"Real quadrant macro workflow blocked: {reason}")
+            self._clear_real_macro_downstream_state()
             return
 
         self._last_macro_regime_error = None
+        self._commit_accepted_real_regime_if_canonical(macro_report, current_date)
         self._run_growth_inflation_downstream_workflow(
             current_date,
             macro_report,
