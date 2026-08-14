@@ -21,9 +21,13 @@ def passed_result(
         "tool": "macro_regime_classifier",
         "status": "passed",
         "mock": False,
-        "mode": "fred_ra_simple_lagged",
+        "mode": "fred_ra_vintage_asof",
         "date": "2024-09-05",
         "as_of": "2024-09-05",
+        "requested_as_of": "2024-09-05",
+        "effective_as_of": "2024-09-05",
+        "lookahead_clamped": False,
+        "as_of_policy": "same_day_vintage",
         "regime": regime,
         "growth_direction": growth_direction,
         "inflation_direction": inflation_direction,
@@ -47,6 +51,12 @@ def passed_result(
             "latest_observation_date": "2024-08-01",
             "data_cutoff": "2024-08-05",
         },
+        "data_quality": {
+            "as_of_policy": "same_day_vintage",
+            "requested_as_of": "2024-09-05",
+            "effective_as_of": "2024-09-05",
+            "lookahead_clamped": False,
+        },
         "confidence": {"level": "medium"},
         "reason_brief": reason_brief,
     }
@@ -57,14 +67,22 @@ def blocked_result(reason: str = "missing_fred_api_key") -> dict:
         "tool": "macro_regime_classifier",
         "status": "blocked",
         "mock": False,
-        "mode": "fred_ra_simple_lagged",
+        "mode": "fred_ra_vintage_asof",
         "date": "2024-09-06",
         "as_of": "2024-09-06",
+        "requested_as_of": "2024-09-06",
+        "effective_as_of": "2024-09-06",
+        "lookahead_clamped": False,
+        "as_of_policy": "same_day_vintage",
         "reason": reason,
         "data_quality": {
             "status": "blocked",
             "errors": ["FRED_API_KEY is required"],
             "warnings": [],
+            "as_of_policy": "same_day_vintage",
+            "requested_as_of": "2024-09-06",
+            "effective_as_of": "2024-09-06",
+            "lookahead_clamped": False,
         },
     }
 
@@ -117,6 +135,89 @@ def test_parse_args_accepts_scanner_options():
     assert args.growth_lag_months == 6
     assert args.inflation_lag_months == 1
     assert args.trend_years == 5
+
+
+def test_default_classifier_config_uses_vintage_asof_mode_without_lag_options():
+    args = scan.parse_args(
+        [
+            "--start",
+            "2024-09-01",
+            "--end",
+            "2024-09-01",
+        ]
+    )
+
+    assert args.mode == "fred_ra_vintage_asof"
+    assert args.as_of_policy == "same_day_vintage"
+    assert args.requested_as_of is None
+    assert scan._classifier_config(args) == {
+        "mode": "fred_ra_vintage_asof",
+        "as_of_policy": "same_day_vintage",
+        "requested_as_of": None,
+        "growth_series_id": "GDPC1",
+        "inflation_series_id": "CPIAUCSL",
+        "trend_years": 5,
+    }
+
+
+def test_explicit_vintage_classifier_config_passes_as_of_policy_and_requested_as_of():
+    args = scan.parse_args(
+        [
+            "--start",
+            "2024-09-01",
+            "--end",
+            "2024-09-01",
+            "--mode",
+            "fred_ra_vintage_asof",
+            "--as-of-policy",
+            "explicit",
+            "--requested-as-of",
+            "2024-08-30",
+            "--growth-series-id",
+            "CUSTOM_GROWTH",
+            "--inflation-series-id",
+            "CUSTOM_INFLATION",
+            "--trend-years",
+            "7",
+        ]
+    )
+
+    assert scan._classifier_config(args) == {
+        "mode": "fred_ra_vintage_asof",
+        "as_of_policy": "explicit",
+        "requested_as_of": "2024-08-30",
+        "growth_series_id": "CUSTOM_GROWTH",
+        "inflation_series_id": "CUSTOM_INFLATION",
+        "trend_years": 7,
+    }
+
+
+def test_legacy_classifier_config_keeps_lag_options_for_comparison_mode():
+    args = scan.parse_args(
+        [
+            "--start",
+            "2024-09-01",
+            "--end",
+            "2024-09-01",
+            "--mode",
+            "fred_ra_simple_lagged",
+            "--growth-lag-months",
+            "8",
+            "--inflation-lag-months",
+            "2",
+        ]
+    )
+
+    assert scan._classifier_config(args) == {
+        "mode": "fred_ra_simple_lagged",
+        "as_of_policy": "same_day_vintage",
+        "requested_as_of": None,
+        "growth_series_id": "GDPC1",
+        "inflation_series_id": "CPIAUCSL",
+        "trend_years": 5,
+        "growth_lag_months": 8,
+        "inflation_lag_months": 2,
+    }
 
 
 def test_parse_args_rejects_negative_window(capsys):
@@ -301,16 +402,19 @@ def test_scan_regimes_calls_classifier_for_each_date_and_tracks_previous_regime(
         scan_dates=dates,
         classifier=fake_classifier,
         classifier_config={
-            "mode": "fred_ra_simple_lagged",
+            "mode": "fred_ra_vintage_asof",
+            "as_of_policy": "same_day_vintage",
+            "requested_as_of": None,
             "growth_series_id": "GDPC1",
             "inflation_series_id": "CPIAUCSL",
-            "growth_lag_months": 6,
-            "inflation_lag_months": 1,
             "trend_years": 5,
         },
     )
 
     assert [call["date"] for call in calls] == ["2024-09-05", "2024-09-06", "2024-09-09"]
+    assert calls[0]["mode"] == "fred_ra_vintage_asof"
+    assert calls[0]["as_of_policy"] == "same_day_vintage"
+    assert calls[0]["requested_as_of"] is None
     assert calls[0]["previous_regime"] is None
     assert calls[1]["previous_regime"] == "growth_up_inflation_down"
     assert calls[2]["previous_regime"] == "growth_up_inflation_down"

@@ -16,11 +16,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lumibot.example_strategies.fred_growth_inflation_regime_classifier import (  # noqa: E402
+    DEFAULT_AS_OF_POLICY,
+    DEFAULT_MODE,
+    LEGACY_LAGGED_MODE,
+)
 from scripts.validate_fred_growth_inflation_data import load_env_file, sanitize_sensitive_text  # noqa: E402
 
 ARTIFACT_ROOT = Path("artifacts") / "macro_regime_scans"
 CALENDAR_MODES = ("calendar-days", "weekdays", "trading-days")
-DEFAULT_MODE = "fred_ra_simple_lagged"
 DEFAULT_GROWTH_SERIES_ID = "GDPC1"
 DEFAULT_INFLATION_SERIES_ID = "CPIAUCSL"
 DEFAULT_GROWTH_LAG_MONTHS = 6
@@ -71,6 +75,7 @@ __all__ = (
     "ARTIFACT_ROOT",
     "CALENDAR_MODES",
     "DAILY_COLUMNS",
+    "DEFAULT_AS_OF_POLICY",
     "DEFAULT_GROWTH_LAG_MONTHS",
     "DEFAULT_GROWTH_SERIES_ID",
     "DEFAULT_INFLATION_LAG_MONTHS",
@@ -78,6 +83,7 @@ __all__ = (
     "DEFAULT_MODE",
     "DEFAULT_TREND_YEARS",
     "FREDMacroData",
+    "LEGACY_LAGGED_MODE",
     "REPO_ROOT",
     "TRANSITION_COLUMNS",
     "build_date_grid",
@@ -173,6 +179,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--env-file", type=Path, default=None)
     parser.add_argument("--mode", default=DEFAULT_MODE)
+    parser.add_argument("--as-of-policy", default=DEFAULT_AS_OF_POLICY)
+    parser.add_argument("--requested-as-of", default=None)
     parser.add_argument("--growth-series-id", default=DEFAULT_GROWTH_SERIES_ID)
     parser.add_argument("--inflation-series-id", default=DEFAULT_INFLATION_SERIES_ID)
     parser.add_argument(
@@ -201,6 +209,8 @@ def _args_summary(args: argparse.Namespace) -> dict[str, Any]:
         "window_before": args.window_before,
         "window_after": args.window_after,
         "mode": args.mode,
+        "as_of_policy": args.as_of_policy,
+        "requested_as_of": args.requested_as_of,
         "growth_series_id": args.growth_series_id,
         "inflation_series_id": args.inflation_series_id,
         "growth_lag_months": args.growth_lag_months,
@@ -210,14 +220,18 @@ def _args_summary(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _classifier_config(args: argparse.Namespace) -> dict[str, Any]:
-    return {
+    config = {
         "mode": args.mode,
+        "as_of_policy": args.as_of_policy,
+        "requested_as_of": args.requested_as_of,
         "growth_series_id": args.growth_series_id,
         "inflation_series_id": args.inflation_series_id,
-        "growth_lag_months": args.growth_lag_months,
-        "inflation_lag_months": args.inflation_lag_months,
         "trend_years": args.trend_years,
     }
+    if args.mode == LEGACY_LAGGED_MODE:
+        config["growth_lag_months"] = args.growth_lag_months
+        config["inflation_lag_months"] = args.inflation_lag_months
+    return config
 
 
 def parse_date_argument(value: Any, *, name: str) -> date:
