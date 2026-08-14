@@ -216,6 +216,23 @@ def test_examples_benchmark_uses_model_specific_key_check(monkeypatch):
     assert benchmark._missing_key_label("openai/gpt-5.6-luna") is None
 
 
+def test_examples_benchmark_builds_strategy_parameters_for_cadence_overrides():
+    benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
+    args = SimpleNamespace(run_frequency="daily", weekly_run_weekday="TUE")
+
+    assert benchmark._strategy_parameters_from_args(args) == {
+        "run_frequency": "daily",
+        "weekly_run_weekday": "TUE",
+    }
+
+
+def test_examples_benchmark_omits_empty_strategy_parameter_overrides():
+    benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
+    args = SimpleNamespace(run_frequency=None, weekly_run_weekday=None)
+
+    assert benchmark._strategy_parameters_from_args(args) == {}
+
+
 def test_examples_benchmark_main_uses_model_specific_key_gate(monkeypatch):
     benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
     monkeypatch.setenv("AI_TRADING_TEAM_MODEL", "openai/gpt-5.6-luna")

@@ -140,6 +140,15 @@ def _parse_date(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%d")
 
 
+def _strategy_parameters_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    parameters: dict[str, Any] = {}
+    if getattr(args, "run_frequency", None):
+        parameters["run_frequency"] = args.run_frequency
+    if getattr(args, "weekly_run_weekday", None):
+        parameters["weekly_run_weekday"] = args.weekly_run_weekday
+    return parameters
+
+
 def _load_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -183,6 +192,7 @@ def _run_one_strategy(name: str, args: argparse.Namespace, root: str) -> dict[st
     tearsheet_file = run_dir / f"{base_filename}_tearsheet.html"
     tearsheet_metrics_file = run_dir / f"{base_filename}_tearsheet_metrics.json"
     started = time.perf_counter()
+    strategy_parameters = _strategy_parameters_from_args(args)
     try:
         result, strategy = strategy_class.run_backtest(
             datasource_class=YahooDataBacktesting,
@@ -191,6 +201,7 @@ def _run_one_strategy(name: str, args: argparse.Namespace, root: str) -> dict[st
             benchmark_asset=Asset("SPY", Asset.AssetType.STOCK),
             quote_asset=Asset("USD", Asset.AssetType.FOREX),
             budget=args.budget,
+            parameters=strategy_parameters,
             stats_file=str(stats_file),
             trades_file=str(trades_file),
             settings_file=str(settings_file),
@@ -250,6 +261,8 @@ def main() -> None:
     parser.add_argument("--max-run-attempts", type=int, default=3)
     parser.add_argument("--agent-run-timeout-seconds", type=int, default=1800)
     parser.add_argument("--strategy", action="append", choices=sorted(STRATEGIES))
+    parser.add_argument("--run-frequency", choices=["daily", "weekly"])
+    parser.add_argument("--weekly-run-weekday", choices=["MON", "TUE", "WED", "THU", "FRI"])
     args = parser.parse_args()
 
     _load_env_file(Path(args.env_file))
