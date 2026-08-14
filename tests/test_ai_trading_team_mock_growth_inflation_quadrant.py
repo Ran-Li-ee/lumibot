@@ -1332,7 +1332,8 @@ def test_on_trading_iteration_runs_agents_in_expected_order_and_context():
     for required_phrase in (
         "Execute the provided execution_plan by calling execution_plan_execute exactly once",
         "complete execution_plan",
-        "Summarize the returned plan report",
+        "Use the returned concise execution summary to write the final result",
+        "Do not infer missing order details beyond the tool response",
         "Do not call per-order tools",
     ):
         assert required_phrase in execution_task_prompt
