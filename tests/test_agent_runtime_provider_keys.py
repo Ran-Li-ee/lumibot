@@ -243,6 +243,54 @@ def test_execution_plan_execute_mutates_trading_metadata_ignores_retry_env_overr
     assert GoogleADKRuntime._max_attempts_for_request(request) == 1
 
 
+def test_execution_plan_execute_pruning_uses_model_facing_summary_even_when_full_result_is_small():
+    from lumibot.components.agents.runtime import _prune_tool_response_for_context_window
+
+    summary = {
+        "schema_version": 1,
+        "tool_name": "execution_plan_execute",
+        "response_type": "model_facing_summary",
+        "plan_status": "completed",
+        "orders_completed": 1,
+        "audit_details_available": True,
+    }
+    full_result = {
+        "schema_version": 1,
+        "plan_status": "completed",
+        "order_results": [{"order_result": {"preflight_result": {"large": "raw audit"}}}],
+        "model_facing_summary": summary,
+    }
+
+    projected = _prune_tool_response_for_context_window(
+        full_result,
+        tool_name="execution_plan_execute",
+        max_chars=100_000,
+    )
+
+    assert projected == summary
+    assert "lumibot_tool_result_pruned" not in projected
+
+
+def test_execution_plan_execute_pruning_uses_generic_excerpt_when_summary_missing():
+    from lumibot.components.agents.runtime import _prune_tool_response_for_context_window
+
+    full_result = {
+        "schema_version": 1,
+        "plan_status": "completed",
+        "order_results": [{"order_result": {"payload": "x" * 5000}}],
+    }
+
+    projected = _prune_tool_response_for_context_window(
+        full_result,
+        tool_name="execution_plan_execute",
+        max_chars=100,
+    )
+
+    assert projected["lumibot_tool_result_pruned"] is True
+    assert projected["tool_name"] == "execution_plan_execute"
+    assert "excerpt" in projected
+
+
 def test_aggregate_usage_metadata_sums_multiple_provider_events():
     usage = _aggregate_usage_metadata(
         [

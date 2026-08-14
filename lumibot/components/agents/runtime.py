@@ -2754,12 +2754,35 @@ def _replace_function_response_payload(part: Any, message: str) -> bool:
         return False
 
 
+def _model_facing_summary_for_tool_response(
+    tool_response: Any,
+    *,
+    tool_name: str | None,
+) -> Any | None:
+    if tool_name != "execution_plan_execute":
+        return None
+    if not isinstance(tool_response, dict):
+        return None
+    summary = tool_response.get("model_facing_summary")
+    if not isinstance(summary, dict):
+        return None
+    if summary.get("response_type") != "model_facing_summary":
+        return None
+    return summary
+
+
 def _prune_tool_response_for_context_window(
     tool_response: Any,
     *,
     tool_name: str | None,
     max_chars: int = 4_000,
 ) -> Any | None:
+    model_facing_summary = _model_facing_summary_for_tool_response(
+        tool_response,
+        tool_name=tool_name,
+    )
+    if model_facing_summary is not None:
+        return model_facing_summary
     if tool_name == "market_load_history_tables_summary":
         max_chars = max(max_chars, 6_000)
     response_chars = _serialized_content_length(tool_response)
