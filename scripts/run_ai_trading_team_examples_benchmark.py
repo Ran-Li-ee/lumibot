@@ -96,6 +96,10 @@ STRATEGIES = _LazyStrategyRegistry(
             "lumibot.example_strategies.ai_trading_team_growth_inflation_quadrant",
             "AITradingTeamGrowthInflationQuadrantStrategy",
         ),
+        "equity-only-llm": (
+            "lumibot.example_strategies.ai_trading_team_equity_only_llm",
+            "AITradingTeamEquityOnlyLLMStrategy",
+        ),
     }
 )
 
@@ -265,7 +269,7 @@ def main() -> None:
     parser.add_argument("--max-run-attempts", type=int, default=3)
     parser.add_argument("--agent-run-timeout-seconds", type=int, default=1800)
     parser.add_argument("--strategy", action="append", choices=sorted(STRATEGIES))
-    parser.add_argument("--run-frequency", choices=["daily", "weekly"])
+    parser.add_argument("--run-frequency", choices=["daily", "weekly", "monthly"])
     parser.add_argument("--weekly-run-weekday", choices=["MON", "TUE", "WED", "THU", "FRI"])
     args = parser.parse_args()
 
