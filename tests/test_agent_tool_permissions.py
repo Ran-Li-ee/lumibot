@@ -1833,6 +1833,86 @@ def test_execution_plan_execute_uses_strategy_cash_check_price_for_market_buy_af
     assert strategy.submitted_orders[0].asset.symbol == "IWM"
 
 
+def test_execution_plan_execute_does_not_hide_internal_cash_check_hook_error():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 3000.0
+    strategy.portfolio_value = 102976.02
+    strategy.last_prices = {"IWM": 208.85}
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    def broken_cash_check_price(asset, **kwargs):
+        raise TypeError("internal hook bug")
+
+    strategy.get_agent_order_cash_check_price = broken_cash_check_price
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "IWM",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "blocked"
+    assert result["orders_completed"] == 0
+    assert result["orders_blocked"] == 1
+    assert result["blockers"] == [{"code": "SUBMIT_FAILED", "message": "internal hook bug"}]
+    assert result["order_results"][0]["order_result"]["preflight_result"] is None
+    assert not strategy.submitted_orders
+
+
+def test_execution_plan_execute_supports_asset_only_cash_check_hook():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 2086.66
+    strategy.portfolio_value = 102976.02
+    strategy.last_prices = {"IWM": 208.85}
+    strategy.fill_prices = {"IWM": 197.90}
+    strategy.deduct_cash_on_submit = True
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    def legacy_asset_only_cash_check_price(asset):
+        return {"price": 197.90, "source": f"legacy_{asset.symbol}"}
+
+    strategy.get_agent_order_cash_check_price = legacy_asset_only_cash_check_price
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "IWM",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "completed"
+    order_result = result["order_results"][0]["order_result"]
+    assert order_result["preflight_result"]["price"]["last_price"] == pytest.approx(197.90)
+    assert order_result["preflight_result"]["price"]["price_source"] == "legacy_IWM"
+
+
 def test_execution_plan_execute_hold_result_includes_model_facing_summary():
     strategy = _OrderReadinessStrategy()
     tool_map = _wrap_execute_plan_tools(strategy)

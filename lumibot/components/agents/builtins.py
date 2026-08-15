@@ -1,3 +1,4 @@
+import inspect
 import json
 import math
 import os
@@ -433,23 +434,42 @@ def _strategy_order_cash_check_price_snapshot(
 
     symbol = getattr(asset, "symbol", asset)
     call_attempts = (
-        lambda: hook(asset=asset, quote=quote, exchange=exchange),
-        lambda: hook(asset, quote=quote, exchange=exchange),
-        lambda: hook(symbol),
+        ((), {"asset": asset, "quote": quote, "exchange": exchange}),
+        ((asset,), {"quote": quote, "exchange": exchange}),
+        ((), {"asset": asset}),
+        ((symbol,), {}),
     )
-    for call in call_attempts:
-        try:
-            value = call()
-        except TypeError:
-            continue
-        except Exception:
-            return None
-        price, source = _extract_order_cash_check_price(value)
-        if price is not None:
-            return {
-                "last_price": price,
-                "price_source": source or "strategy_order_cash_check_price",
-            }
+    try:
+        signature = inspect.signature(hook)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is not None:
+        for args, kwargs in call_attempts:
+            try:
+                signature.bind(*args, **kwargs)
+            except TypeError:
+                continue
+            value = hook(*args, **kwargs)
+            price, source = _extract_order_cash_check_price(value)
+            if price is not None:
+                return {
+                    "last_price": price,
+                    "price_source": source or "strategy_order_cash_check_price",
+                }
+    else:
+        for args, kwargs in call_attempts:
+            try:
+                value = hook(*args, **kwargs)
+            except TypeError:
+                continue
+            price, source = _extract_order_cash_check_price(value)
+            if price is not None:
+                return {
+                    "last_price": price,
+                    "price_source": source or "strategy_order_cash_check_price",
+                }
+
     return None
 
 
