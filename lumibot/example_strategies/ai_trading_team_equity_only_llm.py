@@ -25,6 +25,9 @@ from lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant i
     validate_execution_plan_matches_planner_result,
     validate_execution_plan_symbols,
 )
+from lumibot.example_strategies.target_portfolio_to_execution_plan import (
+    get_agent_order_cash_check_price as target_portfolio_order_cash_check_price,
+)
 from lumibot.example_strategies.target_portfolio_to_execution_plan import target_portfolio_to_execution_plan
 
 EQUITY_ONLY_TARGET_WEIGHT = 1.0
@@ -144,6 +147,9 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         "weekly_holiday_policy": "first_open_trading_day",
     }
     _execution_agent_base_system_prompt_mode = "execution_minimal"
+
+    def get_agent_order_cash_check_price(self, asset: Any, **kwargs: Any) -> dict[str, Any]:
+        return target_portfolio_order_cash_check_price(self, asset, **kwargs)
 
     def _initialize_equity_only_workflow_state(self) -> None:
         self._run_frequency = _normalize_equity_run_frequency(self.parameters.get("run_frequency", "monthly"))

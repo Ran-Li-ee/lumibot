@@ -136,6 +136,38 @@ def test_initialize_creates_only_equity_and_execution_agents():
     assert strategy._run_frequency == "monthly"
 
 
+def test_equity_only_order_cash_check_price_uses_planner_sizing_policy(monkeypatch):
+    module = load_module()
+    strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    captured = {}
+
+    def fake_order_cash_check_price(strategy_arg, asset, **kwargs):
+        captured["strategy"] = strategy_arg
+        captured["asset"] = asset
+        captured["kwargs"] = kwargs
+        return {
+            "price": 32.78,
+            "source": "yahoo_daily_open",
+            "datetime": "2024-09-30T09:30:00-04:00",
+            "granularity": "1D",
+            "field": "open",
+            "warning": None,
+        }
+
+    monkeypatch.setattr(module, "target_portfolio_order_cash_check_price", fake_order_cash_check_price)
+    asset = SimpleNamespace(symbol="FXI")
+
+    result = strategy.get_agent_order_cash_check_price(asset, order={"symbol": "FXI"})
+
+    assert result["price"] == pytest.approx(32.78)
+    assert result["source"] == "yahoo_daily_open"
+    assert captured == {
+        "strategy": strategy,
+        "asset": asset,
+        "kwargs": {"order": {"symbol": "FXI"}},
+    }
+
+
 def test_monthly_cadence_runs_once_per_month():
     module = load_module()
     strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
