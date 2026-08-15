@@ -5,25 +5,27 @@ from datetime import date as date_type
 from typing import Any
 
 from lumibot.components.agents.builtins import BuiltinTools
-from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
-    AITradingTeamGrowthExecutionTestStrategy,
-    validate_decision_buy_sizing,
-    validate_execution_plan_cash_safety,
-)
-from lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant import (
-    BASKET_AGENT_NAMES,
-    BASKET_UNIVERSES,
+from lumibot.example_strategies.ai_trading_team_equity_only_helpers import (
+    ACTIVE_SELECTION_STATUSES,
+    EQUITY_AGENT_NAME,
+    EQUITY_BASKET_ID,
+    EQUITY_ONLY_BASKET_UNIVERSES,
     WEEKDAY_INDEX_BY_CODE,
-    _parse_json_summary,
-    basket_agent_system_prompt,
-    basket_agent_task_prompt,
-    basket_agent_tools,
+    equity_basket_agent_system_prompt,
+    equity_basket_agent_task_prompt,
+    equity_basket_agent_tools,
     execution_plan_execute_payload,
     iso_week_key,
     normalize_execution_plan,
     normalize_weekly_run_weekday,
+    parse_json_summary,
     validate_execution_plan_matches_planner_result,
     validate_execution_plan_symbols,
+)
+from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
+    AITradingTeamGrowthExecutionTestStrategy,
+    validate_decision_buy_sizing,
+    validate_execution_plan_cash_safety,
 )
 from lumibot.example_strategies.target_portfolio_to_execution_plan import (
     get_agent_order_cash_check_price as target_portfolio_order_cash_check_price,
@@ -31,8 +33,6 @@ from lumibot.example_strategies.target_portfolio_to_execution_plan import (
 from lumibot.example_strategies.target_portfolio_to_execution_plan import target_portfolio_to_execution_plan
 
 EQUITY_ONLY_TARGET_WEIGHT = 1.0
-EQUITY_BASKET_ID = "equity"
-EQUITY_AGENT_NAME = BASKET_AGENT_NAMES[EQUITY_BASKET_ID]
 ALLOWED_EQUITY_RUN_FREQUENCIES = {"daily", "weekly", "monthly"}
 
 
@@ -126,7 +126,7 @@ def equity_only_target_portfolio(
         raise ValueError("basket_id must be 'equity'.")
 
     status = str(equity_report.get("status") or "").strip().lower()
-    if status != "active":
+    if status not in ACTIVE_SELECTION_STATUSES:
         raise ValueError("equity report must be active.")
 
     selected_symbol = str(equity_report.get("selected_symbol") or "").strip().upper()
@@ -141,7 +141,7 @@ def equity_only_target_portfolio(
 
 class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrategy):
     parameters = {
-        "basket_universes": BASKET_UNIVERSES,
+        "basket_universes": EQUITY_ONLY_BASKET_UNIVERSES,
         "run_frequency": "monthly",
         "weekly_run_weekday": "MON",
         "weekly_holiday_policy": "first_open_trading_day",
@@ -170,7 +170,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         self.sleeptime = "1D"
         self._initialize_equity_only_workflow_state()
         model = os.environ.get("AI_TRADING_TEAM_MODEL", "gemini-3.1-flash-lite")
-        basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
+        basket_universes = self.parameters.get("basket_universes", EQUITY_ONLY_BASKET_UNIVERSES)
         equity_symbols = ", ".join(basket_universes[EQUITY_BASKET_ID])
 
         self.agents.create(
@@ -178,12 +178,11 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             model=model,
             allow_trading=False,
             include_builtin_tools=False,
-            tools=basket_agent_tools(EQUITY_BASKET_ID),
+            tools=equity_basket_agent_tools(),
             system_prompt=(
-                basket_agent_system_prompt(EQUITY_BASKET_ID, equity_symbols)
+                equity_basket_agent_system_prompt(equity_symbols)
                 + " This equity-only strategy allocates the full target portfolio to the selected equity symbol. "
-                "Stay inside the configured equity universe. Do not discuss macro quadrant allocation, commodity, "
-                "TIPS, nominal bonds, or multi-basket diversification. Do not place orders."
+                "Stay inside the configured equity universe. Do not place orders."
             ),
         )
 
@@ -263,12 +262,12 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         return True
 
     def _run_equity_only_workflow(self, current_date: str) -> None:
-        basket_universes = self.parameters.get("basket_universes", BASKET_UNIVERSES)
+        basket_universes = self.parameters.get("basket_universes", EQUITY_ONLY_BASKET_UNIVERSES)
         equity_universe = list(basket_universes[EQUITY_BASKET_ID])
         try:
             equity_result = self.agents[EQUITY_AGENT_NAME].run(
                 task_prompt=(
-                    basket_agent_task_prompt(EQUITY_BASKET_ID)
+                    equity_basket_agent_task_prompt()
                     + " This equity-only strategy has target_weight 1.0 for the selected equity symbol. "
                     "Return only one JSON object. Do not include markdown or extra prose."
                 ),
@@ -279,7 +278,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
                     "target_weight": EQUITY_ONLY_TARGET_WEIGHT,
                 },
             )
-            equity_report = _parse_json_summary(equity_result.summary, EQUITY_AGENT_NAME)
+            equity_report = parse_json_summary(equity_result.summary, EQUITY_AGENT_NAME)
             target_portfolio = equity_only_target_portfolio(equity_report, equity_universe=equity_universe)
             self._last_target_portfolio_planner_result = None
             planner_result = target_portfolio_to_execution_plan(
@@ -332,7 +331,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             ),
             (
                 "validate_execution_plan_symbols",
-                lambda: validate_execution_plan_symbols(execution_plan, [equity_report]),
+                lambda: validate_execution_plan_symbols(execution_plan, equity_report),
             ),
             (
                 "validate_decision_buy_sizing",

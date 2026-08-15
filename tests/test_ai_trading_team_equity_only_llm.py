@@ -1,6 +1,7 @@
 import importlib
 import json
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -90,6 +91,51 @@ def test_equity_only_target_portfolio_uses_selected_symbol_at_full_weight():
     assert result == [{"basket_id": "equity", "symbol": "ORCL", "target_weight": 1.0}]
 
 
+def test_equity_only_target_portfolio_accepts_selected_status_synonym():
+    module = load_module()
+
+    result = module.equity_only_target_portfolio(
+        {
+            "basket_id": "equity",
+            "status": "selected",
+            "selected_symbol": "spy",
+            "reason_brief": "SPY is selected from the equity basket.",
+        },
+        equity_universe=["SPY", "ORCL", "MSFT"],
+    )
+
+    assert result == [{"basket_id": "equity", "symbol": "SPY", "target_weight": 1.0}]
+
+
+def test_validate_execution_plan_symbols_accepts_selected_status_synonym():
+    module = load_module()
+
+    module.validate_execution_plan_symbols(
+        {
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "SPY",
+                    "asset_type": "stock",
+                    "side": "buy",
+                    "quantity": 10,
+                    "quantity_mode": "shares",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+        {
+            "basket_id": "equity",
+            "status": "selected",
+            "selected_symbol": "SPY",
+        },
+    )
+
+
 def test_equity_only_target_portfolio_rejects_inactive_report():
     module = load_module()
 
@@ -134,6 +180,11 @@ def test_initialize_creates_only_equity_and_execution_agents():
     assert "tips_basket_agent" not in created_names
     assert "nominal_bond_basket_agent" not in created_names
     assert strategy._run_frequency == "monthly"
+    equity_prompt = strategy.agents.created[0]["system_prompt"].lower()
+    assert "quadrant" not in equity_prompt
+    assert "commodity" not in equity_prompt
+    assert "tips" not in equity_prompt
+    assert "nominal bond" not in equity_prompt
 
 
 def test_equity_only_order_cash_check_price_uses_planner_sizing_policy(monkeypatch):
@@ -282,3 +333,18 @@ def test_benchmark_runner_exposes_neutral_equity_only_strategy():
 
     assert "equity-only-llm" in benchmark.STRATEGIES
     assert benchmark.STRATEGIES["equity-only-llm"].__name__ == "AITradingTeamEquityOnlyLLMStrategy"
+
+
+def test_benchmark_runner_does_not_expose_quadrant_strategies_on_equity_mainline():
+    benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
+
+    assert "mock-growth-inflation-quadrant" not in benchmark.STRATEGIES
+    assert "growth-inflation-quadrant" not in benchmark.STRATEGIES
+
+
+def test_equity_only_strategy_does_not_import_quadrant_strategy_module():
+    module = load_module()
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+
+    assert "ai_trading_team_mock_growth_inflation_quadrant" not in source

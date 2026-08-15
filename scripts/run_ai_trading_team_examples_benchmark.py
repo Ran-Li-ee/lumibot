@@ -88,14 +88,6 @@ STRATEGIES = _LazyStrategyRegistry(
             "lumibot.example_strategies.ai_trading_team_growth_execution_test",
             "AITradingTeamGrowthExecutionTestStrategy",
         ),
-        "mock-growth-inflation-quadrant": (
-            "lumibot.example_strategies.ai_trading_team_mock_growth_inflation_quadrant",
-            "AITradingTeamMockGrowthInflationQuadrantStrategy",
-        ),
-        "growth-inflation-quadrant": (
-            "lumibot.example_strategies.ai_trading_team_growth_inflation_quadrant",
-            "AITradingTeamGrowthInflationQuadrantStrategy",
-        ),
         "equity-only-llm": (
             "lumibot.example_strategies.ai_trading_team_equity_only_llm",
             "AITradingTeamEquityOnlyLLMStrategy",
