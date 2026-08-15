@@ -2146,7 +2146,7 @@ def test_target_portfolio_to_execution_plan_applies_buy_sizing_buffer_to_new_tar
     assert {row["reason_code"] for row in result["current_vs_target"]} == {"buy_new_target"}
 
 
-def test_target_portfolio_to_execution_plan_prefers_previous_completed_daily_close_for_sizing():
+def test_target_portfolio_to_execution_plan_falls_back_to_last_price_without_run_time_open():
     planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
     strategy = make_planner_strategy(
         positions=[],
@@ -2166,9 +2166,10 @@ def test_target_portfolio_to_execution_plan_prefers_previous_completed_daily_clo
 
     diagnostics = {row["symbol"]: row for row in result["current_vs_target"]}
     gld = diagnostics["GLD"]
-    assert gld["sizing_price"] == pytest.approx(230.429993)
-    assert gld["sizing_price_source"] == "previous_completed_daily_close"
-    assert gld["sizing_price_datetime"] == "2024-09-04"
+    assert gld["sizing_price"] == pytest.approx(229.789993)
+    assert gld["sizing_price_source"] == "strategy_last_price_fallback"
+    assert gld["sizing_price_datetime"] is None
+    assert gld["sizing_price_warning"] == "MINUTE_OPEN_PRICE_UNAVAILABLE"
     assert gld["buy_sizing_buffer_pct"] == pytest.approx(0.02)
     assert gld["effective_buy_target_value"] == pytest.approx(24500.0)
     assert result["execution_plan"]["orders"][0]["quantity"] == 106
@@ -2496,7 +2497,7 @@ def test_target_portfolio_to_execution_plan_combines_duplicate_targets_and_rejec
         )
 
 
-def test_target_portfolio_to_execution_plan_rejects_missing_price():
+def test_target_portfolio_to_execution_plan_blocks_when_target_price_is_missing():
     planner = importlib.import_module("lumibot.example_strategies.target_portfolio_to_execution_plan")
     strategy = make_planner_strategy(
         positions=[],
@@ -2505,12 +2506,20 @@ def test_target_portfolio_to_execution_plan_rejects_missing_price():
         prices={"SPY": 100},
     )
 
-    with pytest.raises(ValueError, match="missing sizing price for GLD"):
-        planner.target_portfolio_to_execution_plan(
-            strategy,
-            date="2024-09-06",
-            target_portfolio=[
-                {"symbol": "SPY", "target_weight": 0.50},
-                {"symbol": "GLD", "target_weight": 0.25},
-            ],
-        )
+    result = planner.target_portfolio_to_execution_plan(
+        strategy,
+        date="2024-09-06",
+        target_portfolio=[
+            {"symbol": "SPY", "target_weight": 0.50},
+            {"symbol": "GLD", "target_weight": 0.25},
+        ],
+    )
+
+    assert result["execution_plan"] == {"schema_version": 1, "intent": "blocked", "orders": []}
+    assert result["blockers"] == [
+        {
+            "code": "MISSING_SIZING_PRICE",
+            "symbol": "GLD",
+            "message": "GLD: missing sizing price; no execution_plan orders were generated.",
+        }
+    ]

@@ -1,15 +1,27 @@
 import math
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
+
+from zoneinfo import ZoneInfo
 
 from lumibot.components.agents.schemas import BoundTool, ToolDefinition
 
 TOOL_NAME = "target_portfolio_to_execution_plan"
 TARGET_WEIGHT_TOLERANCE = Decimal("0.000001")
 BUY_SIZING_BUFFER_PCT = Decimal("0.02")
+NY_TZ = ZoneInfo("America/New_York")
+SIZING_PRICE_POLICY_YAHOO_DAILY_OPEN = "yahoo_daily_open"
+SIZING_PRICE_POLICY_MINUTE_OPEN = "minute_open"
+SIZING_PRICE_SOURCE_INTRADAY_OPEN = "run_time_minute_open"
+SIZING_PRICE_SOURCE_YAHOO_DAILY_OPEN = "yahoo_daily_open"
 SIZING_PRICE_SOURCE_PREVIOUS_CLOSE = "previous_completed_daily_close"
 SIZING_PRICE_SOURCE_LAST_PRICE_FALLBACK = "strategy_last_price_fallback"
+MINUTE_OPEN_UNAVAILABLE_WARNING = "MINUTE_OPEN_PRICE_UNAVAILABLE"
+YAHOO_DAILY_OPEN_UNAVAILABLE_WARNING = "YAHOO_DAILY_OPEN_UNAVAILABLE"
+PREVIOUS_CLOSE_FALLBACK_WARNING = "PREVIOUS_CLOSE_SIZING_FALLBACK"
+MISSING_SIZING_PRICE_WARNING = "MISSING_SIZING_PRICE"
 QUOTE_SYMBOLS = {"USD", "CASH"}
 
 
@@ -18,6 +30,16 @@ class SizingPrice:
     price: Decimal
     source: str
     datetime: str | None = None
+    granularity: str | None = None
+    field: str | None = None
+    warning: str | None = None
+
+
+def _combine_warnings(*warnings: str | None) -> str | None:
+    parts = [warning for warning in warnings if warning]
+    if not parts:
+        return None
+    return "; ".join(parts)
 
 
 def _decimal(value: Any, label: str) -> Decimal:
@@ -39,12 +61,48 @@ def _float(value: Decimal) -> float:
 def _bars_dataframe(bars: Any) -> Any | None:
     if bars is None:
         return None
+    if hasattr(bars, "empty") and hasattr(bars, "columns"):
+        return bars
     frame = getattr(bars, "pandas_df", None)
     if frame is None:
         frame = getattr(bars, "df", None)
     if frame is None or not hasattr(frame, "empty") or frame.empty:
         return None
     return frame
+
+
+def _frame_row_for_minute(frame: Any, target: datetime) -> Any | None:
+    if frame is None or not hasattr(frame, "empty") or frame.empty:
+        return None
+    for column in ("timestamp", "datetime", "Datetime", "date", "Date"):
+        if column in frame.columns:
+            for _, row in frame.iterrows():
+                if _same_minute(row[column], target):
+                    return row
+    try:
+        for index, row in frame.iterrows():
+            if _same_minute(index, target):
+                return row
+    except Exception:
+        return None
+    return None
+
+
+def _frame_row_for_ny_date(frame: Any, target: datetime) -> Any | None:
+    if frame is None or not hasattr(frame, "empty") or frame.empty:
+        return None
+    for column in ("timestamp", "datetime", "Datetime", "date", "Date"):
+        if column in frame.columns:
+            for _, row in frame.iterrows():
+                if _same_ny_date(row[column], target):
+                    return row
+    try:
+        for index, row in frame.iterrows():
+            if _same_ny_date(index, target):
+                return row
+    except Exception:
+        return None
+    return None
 
 
 def _last_row_datetime_text(frame: Any) -> str | None:
@@ -63,6 +121,79 @@ def _last_row_datetime_text(frame: Any) -> str | None:
     if index_value is None:
         return None
     return str(index_value.date() if hasattr(index_value, "date") else index_value)
+
+
+def _strategy_datetime(strategy: Any) -> datetime | None:
+    get_datetime = getattr(strategy, "get_datetime", None)
+    if not callable(get_datetime):
+        return None
+    value = get_datetime()
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=NY_TZ)
+    return value.astimezone(NY_TZ)
+
+
+def _strategy_data_source(strategy: Any) -> Any | None:
+    broker = getattr(strategy, "broker", None)
+    return getattr(broker, "data_source", None)
+
+
+def _data_source_identity(strategy: Any) -> tuple[str, str]:
+    data_source = _strategy_data_source(strategy)
+    source = str(getattr(data_source, "SOURCE", "") or "").strip().upper()
+    class_name = data_source.__class__.__name__ if data_source is not None else ""
+    return source, class_name
+
+
+def _is_yahoo_data_source(strategy: Any) -> bool:
+    source, class_name = _data_source_identity(strategy)
+    return source == "YAHOO" or class_name == "YahooDataBacktesting"
+
+
+def _sizing_price_policy(strategy: Any) -> str:
+    if _is_yahoo_data_source(strategy):
+        return SIZING_PRICE_POLICY_YAHOO_DAILY_OPEN
+    return SIZING_PRICE_POLICY_MINUTE_OPEN
+
+
+def _same_minute(left: Any, right: datetime) -> bool:
+    try:
+        value = left.to_pydatetime() if hasattr(left, "to_pydatetime") else left
+    except Exception:
+        value = left
+    if not isinstance(value, datetime):
+        try:
+            value = datetime.fromisoformat(str(left))
+        except Exception:
+            return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=NY_TZ)
+    else:
+        value = value.astimezone(NY_TZ)
+    return value.replace(second=0, microsecond=0) == right.replace(second=0, microsecond=0)
+
+
+def _same_ny_date(left: Any, right: datetime) -> bool:
+    try:
+        value = left.to_pydatetime() if hasattr(left, "to_pydatetime") else left
+    except Exception:
+        value = left
+    if not isinstance(value, datetime):
+        try:
+            value = datetime.fromisoformat(str(left))
+        except Exception:
+            return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=NY_TZ)
+    else:
+        value = value.astimezone(NY_TZ)
+    if right.tzinfo is None:
+        right = right.replace(tzinfo=NY_TZ)
+    else:
+        right = right.astimezone(NY_TZ)
+    return value.date() == right.date()
 
 
 def _symbol(value: Any) -> str:
@@ -146,10 +277,165 @@ def _get_previous_completed_daily_close(strategy: Any, symbol: str) -> SizingPri
         price=price,
         source=SIZING_PRICE_SOURCE_PREVIOUS_CLOSE,
         datetime=_last_row_datetime_text(frame),
+        granularity="1Day",
+        field="close",
+        warning=PREVIOUS_CLOSE_FALLBACK_WARNING,
     )
 
 
-def _get_last_price_fallback(strategy: Any, symbol: str) -> SizingPrice:
+def _get_yahoo_same_session_daily_open(strategy: Any, symbol: str) -> SizingPrice | None:
+    run_dt = _strategy_datetime(strategy)
+    if run_dt is None:
+        return None
+    get_historical_prices = getattr(strategy, "get_historical_prices", None)
+    if not callable(get_historical_prices):
+        return None
+
+    try:
+        bars = get_historical_prices(symbol, 2, timestep="day", timeshift=timedelta(days=-1))
+    except TypeError:
+        try:
+            bars = get_historical_prices(symbol, 2, "day", timeshift=timedelta(days=-1))
+        except (IndexError, KeyError, TypeError, ValueError, InvalidOperation):
+            try:
+                bars = get_historical_prices(symbol, 2, "day")
+            except (IndexError, KeyError, TypeError, ValueError, InvalidOperation):
+                return None
+    except (IndexError, KeyError, ValueError, InvalidOperation):
+        return None
+
+    frame = _bars_dataframe(bars)
+    if frame is None or "open" not in frame.columns:
+        return None
+
+    row = _frame_row_for_ny_date(frame, run_dt)
+    if row is None:
+        return None
+    try:
+        price = _finite_positive_price(row["open"], f"Yahoo same-session daily open for {symbol}")
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+
+    return SizingPrice(
+        price=price,
+        source=SIZING_PRICE_SOURCE_YAHOO_DAILY_OPEN,
+        datetime=run_dt.isoformat(),
+        granularity="1D",
+        field="open",
+    )
+
+
+def _get_run_time_minute_open_from_data_source(strategy: Any, symbol: str) -> SizingPrice | None:
+    run_dt = _strategy_datetime(strategy)
+    if run_dt is None:
+        return None
+    broker = getattr(strategy, "broker", None)
+    data_source = getattr(broker, "data_source", None)
+    method = getattr(data_source, "get_historical_prices_between_dates", None)
+    if not callable(method):
+        return None
+    try:
+        from lumibot.entities import Asset
+
+        base_asset = Asset(symbol, Asset.AssetType.STOCK)
+        quote_asset = Asset("USD", Asset.AssetType.FOREX)
+    except Exception:
+        base_asset = symbol
+        quote_asset = None
+
+    end_dt = run_dt + timedelta(minutes=1)
+    attempts = (
+        {
+            "base_asset": base_asset,
+            "quote_asset": quote_asset,
+            "timestep": "minute",
+            "data_datetime_start": run_dt,
+            "data_datetime_end": end_dt,
+        },
+        {
+            "_args": (base_asset,),
+            "timestep": "minute",
+            "quote": quote_asset,
+            "start_date": run_dt,
+            "end_date": end_dt,
+        },
+        {
+            "_args": (base_asset,),
+            "timestep": "minute",
+            "start_date": run_dt,
+            "end_date": end_dt,
+        },
+    )
+    frame = None
+    for attempt in attempts:
+        args = attempt.get("_args", ())
+        kwargs = {key: value for key, value in attempt.items() if key != "_args" and value is not None}
+        try:
+            raw_frame = method(*args, **kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            continue
+        frame = _bars_dataframe(raw_frame)
+        if frame is not None:
+            break
+    if frame is None:
+        return None
+    row = _frame_row_for_minute(frame, run_dt)
+    if row is None or "open" not in frame.columns:
+        return None
+    try:
+        price = _finite_positive_price(row["open"], f"run-time minute open for {symbol}")
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+    return SizingPrice(
+        price=price,
+        source=SIZING_PRICE_SOURCE_INTRADAY_OPEN,
+        datetime=run_dt.isoformat(),
+        granularity="1Min",
+        field="open",
+    )
+
+
+def _get_run_time_minute_open_from_strategy(strategy: Any, symbol: str) -> SizingPrice | None:
+    run_dt = _strategy_datetime(strategy)
+    if run_dt is None:
+        return None
+    get_historical_prices = getattr(strategy, "get_historical_prices", None)
+    if not callable(get_historical_prices):
+        return None
+    try:
+        bars = get_historical_prices(
+            symbol,
+            1,
+            "minute",
+            remove_incomplete_current_bar=False,
+        )
+    except TypeError:
+        try:
+            bars = get_historical_prices(symbol, 1, timestep="minute")
+        except Exception:
+            return None
+    except Exception:
+        return None
+    frame = _bars_dataframe(bars)
+    row = _frame_row_for_minute(frame, run_dt)
+    if row is None or frame is None or "open" not in frame.columns:
+        return None
+    try:
+        price = _finite_positive_price(row["open"], f"run-time minute open for {symbol}")
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+    return SizingPrice(
+        price=price,
+        source=SIZING_PRICE_SOURCE_INTRADAY_OPEN,
+        datetime=run_dt.isoformat(),
+        granularity="1Min",
+        field="open",
+    )
+
+
+def _get_last_price_fallback(strategy: Any, symbol: str, *, warning: str | None = None) -> SizingPrice:
     raw_price = strategy.get_last_price(symbol)
     if raw_price is None:
         raise ValueError(f"missing sizing price for {symbol}")
@@ -157,14 +443,57 @@ def _get_last_price_fallback(strategy: Any, symbol: str) -> SizingPrice:
         price=_finite_positive_price(raw_price, f"last price fallback for {symbol}"),
         source=SIZING_PRICE_SOURCE_LAST_PRICE_FALLBACK,
         datetime=None,
+        granularity=None,
+        field="last_price",
+        warning=warning,
     )
 
 
 def _get_sizing_price(strategy: Any, symbol: str) -> SizingPrice:
-    previous_close = _get_previous_completed_daily_close(strategy, symbol)
-    if previous_close is not None:
-        return previous_close
-    return _get_last_price_fallback(strategy, symbol)
+    policy = _sizing_price_policy(strategy)
+    primary_warning = MINUTE_OPEN_UNAVAILABLE_WARNING
+
+    if policy == SIZING_PRICE_POLICY_YAHOO_DAILY_OPEN:
+        yahoo_open = _get_yahoo_same_session_daily_open(strategy, symbol)
+        if yahoo_open is not None:
+            return yahoo_open
+        primary_warning = YAHOO_DAILY_OPEN_UNAVAILABLE_WARNING
+    else:
+        minute_open = _get_run_time_minute_open_from_data_source(strategy, symbol)
+        if minute_open is None:
+            minute_open = _get_run_time_minute_open_from_strategy(strategy, symbol)
+        if minute_open is not None:
+            return minute_open
+
+    try:
+        return _get_last_price_fallback(strategy, symbol, warning=primary_warning)
+    except (TypeError, ValueError, InvalidOperation):
+        previous_close = _get_previous_completed_daily_close(strategy, symbol)
+        if previous_close is not None:
+            if primary_warning != MINUTE_OPEN_UNAVAILABLE_WARNING:
+                return SizingPrice(
+                    price=previous_close.price,
+                    source=previous_close.source,
+                    datetime=previous_close.datetime,
+                    granularity=previous_close.granularity,
+                    field=previous_close.field,
+                    warning=_combine_warnings(primary_warning, previous_close.warning),
+                )
+            return previous_close
+        raise ValueError(f"missing sizing price for {symbol}") from None
+
+
+def get_agent_order_cash_check_price(strategy: Any, asset: Any, **_kwargs: Any) -> dict[str, Any]:
+    symbol = _symbol(getattr(asset, "symbol", asset))
+    sizing_price = _get_sizing_price(strategy, symbol)
+    return {
+        "price": _float(sizing_price.price),
+        "source": sizing_price.source,
+        "datetime": sizing_price.datetime,
+        "granularity": sizing_price.granularity,
+        "field": sizing_price.field,
+        "warning": sizing_price.warning,
+    }
 
 
 def normalize_target_portfolio(target_portfolio: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -268,6 +597,9 @@ def _diagnostic_row(
         "sizing_price": _float(sizing_price.price),
         "sizing_price_source": sizing_price.source,
         "sizing_price_datetime": sizing_price.datetime,
+        "sizing_price_granularity": sizing_price.granularity,
+        "sizing_price_field": sizing_price.field,
+        "sizing_price_warning": sizing_price.warning,
         "current_value": _float(current_value),
         "current_weight": _float(current_weight),
         "target_weight": _float(target_weight),
@@ -299,12 +631,53 @@ def target_portfolio_to_execution_plan(
     portfolio_value = _get_portfolio_value(strategy)
     current_positions = _current_positions_by_symbol(strategy)
     relevant_symbols = sorted(set(current_positions) | set(target_by_symbol))
-    sizing_prices = {symbol: _get_sizing_price(strategy, symbol) for symbol in relevant_symbols}
+    sizing_prices: dict[str, SizingPrice] = {}
+    missing_price_blockers: list[dict[str, str]] = []
+    for symbol in relevant_symbols:
+        try:
+            sizing_prices[symbol] = _get_sizing_price(strategy, symbol)
+        except ValueError as exc:
+            if str(exc) != f"missing sizing price for {symbol}":
+                raise
+            missing_price_blockers.append(
+                {
+                    "code": MISSING_SIZING_PRICE_WARNING,
+                    "symbol": symbol,
+                    "message": f"{symbol}: missing sizing price; no execution_plan orders were generated.",
+                }
+            )
+    if missing_price_blockers:
+        warnings = [
+            f"{blocker['symbol']}: {blocker['code']}" for blocker in missing_price_blockers
+        ]
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": normalized_targets,
+            "current_vs_target": [],
+            "cash_projection": {
+                "cash_before": _float(cash_before),
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 0.0,
+                "cash_after_estimate": _float(cash_before),
+                "buy_sizing_buffer_pct": _float(BUY_SIZING_BUFFER_PCT),
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {"schema_version": 1, "intent": "blocked", "orders": []},
+            "warnings": warnings,
+            "blockers": missing_price_blockers,
+        }
+    price_warnings = [
+        f"{symbol}: {sizing_price.warning}"
+        for symbol, sizing_price in sizing_prices.items()
+        if sizing_price.warning
+    ]
 
     diagnostics: list[dict[str, Any]] = []
     sell_candidates: list[tuple[int, str, int]] = []
     buy_candidates: list[tuple[int, str, Decimal, str]] = []
     warnings: list[str] = []
+    warnings.extend(price_warnings)
     estimated_sell_proceeds = Decimal("0")
 
     for symbol in relevant_symbols:
@@ -425,11 +798,15 @@ def make_target_portfolio_to_execution_plan_tool() -> ToolDefinition:
     description = (
         "Convert a target portfolio into a strict market/day execution_plan. "
         "Use this after choosing target symbols and target weights. The tool reads current positions, "
-        "cash, portfolio value, and deterministic sizing prices from the strategy. In daily backtests, "
-        "buy sizing uses the previous completed daily close when available and applies a default 2% "
-        "buy sizing buffer. The buffer reduces planned buy quantity only; it is not a hard execution "
-        "price cap. The tool returns current_vs_target diagnostics and an execution_plan. Do not "
-        "manually edit the execution_plan returned by this tool."
+        "cash, portfolio value, and deterministic sizing prices from the strategy. It chooses sizing "
+        "prices according to the active backtest data source. In Yahoo daily backtests, market-order "
+        "buy sizing uses the same-session daily open because Yahoo market fills use that open. In "
+        "minute-capable backtests, buy sizing may use the run-time one-minute open when available. "
+        "If the primary source is unavailable, the tool falls back to current strategy last price and "
+        "then previous completed daily close with explicit warnings. A default 2% buy sizing buffer "
+        "reduces planned buy quantity only; it is not a hard execution price cap. The tool returns "
+        "current_vs_target diagnostics, sizing price provenance, warnings, and an execution_plan. "
+        "Do not manually edit the execution_plan returned by this tool."
     )
     metadata = {"kind": "portfolio_transition_planner", "replay_on_cache": True}
 
