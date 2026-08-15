@@ -3,17 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-try:
-    from lumibot.tools import YahooHelper as YahooHelper
-except ModuleNotFoundError as exc:
-    if exc.name not in {"yfinance", "yahooquery"}:
-        raise
-    YahooHelper = None
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+YahooHelper = None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -71,7 +70,7 @@ def _annualized_return(stats: pd.DataFrame) -> float | None:
     end_value = float(stats["portfolio_value"].iloc[-1])
     if start_value <= 0 or end_value <= 0:
         return None
-    days = (stats["datetime"].iloc[-1] - stats["datetime"].iloc[0]).days
+    days = (stats["datetime"].iloc[-1] - stats["datetime"].iloc[0]).total_seconds() / 86400
     if days <= 0:
         return None
     return _rounded((end_value / start_value) ** (365.25 / days) - 1.0)
@@ -80,7 +79,7 @@ def _annualized_return(stats: pd.DataFrame) -> float | None:
 def _annualization_factor(stats: pd.DataFrame) -> int:
     if len(stats) < 3:
         return 252
-    day_deltas = stats["datetime"].diff().dt.days.dropna()
+    day_deltas = stats["datetime"].diff().dt.total_seconds().dropna() / 86400
     if day_deltas.empty:
         return 252
     median_days = float(day_deltas.median())
@@ -125,9 +124,11 @@ def _yearly_returns(stats: pd.DataFrame) -> dict[str, float]:
     frame = stats.copy()
     frame["year"] = frame["datetime"].dt.year.astype(str)
     returns: dict[str, float] = {}
+    previous_year_close: float | None = None
     for year, group in frame.groupby("year", sort=True):
-        first = float(group["portfolio_value"].iloc[0])
+        first = previous_year_close if previous_year_close is not None else float(group["portfolio_value"].iloc[0])
         last = float(group["portfolio_value"].iloc[-1])
+        previous_year_close = last
         if first > 0:
             returns[str(year)] = _rounded((last / first) - 1.0) or 0.0
     return returns
@@ -186,10 +187,11 @@ def buy_and_hold_metrics(
     symbol = symbol.upper().strip()
     if not symbol:
         raise ValueError("symbol must be non-empty")
-    if YahooHelper is None:
+    yahoo_helper = _get_yahoo_helper()
+    if yahoo_helper is None:
         raise RuntimeError("YahooHelper is unavailable; install optional Yahoo data dependencies to use SPY metrics")
 
-    data = YahooHelper.get_symbol_data(symbol, interval="1d", auto_adjust=True, caching=True)
+    data = yahoo_helper.get_symbol_data(symbol, interval="1d", auto_adjust=True, caching=True)
     if data is None or data.empty:
         raise ValueError(f"Yahoo data for {symbol} is empty")
     close_column = "Close" if "Close" in data.columns else "close" if "close" in data.columns else None
@@ -234,6 +236,20 @@ def _diff(left: Any, right: Any) -> Any:
         if math.isfinite(float(left)) and math.isfinite(float(right)):
             return _rounded(float(left) - float(right))
     return None
+
+
+def _get_yahoo_helper():
+    global YahooHelper
+    if YahooHelper is not None:
+        return YahooHelper
+    try:
+        from lumibot.tools import YahooHelper as imported_yahoo_helper
+    except ModuleNotFoundError as exc:
+        if exc.name in {"yfinance", "yahooquery"}:
+            return None
+        raise
+    YahooHelper = imported_yahoo_helper
+    return YahooHelper
 
 
 def compare_artifacts(baseline_artifact: str | Path, candidate_artifact: str | Path) -> dict[str, Any]:
@@ -366,7 +382,8 @@ def render_markdown(payload: dict[str, Any]) -> str:
 def render_multi_markdown(payload: dict[str, Any]) -> str:
     rows = [_multi_metric_row(label, payload["metrics"][label]) for label in payload["strategies"]]
     if payload.get("spy_buy_and_hold") is not None:
-        rows.append(_multi_metric_row("SPY buy and hold", payload["spy_buy_and_hold"]))
+        benchmark = payload["spy_buy_and_hold"]
+        rows.append(_multi_metric_row(str(benchmark.get("strategy") or "buy and hold"), benchmark))
 
     return "\n".join(
         [

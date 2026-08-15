@@ -1,4 +1,6 @@
 import importlib
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pandas as pd
@@ -61,3 +63,37 @@ def test_buy_and_hold_metrics_rejects_empty_yahoo_data(monkeypatch):
 
     with pytest.raises(ValueError, match="Yahoo data for SPY is empty"):
         compare.buy_and_hold_metrics("SPY", start="2020-05-01", end="2025-05-01")
+
+
+def test_render_multi_markdown_uses_benchmark_strategy_label(tmp_path):
+    first = _write_artifact(tmp_path, name="first", values=[100000, 110000], trades=1)
+    payload = compare.compare_named_artifacts(
+        {"first": first},
+        reference_label="first",
+        spy_buy_hold_metrics={
+            "strategy": "QQQ buy and hold",
+            "total_return": 0.2,
+            "cagr": 0.1,
+            "max_drawdown": -0.05,
+            "volatility": 0.15,
+            "sharpe": 0.7,
+            "trade_count": 1,
+        },
+    )
+
+    markdown = compare.render_multi_markdown(payload)
+
+    assert "QQQ buy and hold" in markdown
+    assert "SPY buy and hold" not in markdown
+
+
+def test_cli_help_does_not_require_yahoo_import():
+    result = subprocess.run(
+        [sys.executable, "scripts/compare_strategy_artifacts.py", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "usage:" in result.stdout
