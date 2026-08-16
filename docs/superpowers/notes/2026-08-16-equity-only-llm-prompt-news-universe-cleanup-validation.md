@@ -3,9 +3,10 @@
 ## Automated Tests
 
 - `python -m pytest tests/test_ai_trading_team_equity_only_llm.py tests/test_agent_manager.py::test_execution_agent_with_execution_plan_execute_tool_receives_stage_d_policy -q`
-  - Result: `18 passed in 4.00s`.
+  - Result after lint follow-up: `18 passed, 1 warning in 4.53s`.
 - `python -m ruff check lumibot/example_strategies/ai_trading_team_equity_only_helpers.py lumibot/example_strategies/ai_trading_team_equity_only_llm.py lumibot/components/agents/manager.py tests/test_ai_trading_team_equity_only_llm.py tests/test_agent_manager.py`
-  - Result: failed with 14 findings in `lumibot/components/agents/manager.py`: 13 `E501` line-length findings and 1 `B023` loop-variable binding finding.
+  - Result after lint follow-up: `All checks passed!`.
+  - Note: ruff still prints the existing config deprecation warning that top-level `select` should move to `lint.select`; that warning is outside this feature's scope.
 
 ## Smoke Backtest
 
@@ -29,6 +30,12 @@
 - Execution context keys: `date`, `execution_plan`.
 - Prompt cleanup: equity prompt contains no `quadrant`, `macro regime`, `commodity`, `TIPS`, or `nominal bond` wording.
 - Notable warnings: `none`.
+
+## Follow-Up Validation Fix
+
+The first validation pass exposed pre-existing ruff findings in `lumibot/components/agents/manager.py`: 13 `E501` line-length findings and 1 `B023` loop-variable binding finding. These findings already existed before the Task 3 prompt wording change, but they blocked the feature's touched-file lint command.
+
+Follow-up commit `ff831e98d54126eb451b9b71bfd79b39a638c105` mechanically wrapped the long lines and fixed the MCP closure binding warning without changing prompt text or strategy behavior. Review confirmed the generated MCP tools still bind distinct server/tool names correctly.
 
 ## Trace Sources
 
