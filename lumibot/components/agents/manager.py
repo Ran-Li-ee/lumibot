@@ -769,7 +769,9 @@ class AgentHandle:
     def _serialize_positions(self) -> list[dict[str, Any]]:
         if not hasattr(self.manager.strategy, "get_positions"):
             return []
-        positions = _safe_call(lambda: self.manager.strategy.get_positions(include_cash_positions=True), default=[]) or []
+        positions = (
+            _safe_call(lambda: self.manager.strategy.get_positions(include_cash_positions=True), default=[]) or []
+        )
         _order_to_dict, _position_to_dict = _get_builtin_serializers()
         return [_position_to_dict(position) for position in positions]
 
@@ -823,7 +825,8 @@ class AgentHandle:
             "Do not invent facts that are not present in runtime context or tool output.",
             "Context pruning is a normal runtime mechanism used to manage context size.",
             "If older tool outputs are marked as pruned, do not treat pruning itself as evidence failure.",
-            "Base your conclusion on the evidence still visible in context, and call targeted tools again if a pruned result is essential.",
+            "Base your conclusion on the evidence still visible in context, and call targeted tools again if a "
+            "pruned result is essential.",
         ]
         if mode == "backtesting":
             lines.extend(
@@ -832,9 +835,12 @@ class AgentHandle:
                     "BACKTESTING SAFETY RULES:",
                     "The current simulated datetime is a hard wall.",
                     "Do not use future data.",
-                    "Only use bars, news, macro data, filings, prices, positions, and events that were available at or before the current simulated datetime.",
-                    "If a tool has any parameter that controls a time range, date filter, or temporal bound, set it so no data after the current simulated datetime can be returned.",
-                    "If a tool response seems to include future timestamps, treat that as suspicious. Do not rely on those records without calling out the risk in your reasoning.",
+                    "Only use bars, news, macro data, filings, prices, positions, and events that were available "
+                    "at or before the current simulated datetime.",
+                    "If a tool has any parameter that controls a time range, date filter, or temporal bound, set "
+                    "it so no data after the current simulated datetime can be returned.",
+                    "If a tool response seems to include future timestamps, treat that as suspicious. Do not rely "
+                    "on those records without calling out the risk in your reasoning.",
                 ]
             )
         else:
@@ -922,7 +928,9 @@ class AgentHandle:
                 "contradictory, or insufficient."
             )
         if has_summary and has_single:
-            lines.append("Do not load raw history tables for every symbol when summary rankings already answer the task.")
+            lines.append(
+                "Do not load raw history tables for every symbol when summary rankings already answer the task."
+            )
         if has_duckdb:
             lines.append(
                 "duckdb_query is targeted follow-up only when computed summaries and rankings do not answer a "
@@ -1057,28 +1065,32 @@ class AgentHandle:
                 description = f"Remote MCP tool {exposed_name} on server {server.name}."
 
                 def make_remote_tool(_server: MCPServer, _tool_name: str):
-                    def remote_tool(payload: dict[str, Any]) -> dict[str, Any]:
+                    def tool_fn(payload: dict[str, Any]) -> dict[str, Any]:
                         warning_key = (_server.name, _tool_name)
-                        if bool(getattr(self.manager.strategy, "is_backtesting", False)) and warning_key not in self.manager._warned_backtest_mcp_tools:
+                        if (
+                            bool(getattr(self.manager.strategy, "is_backtesting", False))
+                            and warning_key not in self.manager._warned_backtest_mcp_tools
+                        ):
                             log_message = getattr(self.manager.strategy, "log_message", None)
                             if callable(log_message):
                                 log_message(
-                                    f"[agents] external MCP tool {_server.name}:{_tool_name} is running during a backtest. "
-                                    "LumiBot will trace it and warn on suspicious temporal behavior, but it will not block it.",
+                                    f"[agents] external MCP tool {_server.name}:{_tool_name} is running during a "
+                                    "backtest. LumiBot will trace it and warn on suspicious temporal behavior, but "
+                                    "it will not block it.",
                                     color="yellow",
                                 )
                             self.manager._warned_backtest_mcp_tools.add(warning_key)
                         _GoogleADKRuntime, _RuntimeRequest, _StubAgentRuntime, call_mcp_tool = _get_runtime_imports()
                         return call_mcp_tool(_server, _tool_name, payload)
 
-                    return remote_tool
+                    return tool_fn
 
-                remote_tool = make_remote_tool(server, exposed_name)
+                bound_remote_tool = make_remote_tool(server, exposed_name)
                 remote_tools.append(
                     BoundTool(
                         name=exposed_name,
                         description=description,
-                        function=remote_tool,
+                        function=bound_remote_tool,
                         source="mcp",
                         metadata={
                             "kind": "mcp",
@@ -1580,7 +1592,9 @@ class AgentHandle:
             warnings.append(
                 {
                     "kind": "order_without_data",
-                    "message": "Agent used an order tool without prior visible non-order data/tool calls in the same run.",
+                    "message": (
+                        "Agent used an order tool without prior visible non-order data/tool calls in the same run."
+                    ),
                 }
             )
         held_symbols = _held_position_symbols(runtime_context)
@@ -1677,7 +1691,8 @@ class AgentHandle:
             f"tokens_uncached_in={usage['uncached_input_tokens']} "
             f"tokens_thinking={usage['thinking_tokens']} tokens_total={usage['total_tokens']} "
             f"latency_ms={result.latency_ms if result.latency_ms is not None else 'unknown'} "
-            f"first_event_latency_ms={result.first_event_latency_ms if result.first_event_latency_ms is not None else 'unknown'} "
+            "first_event_latency_ms="
+            f"{result.first_event_latency_ms if result.first_event_latency_ms is not None else 'unknown'} "
             f"tool_calls={len(result.tool_calls)} observability_warnings={len(result.warnings)} "
             f"summary={summary!r} trace={trace_path}"
         )
@@ -2168,7 +2183,11 @@ class AgentManager:
         normalized_events = result.events or [AgentTraceEvent(kind="text", text=result.summary or "")]
         thinking_texts = _thinking_texts(result)
         final_texts = _visible_model_texts(result)
-        final_text = " || ".join(final_texts) if final_texts else _sanitize_csv_text(result.summary or result.text or "")
+        final_text = (
+            " || ".join(final_texts)
+            if final_texts
+            else _sanitize_csv_text(result.summary or result.text or "")
+        )
         thinking_text = " || ".join(thinking_texts)
         tool_sequence = " -> ".join(event.tool_name or "unknown_tool" for event in result.tool_calls)
         task_prompt = _sanitize_csv_text(cache_payload.get("task_prompt") or "")
@@ -2279,7 +2298,9 @@ class AgentManager:
         agent_rows = self._observability_rows.setdefault(handle.name, [])
         agent_rows.extend(rows)
         self._observability_all_rows.extend(rows)
-        configured_stats_file = getattr(self.strategy, "stats_file", None) or getattr(self.strategy, "_stats_file", None)
+        configured_stats_file = getattr(self.strategy, "stats_file", None) or getattr(
+            self.strategy, "_stats_file", None
+        )
         if isinstance(configured_stats_file, str) and configured_stats_file:
             detail_rows = self._observability_all_rows
         else:
