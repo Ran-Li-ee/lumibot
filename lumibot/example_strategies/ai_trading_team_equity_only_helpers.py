@@ -6,7 +6,7 @@ from datetime import date as date_type
 from typing import Any
 
 from lumibot.components.agents.builtins import BuiltinTools
-from lumibot.components.agents.schemas import ToolDefinition
+from lumibot.components.agents.schemas import BoundTool, ToolDefinition
 
 EQUITY_BASKET_ID = "equity"
 EQUITY_AGENT_NAME = "equity_basket_agent"
@@ -66,6 +66,21 @@ EQUITY_ONLY_BASKET_UNIVERSES = {EQUITY_BASKET_ID: EQUITY_UNIVERSE}
 
 WEEKDAY_INDEX_BY_CODE = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4}
 
+EQUITY_ALPACA_NEWS_DESCRIPTION = (
+    "Fetch Alpaca/Benzinga news articles for leading stock candidates in the assigned basket_symbols. "
+    "This is symbol/date-window retrieval, not keyword search: arguments are optional symbols comma-list, "
+    "start, end, limit <= 50, include_content, exclude_contentless, page_token, optional content_max_chars, "
+    "and sort. In backtests, only use articles at or before the current simulated datetime; if end is omitted, "
+    "LumiBot uses the current simulated datetime, and future end times are clamped to avoid look-ahead bias. "
+    "Use only after rank evidence is close, conflicting, or uncertain. Query only the leading candidate stock "
+    "tickers from basket_symbols. Do not broaden beyond basket_symbols or add unrelated tickers. First scan "
+    "with include_content=False to read headlines, summaries, timestamps, URLs, sources, and symbols. If a "
+    "story matters, call again for the same or narrower window with include_content=True and usually "
+    "exclude_contentless=True to read the full article body. Full content is not truncated unless you set "
+    "content_max_chars. Use page_token when next_page_token is returned. Do not trade from one weak or noisy "
+    "article."
+)
+
 ALLOWED_INTENTS = {"hold", "rebalance"}
 ALLOWED_ACTIONS = {"submit_order"}
 ALLOWED_SIDES = {"buy", "sell"}
@@ -110,8 +125,33 @@ def equity_basket_agent_tools() -> list[ToolDefinition]:
     return [
         BuiltinTools.market.load_history_tables_summary(),
         BuiltinTools.market.last_price(),
-        BuiltinTools.news.alpaca_news(),
+        equity_alpaca_news_tool(),
     ]
+
+
+def equity_alpaca_news_tool() -> ToolDefinition:
+    base_tool = BuiltinTools.news.alpaca_news()
+
+    def _bind_equity_alpaca_news(strategy: Any, manager: Any) -> BoundTool:
+        bound = base_tool.binder(strategy, manager)
+        metadata = dict(bound.metadata or {})
+        metadata["scope"] = "equity_only"
+        return BoundTool(
+            name=bound.name,
+            description=EQUITY_ALPACA_NEWS_DESCRIPTION,
+            function=bound.function,
+            source=bound.source,
+            metadata=metadata,
+        )
+
+    metadata = dict(base_tool.metadata or {})
+    metadata["scope"] = "equity_only"
+    return ToolDefinition(
+        name=base_tool.name,
+        description=EQUITY_ALPACA_NEWS_DESCRIPTION,
+        binder=_bind_equity_alpaca_news,
+        metadata=metadata,
+    )
 
 
 def equity_basket_agent_system_prompt(symbols: str) -> str:

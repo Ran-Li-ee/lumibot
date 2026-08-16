@@ -285,6 +285,41 @@ def test_equity_agent_tool_surface_includes_rank_price_and_news_only():
     assert tool_names(execution_agent) == ["execution_plan_execute"]
 
 
+def test_equity_news_tool_description_is_stock_candidate_scoped():
+    module = load_module()
+    strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+
+    strategy.initialize()
+
+    equity_agent = created_agent_config(strategy, "equity_basket_agent")
+    news_tool = next(tool for tool in equity_agent["tools"] if tool.name == "alpaca_news")
+    bound_news_tool = news_tool.binder(strategy, strategy.agents)
+    descriptions = [
+        news_tool.description.lower(),
+        bound_news_tool.description.lower(),
+    ]
+
+    for description in descriptions:
+        for required in (
+            "leading stock candidates",
+            "basket_symbols",
+            "do not broaden",
+        ):
+            assert required in description
+
+        for forbidden in (
+            "spy",
+            "qqq",
+            "tlt",
+            "gld",
+            "commodity",
+            "commodities",
+            "bond",
+            "bonds",
+        ):
+            assert forbidden not in description
+
+
 def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_news():
     module = load_module()
     strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
