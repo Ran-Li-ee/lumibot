@@ -37,6 +37,12 @@ The first validation pass exposed pre-existing ruff findings in `lumibot/compone
 
 Follow-up commit `ff831e98d54126eb451b9b71bfd79b39a638c105` mechanically wrapped the long lines and fixed the MCP closure binding warning without changing prompt text or strategy behavior. Review confirmed the generated MCP tools still bind distinct server/tool names correctly.
 
+## Final Review Hardening
+
+Final review found that the generic `alpaca_news` tool description still contained cross-asset fallback examples such as broad-market, bond, gold, and commodity symbols. Commit `3f419867f8d27d8637d27d65b790ec482d42a59c` keeps the shared news tool behavior unchanged, but gives the equity-only strategy an equity-scoped wrapper description. The equity agent now sees `alpaca_news` as a tool for leading stock candidates from `basket_symbols` only, with explicit "do not broaden" wording.
+
+Additional regression coverage checks both the `ToolDefinition.description` and the bound `BoundTool.description`, because the latter is what the model ultimately receives at runtime.
+
 ## Trace Sources
 
 - Equity trace: `artifacts\ai_trading_team_example_benchmarks\20260816_133002_919838\equity-only-llm\cache\agent_runtime\traces\equity_basket_agent\a62958e2b6f952985c34e331454ca6fa370972c869680647b463646fd0ead2d9-20260816053106866446.json`.
