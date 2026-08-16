@@ -705,6 +705,8 @@ def test_execution_agent_with_execution_plan_execute_tool_receives_stage_d_polic
     assert "full audit details" in prompt_lower
     assert "does not research, generate, repair, reorder, optimize, or modify the plan" in prompt_lower
     assert "orders_execute_order executes one explicit execution_plan order end to end" not in prompt_lower
+    assert "before submitting any order, inspect current positions" not in prompt_lower
+    assert "use execution tools that are available to perform required execution-level account" in prompt_lower
     assert "price/history tool policy" not in prompt_lower
 
 

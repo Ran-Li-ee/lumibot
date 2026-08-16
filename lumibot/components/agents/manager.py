@@ -858,8 +858,8 @@ class AgentHandle:
             "Do not perform investment research, do not re-rank candidates, do not substitute symbols, and do not "
             "change the plan.",
             "Do not add, remove, replace, or reorder execution_plan.orders.",
-            "Before submitting any order, inspect current positions, available cash, portfolio value, open orders, "
-            "and the latest price for the ordered asset.",
+            "Use execution tools that are available to perform required execution-level account, cash, open-order, "
+            "and price checks before submission.",
             "Execute execution_plan.orders in ascending sequence order.",
             "When switching from one asset to another, submit the sell or reduce order before the replacement buy "
             "order when that is the sequence provided.",
