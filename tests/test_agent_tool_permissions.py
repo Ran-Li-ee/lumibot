@@ -80,6 +80,8 @@ class _OrderReadinessStrategy(_Strategy):
         self.positions = []
         self.open_orders = []
         self.last_prices = {}
+        self.cash_check_prices = {}
+        self.fill_prices = {}
         self.cash = 100000.0
         self.portfolio_value = 100000.0
         self.orders_by_identifier = {}
@@ -88,6 +90,9 @@ class _OrderReadinessStrategy(_Strategy):
         self.get_order_calls = []
         self.get_cash_calls = 0
         self.force_negative_cash_after_submit = False
+        self.force_negative_cash_after_confirm = False
+        self._submitted_once = False
+        self.deduct_cash_on_submit = False
 
     def get_positions(self, include_cash_positions=True):
         return list(self.positions)
@@ -97,6 +102,8 @@ class _OrderReadinessStrategy(_Strategy):
 
     def get_cash(self):
         self.get_cash_calls += 1
+        if self.force_negative_cash_after_confirm and self._submitted_once:
+            return -1.0
         if self.force_negative_cash_after_submit and self.get_cash_calls > 1:
             return -1.0
         return self.cash
@@ -106,6 +113,10 @@ class _OrderReadinessStrategy(_Strategy):
 
     def get_last_price(self, asset, quote=None, exchange=None):
         return self.last_prices.get(getattr(asset, "symbol", None), 100.0)
+
+    def get_agent_order_cash_check_price(self, asset, quote=None, exchange=None):
+        symbol = getattr(asset, "symbol", asset)
+        return self.cash_check_prices.get(symbol)
 
     def create_order(self, asset, quantity, side, **kwargs):
         self.created_order_count += 1
@@ -126,9 +137,17 @@ class _OrderReadinessStrategy(_Strategy):
 
     def submit_order(self, order):
         order.status = self.submitted_order_status
-        order.avg_fill_price = self.last_prices.get(getattr(order.asset, "symbol", None), 100.0)
+        symbol = getattr(order.asset, "symbol", None)
+        order.avg_fill_price = self.fill_prices.get(symbol, self.last_prices.get(symbol, 100.0))
         self.submitted_orders.append(order)
         self.orders_by_identifier[order.identifier] = order
+        if self.deduct_cash_on_submit:
+            signed_value = float(order.quantity) * float(order.avg_fill_price)
+            if str(order.side).lower() == "buy":
+                self.cash -= signed_value
+            elif str(order.side).lower() == "sell":
+                self.cash += signed_value
+        self._submitted_once = True
         return order
 
     def get_order(self, identifier, broker_refresh=True, broker_refresh_ttl_seconds=0.0):
@@ -1681,6 +1700,219 @@ def test_execution_plan_execute_completed_result_includes_model_facing_summary()
     assert "order_results" not in summary
 
 
+def test_execution_plan_execute_blocks_if_buy_leaves_negative_cash_after_submit():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 1000.0
+    strategy.portfolio_value = 1000.0
+    strategy.last_prices = {"SPY": 100.0}
+    strategy.force_negative_cash_after_confirm = True
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "SPY",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 3,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "blocked"
+    assert result["can_continue"] is False
+    assert result["orders_attempted"] == 1
+    assert result["orders_completed"] == 0
+    assert result["orders_blocked"] == 1
+    assert "NEGATIVE_CASH_INVARIANT_VIOLATION" in {
+        blocker["code"]
+        for blocker in result["blocked_orders"][0]["blockers"]
+    }
+    assert any(
+        blocker["code"] == "NEGATIVE_CASH_INVARIANT_VIOLATION"
+        for blocker in result["blockers"]
+    )
+
+
+def test_execution_plan_execute_second_buy_uses_updated_cash_and_blocks_before_submit():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 500.0
+    strategy.portfolio_value = 1000.0
+    strategy.last_prices = {"SPY": 100.0, "GLD": 100.0}
+    strategy.deduct_cash_on_submit = True
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "SPY",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 5,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+                {
+                    "sequence": 2,
+                    "action": "submit_order",
+                    "symbol": "GLD",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 1,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                },
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "blocked"
+    assert result["orders_attempted"] == 2
+    assert result["orders_completed"] == 1
+    assert result["orders_blocked"] == 1
+    assert result["blocked_orders"][0]["sequence"] == 2
+    assert "INSUFFICIENT_CASH_ESTIMATE" in {
+        blocker["code"]
+        for blocker in result["blocked_orders"][0]["blockers"]
+    }
+    assert len(strategy.submitted_orders) == 1
+    assert strategy.submitted_orders[0].asset.symbol == "SPY"
+
+
+def test_execution_plan_execute_uses_strategy_cash_check_price_for_market_buy_affordability():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 2086.66
+    strategy.portfolio_value = 102976.02
+    strategy.last_prices = {"IWM": 208.85}
+    strategy.cash_check_prices = {"IWM": 197.90}
+    strategy.fill_prices = {"IWM": 197.90}
+    strategy.deduct_cash_on_submit = True
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "IWM",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "completed"
+    assert result["orders_completed"] == 1
+    order_result = result["order_results"][0]["order_result"]
+    assert order_result["preflight_result"]["price"]["last_price"] == pytest.approx(197.90)
+    assert order_result["preflight_result"]["estimate"]["estimated_cash_after_order"] == pytest.approx(107.66)
+    assert strategy.submitted_orders[0].asset.symbol == "IWM"
+
+
+def test_execution_plan_execute_does_not_hide_internal_cash_check_hook_error():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 3000.0
+    strategy.portfolio_value = 102976.02
+    strategy.last_prices = {"IWM": 208.85}
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    def broken_cash_check_price(asset, **kwargs):
+        raise TypeError("internal hook bug")
+
+    strategy.get_agent_order_cash_check_price = broken_cash_check_price
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "IWM",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "blocked"
+    assert result["orders_completed"] == 0
+    assert result["orders_blocked"] == 1
+    assert result["blockers"] == [{"code": "SUBMIT_FAILED", "message": "internal hook bug"}]
+    assert result["order_results"][0]["order_result"]["preflight_result"] is None
+    assert not strategy.submitted_orders
+
+
+def test_execution_plan_execute_supports_asset_only_cash_check_hook():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 2086.66
+    strategy.portfolio_value = 102976.02
+    strategy.last_prices = {"IWM": 208.85}
+    strategy.fill_prices = {"IWM": 197.90}
+    strategy.deduct_cash_on_submit = True
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    def legacy_asset_only_cash_check_price(asset):
+        return {"price": 197.90, "source": f"legacy_{asset.symbol}"}
+
+    strategy.get_agent_order_cash_check_price = legacy_asset_only_cash_check_price
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "rebalance",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "IWM",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "completed"
+    order_result = result["order_results"][0]["order_result"]
+    assert order_result["preflight_result"]["price"]["last_price"] == pytest.approx(197.90)
+    assert order_result["preflight_result"]["price"]["price_source"] == "legacy_IWM"
+
+
 def test_execution_plan_execute_hold_result_includes_model_facing_summary():
     strategy = _OrderReadinessStrategy()
     tool_map = _wrap_execute_plan_tools(strategy)
@@ -2155,7 +2387,7 @@ def test_execution_plan_execute_blocked_result_includes_model_facing_summary_wit
     assert summary["blocked_orders"][0]["sequence"] == 2
     assert summary["blocked_orders"][0]["symbol"] == "GLD"
     assert summary["skipped_orders"][0]["sequence"] == 3
-    assert summary["blockers"][0]["code"] == "ORDER_BLOCKED"
+    assert summary["blockers"][0]["code"] == "INSUFFICIENT_CASH_ESTIMATE"
     assert any(
         blocker["code"] == "INSUFFICIENT_CASH_ESTIMATE"
         for blocker in summary["blocked_orders"][0]["blockers"]

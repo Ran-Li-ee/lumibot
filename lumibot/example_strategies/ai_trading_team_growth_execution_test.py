@@ -1,5 +1,6 @@
 """Growth-to-execution AI trading team example."""
 
+import inspect
 import json
 import math
 import os
@@ -44,6 +45,11 @@ SYSTEM_EXECUTION_CONSTRAINTS = {
     "allow_negative_cash": False,
     "if_any_order_blocked": "stop_remaining_orders",
 }
+
+
+class _OrderPriceAsset:
+    def __init__(self, symbol):
+        self.symbol = symbol
 
 
 def _extract_first_json_object(text):
@@ -240,19 +246,116 @@ def _agent_result_tool_names(result):
     return {event.tool_name for event in getattr(result, "tool_calls", []) if getattr(event, "tool_name", None)}
 
 
-def _raw_execution_order_price(strategy, order):
-    raw_price = strategy.get_last_price(order["symbol"])
+def _valid_positive_float(value):
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
+def _coerce_source_aware_price_info(symbol, result):
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        raw_price = result.get("price")
+        price = _valid_positive_float(raw_price)
+        if price is None:
+            return None
+        return {
+            "price": price,
+            "raw_price": raw_price,
+            "source": result.get("source"),
+            "datetime": result.get("datetime"),
+            "granularity": result.get("granularity"),
+            "field": result.get("field"),
+            "warning": result.get("warning"),
+        }
+
+    price = _valid_positive_float(result)
+    if price is None:
+        return None
+    return {
+        "price": price,
+        "raw_price": result,
+        "source": "strategy_order_cash_check_price",
+        "datetime": None,
+        "granularity": None,
+        "field": None,
+        "warning": None,
+    }
+
+
+def _format_price_source(price_info):
+    parts = []
+    for key in ("source", "field", "granularity", "datetime", "warning"):
+        value = price_info.get(key)
+        if value is not None:
+            parts.append(f"{key}={value}")
+    return ", ".join(parts) if parts else "source=last_price"
+
+
+def _callable_accepts_arguments(callable_object, *args, **kwargs):
+    try:
+        signature = inspect.signature(callable_object)
+    except (TypeError, ValueError):
+        return True
+
+    try:
+        signature.bind(*args, **kwargs)
+    except TypeError:
+        return False
+    return True
+
+
+def _source_aware_order_price_info(strategy, order):
+    symbol = order["symbol"]
+    hook = getattr(strategy, "get_agent_order_cash_check_price", None)
+    if callable(hook):
+        asset = _OrderPriceAsset(symbol)
+        hook_kwargs = {
+            "order": order,
+            "symbol": symbol,
+            "side": order.get("side"),
+            "quantity": order.get("quantity"),
+        }
+        if _callable_accepts_arguments(hook, asset, **hook_kwargs):
+            hook_result = hook(
+                asset,
+                **hook_kwargs,
+            )
+        else:
+            hook_result = hook(asset)
+        price_info = _coerce_source_aware_price_info(symbol, hook_result)
+        if price_info is not None:
+            return price_info
+
+    raw_price = strategy.get_last_price(symbol)
     if raw_price is None:
-        raise ValueError(f"PRICE_REQUIRED: cannot validate execution plan because {order['symbol']} has no last price.")
-    return raw_price, None
+        raise ValueError(f"PRICE_REQUIRED: cannot validate execution plan because {symbol} has no last price.")
+    price = _valid_positive_float(raw_price)
+    if price is None:
+        raise ValueError(f"PRICE_REQUIRED: invalid last price for {symbol}: {raw_price!r}.")
+    return {
+        "price": price,
+        "raw_price": raw_price,
+        "source": "last_price",
+        "datetime": None,
+        "granularity": None,
+        "field": None,
+        "warning": None,
+    }
+
+
+def _raw_execution_order_price(strategy, order):
+    price_info = _source_aware_order_price_info(strategy, order)
+    return price_info["price"], price_info.get("field")
 
 
 def _execution_order_price(strategy, order):
-    raw_price, _price_field = _raw_execution_order_price(strategy, order)
-    price = float(raw_price)
-    if not math.isfinite(price) or price <= 0:
-        raise ValueError(f"PRICE_REQUIRED: invalid last price for {order['symbol']}: {raw_price!r}.")
-    return price
+    return float(_source_aware_order_price_info(strategy, order)["price"])
 
 
 def _decimal_number(value, label):
@@ -266,12 +369,8 @@ def _decimal_number(value, label):
 
 
 def _decision_order_price(strategy, order):
-    raw_price, _price_field = _raw_execution_order_price(strategy, order)
-    label = f"last price for {order['symbol']}"
-    price = _decimal_number(raw_price, label)
-    if price <= 0:
-        raise ValueError(f"PRICE_REQUIRED: invalid last price for {order['symbol']}: {raw_price!r}.")
-    return price
+    price_info = _source_aware_order_price_info(strategy, order)
+    return _decimal_number(price_info.get("raw_price", price_info["price"]), f"execution price for {order['symbol']}")
 
 
 def _current_long_holdings(strategy):
@@ -338,7 +437,8 @@ def validate_execution_plan_cash_safety(strategy, execution_plan):
 
     orders = sorted(execution_plan["orders"], key=lambda order: order["sequence"])
     for order in orders:
-        price = _execution_order_price(strategy, order)
+        price_info = _source_aware_order_price_info(strategy, order)
+        price = float(price_info["price"])
         notional = float(order["quantity"]) * price
         if order["side"] == "sell":
             simulated_cash += notional
@@ -350,7 +450,8 @@ def validate_execution_plan_cash_safety(strategy, execution_plan):
         if projected_cash < 0 and not allow_negative_cash:
             raise ValueError(
                 "NEGATIVE_CASH_NOT_ALLOWED: execution_plan buy order "
-                f"sequence {order['sequence']} for {order['symbol']} would leave cash {projected_cash:.2f}."
+                f"sequence {order['sequence']} for {order['symbol']} would leave cash {projected_cash:.2f} "
+                f"using price {price:.4f} ({_format_price_source(price_info)})."
             )
         simulated_cash = projected_cash
 

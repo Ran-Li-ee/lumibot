@@ -1381,6 +1381,25 @@ def test_execution_handoff_keeps_execution_agent_free_of_buffer_and_retry_materi
     }
 
 
+def _single_buy_plan(symbol="QQQ", quantity=1):
+    return {
+        "intent": "enter_position",
+        "orders": [
+            {
+                "sequence": 1,
+                "symbol": symbol,
+                "side": "buy",
+                "quantity": float(quantity),
+                "order_type": "market",
+                "limit_price": None,
+                "stop_price": None,
+                "stop_limit_price": None,
+            }
+        ],
+        "constraints": {"allow_negative_cash": False},
+    }
+
+
 def test_execution_cash_safety_allows_positive_cash_below_decision_buffer():
     strategy_module, _strategy_class = load_strategy_module()
     strategy = SimpleNamespace(
@@ -1406,6 +1425,116 @@ def test_execution_cash_safety_allows_positive_cash_below_decision_buffer():
     }
 
     strategy_module.validate_execution_plan_cash_safety(strategy, plan)
+
+
+def test_execution_cash_safety_uses_source_aware_cash_check_price():
+    strategy_module, _strategy_class = load_strategy_module()
+    strategy = SimpleNamespace(
+        get_cash=lambda: 1000.0,
+        get_portfolio_value=lambda: 1000.0,
+        get_last_price=lambda symbol: 100.0,
+        get_agent_order_cash_check_price=lambda asset, **kwargs: {
+            "price": 50.0,
+            "source": "yahoo_daily_open",
+            "datetime": "2024-11-11T09:30:00-05:00",
+            "granularity": "1D",
+            "field": "open",
+            "warning": None,
+        },
+    )
+    plan = _single_buy_plan(quantity=20)
+
+    strategy_module.validate_execution_plan_cash_safety(strategy, plan)
+    assert strategy_module._execution_order_price(strategy, plan["orders"][0]) == pytest.approx(50.0)
+
+
+def test_decision_order_price_uses_source_aware_cash_check_price():
+    strategy_module, _strategy_class = load_strategy_module()
+    strategy = SimpleNamespace(
+        get_last_price=lambda symbol: 100.0,
+        get_agent_order_cash_check_price=lambda asset, **kwargs: {"price": 50.0, "source": "yahoo_daily_open"},
+    )
+    order = _single_buy_plan(quantity=1)["orders"][0]
+
+    assert strategy_module._decision_order_price(strategy, order) == Decimal("50.0")
+
+
+def test_source_aware_order_price_falls_back_without_hook():
+    strategy_module, _strategy_class = load_strategy_module()
+    strategy = SimpleNamespace(get_last_price=lambda symbol: 25.0)
+    order = _single_buy_plan(quantity=1)["orders"][0]
+
+    assert strategy_module._execution_order_price(strategy, order) == pytest.approx(25.0)
+    assert strategy_module._decision_order_price(strategy, order) == Decimal("25.0")
+
+
+def test_source_aware_order_price_falls_back_when_hook_price_is_invalid():
+    strategy_module, _strategy_class = load_strategy_module()
+    strategy = SimpleNamespace(
+        get_last_price=lambda symbol: 25.0,
+        get_agent_order_cash_check_price=lambda asset, **kwargs: {
+            "price": None,
+            "source": "yahoo_daily_open",
+            "warning": "missing daily open",
+        },
+    )
+    order = _single_buy_plan(quantity=1)["orders"][0]
+
+    assert strategy_module._execution_order_price(strategy, order) == pytest.approx(25.0)
+
+
+def test_source_aware_order_price_supports_legacy_asset_only_hook():
+    strategy_module, _strategy_class = load_strategy_module()
+
+    def legacy_hook(asset):
+        return {"price": 50.0, "source": f"legacy_{asset.symbol}"}
+
+    strategy = SimpleNamespace(
+        get_last_price=lambda symbol: 25.0,
+        get_agent_order_cash_check_price=legacy_hook,
+    )
+    order = _single_buy_plan(quantity=1)["orders"][0]
+
+    assert strategy_module._execution_order_price(strategy, order) == pytest.approx(50.0)
+
+
+def test_source_aware_order_price_does_not_hide_internal_hook_type_error():
+    strategy_module, _strategy_class = load_strategy_module()
+
+    def broken_hook(asset, **kwargs):
+        if kwargs:
+            raise TypeError("internal hook bug")
+        return None
+
+    strategy = SimpleNamespace(
+        get_last_price=lambda symbol: 25.0,
+        get_agent_order_cash_check_price=broken_hook,
+    )
+    order = _single_buy_plan(quantity=1)["orders"][0]
+
+    with pytest.raises(TypeError, match="internal hook bug"):
+        strategy_module._execution_order_price(strategy, order)
+
+
+def test_execution_cash_safety_still_blocks_true_negative_cash_with_hook_price():
+    strategy_module, _strategy_class = load_strategy_module()
+    strategy = SimpleNamespace(
+        get_cash=lambda: 1000.0,
+        get_portfolio_value=lambda: 1000.0,
+        get_last_price=lambda symbol: 80.0,
+        get_agent_order_cash_check_price=lambda asset, **kwargs: {
+            "price": 80.0,
+            "source": "yahoo_daily_open",
+            "datetime": "2024-11-11T09:30:00-05:00",
+            "granularity": "1D",
+            "field": "open",
+            "warning": None,
+        },
+    )
+    plan = _single_buy_plan(quantity=20)
+
+    with pytest.raises(ValueError, match="NEGATIVE_CASH_NOT_ALLOWED"):
+        strategy_module.validate_execution_plan_cash_safety(strategy, plan)
 
 
 def test_parse_execution_plan_rejects_market_order_stop_price_before_cash_safety():

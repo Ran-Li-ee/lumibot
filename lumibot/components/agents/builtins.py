@@ -1,3 +1,4 @@
+import inspect
 import json
 import math
 import os
@@ -49,8 +50,8 @@ ORDERS_EXECUTE_ORDER_DESCRIPTION = (
 EXECUTION_PLAN_EXECUTE_DESCRIPTION = (
     "Execute one complete strict execution_plan in sequence order. "
     "This tool validates the plan, executes each order through readiness checks, submission, and confirmation, "
-    "stops on the first blocker, and returns a concise execution summary to the model while full audit details "
-    "are recorded in trace/replay. "
+    "enforces no-negative-cash behavior for buys, stops on the first blocker, and returns a concise execution "
+    "summary to the model while full audit details are recorded in trace/replay. "
     "This tool mutates trading state. It does not generate, repair, reorder, optimize, or modify the plan. "
     "Pass the execution_plan exactly as provided by the upstream planner. "
     "If plan_status is blocked or invalid, do not call lower-level tools; summarize where execution stopped and why."
@@ -401,6 +402,77 @@ def _agent_negative_cash_guard_enabled() -> bool:
     return value.strip().lower() not in {"1", "true", "yes", "on"}
 
 
+def _extract_order_cash_check_price(value: Any) -> tuple[float | None, str | None]:
+    source = None
+    raw_price = value
+    if isinstance(value, dict):
+        raw_price = (
+            value.get("price")
+            if value.get("price") is not None
+            else value.get("sizing_price")
+            if value.get("sizing_price") is not None
+            else value.get("last_price")
+        )
+        source = value.get("source") or value.get("sizing_price_source") or value.get("price_source")
+    elif hasattr(value, "price"):
+        raw_price = value.price
+        source = getattr(value, "source", None)
+    price = _finite_positive_price(raw_price)
+    return price, str(source) if source is not None else None
+
+
+def _strategy_order_cash_check_price_snapshot(
+    strategy: Any,
+    *,
+    asset: Any,
+    quote: Any = None,
+    exchange: str | None = None,
+) -> dict[str, Any] | None:
+    hook = getattr(strategy, "get_agent_order_cash_check_price", None)
+    if not callable(hook):
+        return None
+
+    symbol = getattr(asset, "symbol", asset)
+    call_attempts = (
+        ((), {"asset": asset, "quote": quote, "exchange": exchange}),
+        ((asset,), {"quote": quote, "exchange": exchange}),
+        ((), {"asset": asset}),
+        ((symbol,), {}),
+    )
+    try:
+        signature = inspect.signature(hook)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is not None:
+        for args, kwargs in call_attempts:
+            try:
+                signature.bind(*args, **kwargs)
+            except TypeError:
+                continue
+            value = hook(*args, **kwargs)
+            price, source = _extract_order_cash_check_price(value)
+            if price is not None:
+                return {
+                    "last_price": price,
+                    "price_source": source or "strategy_order_cash_check_price",
+                }
+    else:
+        for args, kwargs in call_attempts:
+            try:
+                value = hook(*args, **kwargs)
+            except TypeError:
+                continue
+            price, source = _extract_order_cash_check_price(value)
+            if price is not None:
+                return {
+                    "last_price": price,
+                    "price_source": source or "strategy_order_cash_check_price",
+                }
+
+    return None
+
+
 def _estimate_buy_order_cash_requirement(
     strategy: Any,
     *,
@@ -425,13 +497,23 @@ def _estimate_buy_order_cash_requirement(
     elif order_type == "stop" and stop_price is not None:
         price = float(stop_price)
     elif order_type == "market":
-        raw_price = strategy.get_last_price(asset, quote=quote, exchange=exchange)
-        if raw_price is None:
+        strategy_price = _strategy_order_cash_check_price_snapshot(
+            strategy,
+            asset=asset,
+            quote=quote,
+            exchange=exchange,
+        )
+        if strategy_price is not None:
+            price = float(strategy_price["last_price"])
+        else:
+            raw_price = strategy.get_last_price(asset, quote=quote, exchange=exchange)
+            if raw_price is not None:
+                price = float(raw_price)
+        if price is None:
             raise ValueError(
                 "NEGATIVE_CASH_CHECK_UNAVAILABLE: orders_submit_order cannot verify affordability because "
                 f"market_last_price for {getattr(asset, 'symbol', asset)!r} returned None."
             )
-        price = float(raw_price)
 
     if price is None:
         return None
@@ -1658,12 +1740,20 @@ def _preflight_order_appears_open(order: Any) -> bool:
 
 def _preflight_price_snapshot(strategy: Any, symbol: str, asset_type: str) -> dict[str, Any]:
     price = None
+    price_source = None
     if symbol and asset_type in {"stock", "us_equity"}:
         asset, quote = resolve_asset_and_quote(strategy, symbol=symbol, asset_type=asset_type)
-        price_ok, raw_price = _preflight_strategy_call(strategy, "get_last_price", asset, quote=quote)
-        if price_ok:
-            price = _finite_positive_price(raw_price)
-    return {"last_price": price}
+        strategy_price = _strategy_order_cash_check_price_snapshot(strategy, asset=asset, quote=quote)
+        if strategy_price is not None:
+            price = strategy_price["last_price"]
+            price_source = strategy_price.get("price_source")
+        else:
+            price_ok, raw_price = _preflight_strategy_call(strategy, "get_last_price", asset, quote=quote)
+            if price_ok:
+                price = _finite_positive_price(raw_price)
+                if price is not None:
+                    price_source = "strategy_last_price"
+    return {"last_price": price, "price_source": price_source}
 
 
 def _preflight_blocked_payload(
@@ -3805,7 +3895,9 @@ def _execution_plan_blocked_payload(
         "order_results": order_results,
         "initial_account_snapshot": None,
         "final_account_snapshot": _execution_plan_final_account_snapshot(strategy, order_results),
-        "blockers": [
+        "blockers": list(blocked_orders[-1].get("blockers") or [])
+        if blocked_orders
+        else [
             _execution_plan_blocker(
                 "ORDER_BLOCKED",
                 f"Execution stopped at sequence {stopped_sequence}.",
@@ -3851,6 +3943,52 @@ def _execution_plan_exception_result(order: dict[str, Any], exc: Exception) -> d
         "submit_and_confirm_result": None,
         "internal_steps": [],
     }
+
+
+def _execution_plan_cash_value(strategy: Any) -> float | None:
+    get_cash = getattr(strategy, "get_cash", None)
+    if not callable(get_cash):
+        return None
+    try:
+        cash = float(get_cash())
+    except Exception:
+        return None
+    if not math.isfinite(cash):
+        return None
+    return cash
+
+
+def _execution_plan_negative_cash_result_if_needed(
+    strategy: Any,
+    order: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not _agent_negative_cash_guard_enabled():
+        return None
+    if str(order.get("side")).strip().lower() != "buy":
+        return None
+    cash = _execution_plan_cash_value(strategy)
+    if cash is None or cash >= 0:
+        return None
+
+    blocker = _execution_plan_blocker(
+        "NEGATIVE_CASH_INVARIANT_VIOLATION",
+        f"Cash became negative after sequence {order.get('sequence')} buy for {order.get('symbol')}: {cash:.2f}.",
+        sequence=order.get("sequence"),
+        symbol=order.get("symbol"),
+    )
+    guarded = dict(result)
+    guarded["execution_status"] = "blocked"
+    guarded["can_continue"] = False
+    guarded["blockers"] = list(guarded.get("blockers") or []) + [blocker]
+    guarded["warnings"] = list(guarded.get("warnings") or []) + [
+        "NEGATIVE_CASH_INVARIANT_VIOLATION: execution stopped because cash became negative after a buy."
+    ]
+    guarded["account_after"] = {
+        **(guarded.get("account_after") if isinstance(guarded.get("account_after"), dict) else {}),
+        "cash": cash,
+    }
+    return guarded
 
 
 def _validate_execution_plan_sequence(orders: list[Any]) -> dict[str, Any] | None:
@@ -4155,6 +4293,10 @@ def _bind_execute_plan(strategy: Any, manager: Any) -> BoundTool:
                     RuntimeError("orders_execute_order did not return a structured result."),
                 )
                 result_warnings = []
+            invariant_result = _execution_plan_negative_cash_result_if_needed(strategy, order, result)
+            if invariant_result is not None:
+                result = invariant_result
+                result_warnings = [str(warning) for warning in list(result.get("warnings") or [])]
             warnings.extend(result_warnings)
             order_results.append(_execution_plan_result_item(order, result))
 
