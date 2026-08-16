@@ -179,11 +179,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             allow_trading=False,
             include_builtin_tools=False,
             tools=equity_basket_agent_tools(),
-            system_prompt=(
-                equity_basket_agent_system_prompt(equity_symbols)
-                + " This equity-only strategy allocates the full target portfolio to the selected equity symbol. "
-                "Stay inside the configured equity universe. Do not place orders."
-            ),
+            system_prompt=equity_basket_agent_system_prompt(equity_symbols),
         )
 
         self.agents.create(
@@ -266,11 +262,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         equity_universe = list(basket_universes[EQUITY_BASKET_ID])
         try:
             equity_result = self.agents[EQUITY_AGENT_NAME].run(
-                task_prompt=(
-                    equity_basket_agent_task_prompt()
-                    + " This equity-only strategy has target_weight 1.0 for the selected equity symbol. "
-                    "Return only one JSON object. Do not include markdown or extra prose."
-                ),
+                task_prompt=equity_basket_agent_task_prompt(),
                 context={
                     "date": current_date,
                     "basket_id": EQUITY_BASKET_ID,

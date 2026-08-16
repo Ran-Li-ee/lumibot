@@ -129,6 +129,16 @@ def make_running_strategy(strategy_class):
     return strategy
 
 
+def created_agent_config(strategy, name):
+    matches = [agent for agent in strategy.agents.created if agent["name"] == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def tool_names(agent_config):
+    return [tool.name for tool in agent_config.get("tools", [])]
+
+
 def test_equity_only_target_portfolio_uses_selected_symbol_at_full_weight():
     module = load_module()
 
@@ -252,6 +262,119 @@ def test_initialize_creates_only_equity_and_execution_agents():
     assert "commodity" not in equity_prompt
     assert "tips" not in equity_prompt
     assert "nominal bond" not in equity_prompt
+
+
+def test_equity_agent_tool_surface_includes_rank_price_and_news_only():
+    module = load_module()
+    strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+
+    strategy.initialize()
+
+    equity_agent = created_agent_config(strategy, "equity_basket_agent")
+    execution_agent = created_agent_config(strategy, "execution_agent")
+
+    assert equity_agent["include_builtin_tools"] is False
+    assert equity_agent["allow_trading"] is False
+    assert tool_names(equity_agent) == [
+        "market_load_history_tables_summary",
+        "market_last_price",
+        "alpaca_news",
+    ]
+    assert execution_agent["include_builtin_tools"] is False
+    assert execution_agent["allow_trading"] is True
+    assert tool_names(execution_agent) == ["execution_plan_execute"]
+
+
+def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_news():
+    module = load_module()
+    strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+
+    strategy.initialize()
+
+    equity_agent = created_agent_config(strategy, "equity_basket_agent")
+    prompt = equity_agent["system_prompt"].lower()
+
+    for required in (
+        "equity-only",
+        "choose exactly one stock",
+        "market_load_history_tables_summary",
+        "separate evidence",
+        "alpaca_news",
+        "leading candidates",
+        "strict json",
+        "do not place orders",
+    ):
+        assert required in prompt
+
+    for forbidden in (
+        "quadrant",
+        "macro regime",
+        "commodity",
+        "tips",
+        "nominal bond",
+        "defensive posture",
+        "duckdb",
+    ):
+        assert forbidden not in prompt
+
+
+def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    strategy.parameters["basket_universes"] = {
+        **strategy.parameters["basket_universes"],
+        "equity": EXPECTED_EQUITY_UNIVERSE,
+    }
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": EXPECTED_EQUITY_UNIVERSE,
+            "selected_symbol": "ORCL",
+            "reason_brief": "ORCL has the strongest setup.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 0.0,
+                "cash_after_estimate": 100000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "hold",
+                "orders": [],
+            },
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    equity_call = strategy.agents["equity_basket_agent"].calls[0]
+    task_prompt = equity_call["task_prompt"].lower()
+
+    assert equity_call["context"]["basket_symbols"] == EXPECTED_EQUITY_UNIVERSE
+    assert "market_load_history_tables_summary" in task_prompt
+    assert "length=252" in task_prompt
+    assert "timestep='day'" in task_prompt
+    assert "top_n=10" in task_prompt
+    assert "alpaca_news" in task_prompt
+    assert "close, conflicting, or uncertain" in task_prompt
+    assert "candidate_symbols must copy the assigned basket_symbols exactly" in task_prompt
+    assert "return exactly one strict json object" in task_prompt
 
 
 def test_equity_only_order_cash_check_price_uses_planner_sizing_policy(monkeypatch):

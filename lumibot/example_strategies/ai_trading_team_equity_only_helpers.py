@@ -110,23 +110,33 @@ def equity_basket_agent_tools() -> list[ToolDefinition]:
     return [
         BuiltinTools.market.load_history_tables_summary(),
         BuiltinTools.market.last_price(),
+        BuiltinTools.news.alpaca_news(),
     ]
 
 
 def equity_basket_agent_system_prompt(symbols: str) -> str:
     return (
-        f"Equity basket role: stay inside the assigned equity basket ({symbols}). "
-        "For the current scheduled review, select one representative equity symbol. "
-        "Return basket_id, selected_symbol, status, and reason_brief. "
-        "Use status='active' when you select a symbol. Do not place orders."
+        f"Equity-only selection role: choose exactly one stock from the assigned basket_symbols ({symbols}). "
+        "The selected stock receives target_weight 1.0 through downstream deterministic planning. "
+        "You cannot place orders or size trades. Use market_load_history_tables_summary first for multi-symbol "
+        "comparison. Treat rankings as separate evidence views; do not invent sector, style, safety, or "
+        "cyclicality labels. If one symbol is clearly stronger across relevant rankings, select it without news. "
+        "Use alpaca_news only when leading candidates are close, conflicting, or uncertain; when used, request "
+        "news only for leading candidates. If news is unavailable, continue with rank-only evidence. "
+        "Return strict JSON only. Do not place orders."
     )
 
 
 def equity_basket_agent_task_prompt() -> str:
     return (
-        "Review only the assigned equity basket for the current scheduled review and return one JSON object "
-        "with basket_id, target_weight, status, candidate_symbols, selected_symbol, and reason_brief. "
-        "candidate_symbols must copy the assigned basket_symbols exactly; do not replace it with a shortlist."
+        "Review only the provided basket_symbols. First call market_load_history_tables_summary with "
+        "symbols=basket_symbols, length=252, timestep='day', and top_n=10. Compare separate ranking views. "
+        "If one symbol is clearly stronger across relevant rankings, select it without news. If leading "
+        "candidates are close, conflicting, or uncertain, call alpaca_news for those leading candidates only. "
+        "If alpaca_news is unavailable or errors, continue with rank-only evidence. Return exactly one strict "
+        "JSON object with basket_id, target_weight, status, candidate_symbols, selected_symbol, and reason_brief. "
+        "Use status='active'. candidate_symbols must copy the assigned basket_symbols exactly; do not replace it "
+        "with a shortlist. selected_symbol must be one of basket_symbols."
     )
 
 
