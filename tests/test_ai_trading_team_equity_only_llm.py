@@ -11,6 +11,60 @@ def load_module():
     return importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_llm")
 
 
+EXPECTED_EQUITY_UNIVERSE = [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA",
+    "AVGO",
+    "AMD",
+    "NFLX",
+    "ORCL",
+    "CRM",
+    "ADBE",
+    "CSCO",
+    "QCOM",
+    "TXN",
+    "IBM",
+    "INTC",
+    "NOW",
+    "PANW",
+    "UNH",
+    "JNJ",
+    "LLY",
+    "MRK",
+    "ABBV",
+    "TMO",
+    "ABT",
+    "JPM",
+    "BAC",
+    "GS",
+    "MS",
+    "V",
+    "MA",
+    "WMT",
+    "COST",
+    "HD",
+    "MCD",
+    "NKE",
+    "SBUX",
+    "DIS",
+    "XOM",
+    "CVX",
+    "CAT",
+    "GE",
+    "HON",
+    "BA",
+    "DE",
+    "PG",
+    "KO",
+    "PEP",
+]
+
+
 class RecordingAgentManager:
     def __init__(self):
         self.created = []
@@ -134,6 +188,19 @@ def test_validate_execution_plan_symbols_accepts_selected_status_synonym():
             "selected_symbol": "SPY",
         },
     )
+
+
+def test_equity_universe_contains_50_us_stock_symbols_without_old_etfs():
+    helpers = importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_helpers")
+
+    universe = helpers.EQUITY_UNIVERSE
+
+    assert universe == EXPECTED_EQUITY_UNIVERSE
+    assert len(universe) == 50
+    assert len(set(universe)) == 50
+    assert all(symbol == symbol.upper() for symbol in universe)
+    assert all(symbol.isalpha() for symbol in universe)
+    assert not {"SPY", "QQQ", "IWM", "EEM", "FXI"} & set(universe)
 
 
 def test_equity_only_target_portfolio_rejects_inactive_report():
