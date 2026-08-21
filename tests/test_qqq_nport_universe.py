@@ -323,6 +323,29 @@ def test_resolve_prototype_as_of_uses_report_date(tmp_path):
     assert result.symbols == ("MSFT",)
 
 
+def test_resolve_as_of_sorts_strict_by_filing_date_and_prototype_by_report_date(tmp_path):
+    qqq_nport.write_normalized_snapshot(
+        _snapshot("0001067839-26-000024", "2026-03-31", "2026-04-01", ["AAPL"]),
+        data_dir=tmp_path,
+    )
+    qqq_nport.write_normalized_snapshot(
+        _snapshot("0001067839-26-000016", "2026-02-28", "2026-04-15", ["MSFT"]),
+        data_dir=tmp_path,
+    )
+
+    strict_result = qqq_nport.resolve_qqq_snapshot("2026-04-20", mode="strict", data_dir=tmp_path)
+    prototype_result = qqq_nport.resolve_qqq_snapshot(
+        "2026-04-20",
+        mode="prototype",
+        data_dir=tmp_path,
+    )
+
+    assert strict_result.selected_filing_date == date(2026, 4, 15)
+    assert strict_result.symbols == ("MSFT",)
+    assert prototype_result.selected_report_date == date(2026, 3, 31)
+    assert prototype_result.symbols == ("AAPL",)
+
+
 def test_resolve_as_of_raises_clear_error_when_no_snapshot_available(tmp_path):
     qqq_nport.write_normalized_snapshot(
         _snapshot("0001067839-26-000016", "2025-12-31", "2026-02-27", ["AAPL"]),

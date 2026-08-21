@@ -423,7 +423,10 @@ def resolve_qqq_snapshot(
             f"No QQQ snapshot available for as_of_date={as_of.isoformat()} mode={mode}"
         )
 
-    report, filing, path, snapshot = max(candidates, key=lambda item: (item[0], item[1]))
+    if mode == "strict":
+        report, filing, path, snapshot = max(candidates, key=lambda item: (item[1], item[0]))
+    else:
+        report, filing, path, snapshot = max(candidates, key=lambda item: (item[0], item[1]))
     accession_number = _snapshot_field(snapshot, "accession_number")
     if not isinstance(accession_number, str):
         raise NoSnapshotAvailableError(
