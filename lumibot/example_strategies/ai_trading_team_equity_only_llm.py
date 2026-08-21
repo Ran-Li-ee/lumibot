@@ -335,17 +335,25 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             equity_universe, universe_source = self._equity_universe_for_date(current_date)
         except NoSnapshotAvailableError as exc:
             self._last_execution_plan_error = str(exc)
-            event = {
-                "date": current_date,
-                "run_frequency": self._run_frequency,
-                "weekly_run_weekday": self._weekly_run_weekday,
-                "week_key": iso_week_key(date_type.fromisoformat(current_date)),
-                "month_key": _month_key(date_type.fromisoformat(current_date)),
-                "should_run": False,
-                "status": "blocked",
-                "reason": "qqq_historical_universe_unavailable",
-                "error": str(exc),
-            }
+            if scheduled_workflow_event is not None:
+                event = {
+                    **scheduled_workflow_event,
+                    "status": "blocked",
+                    "reason": "qqq_historical_universe_unavailable",
+                    "error": str(exc),
+                }
+            else:
+                event = {
+                    "date": current_date,
+                    "run_frequency": self._run_frequency,
+                    "weekly_run_weekday": self._weekly_run_weekday,
+                    "week_key": iso_week_key(date_type.fromisoformat(current_date)),
+                    "month_key": _month_key(date_type.fromisoformat(current_date)),
+                    "should_run": False,
+                    "status": "blocked",
+                    "reason": "qqq_historical_universe_unavailable",
+                    "error": str(exc),
+                }
             self._record_scheduled_workflow_event(event)
             self._log_equity_only_workflow_blocked(f"Equity-only LLM workflow blocked: {exc}")
             return

@@ -588,8 +588,17 @@ def test_qqq_historical_strategy_blocks_without_fallback_when_snapshot_missing(m
     assert strategy.agents["equity_basket_agent"].calls == []
     assert strategy.agents["execution_agent"].calls == []
     assert strategy._last_execution_plan_error == "No QQQ snapshot available"
-    assert strategy._scheduled_workflow_events[-1]["reason"] == "qqq_historical_universe_unavailable"
-    assert strategy._scheduled_workflow_events[-1]["status"] == "blocked"
+    blocked_event = strategy._scheduled_workflow_events[-1]
+    assert blocked_event["date"] == "2024-09-05"
+    assert blocked_event["run_frequency"] == "weekly"
+    assert blocked_event["weekly_run_weekday"] == "MON"
+    assert blocked_event["week_key"] == "2024-W36"
+    assert blocked_event["month_key"] == "2024-09"
+    assert blocked_event["should_run"] is True
+    assert blocked_event["reason"] == "qqq_historical_universe_unavailable"
+    assert blocked_event["status"] == "blocked"
+    assert blocked_event["error"] == "No QQQ snapshot available"
+    assert strategy._scheduled_workflow_attempted_week_keys == set()
 
 
 def test_qqq_historical_strategy_retries_same_week_after_missing_snapshot(monkeypatch):
@@ -649,6 +658,7 @@ def test_qqq_historical_strategy_retries_same_week_after_missing_snapshot(monkey
     assert resolver_calls == ["2024-09-02", "2024-09-03"]
     assert strategy.agents["equity_basket_agent"].calls
     assert strategy.agents["equity_basket_agent"].calls[0]["context"]["date"] == "2024-09-03"
+    assert len(strategy._scheduled_workflow_events) == 2
     assert strategy._scheduled_workflow_events[0]["reason"] == "qqq_historical_universe_unavailable"
     assert strategy._scheduled_workflow_events[0]["status"] == "blocked"
     assert strategy._scheduled_workflow_events[1]["reason"] == "first_observed_after_preferred_weekday"
