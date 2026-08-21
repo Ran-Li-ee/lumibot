@@ -283,6 +283,12 @@ Normalization rules:
 
 The implementation should not assume every N-PORT row maps cleanly to a tradable ticker.
 
+### Identifier Normalization
+
+Real QQQ N-PORT filings may omit ticker symbols even for ordinary equity rows, while still providing CUSIP and ISIN identifiers. The holdings source remains the SEC N-PORT XML; OpenFIGI may be used only as a narrow identifier-normalization service that maps SEC-provided CUSIP/ISIN values to tradable ticker symbols.
+
+OpenFIGI mappings should be cached locally under the QQQ N-PORT data directory so repeat collection runs do not need to re-query the same identifiers. If OpenFIGI is unavailable, rate limited, or does not resolve an identifier, the holding must remain in `excluded_holdings` and the snapshot/report should include a clear warning or metadata signal. The implementation must not fabricate symbols from CUSIP/ISIN values.
+
 ### Snapshot Model
 
 Normalized snapshot schema:

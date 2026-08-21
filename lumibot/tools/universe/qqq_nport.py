@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -17,9 +18,11 @@ QQQ_CIK = "0001067839"
 QQQ_SYMBOL = "QQQ"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_ARCHIVES_BASE_URL = "https://www.sec.gov/Archives/edgar/data"
+OPENFIGI_MAPPING_URL = "https://api.openfigi.com/v3/mapping"
 DEFAULT_USER_AGENT = "LumiBot qqq-nport universe discovery contact@example.com"
 DEFAULT_DATA_DIR = Path(LUMIBOT_CACHE_FOLDER) / "universe" / "qqq_nport"
 SNAPSHOT_SCHEMA_VERSION = 1
+DEFAULT_OPENFIGI_BATCH_SIZE = 10
 
 
 @dataclass(frozen=True)
@@ -305,6 +308,14 @@ def reports_dir(data_dir: str | Path | None = None) -> Path:
     return Path(data_dir or DEFAULT_DATA_DIR) / "reports"
 
 
+def mappings_dir(data_dir: str | Path | None = None) -> Path:
+    return Path(data_dir or DEFAULT_DATA_DIR) / "mappings"
+
+
+def openfigi_symbol_cache_path(data_dir: str | Path | None = None) -> Path:
+    return mappings_dir(data_dir) / "openfigi_symbol_cache.json"
+
+
 def _snapshot_mapping(snapshot: Mapping[str, Any] | SnapshotResolution) -> dict[str, Any]:
     if hasattr(snapshot, "to_dict"):
         data = snapshot.to_dict()
@@ -484,6 +495,50 @@ class SecClient:
             return response.read().decode("utf-8")
 
 
+class OpenFigiClient:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        timeout: int = 30,
+        batch_size: int = DEFAULT_OPENFIGI_BATCH_SIZE,
+    ):
+        self.api_key = api_key or os.environ.get("OPENFIGI_API_KEY")
+        self.timeout = timeout
+        self.batch_size = batch_size
+
+    def map_identifiers(self, jobs: list[Mapping[str, str]]) -> dict[str, str]:
+        mappings: dict[str, str] = {}
+        for start in range(0, len(jobs), self.batch_size):
+            batch = jobs[start : start + self.batch_size]
+            payload = json.dumps(batch).encode("utf-8")
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            if self.api_key:
+                headers["X-OPENFIGI-APIKEY"] = self.api_key
+            request = Request(OPENFIGI_MAPPING_URL, data=payload, headers=headers, method="POST")
+            with urlopen(request, timeout=self.timeout) as response:
+                rows = json.loads(response.read().decode("utf-8"))
+            if not isinstance(rows, list):
+                raise ValueError("OpenFIGI mapping response must be a list")
+            for job, row in zip(batch, rows, strict=False):
+                if not isinstance(row, Mapping):
+                    continue
+                data = row.get("data")
+                if not isinstance(data, list) or not data:
+                    continue
+                first = data[0]
+                if not isinstance(first, Mapping):
+                    continue
+                symbol = normalize_symbol(first.get("ticker"))
+                id_value = job.get("idValue")
+                if isinstance(id_value, str) and symbol:
+                    mappings[id_value] = symbol
+        return mappings
+
+
 def fetch_submissions_json(
     *,
     cik: str = QQQ_CIK,
@@ -515,6 +570,150 @@ def download_or_read_xml(
     return xml_text, "downloaded", path
 
 
+def load_openfigi_symbol_cache(data_dir: str | Path | None = None) -> dict[str, str]:
+    path = openfigi_symbol_cache_path(data_dir)
+    if not path.exists():
+        return {}
+    try:
+        raw_cache = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw_cache, Mapping):
+        return {}
+    cache: dict[str, str] = {}
+    for identifier, symbol in raw_cache.items():
+        normalized = normalize_symbol(symbol)
+        if isinstance(identifier, str) and normalized:
+            cache[identifier] = normalized
+    return cache
+
+
+def write_openfigi_symbol_cache(
+    cache: Mapping[str, str],
+    data_dir: str | Path | None = None,
+) -> None:
+    write_json(openfigi_symbol_cache_path(data_dir), dict(cache))
+
+
+def _identifier_jobs(holdings: Iterable[Holding], id_type: str) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    jobs: list[dict[str, str]] = []
+    for holding in holdings:
+        identifier = holding.cusip if id_type == "ID_CUSIP" else holding.isin
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+        job = {"idType": id_type, "idValue": identifier}
+        if id_type == "ID_CUSIP" or identifier.startswith("US"):
+            job["exchCode"] = "US"
+        jobs.append(job)
+    return jobs
+
+
+def _map_identifier_jobs(
+    jobs: list[dict[str, str]],
+    *,
+    client: Any,
+    cache: dict[str, str],
+    warnings: list[str],
+) -> None:
+    missing_jobs = [job for job in jobs if job["idValue"] not in cache]
+    if not missing_jobs:
+        return
+    try:
+        mapped = client.map_identifiers(missing_jobs)
+    except Exception as exc:
+        warnings.append(f"OpenFIGI identifier mapping failed: {type(exc).__name__}: {exc}")
+        return
+    for identifier, symbol in mapped.items():
+        normalized = normalize_symbol(symbol)
+        if isinstance(identifier, str) and normalized:
+            cache[identifier] = normalized
+
+
+def build_openfigi_symbol_map(
+    holdings: Iterable[Holding],
+    *,
+    data_dir: str | Path | None = None,
+    openfigi_client: Any | None = None,
+    openfigi_api_key: str | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    unresolved_equities = [
+        holding
+        for holding in holdings
+        if holding.symbol is None and _is_equity_like(holding) and (holding.cusip or holding.isin)
+    ]
+    if not unresolved_equities:
+        return {}, []
+
+    warnings: list[str] = []
+    cache = load_openfigi_symbol_cache(data_dir)
+    client = openfigi_client or OpenFigiClient(api_key=openfigi_api_key)
+
+    _map_identifier_jobs(
+        _identifier_jobs(unresolved_equities, "ID_CUSIP"),
+        client=client,
+        cache=cache,
+        warnings=warnings,
+    )
+    still_unresolved = [
+        holding
+        for holding in unresolved_equities
+        if not (holding.cusip and holding.cusip in cache)
+    ]
+    _map_identifier_jobs(
+        _identifier_jobs(still_unresolved, "ID_ISIN"),
+        client=client,
+        cache=cache,
+        warnings=warnings,
+    )
+
+    symbol_map: dict[str, str] = {}
+    unresolved_count = 0
+    for holding in unresolved_equities:
+        symbol = None
+        if holding.cusip:
+            symbol = cache.get(holding.cusip)
+        if symbol is None and holding.isin:
+            symbol = cache.get(holding.isin)
+        if symbol is None:
+            unresolved_count += 1
+            continue
+        if holding.cusip:
+            symbol_map[holding.cusip] = symbol
+        if holding.isin:
+            symbol_map[holding.isin] = symbol
+
+    if symbol_map:
+        write_openfigi_symbol_cache(cache, data_dir)
+    if unresolved_count:
+        warnings.append(f"unresolved identifier mappings: {unresolved_count} equity holdings remain excluded")
+    return symbol_map, warnings
+
+
+def _with_additional_warnings(
+    snapshot: SnapshotResolution,
+    warnings: Iterable[str],
+) -> SnapshotResolution:
+    extra = tuple(warning for warning in warnings if warning)
+    if not extra:
+        return snapshot
+    return SnapshotResolution(
+        fund_symbol=snapshot.fund_symbol,
+        report_date=snapshot.report_date,
+        filing_date=snapshot.filing_date,
+        filing=snapshot.filing,
+        holdings=snapshot.holdings,
+        excluded_holdings=snapshot.excluded_holdings,
+        included_value_usd=snapshot.included_value_usd,
+        excluded_value_usd=snapshot.excluded_value_usd,
+        warnings=snapshot.warnings + extra,
+        summary=snapshot.summary,
+        downloaded_at=snapshot.downloaded_at,
+        schema_version=snapshot.schema_version,
+    )
+
+
 def collect_qqq_nport_snapshots(
     *,
     limit: int | None = None,
@@ -524,6 +723,9 @@ def collect_qqq_nport_snapshots(
     sec_client: Any | None = None,
     refresh: bool = False,
     downloaded_at: str | None = None,
+    resolve_symbols: bool = True,
+    openfigi_client: Any | None = None,
+    openfigi_api_key: str | None = None,
 ) -> dict[str, Any]:
     client = sec_client or SecClient()
     submissions = fetch_submissions_json(cik=QQQ_CIK, sec_client=client)
@@ -552,6 +754,25 @@ def collect_qqq_nport_snapshots(
                 metadata=metadata,
                 downloaded_at=downloaded_at,
             )
+            mapping_warnings: list[str] = []
+            if resolve_symbols and snapshot.holding_count == 0 and snapshot.excluded_holdings:
+                symbol_map, mapping_warnings = build_openfigi_symbol_map(
+                    snapshot.excluded_holdings,
+                    data_dir=data_dir,
+                    openfigi_client=openfigi_client,
+                    openfigi_api_key=openfigi_api_key,
+                )
+                if symbol_map:
+                    def identifier_resolver(holding: Holding, mapping: Mapping[str, str] = symbol_map) -> str | None:
+                        return mapping.get(holding.cusip or "") or mapping.get(holding.isin or "")
+
+                    snapshot = parse_nport_xml(
+                        xml_text,
+                        metadata=metadata,
+                        downloaded_at=downloaded_at,
+                        symbol_resolver=identifier_resolver,
+                    )
+            snapshot = _with_additional_warnings(snapshot, mapping_warnings)
             snapshot_path = write_normalized_snapshot(snapshot, data_dir=data_dir)
             snapshot_paths.append(str(snapshot_path))
             result_rows.append(

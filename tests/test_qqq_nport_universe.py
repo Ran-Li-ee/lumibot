@@ -439,6 +439,20 @@ class FakeSecClient:
         return self.xml_by_url[url]
 
 
+class FakeOpenFigiClient:
+    def __init__(self, mappings):
+        self.mappings = mappings
+        self.requested_jobs = []
+
+    def map_identifiers(self, jobs):
+        self.requested_jobs.append(list(jobs))
+        return {
+            job["idValue"]: self.mappings[job["idValue"]]
+            for job in jobs
+            if job["idValue"] in self.mappings
+        }
+
+
 def test_collect_qqq_nport_snapshots_uses_injected_client_and_writes_files(tmp_path):
     xml_text = NPORT_FIXTURE.read_text(encoding="utf-8")
     submissions = {
@@ -501,6 +515,129 @@ def test_collect_qqq_nport_snapshots_reuses_raw_xml_without_refresh(tmp_path):
 
     assert result["filings"][0]["download_status"] == "reused"
     assert metadata.sec_xml_url not in client.requested_urls
+
+
+def test_collect_qqq_nport_snapshots_resolves_identifiers_with_openfigi(tmp_path):
+    xml_text = (
+        NPORT_FIXTURE.read_text(encoding="utf-8")
+        .replace('<ticker value="AAPL"/>', "")
+        .replace('<ticker value="MSFT"/>', "")
+    )
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001067839-26-000024"],
+                "filingDate": ["2026-05-28"],
+                "reportDate": ["2026-03-31"],
+                "form": ["NPORT-P"],
+                "primaryDocument": ["primary_doc.xml"],
+            }
+        }
+    }
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+    sec_client = FakeSecClient(submissions, {metadata.sec_xml_url: xml_text})
+    openfigi_client = FakeOpenFigiClient({"037833100": "AAPL", "594918104": "MSFT"})
+
+    result = qqq_nport.collect_qqq_nport_snapshots(
+        limit=1,
+        data_dir=tmp_path,
+        sec_client=sec_client,
+        openfigi_client=openfigi_client,
+    )
+    snapshot = qqq_nport.load_snapshot(result["snapshot_paths"][0])
+
+    assert [holding["symbol"] for holding in snapshot["holdings"]] == ["AAPL", "MSFT"]
+    assert snapshot["holding_count"] == 2
+    assert snapshot["excluded_count"] == 1
+
+
+def test_collect_qqq_nport_snapshots_reuses_cached_identifier_mappings(tmp_path):
+    xml_text = (
+        NPORT_FIXTURE.read_text(encoding="utf-8")
+        .replace('<ticker value="AAPL"/>', "")
+        .replace('<ticker value="MSFT"/>', "")
+    )
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001067839-26-000024"],
+                "filingDate": ["2026-05-28"],
+                "reportDate": ["2026-03-31"],
+                "form": ["NPORT-P"],
+                "primaryDocument": ["primary_doc.xml"],
+            }
+        }
+    }
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+    sec_client = FakeSecClient(submissions, {metadata.sec_xml_url: xml_text})
+    openfigi_client = FakeOpenFigiClient({"037833100": "AAPL", "594918104": "MSFT"})
+
+    qqq_nport.collect_qqq_nport_snapshots(
+        limit=1,
+        data_dir=tmp_path,
+        sec_client=sec_client,
+        openfigi_client=openfigi_client,
+    )
+    qqq_nport.collect_qqq_nport_snapshots(
+        limit=1,
+        data_dir=tmp_path,
+        sec_client=sec_client,
+        openfigi_client=openfigi_client,
+    )
+
+    assert len(openfigi_client.requested_jobs) == 1
+
+
+def test_collect_qqq_nport_snapshots_warns_when_identifiers_unresolved(tmp_path):
+    xml_text = (
+        NPORT_FIXTURE.read_text(encoding="utf-8")
+        .replace('<ticker value="AAPL"/>', "")
+        .replace('<ticker value="MSFT"/>', "")
+    )
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001067839-26-000024"],
+                "filingDate": ["2026-05-28"],
+                "reportDate": ["2026-03-31"],
+                "form": ["NPORT-P"],
+                "primaryDocument": ["primary_doc.xml"],
+            }
+        }
+    }
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+    sec_client = FakeSecClient(submissions, {metadata.sec_xml_url: xml_text})
+    openfigi_client = FakeOpenFigiClient({})
+
+    result = qqq_nport.collect_qqq_nport_snapshots(
+        limit=1,
+        data_dir=tmp_path,
+        sec_client=sec_client,
+        openfigi_client=openfigi_client,
+    )
+    snapshot = qqq_nport.load_snapshot(result["snapshot_paths"][0])
+
+    assert snapshot["holding_count"] == 0
+    assert snapshot["excluded_count"] == 3
+    assert any("unresolved identifier" in warning for warning in snapshot["warnings"])
 
 
 def test_build_validation_report_includes_snapshot_quality(tmp_path):

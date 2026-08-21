@@ -1540,6 +1540,33 @@ Do not commit generated files under `data/universe/qqq_nport/`.
 
 ---
 
+### Task 7b: Resolve SEC Identifiers To Tickers With OpenFIGI
+
+Live SEC validation showed that real QQQ N-PORT equity rows often include CUSIP/ISIN identifiers but no ticker fields. The holdings source remains SEC N-PORT; OpenFIGI is used only as a narrow identifier-normalization layer to translate SEC-provided CUSIP/ISIN values to tradable tickers when the XML lacks ticker data.
+
+Implementation notes:
+
+1. Use stdlib `urllib` against `https://api.openfigi.com/v3/mapping`.
+2. Support `OPENFIGI_API_KEY` or an explicit API key parameter, sent as `X-OPENFIGI-APIKEY` when present.
+3. Use conservative batches, defaulting to 10 mapping jobs per request.
+4. Cache successful mappings under the QQQ N-PORT data directory, for example `mappings/openfigi_symbol_cache.json`.
+5. Resolve CUSIP first, then ISIN fallback, using `exchCode` `US` for US identifiers.
+6. Keep unresolved rows in `excluded_holdings`; do not fabricate symbols from identifiers.
+7. Include clear warning/report metadata when identifier mapping fails or leaves equity rows unresolved.
+8. Keep all unit tests network-free with an injected fake OpenFIGI client.
+
+Verification:
+
+```powershell
+python -m pytest tests/test_qqq_nport_universe.py -m "not apitest" -q
+python -m ruff check lumibot/tools/universe/qqq_nport.py scripts/collect_qqq_nport_universe.py tests/test_qqq_nport_universe.py
+python scripts\collect_qqq_nport_universe.py --limit 1 --write-report --as-of 2026-06-01
+```
+
+Do not commit generated OpenFIGI cache or QQQ N-PORT data files.
+
+---
+
 ### Task 8: Final Verification And Hygiene
 
 **Files:**
