@@ -4,9 +4,10 @@ import json
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 from lumibot.constants import LUMIBOT_CACHE_FOLDER
@@ -454,6 +455,133 @@ def resolve_qqq_snapshot(
         snapshot_path=path,
         source_url=source_url,
     )
+
+
+class SecClient:
+    def __init__(self, *, user_agent: str = DEFAULT_USER_AGENT, timeout: int = 30):
+        self.user_agent = user_agent
+        self.timeout = timeout
+
+    def _request(self, url: str) -> Request:
+        return Request(
+            url,
+            headers={
+                "User-Agent": self.user_agent,
+                "Accept-Encoding": "identity",
+            },
+        )
+
+    def get_json(self, url: str) -> dict[str, Any]:
+        with urlopen(self._request(url), timeout=self.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"SEC JSON response must be an object for {url}")
+        return payload
+
+    def get_text(self, url: str) -> str:
+        with urlopen(self._request(url), timeout=self.timeout) as response:
+            return response.read().decode("utf-8")
+
+
+def fetch_submissions_json(
+    *,
+    cik: str = QQQ_CIK,
+    sec_client: Any | None = None,
+) -> dict[str, Any]:
+    client = sec_client or SecClient()
+    return client.get_json(SEC_SUBMISSIONS_URL.format(cik=cik))
+
+
+def raw_xml_path(metadata: FilingMetadata, *, data_dir: str | Path | None = None) -> Path:
+    return raw_dir(data_dir) / f"{metadata.accession_number}.xml"
+
+
+def download_or_read_xml(
+    metadata: FilingMetadata,
+    *,
+    data_dir: str | Path | None = None,
+    sec_client: Any | None = None,
+    refresh: bool = False,
+) -> tuple[str, str, Path]:
+    path = raw_xml_path(metadata, data_dir=data_dir)
+    if path.exists() and not refresh:
+        return path.read_text(encoding="utf-8"), "reused", path
+
+    client = sec_client or SecClient()
+    xml_text = client.get_text(metadata.sec_xml_url)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(xml_text, encoding="utf-8")
+    return xml_text, "downloaded", path
+
+
+def collect_qqq_nport_snapshots(
+    *,
+    limit: int | None = None,
+    start_date: date | str | None = None,
+    end_date: date | str | None = None,
+    data_dir: str | Path | None = None,
+    sec_client: Any | None = None,
+    refresh: bool = False,
+    downloaded_at: str | None = None,
+) -> dict[str, Any]:
+    client = sec_client or SecClient()
+    submissions = fetch_submissions_json(cik=QQQ_CIK, sec_client=client)
+    filings = discover_nport_filings_from_submissions(
+        submissions,
+        cik=QQQ_CIK,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+    )
+
+    result_rows: list[dict[str, Any]] = []
+    snapshot_paths: list[str] = []
+    warnings: list[str] = []
+
+    for metadata in filings:
+        try:
+            xml_text, status, raw_path = download_or_read_xml(
+                metadata,
+                data_dir=data_dir,
+                sec_client=client,
+                refresh=refresh,
+            )
+            snapshot = parse_nport_xml(
+                xml_text,
+                metadata=metadata,
+                downloaded_at=downloaded_at,
+            )
+            snapshot_path = write_normalized_snapshot(snapshot, data_dir=data_dir)
+            snapshot_paths.append(str(snapshot_path))
+            result_rows.append(
+                {
+                    **metadata.to_dict(),
+                    "download_status": status,
+                    "raw_path": str(raw_path),
+                    "snapshot_path": str(snapshot_path),
+                    "holding_count": snapshot.holding_count,
+                    "excluded_count": snapshot.excluded_count,
+                    "warnings": list(snapshot.warnings),
+                }
+            )
+        except Exception as exc:
+            message = f"{metadata.accession_number}: {type(exc).__name__}: {exc}"
+            warnings.append(message)
+            result_rows.append({**metadata.to_dict(), "error": message})
+
+    summary = {
+        "filings_discovered": len(filings),
+        "snapshots_normalized": len(snapshot_paths),
+        "warnings": warnings,
+        "collected_at": downloaded_at or datetime.now(timezone.utc).isoformat(),
+    }
+    result = {
+        "summary": summary,
+        "filings": result_rows,
+        "snapshot_paths": snapshot_paths,
+    }
+    write_json(Path(data_dir or DEFAULT_DATA_DIR) / "latest.json", result)
+    return result
 
 
 def _local_name(tag: str) -> str:

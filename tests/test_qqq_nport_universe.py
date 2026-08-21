@@ -422,3 +422,82 @@ def test_resolve_as_of_skips_snapshot_with_invalid_source_before_selection(tmp_p
     assert result.accession_number == "0001067839-26-000016"
     assert result.symbols == ("AAPL",)
     assert result.source_url is not None
+
+
+class FakeSecClient:
+    def __init__(self, submissions, xml_by_url):
+        self.submissions = submissions
+        self.xml_by_url = xml_by_url
+        self.requested_urls = []
+
+    def get_json(self, url):
+        self.requested_urls.append(url)
+        return self.submissions
+
+    def get_text(self, url):
+        self.requested_urls.append(url)
+        return self.xml_by_url[url]
+
+
+def test_collect_qqq_nport_snapshots_uses_injected_client_and_writes_files(tmp_path):
+    xml_text = NPORT_FIXTURE.read_text(encoding="utf-8")
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001067839-26-000024"],
+                "filingDate": ["2026-05-28"],
+                "reportDate": ["2026-03-31"],
+                "form": ["NPORT-P"],
+                "primaryDocument": ["primary_doc.xml"],
+            }
+        }
+    }
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+    client = FakeSecClient(submissions, {metadata.sec_xml_url: xml_text})
+
+    result = qqq_nport.collect_qqq_nport_snapshots(limit=1, data_dir=tmp_path, sec_client=client)
+
+    assert result["summary"]["filings_discovered"] == 1
+    assert result["summary"]["snapshots_normalized"] == 1
+    assert len(list((tmp_path / "raw").glob("*.xml"))) == 1
+    assert len(list((tmp_path / "normalized").glob("*.json"))) == 1
+    assert (tmp_path / "latest.json").exists()
+    assert result["filings"][0]["holding_count"] == 2
+    assert result["filings"][0]["excluded_count"] == 1
+
+
+def test_collect_qqq_nport_snapshots_reuses_raw_xml_without_refresh(tmp_path):
+    xml_text = NPORT_FIXTURE.read_text(encoding="utf-8")
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001067839-26-000024"],
+                "filingDate": ["2026-05-28"],
+                "reportDate": ["2026-03-31"],
+                "form": ["NPORT-P"],
+                "primaryDocument": ["primary_doc.xml"],
+            }
+        }
+    }
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+    raw_path = tmp_path / "raw" / "0001067839-26-000024.xml"
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_text(xml_text, encoding="utf-8")
+    client = FakeSecClient(submissions, {metadata.sec_xml_url: "<should-not-download/>"})
+
+    result = qqq_nport.collect_qqq_nport_snapshots(limit=1, data_dir=tmp_path, sec_client=client)
+
+    assert result["filings"][0]["download_status"] == "reused"
+    assert metadata.sec_xml_url not in client.requested_urls
