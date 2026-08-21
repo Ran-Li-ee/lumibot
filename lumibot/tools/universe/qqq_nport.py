@@ -406,17 +406,25 @@ def resolve_qqq_snapshot(
     if mode not in {"strict", "prototype"}:
         raise ValueError("mode must be 'strict' or 'prototype'")
 
-    candidates: list[tuple[date, date, Path, dict[str, Any]]] = []
+    candidates: list[tuple[date, date, Path, Mapping[str, Any], str]] = []
     for path in iter_snapshot_paths(data_dir):
-        snapshot = load_snapshot(path)
+        try:
+            snapshot = load_snapshot(path)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(snapshot, Mapping):
+            continue
         try:
             report = parse_date(_snapshot_field(snapshot, "report_date"))
             filing = parse_date(_snapshot_field(snapshot, "filing_date"))
         except (TypeError, ValueError):
             continue
+        accession_number = _snapshot_field(snapshot, "accession_number")
+        if not isinstance(accession_number, str):
+            continue
         effective_date = filing if mode == "strict" else report
         if effective_date <= as_of:
-            candidates.append((report, filing, path, snapshot))
+            candidates.append((report, filing, path, snapshot, accession_number))
 
     if not candidates:
         raise NoSnapshotAvailableError(
@@ -424,13 +432,14 @@ def resolve_qqq_snapshot(
         )
 
     if mode == "strict":
-        report, filing, path, snapshot = max(candidates, key=lambda item: (item[1], item[0]))
+        report, filing, path, snapshot, accession_number = max(
+            candidates,
+            key=lambda item: (item[1], item[0]),
+        )
     else:
-        report, filing, path, snapshot = max(candidates, key=lambda item: (item[0], item[1]))
-    accession_number = _snapshot_field(snapshot, "accession_number")
-    if not isinstance(accession_number, str):
-        raise NoSnapshotAvailableError(
-            f"Stored QQQ snapshot {path} is missing accession_number"
+        report, filing, path, snapshot, accession_number = max(
+            candidates,
+            key=lambda item: (item[0], item[1]),
         )
     source_url = _snapshot_field(snapshot, "source_url") or _snapshot_field(snapshot, "sec_xml_url")
     if not isinstance(source_url, str):
