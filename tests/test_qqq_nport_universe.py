@@ -257,3 +257,77 @@ def test_parse_nport_xml_excludes_no_ticker_equity_rows_without_resolver():
     assert snapshot.holdings == ()
     assert [holding.cusip for holding in snapshot.excluded_holdings[:2]] == ["037833100", "594918104"]
     assert [holding.symbol for holding in snapshot.excluded_holdings[:2]] == [None, None]
+
+
+def _snapshot(accession, report_date, filing_date, symbols):
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number=accession,
+        filing_date=filing_date,
+        report_date=report_date,
+        primary_document="primary_doc.xml",
+    )
+    holdings = tuple(
+        qqq_nport.Holding(symbol=symbol, name=f"{symbol} Inc.", value_usd=100.0)
+        for symbol in symbols
+    )
+    return qqq_nport.SnapshotResolution(
+        fund_symbol="QQQ",
+        report_date=date.fromisoformat(report_date),
+        filing_date=date.fromisoformat(filing_date),
+        filing=metadata,
+        holdings=holdings,
+        included_value_usd=100.0 * len(holdings),
+        summary=qqq_nport.SnapshotSummary(top_holdings=holdings),
+    )
+
+
+def test_write_snapshot_and_resolve_strict_as_of(tmp_path):
+    qqq_nport.write_normalized_snapshot(
+        _snapshot("0001067839-26-000016", "2025-12-31", "2026-02-27", ["AAPL"]),
+        data_dir=tmp_path,
+    )
+    qqq_nport.write_normalized_snapshot(
+        _snapshot("0001067839-26-000024", "2026-03-31", "2026-05-28", ["MSFT"]),
+        data_dir=tmp_path,
+    )
+
+    result = qqq_nport.resolve_qqq_snapshot("2026-04-15", mode="strict", data_dir=tmp_path)
+
+    assert result.as_of_date == date(2026, 4, 15)
+    assert result.mode == "strict"
+    assert result.selected_report_date == date(2025, 12, 31)
+    assert result.selected_filing_date == date(2026, 2, 27)
+    assert result.accession_number == "0001067839-26-000016"
+    assert result.symbols == ("AAPL",)
+    assert result.snapshot_path.name == "qqq_2025-12-31_0001067839-26-000016.json"
+    assert result.source_url.endswith("/primary_doc.xml")
+
+
+def test_resolve_prototype_as_of_uses_report_date(tmp_path):
+    qqq_nport.write_normalized_snapshot(
+        _snapshot("0001067839-26-000016", "2025-12-31", "2026-02-27", ["AAPL"]),
+        data_dir=tmp_path,
+    )
+    qqq_nport.write_normalized_snapshot(
+        _snapshot("0001067839-26-000024", "2026-03-31", "2026-05-28", ["MSFT"]),
+        data_dir=tmp_path,
+    )
+
+    result = qqq_nport.resolve_qqq_snapshot("2026-04-15", mode="prototype", data_dir=tmp_path)
+
+    assert result.mode == "prototype"
+    assert result.selected_report_date == date(2026, 3, 31)
+    assert result.selected_filing_date == date(2026, 5, 28)
+    assert result.accession_number == "0001067839-26-000024"
+    assert result.symbols == ("MSFT",)
+
+
+def test_resolve_as_of_raises_clear_error_when_no_snapshot_available(tmp_path):
+    qqq_nport.write_normalized_snapshot(
+        _snapshot("0001067839-26-000016", "2025-12-31", "2026-02-27", ["AAPL"]),
+        data_dir=tmp_path,
+    )
+
+    with pytest.raises(qqq_nport.NoSnapshotAvailableError, match="No QQQ snapshot available"):
+        qqq_nport.resolve_qqq_snapshot("2026-01-01", mode="strict", data_dir=tmp_path)

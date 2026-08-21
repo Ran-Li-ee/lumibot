@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -74,6 +75,10 @@ class Holding:
 SymbolResolver = Callable[[Holding], str | None]
 
 
+class NoSnapshotAvailableError(LookupError):
+    """Raised when no stored QQQ snapshot can satisfy an as-of request."""
+
+
 @dataclass(frozen=True)
 class SnapshotSummary:
     top_holdings: tuple[Holding, ...] = field(default_factory=tuple)
@@ -131,6 +136,30 @@ class SnapshotResolution:
             "summary": self.summary.to_dict(),
             "downloaded_at": self.downloaded_at,
             "schema_version": self.schema_version,
+        }
+
+
+@dataclass(frozen=True)
+class AsOfSnapshotResolution:
+    as_of_date: date
+    mode: str
+    selected_report_date: date
+    selected_filing_date: date
+    accession_number: str
+    symbols: tuple[str, ...]
+    snapshot_path: Path
+    source_url: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "as_of_date": self.as_of_date.isoformat(),
+            "mode": self.mode,
+            "selected_report_date": self.selected_report_date.isoformat(),
+            "selected_filing_date": self.selected_filing_date.isoformat(),
+            "accession_number": self.accession_number,
+            "symbols": list(self.symbols),
+            "snapshot_path": str(self.snapshot_path),
+            "source_url": self.source_url,
         }
 
 
@@ -260,6 +289,159 @@ def discover_nport_filings_from_submissions(
     if limit is not None:
         return rows[:limit]
     return rows
+
+
+def raw_dir(data_dir: str | Path | None = None) -> Path:
+    return Path(data_dir or DEFAULT_DATA_DIR) / "raw"
+
+
+def normalized_dir(data_dir: str | Path | None = None) -> Path:
+    return Path(data_dir or DEFAULT_DATA_DIR) / "normalized"
+
+
+def reports_dir(data_dir: str | Path | None = None) -> Path:
+    return Path(data_dir or DEFAULT_DATA_DIR) / "reports"
+
+
+def _snapshot_mapping(snapshot: Mapping[str, Any] | SnapshotResolution) -> dict[str, Any]:
+    if hasattr(snapshot, "to_dict"):
+        data = snapshot.to_dict()
+    else:
+        data = dict(snapshot)
+
+    filing = data.get("filing")
+    if isinstance(filing, Mapping):
+        data.setdefault("cik", filing.get("cik"))
+        data.setdefault("accession_number", filing.get("accession_number"))
+        data.setdefault("sec_index_url", filing.get("sec_index_url"))
+        data.setdefault("sec_xml_url", filing.get("sec_xml_url"))
+        data.setdefault("source_url", filing.get("sec_xml_url"))
+    data.setdefault("source", "sec_nport")
+    return data
+
+
+def snapshot_filename(snapshot: Mapping[str, Any] | SnapshotResolution) -> str:
+    data = _snapshot_mapping(snapshot)
+    report_date = data.get("report_date")
+    accession_number = data.get("accession_number")
+    if not isinstance(report_date, str):
+        raise ValueError("snapshot report_date must be an ISO date string")
+    if not isinstance(accession_number, str):
+        raise ValueError("snapshot accession_number must be a string")
+    return f"qqq_{report_date}_{accession_number}.json"
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def write_json(path: str | Path, data: Mapping[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(_json_ready(data), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_normalized_snapshot(
+    snapshot: Mapping[str, Any] | SnapshotResolution,
+    data_dir: str | Path | None = None,
+) -> Path:
+    data = _snapshot_mapping(snapshot)
+    path = normalized_dir(data_dir) / snapshot_filename(data)
+    write_json(path, data)
+    return path
+
+
+def load_snapshot(path: str | Path) -> dict[str, Any]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def iter_snapshot_paths(data_dir: str | Path | None = None) -> list[Path]:
+    directory = normalized_dir(data_dir)
+    if not directory.exists():
+        return []
+    return sorted(directory.glob("qqq_*.json"))
+
+
+def _snapshot_field(snapshot: Mapping[str, Any], name: str) -> Any:
+    value = snapshot.get(name)
+    if value is not None:
+        return value
+    filing = snapshot.get("filing")
+    if isinstance(filing, Mapping):
+        return filing.get(name)
+    return None
+
+
+def _snapshot_symbols(snapshot: Mapping[str, Any]) -> tuple[str, ...]:
+    holdings = snapshot.get("holdings")
+    if not isinstance(holdings, list):
+        return ()
+    symbols: list[str] = []
+    for holding in holdings:
+        if not isinstance(holding, Mapping):
+            continue
+        symbol = holding.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            symbols.append(symbol)
+    return tuple(symbols)
+
+
+def resolve_qqq_snapshot(
+    as_of_date: date | str,
+    mode: str = "strict",
+    data_dir: str | Path | None = None,
+) -> AsOfSnapshotResolution:
+    as_of = parse_date(as_of_date)
+    if mode not in {"strict", "prototype"}:
+        raise ValueError("mode must be 'strict' or 'prototype'")
+
+    candidates: list[tuple[date, date, Path, dict[str, Any]]] = []
+    for path in iter_snapshot_paths(data_dir):
+        snapshot = load_snapshot(path)
+        try:
+            report = parse_date(_snapshot_field(snapshot, "report_date"))
+            filing = parse_date(_snapshot_field(snapshot, "filing_date"))
+        except (TypeError, ValueError):
+            continue
+        effective_date = filing if mode == "strict" else report
+        if effective_date <= as_of:
+            candidates.append((report, filing, path, snapshot))
+
+    if not candidates:
+        raise NoSnapshotAvailableError(
+            f"No QQQ snapshot available for as_of_date={as_of.isoformat()} mode={mode}"
+        )
+
+    report, filing, path, snapshot = max(candidates, key=lambda item: (item[0], item[1]))
+    accession_number = _snapshot_field(snapshot, "accession_number")
+    if not isinstance(accession_number, str):
+        raise NoSnapshotAvailableError(
+            f"Stored QQQ snapshot {path} is missing accession_number"
+        )
+    source_url = _snapshot_field(snapshot, "source_url") or _snapshot_field(snapshot, "sec_xml_url")
+    if not isinstance(source_url, str):
+        source_url = None
+    return AsOfSnapshotResolution(
+        as_of_date=as_of,
+        mode=mode,
+        selected_report_date=report,
+        selected_filing_date=filing,
+        accession_number=accession_number,
+        symbols=_snapshot_symbols(snapshot),
+        snapshot_path=path,
+        source_url=source_url,
+    )
 
 
 def _local_name(tag: str) -> str:
