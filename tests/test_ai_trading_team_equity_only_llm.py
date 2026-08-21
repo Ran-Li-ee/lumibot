@@ -592,6 +592,70 @@ def test_qqq_historical_strategy_blocks_without_fallback_when_snapshot_missing(m
     assert strategy._scheduled_workflow_events[-1]["status"] == "blocked"
 
 
+def test_qqq_historical_strategy_retries_same_week_after_missing_snapshot(monkeypatch):
+    module = load_module()
+    qqq_nport = importlib.import_module("lumibot.tools.universe.qqq_nport")
+    strategy = make_running_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)
+    current_datetime = datetime(2024, 9, 2, 9, 30)
+    strategy.get_datetime = lambda: current_datetime
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": ["MSFT", "AAPL", "NVDA"],
+            "selected_symbol": "AAPL",
+            "reason_brief": "AAPL has the strongest QQQ constituent evidence.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+    resolver_calls = []
+
+    def fake_resolve_qqq_snapshot(as_of_date, *, mode="strict", data_dir=None):
+        resolver_calls.append(as_of_date)
+        if as_of_date == "2024-09-02":
+            raise qqq_nport.NoSnapshotAvailableError("No QQQ snapshot available")
+        return qqq_resolution(as_of_date="2024-09-03", symbols=("MSFT", "AAPL", "NVDA"))
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 0.0,
+                "cash_after_estimate": 100000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []},
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "resolve_qqq_snapshot", fake_resolve_qqq_snapshot)
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+    assert strategy._scheduled_workflow_attempted_week_keys == set()
+    assert strategy.agents["equity_basket_agent"].calls == []
+    assert len(strategy._scheduled_workflow_events) == 1
+
+    current_datetime = datetime(2024, 9, 3, 9, 30)
+    strategy.on_trading_iteration()
+
+    assert resolver_calls == ["2024-09-02", "2024-09-03"]
+    assert strategy.agents["equity_basket_agent"].calls
+    assert strategy.agents["equity_basket_agent"].calls[0]["context"]["date"] == "2024-09-03"
+    assert strategy._scheduled_workflow_events[0]["reason"] == "qqq_historical_universe_unavailable"
+    assert strategy._scheduled_workflow_events[0]["status"] == "blocked"
+    assert strategy._scheduled_workflow_events[1]["reason"] == "first_observed_after_preferred_weekday"
+    assert strategy._scheduled_workflow_events[1]["status"] == "run"
+    assert "2024-W36" in strategy._scheduled_workflow_attempted_week_keys
+
+
 def test_qqq_historical_strategy_rejects_selected_symbol_outside_resolved_universe(monkeypatch):
     module = load_module()
     strategy = make_running_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)

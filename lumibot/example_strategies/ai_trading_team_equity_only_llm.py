@@ -326,7 +326,11 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             return False
         return True
 
-    def _run_equity_only_workflow(self, current_date: str) -> None:
+    def _run_equity_only_workflow(
+        self,
+        current_date: str,
+        scheduled_workflow_event: dict[str, Any] | None = None,
+    ) -> None:
         try:
             equity_universe, universe_source = self._equity_universe_for_date(current_date)
         except NoSnapshotAvailableError as exc:
@@ -346,9 +350,13 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             self._log_equity_only_workflow_blocked(f"Equity-only LLM workflow blocked: {exc}")
             return
         except ValueError as exc:
+            if scheduled_workflow_event is not None:
+                self._mark_scheduled_workflow_attempted(scheduled_workflow_event)
             self._last_execution_plan_error = str(exc)
             self._log_equity_only_workflow_blocked(f"Equity-only LLM workflow blocked: {exc}")
             return
+        if scheduled_workflow_event is not None:
+            self._mark_scheduled_workflow_attempted(scheduled_workflow_event)
         try:
             equity_result = self.agents[EQUITY_AGENT_NAME].run(
                 task_prompt=equity_basket_agent_task_prompt(),
@@ -454,8 +462,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         if not cadence_event["should_run"]:
             self._record_scheduled_workflow_event(cadence_event)
             return
-        self._mark_scheduled_workflow_attempted(cadence_event)
-        self._run_equity_only_workflow(current_date)
+        self._run_equity_only_workflow(current_date, scheduled_workflow_event=cadence_event)
 
 
 class AITradingTeamQQQHistoricalEquityOnlyLLMStrategy(AITradingTeamEquityOnlyLLMStrategy):
