@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -582,6 +582,162 @@ def collect_qqq_nport_snapshots(
     }
     write_json(Path(data_dir or DEFAULT_DATA_DIR) / "latest.json", result)
     return result
+
+
+def _format_money(value: Any) -> str:
+    try:
+        return f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _format_weight(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _collection_warnings(summary: Mapping[str, Any]) -> list[Any]:
+    warnings = summary.get("warnings", [])
+    if isinstance(warnings, list):
+        return warnings
+    return []
+
+
+def _snapshot_report_data(path: Any) -> Mapping[str, Any] | None:
+    if not isinstance(path, str):
+        return None
+    snapshot_path = Path(path)
+    if not snapshot_path.exists():
+        return None
+    try:
+        snapshot = load_snapshot(snapshot_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(snapshot, Mapping):
+        return None
+    return snapshot
+
+
+def build_validation_report(
+    collection_result: Mapping[str, Any],
+    *,
+    data_dir: Path | str | None = None,
+    example_as_of_dates: Iterable[date | str] | None = None,
+) -> str:
+    summary = collection_result.get("summary", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+    warnings = _collection_warnings(summary)
+
+    lines = [
+        "# QQQ N-PORT Universe Collection Report",
+        "",
+        "## Summary",
+        "",
+        f"- Collected at: {summary.get('collected_at', 'n/a')}",
+        f"- Filings discovered: {summary.get('filings_discovered', 0)}",
+        f"- Snapshots normalized: {summary.get('snapshots_normalized', 0)}",
+        f"- Warnings: {len(warnings)}",
+        "",
+    ]
+    if warnings:
+        lines.extend(["## Collection Warnings", ""])
+        for warning in warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    lines.extend(["## Snapshots", ""])
+    filings = collection_result.get("filings", [])
+    if not isinstance(filings, list):
+        filings = []
+    for row in filings:
+        if not isinstance(row, Mapping):
+            continue
+        lines.extend(
+            [
+                f"### {row.get('report_date', 'n/a')} / {row.get('accession_number', 'n/a')}",
+                "",
+                f"- Filing date: {row.get('filing_date', 'n/a')}",
+                f"- Holding count: {row.get('holding_count', 'n/a')}",
+                f"- Excluded count: {row.get('excluded_count', 'n/a')}",
+            ]
+        )
+
+        snapshot = _snapshot_report_data(row.get("snapshot_path"))
+        if snapshot is not None:
+            lines.append(f"- Included value USD: {_format_money(snapshot.get('included_value_usd'))}")
+            lines.append(f"- Excluded value USD: {_format_money(snapshot.get('excluded_value_usd'))}")
+            lines.extend(["", "| Symbol | Weight | Value USD |", "|---|---:|---:|"])
+            snapshot_summary = snapshot.get("summary", {})
+            top_holdings = []
+            if isinstance(snapshot_summary, Mapping):
+                top_holdings = snapshot_summary.get("top_holdings", [])
+            if not isinstance(top_holdings, list) or not top_holdings:
+                top_holdings = snapshot.get("holdings", [])
+            if not isinstance(top_holdings, list):
+                top_holdings = []
+            for holding in top_holdings[:10]:
+                if not isinstance(holding, Mapping):
+                    continue
+                lines.append(
+                    "| "
+                    f"{holding.get('symbol', '')} | "
+                    f"{_format_weight(holding.get('weight'))} | "
+                    f"{_format_money(holding.get('value_usd'))} |"
+                )
+
+        row_warnings = row.get("warnings", [])
+        if isinstance(row_warnings, list) and row_warnings:
+            lines.extend(["", "Warnings:"])
+            for warning in row_warnings:
+                lines.append(f"- {warning}")
+        lines.append("")
+
+    dates = list(example_as_of_dates or [])
+    if dates:
+        lines.extend(["## Example As-Of Lookups", ""])
+        for as_of in dates:
+            as_of_text = parse_date(as_of).isoformat()
+            for mode in ("strict", "prototype"):
+                try:
+                    resolution = resolve_qqq_snapshot(as_of, mode=mode, data_dir=data_dir)
+                    lines.append(
+                        f"- {as_of_text} `{mode}` -> "
+                        f"{resolution.accession_number}, {len(resolution.symbols)} symbols"
+                    )
+                except (NoSnapshotAvailableError, ValueError) as exc:
+                    lines.append(f"- {as_of_text} `{mode}` -> unavailable: {exc}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_validation_report(
+    collection_result: Mapping[str, Any],
+    *,
+    data_dir: Path | str | None = None,
+    timestamp: str | None = None,
+    example_as_of_dates: Iterable[date | str] | None = None,
+) -> dict[str, Path]:
+    report_timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    directory = reports_dir(data_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    markdown_path = directory / f"qqq_nport_collection_{report_timestamp}.md"
+    json_path = directory / f"qqq_nport_collection_{report_timestamp}.json"
+    markdown_path.write_text(
+        build_validation_report(
+            collection_result,
+            data_dir=data_dir,
+            example_as_of_dates=example_as_of_dates,
+        ),
+        encoding="utf-8",
+    )
+    write_json(json_path, collection_result)
+    return {"markdown": markdown_path, "json": json_path}
 
 
 def _local_name(tag: str) -> str:

@@ -501,3 +501,74 @@ def test_collect_qqq_nport_snapshots_reuses_raw_xml_without_refresh(tmp_path):
 
     assert result["filings"][0]["download_status"] == "reused"
     assert metadata.sec_xml_url not in client.requested_urls
+
+
+def test_build_validation_report_includes_snapshot_quality(tmp_path):
+    snapshot_path = qqq_nport.write_normalized_snapshot(
+        _snapshot("new", "2026-03-31", "2026-05-28", ["AAPL", "MSFT"]),
+        data_dir=tmp_path,
+    )
+    result = {
+        "summary": {
+            "filings_discovered": 1,
+            "snapshots_normalized": 1,
+            "warnings": ["collection warning"],
+            "collected_at": "2026-08-21T12:00:00+00:00",
+        },
+        "filings": [
+            {
+                "accession_number": "new",
+                "report_date": "2026-03-31",
+                "filing_date": "2026-05-28",
+                "snapshot_path": str(snapshot_path),
+                "holding_count": 2,
+                "excluded_count": 0,
+                "warnings": ["snapshot warning"],
+            }
+        ],
+    }
+
+    report = qqq_nport.build_validation_report(
+        result,
+        data_dir=tmp_path,
+        example_as_of_dates=["2026-06-01"],
+    )
+
+    assert "# QQQ N-PORT Universe Collection Report" in report
+    assert "2026-08-21T12:00:00+00:00" in report
+    assert "2026-03-31" in report
+    assert "new" in report
+    assert "Holding count: 2" in report
+    assert "Excluded count: 0" in report
+    assert "Included value USD: 200.00" in report
+    assert "Excluded value USD: 0.00" in report
+    assert "AAPL" in report
+    assert "MSFT" in report
+    assert "snapshot warning" in report
+    assert "strict" in report
+    assert "prototype" in report
+
+
+def test_write_validation_report_writes_markdown_and_json(tmp_path):
+    result = {
+        "summary": {
+            "filings_discovered": 0,
+            "snapshots_normalized": 0,
+            "warnings": [],
+            "collected_at": "now",
+        },
+        "filings": [],
+    }
+
+    paths = qqq_nport.write_validation_report(
+        result,
+        data_dir=tmp_path,
+        timestamp="20260821_120000",
+    )
+
+    assert paths["markdown"].name == "qqq_nport_collection_20260821_120000.md"
+    assert paths["json"].name == "qqq_nport_collection_20260821_120000.json"
+    assert paths["markdown"].exists()
+    assert paths["json"].exists()
+    assert paths["markdown"].parent == qqq_nport.reports_dir(tmp_path)
+    assert qqq_nport.load_snapshot(paths["json"]) == result
