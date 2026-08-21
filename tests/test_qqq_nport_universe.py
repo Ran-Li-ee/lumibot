@@ -1,7 +1,5 @@
 from datetime import date
 
-import pytest
-
 from lumibot.tools.universe import qqq_nport
 
 
@@ -82,3 +80,42 @@ def test_discover_nport_filings_applies_date_filters_and_limit():
 
     assert len(rows) == 1
     assert rows[0].accession_number == "0001067839-26-000024"
+
+
+def test_discover_nport_filings_skips_rows_with_invalid_dates():
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": [
+                    "0001067839-26-000024",
+                    "0001067839-26-000016",
+                ],
+                "filingDate": ["not-a-date", "2026-02-27"],
+                "reportDate": ["2026-03-31", "2025-12-31"],
+                "form": ["NPORT-P", "NPORT-P"],
+                "primaryDocument": ["primary_doc.xml", "primary_doc.xml"],
+            }
+        }
+    }
+
+    rows = qqq_nport.discover_nport_filings_from_submissions(submissions, cik="0001067839")
+
+    assert [row.accession_number for row in rows] == ["0001067839-26-000016"]
+
+
+def test_discover_nport_filings_ignores_scalar_recent_values():
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": "0001067839-26-000024",
+                "filingDate": "2026-05-28",
+                "reportDate": {"date": "2026-03-31"},
+                "form": "NPORT-P",
+                "primaryDocument": "primary_doc.xml",
+            }
+        }
+    }
+
+    rows = qqq_nport.discover_nport_filings_from_submissions(submissions, cik="0001067839")
+
+    assert rows == []

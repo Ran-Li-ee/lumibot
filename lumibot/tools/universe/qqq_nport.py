@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Mapping
 
 from lumibot.constants import LUMIBOT_CACHE_FOLDER
 
@@ -43,12 +43,12 @@ class FilingMetadata:
 class Holding:
     symbol: str
     name: str
-    cusip: Optional[str] = None
-    isin: Optional[str] = None
-    value_usd: Optional[Decimal] = None
-    balance: Optional[Decimal] = None
-    units: Optional[str] = None
-    percent_value: Optional[Decimal] = None
+    cusip: str | None = None
+    isin: str | None = None
+    value_usd: Decimal | None = None
+    balance: Decimal | None = None
+    units: str | None = None
+    percent_value: Decimal | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -146,7 +146,7 @@ def _recent_filings(submissions: Mapping[str, Any]) -> Mapping[str, list[Any]]:
     recent = filings.get("recent")
     if not isinstance(recent, Mapping):
         return {}
-    return {key: list(value) for key, value in recent.items() if isinstance(value, Iterable)}
+    return {key: value for key, value in recent.items() if isinstance(value, list)}
 
 
 def discover_nport_filings_from_submissions(
@@ -179,7 +179,7 @@ def discover_nport_filings_from_submissions(
                 report_date=report_dates[index],
                 primary_document=primary_documents[index],
             )
-        except IndexError:
+        except (AttributeError, IndexError, TypeError, ValueError):
             continue
 
         if start is not None and row.filing_date < start:
