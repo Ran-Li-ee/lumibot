@@ -92,6 +92,10 @@ STRATEGIES = _LazyStrategyRegistry(
             "lumibot.example_strategies.ai_trading_team_equity_only_llm",
             "AITradingTeamEquityOnlyLLMStrategy",
         ),
+        "qqq-historical-equity-only-llm": (
+            "lumibot.example_strategies.ai_trading_team_equity_only_llm",
+            "AITradingTeamQQQHistoricalEquityOnlyLLMStrategy",
+        ),
     }
 )
 
