@@ -549,6 +549,15 @@ def test_build_validation_report_includes_snapshot_quality(tmp_path):
     assert "prototype" in report
 
 
+def test_build_validation_report_marks_malformed_as_of_example_unavailable():
+    result = {"summary": {}, "filings": []}
+
+    report = qqq_nport.build_validation_report(result, example_as_of_dates=["not-a-date"])
+
+    assert "not-a-date" in report
+    assert "unavailable" in report
+
+
 def test_write_validation_report_writes_markdown_and_json(tmp_path):
     result = {
         "summary": {

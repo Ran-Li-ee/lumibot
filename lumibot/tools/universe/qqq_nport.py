@@ -701,15 +701,16 @@ def build_validation_report(
     if dates:
         lines.extend(["## Example As-Of Lookups", ""])
         for as_of in dates:
-            as_of_text = parse_date(as_of).isoformat()
             for mode in ("strict", "prototype"):
                 try:
+                    as_of_text = parse_date(as_of).isoformat()
                     resolution = resolve_qqq_snapshot(as_of, mode=mode, data_dir=data_dir)
                     lines.append(
                         f"- {as_of_text} `{mode}` -> "
                         f"{resolution.accession_number}, {len(resolution.symbols)} symbols"
                     )
-                except (NoSnapshotAvailableError, ValueError) as exc:
+                except (NoSnapshotAvailableError, TypeError, ValueError) as exc:
+                    as_of_text = str(as_of)
                     lines.append(f"- {as_of_text} `{mode}` -> unavailable: {exc}")
         lines.append("")
 
