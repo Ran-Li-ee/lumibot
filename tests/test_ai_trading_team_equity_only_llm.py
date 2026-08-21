@@ -507,7 +507,7 @@ def test_qqq_historical_strategy_resolves_snapshot_and_passes_metadata_to_equity
         "selected_filing_date": "2024-08-28",
         "accession_number": "0001752724-24-196011",
         "holding_count": 4,
-        "snapshot_path": "C:/cache/qqq_nport_2024-06-30.json",
+        "snapshot_path": str(Path("C:/cache/qqq_nport_2024-06-30.json")),
         "source_url": "https://www.sec.gov/example.xml",
     }
 
@@ -631,6 +631,7 @@ def test_qqq_historical_equity_agent_prompt_mentions_historical_constituents_wit
         "provided basket_symbols",
         "current backtest date",
         "current rank evidence",
+        "do not invent sector",
         "do not add symbols",
         "index weight",
     ):
@@ -640,8 +641,6 @@ def test_qqq_historical_equity_agent_prompt_mentions_historical_constituents_wit
         "automatically high quality",
         "always prefer",
         "buy qqq",
-        "sector",
-        "style",
         "safety label",
     ):
         assert forbidden not in prompt
