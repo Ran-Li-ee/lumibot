@@ -401,3 +401,24 @@ def test_resolve_as_of_skips_snapshot_with_invalid_accession_before_selection(tm
 
     assert result.accession_number == "0001067839-26-000016"
     assert result.symbols == ("AAPL",)
+
+
+def test_resolve_as_of_skips_snapshot_with_invalid_source_before_selection(tmp_path):
+    qqq_nport.write_normalized_snapshot(
+        _snapshot("0001067839-26-000016", "2025-12-31", "2026-02-27", ["AAPL"]),
+        data_dir=tmp_path,
+    )
+    malformed = _snapshot("0001067839-26-000024", "2026-03-31", "2026-05-28", ["MSFT"]).to_dict()
+    malformed["source_url"] = None
+    malformed["sec_xml_url"] = None
+    malformed["filing"]["sec_xml_url"] = None
+    qqq_nport.write_json(
+        qqq_nport.normalized_dir(tmp_path) / "qqq_nport_2026-03-31_invalid_source.json",
+        malformed,
+    )
+
+    result = qqq_nport.resolve_qqq_snapshot("2026-06-01", mode="strict", data_dir=tmp_path)
+
+    assert result.accession_number == "0001067839-26-000016"
+    assert result.symbols == ("AAPL",)
+    assert result.source_url is not None

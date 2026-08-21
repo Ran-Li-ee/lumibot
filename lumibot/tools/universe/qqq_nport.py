@@ -406,7 +406,7 @@ def resolve_qqq_snapshot(
     if mode not in {"strict", "prototype"}:
         raise ValueError("mode must be 'strict' or 'prototype'")
 
-    candidates: list[tuple[date, date, Path, Mapping[str, Any], str]] = []
+    candidates: list[tuple[date, date, Path, Mapping[str, Any], str, str]] = []
     for path in iter_snapshot_paths(data_dir):
         try:
             snapshot = load_snapshot(path)
@@ -422,9 +422,12 @@ def resolve_qqq_snapshot(
         accession_number = _snapshot_field(snapshot, "accession_number")
         if not isinstance(accession_number, str):
             continue
+        source_url = _snapshot_field(snapshot, "source_url") or _snapshot_field(snapshot, "sec_xml_url")
+        if not isinstance(source_url, str) or not source_url:
+            continue
         effective_date = filing if mode == "strict" else report
         if effective_date <= as_of:
-            candidates.append((report, filing, path, snapshot, accession_number))
+            candidates.append((report, filing, path, snapshot, accession_number, source_url))
 
     if not candidates:
         raise NoSnapshotAvailableError(
@@ -432,18 +435,15 @@ def resolve_qqq_snapshot(
         )
 
     if mode == "strict":
-        report, filing, path, snapshot, accession_number = max(
+        report, filing, path, snapshot, accession_number, source_url = max(
             candidates,
             key=lambda item: (item[1], item[0]),
         )
     else:
-        report, filing, path, snapshot, accession_number = max(
+        report, filing, path, snapshot, accession_number, source_url = max(
             candidates,
             key=lambda item: (item[0], item[1]),
         )
-    source_url = _snapshot_field(snapshot, "source_url") or _snapshot_field(snapshot, "sec_xml_url")
-    if not isinstance(source_url, str):
-        source_url = None
     return AsOfSnapshotResolution(
         as_of_date=as_of,
         mode=mode,
