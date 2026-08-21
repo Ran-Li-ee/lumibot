@@ -620,3 +620,16 @@ def test_parse_cli_args_accepts_collection_options():
     assert args.refresh is True
     assert args.write_report is True
     assert args.as_of == "2025-04-15"
+
+
+@pytest.mark.apitest
+def test_live_sec_smoke_collects_one_recent_qqq_snapshot(tmp_path):
+    result = qqq_nport.collect_qqq_nport_snapshots(limit=1, data_dir=tmp_path)
+
+    assert result["summary"]["filings_discovered"] == 1
+    assert result["summary"]["snapshots_normalized"] == 1
+    snapshot_paths = list((tmp_path / "normalized").glob("*.json"))
+    assert len(snapshot_paths) == 1
+    snapshot = qqq_nport.load_snapshot(snapshot_paths[0])
+    assert snapshot["fund_symbol"] == "QQQ"
+    assert snapshot["holding_count"] >= 80
