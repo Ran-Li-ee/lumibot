@@ -1,6 +1,11 @@
 from datetime import date
+from pathlib import Path
+
+import pytest
 
 from lumibot.tools.universe import qqq_nport
+
+NPORT_FIXTURE = Path(__file__).parent / "fixtures" / "qqq_nport" / "sample_primary_doc.xml"
 
 
 def test_build_sec_archive_urls_for_qqq_nport_filing():
@@ -141,3 +146,44 @@ def test_discover_nport_filings_skips_rows_with_non_string_primary_document():
 
     assert [row.accession_number for row in rows] == ["0001067839-26-000016"]
     assert rows[0].primary_document == "primary_doc.xml"
+
+
+def test_parse_nport_xml_normalizes_holdings_and_exclusions():
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+
+    snapshot = qqq_nport.parse_nport_xml(NPORT_FIXTURE.read_text(encoding="utf-8"), metadata)
+
+    assert snapshot.schema_version == 1
+    assert snapshot.fund_symbol == "QQQ"
+    assert snapshot.report_date == date(2026, 3, 31)
+    assert snapshot.filing_date == date(2026, 5, 28)
+    assert [holding.symbol for holding in snapshot.holdings] == ["AAPL", "MSFT"]
+    assert snapshot.holding_count == 2
+    assert snapshot.excluded_count == 1
+    assert snapshot.included_value_usd == 250000.0
+    assert snapshot.excluded_value_usd == 1000.0
+    assert snapshot.holdings[0].weight == pytest.approx(0.6)
+    assert snapshot.holdings[1].weight == pytest.approx(0.4)
+    assert snapshot.excluded_holdings[0].name == "Cash Collateral"
+    assert [holding.symbol for holding in snapshot.summary.top_holdings] == ["AAPL", "MSFT"]
+
+
+def test_parse_nport_xml_warns_on_duplicate_symbols():
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+    xml_text = NPORT_FIXTURE.read_text(encoding="utf-8").replace("<ticker>MSFT</ticker>", "<ticker>AAPL</ticker>")
+
+    snapshot = qqq_nport.parse_nport_xml(xml_text, metadata)
+
+    assert any("duplicate symbol" in warning for warning in snapshot.warnings)

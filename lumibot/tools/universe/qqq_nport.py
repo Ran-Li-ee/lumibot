@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
+from xml.etree import ElementTree
 
 from lumibot.constants import LUMIBOT_CACHE_FOLDER
 
@@ -41,14 +42,16 @@ class FilingMetadata:
 
 @dataclass(frozen=True)
 class Holding:
-    symbol: str
+    symbol: str | None
     name: str
     cusip: str | None = None
     isin: str | None = None
-    value_usd: Decimal | None = None
-    balance: Decimal | None = None
+    value_usd: float | None = None
+    balance: float | None = None
     units: str | None = None
-    percent_value: Decimal | None = None
+    percent_value: float | None = None
+    asset_category: str | None = None
+    weight: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,27 +59,71 @@ class Holding:
             "name": self.name,
             "cusip": self.cusip,
             "isin": self.isin,
-            "value_usd": str(self.value_usd) if self.value_usd is not None else None,
-            "balance": str(self.balance) if self.balance is not None else None,
+            "value_usd": self.value_usd,
+            "balance": self.balance,
             "units": self.units,
-            "percent_value": str(self.percent_value) if self.percent_value is not None else None,
+            "percent_value": self.percent_value,
+            "asset_category": self.asset_category,
+            "weight": self.weight,
+        }
+
+
+@dataclass(frozen=True)
+class SnapshotSummary:
+    top_holdings: tuple[Holding, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "top_holdings": [holding.to_dict() for holding in self.top_holdings],
         }
 
 
 @dataclass(frozen=True)
 class SnapshotResolution:
-    symbol: str
-    as_of_date: date
+    fund_symbol: str
+    report_date: date
+    filing_date: date
     filing: FilingMetadata
     holdings: tuple[Holding, ...] = field(default_factory=tuple)
+    excluded_holdings: tuple[Holding, ...] = field(default_factory=tuple)
+    included_value_usd: float = 0.0
+    excluded_value_usd: float = 0.0
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+    summary: SnapshotSummary = field(default_factory=SnapshotSummary)
+    downloaded_at: str | None = None
     schema_version: int = SNAPSHOT_SCHEMA_VERSION
+
+    @property
+    def symbol(self) -> str:
+        return self.fund_symbol
+
+    @property
+    def as_of_date(self) -> date:
+        return self.report_date
+
+    @property
+    def holding_count(self) -> int:
+        return len(self.holdings)
+
+    @property
+    def excluded_count(self) -> int:
+        return len(self.excluded_holdings)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "symbol": self.symbol,
-            "as_of_date": self.as_of_date.isoformat(),
+            "fund_symbol": self.fund_symbol,
+            "report_date": self.report_date.isoformat(),
+            "filing_date": self.filing_date.isoformat(),
             "filing": self.filing.to_dict(),
             "holdings": [holding.to_dict() for holding in self.holdings],
+            "excluded_holdings": [holding.to_dict() for holding in self.excluded_holdings],
+            "holding_count": self.holding_count,
+            "excluded_count": self.excluded_count,
+            "included_value_usd": self.included_value_usd,
+            "excluded_value_usd": self.excluded_value_usd,
+            "warnings": list(self.warnings),
+            "summary": self.summary.to_dict(),
+            "downloaded_at": self.downloaded_at,
             "schema_version": self.schema_version,
         }
 
@@ -201,3 +248,152 @@ def discover_nport_filings_from_submissions(
     if limit is not None:
         return rows[:limit]
     return rows
+
+
+def _local_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.rsplit("}", 1)[1]
+    return tag
+
+
+def _child_text(element: ElementTree.Element, *names: str) -> str | None:
+    wanted = set(names)
+    for child in element.iter():
+        if child is element:
+            continue
+        if _local_name(child.tag) in wanted and child.text is not None:
+            value = child.text.strip()
+            if value:
+                return value
+    return None
+
+
+def normalize_symbol(value: str | None) -> str | None:
+    if value is None:
+        return None
+    symbol = value.strip().upper()
+    if symbol in {"", "N/A", "NA", "NIL", "NONE", "NULL"}:
+        return None
+    if not all(character.isalnum() or character in {".", "-"} for character in symbol):
+        return None
+    return symbol
+
+
+def _to_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    normalized = value.strip().replace(",", "")
+    if not normalized:
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _parse_holding(element: ElementTree.Element) -> Holding:
+    return Holding(
+        symbol=normalize_symbol(_child_text(element, "ticker", "issuerTicker")),
+        name=_child_text(element, "name", "title") or "",
+        cusip=_child_text(element, "cusip"),
+        isin=_child_text(element, "isin"),
+        value_usd=_to_float(_child_text(element, "valUSD")),
+        balance=_to_float(_child_text(element, "balance")),
+        units=_child_text(element, "units"),
+        percent_value=_to_float(_child_text(element, "pctVal", "percentValue")),
+        asset_category=_child_text(element, "assetCat"),
+    )
+
+
+def _find_investment_elements(root: ElementTree.Element) -> list[ElementTree.Element]:
+    return [
+        element
+        for element in root.iter()
+        if _local_name(element.tag) in {"invstOrSec", "investment"}
+    ]
+
+
+def _is_equity_like(holding: Holding) -> bool:
+    return (holding.asset_category or "").upper() in {"EC"}
+
+
+def _with_weight(holding: Holding, weight: float | None) -> Holding:
+    return Holding(
+        symbol=holding.symbol,
+        name=holding.name,
+        cusip=holding.cusip,
+        isin=holding.isin,
+        value_usd=holding.value_usd,
+        balance=holding.balance,
+        units=holding.units,
+        percent_value=holding.percent_value,
+        asset_category=holding.asset_category,
+        weight=weight,
+    )
+
+
+def parse_nport_xml(
+    xml_text: str,
+    metadata: FilingMetadata,
+    downloaded_at: str | None = None,
+) -> SnapshotResolution:
+    root = ElementTree.fromstring(xml_text)
+    included: list[Holding] = []
+    excluded: list[Holding] = []
+
+    for element in _find_investment_elements(root):
+        holding = _parse_holding(element)
+        if holding.symbol is not None and _is_equity_like(holding):
+            included.append(holding)
+        else:
+            excluded.append(holding)
+
+    included_value_usd = sum(holding.value_usd or 0.0 for holding in included)
+    excluded_value_usd = sum(holding.value_usd or 0.0 for holding in excluded)
+
+    weighted_holdings = tuple(
+        _with_weight(
+            holding,
+            (holding.value_usd or 0.0) / included_value_usd
+            if included_value_usd
+            else None,
+        )
+        for holding in included
+    )
+    excluded_holdings = tuple(_with_weight(holding, None) for holding in excluded)
+
+    warnings: list[str] = []
+    duplicate_symbols = [
+        symbol
+        for symbol, count in Counter(holding.symbol for holding in weighted_holdings).items()
+        if symbol is not None and count > 1
+    ]
+    for symbol in duplicate_symbols:
+        warnings.append(f"duplicate symbol {symbol} in N-PORT holdings")
+    if len(weighted_holdings) < 2:
+        warnings.append(f"low holding count: {len(weighted_holdings)}")
+    total_value_usd = included_value_usd + excluded_value_usd
+    if total_value_usd and excluded_value_usd / total_value_usd > 0.2:
+        warnings.append("high excluded value ratio")
+
+    top_holdings = tuple(
+        sorted(
+            weighted_holdings,
+            key=lambda holding: holding.weight or 0.0,
+            reverse=True,
+        )
+    )
+
+    return SnapshotResolution(
+        fund_symbol=QQQ_SYMBOL,
+        report_date=metadata.report_date,
+        filing_date=metadata.filing_date,
+        filing=metadata,
+        holdings=weighted_holdings,
+        excluded_holdings=excluded_holdings,
+        included_value_usd=included_value_usd,
+        excluded_value_usd=excluded_value_usd,
+        warnings=tuple(warnings),
+        summary=SnapshotSummary(top_holdings=top_holdings),
+        downloaded_at=downloaded_at,
+    )

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<edgarSubmission xmlns="http://www.sec.gov/edgar/nport">
+  <formData>
+    <invstOrSecs>
+      <invstOrSec>
+        <name>Apple Inc.</name>
+        <ticker>AAPL</ticker>
+        <valUSD>150000</valUSD>
+        <assetCat>EC</assetCat>
+      </invstOrSec>
+      <invstOrSec>
+        <name>Microsoft Corporation</name>
+        <ticker>MSFT</ticker>
+        <valUSD>100000</valUSD>
+        <assetCat>EC</assetCat>
+      </invstOrSec>
+      <invstOrSec>
+        <name>Cash Collateral</name>
+        <valUSD>1000</valUSD>
+        <assetCat>STIV</assetCat>
+      </invstOrSec>
+    </invstOrSecs>
+  </formData>
+</edgarSubmission>
