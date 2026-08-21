@@ -118,6 +118,15 @@ def build_filing_metadata(
     report_date: date | str,
     primary_document: str,
 ) -> FilingMetadata:
+    if not isinstance(accession_number, str):
+        raise TypeError("accession_number must be a string")
+    if not isinstance(filing_date, (date, str)):
+        raise TypeError("filing_date must be a date or string")
+    if not isinstance(report_date, (date, str)):
+        raise TypeError("report_date must be a date or string")
+    if not isinstance(primary_document, str):
+        raise TypeError("primary_document must be a string")
+
     sec_index_url = build_sec_archive_url(
         cik=cik,
         accession_number=accession_number,

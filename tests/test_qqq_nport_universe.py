@@ -119,3 +119,25 @@ def test_discover_nport_filings_ignores_scalar_recent_values():
     rows = qqq_nport.discover_nport_filings_from_submissions(submissions, cik="0001067839")
 
     assert rows == []
+
+
+def test_discover_nport_filings_skips_rows_with_non_string_primary_document():
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": [
+                    "0001067839-26-000024",
+                    "0001067839-26-000016",
+                ],
+                "filingDate": ["2026-05-28", "2026-02-27"],
+                "reportDate": ["2026-03-31", "2025-12-31"],
+                "form": ["NPORT-P", "NPORT-P"],
+                "primaryDocument": [{"bad": "doc"}, "primary_doc.xml"],
+            }
+        }
+    }
+
+    rows = qqq_nport.discover_nport_filings_from_submissions(submissions, cik="0001067839")
+
+    assert [row.accession_number for row in rows] == ["0001067839-26-000016"]
+    assert rows[0].primary_document == "primary_doc.xml"
