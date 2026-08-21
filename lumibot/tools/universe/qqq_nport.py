@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -44,6 +45,7 @@ class FilingMetadata:
 class Holding:
     symbol: str | None
     name: str
+    title: str | None = None
     cusip: str | None = None
     isin: str | None = None
     value_usd: float | None = None
@@ -57,6 +59,7 @@ class Holding:
         return {
             "symbol": self.symbol,
             "name": self.name,
+            "title": self.title,
             "cusip": self.cusip,
             "isin": self.isin,
             "value_usd": self.value_usd,
@@ -66,6 +69,9 @@ class Holding:
             "asset_category": self.asset_category,
             "weight": self.weight,
         }
+
+
+SymbolResolver = Callable[[Holding], str | None]
 
 
 @dataclass(frozen=True)
@@ -261,15 +267,18 @@ def _child_text(element: ElementTree.Element, *names: str) -> str | None:
     for child in element.iter():
         if child is element:
             continue
-        if _local_name(child.tag) in wanted and child.text is not None:
-            value = child.text.strip()
+        if _local_name(child.tag) in wanted:
+            raw_value = child.text or child.attrib.get("value")
+            if raw_value is None:
+                continue
+            value = raw_value.strip()
             if value:
                 return value
     return None
 
 
-def normalize_symbol(value: str | None) -> str | None:
-    if value is None:
+def normalize_symbol(value: object) -> str | None:
+    if not isinstance(value, str):
         return None
     symbol = value.strip().upper()
     if symbol in {"", "N/A", "NA", "NIL", "NONE", "NULL"}:
@@ -292,9 +301,11 @@ def _to_float(value: str | None) -> float | None:
 
 
 def _parse_holding(element: ElementTree.Element) -> Holding:
+    title = _child_text(element, "title")
     return Holding(
         symbol=normalize_symbol(_child_text(element, "ticker", "issuerTicker")),
-        name=_child_text(element, "name", "title") or "",
+        name=_child_text(element, "name") or title or "",
+        title=title,
         cusip=_child_text(element, "cusip"),
         isin=_child_text(element, "isin"),
         value_usd=_to_float(_child_text(element, "valUSD")),
@@ -321,6 +332,7 @@ def _with_weight(holding: Holding, weight: float | None) -> Holding:
     return Holding(
         symbol=holding.symbol,
         name=holding.name,
+        title=holding.title,
         cusip=holding.cusip,
         isin=holding.isin,
         value_usd=holding.value_usd,
@@ -332,10 +344,27 @@ def _with_weight(holding: Holding, weight: float | None) -> Holding:
     )
 
 
+def _with_symbol(holding: Holding, symbol: str) -> Holding:
+    return Holding(
+        symbol=symbol,
+        name=holding.name,
+        title=holding.title,
+        cusip=holding.cusip,
+        isin=holding.isin,
+        value_usd=holding.value_usd,
+        balance=holding.balance,
+        units=holding.units,
+        percent_value=holding.percent_value,
+        asset_category=holding.asset_category,
+        weight=holding.weight,
+    )
+
+
 def parse_nport_xml(
     xml_text: str,
     metadata: FilingMetadata,
     downloaded_at: str | None = None,
+    symbol_resolver: SymbolResolver | None = None,
 ) -> SnapshotResolution:
     root = ElementTree.fromstring(xml_text)
     included: list[Holding] = []
@@ -343,6 +372,10 @@ def parse_nport_xml(
 
     for element in _find_investment_elements(root):
         holding = _parse_holding(element)
+        if holding.symbol is None and symbol_resolver is not None:
+            resolved_symbol = normalize_symbol(symbol_resolver(holding))
+            if resolved_symbol is not None:
+                holding = _with_symbol(holding, resolved_symbol)
         if holding.symbol is not None and _is_equity_like(holding):
             included.append(holding)
         else:

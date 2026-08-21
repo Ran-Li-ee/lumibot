@@ -4,13 +4,21 @@
     <invstOrSecs>
       <invstOrSec>
         <name>Apple Inc.</name>
-        <ticker>AAPL</ticker>
+        <cusip>037833100</cusip>
+        <identifiers>
+          <ticker value="AAPL"/>
+          <isin value="US0378331005"/>
+        </identifiers>
         <valUSD>150000</valUSD>
         <assetCat>EC</assetCat>
       </invstOrSec>
       <invstOrSec>
         <name>Microsoft Corporation</name>
-        <ticker>MSFT</ticker>
+        <cusip>594918104</cusip>
+        <identifiers>
+          <ticker value="MSFT"/>
+          <isin value="US5949181045"/>
+        </identifiers>
         <valUSD>100000</valUSD>
         <assetCat>EC</assetCat>
       </invstOrSec>

@@ -182,8 +182,62 @@ def test_parse_nport_xml_warns_on_duplicate_symbols():
         report_date="2026-03-31",
         primary_document="primary_doc.xml",
     )
-    xml_text = NPORT_FIXTURE.read_text(encoding="utf-8").replace("<ticker>MSFT</ticker>", "<ticker>AAPL</ticker>")
+    xml_text = NPORT_FIXTURE.read_text(encoding="utf-8").replace(
+        '<ticker value="MSFT"/>',
+        '<ticker value="AAPL"/>',
+    )
 
     snapshot = qqq_nport.parse_nport_xml(xml_text, metadata)
 
     assert any("duplicate symbol" in warning for warning in snapshot.warnings)
+
+
+def test_parse_nport_xml_resolves_no_ticker_equity_rows_from_identifiers():
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+    xml_text = (
+        NPORT_FIXTURE.read_text(encoding="utf-8")
+        .replace('<ticker value="AAPL"/>', "")
+        .replace('<ticker value="MSFT"/>', "")
+    )
+
+    def resolve_symbol(holding):
+        return {
+            "037833100": "AAPL",
+            "US5949181045": "MSFT",
+        }.get(holding.cusip) or {
+            "037833100": "AAPL",
+            "US5949181045": "MSFT",
+        }.get(holding.isin)
+
+    snapshot = qqq_nport.parse_nport_xml(xml_text, metadata, symbol_resolver=resolve_symbol)
+
+    assert [holding.symbol for holding in snapshot.holdings] == ["AAPL", "MSFT"]
+    assert snapshot.holding_count == 2
+    assert snapshot.excluded_holdings[0].name == "Cash Collateral"
+
+
+def test_parse_nport_xml_excludes_no_ticker_equity_rows_without_resolver():
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+    xml_text = (
+        NPORT_FIXTURE.read_text(encoding="utf-8")
+        .replace('<ticker value="AAPL"/>', "")
+        .replace('<ticker value="MSFT"/>', "")
+    )
+
+    snapshot = qqq_nport.parse_nport_xml(xml_text, metadata)
+
+    assert snapshot.holdings == ()
+    assert [holding.cusip for holding in snapshot.excluded_holdings[:2]] == ["037833100", "594918104"]
+    assert [holding.symbol for holding in snapshot.excluded_holdings[:2]] == [None, None]
