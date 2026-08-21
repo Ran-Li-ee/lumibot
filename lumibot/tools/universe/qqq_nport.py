@@ -328,7 +328,7 @@ def snapshot_filename(snapshot: Mapping[str, Any] | SnapshotResolution) -> str:
         raise ValueError("snapshot report_date must be an ISO date string")
     if not isinstance(accession_number, str):
         raise ValueError("snapshot accession_number must be a string")
-    return f"qqq_{report_date}_{accession_number}.json"
+    return f"qqq_nport_{report_date}_{accession_number}.json"
 
 
 def _json_ready(value: Any) -> Any:
@@ -370,7 +370,7 @@ def iter_snapshot_paths(data_dir: str | Path | None = None) -> list[Path]:
     directory = normalized_dir(data_dir)
     if not directory.exists():
         return []
-    return sorted(directory.glob("qqq_*.json"))
+    return sorted(directory.glob("qqq_nport_*.json"))
 
 
 def _snapshot_field(snapshot: Mapping[str, Any], name: str) -> Any:

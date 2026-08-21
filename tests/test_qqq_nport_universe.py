@@ -300,7 +300,7 @@ def test_write_snapshot_and_resolve_strict_as_of(tmp_path):
     assert result.selected_filing_date == date(2026, 2, 27)
     assert result.accession_number == "0001067839-26-000016"
     assert result.symbols == ("AAPL",)
-    assert result.snapshot_path.name == "qqq_2025-12-31_0001067839-26-000016.json"
+    assert result.snapshot_path.name == "qqq_nport_2025-12-31_0001067839-26-000016.json"
     assert result.source_url.endswith("/primary_doc.xml")
 
 
