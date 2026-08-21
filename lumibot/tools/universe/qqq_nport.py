@@ -163,6 +163,12 @@ def build_sec_archive_url(
     )
 
 
+def _raw_xml_document_path(primary_document: str) -> str:
+    if primary_document.startswith("xslFormNPORT-P_"):
+        return primary_document.rsplit("/", 1)[-1]
+    return primary_document
+
+
 def build_filing_metadata(
     *,
     cik: str,
@@ -188,7 +194,7 @@ def build_filing_metadata(
     sec_xml_url = build_sec_archive_url(
         cik=cik,
         accession_number=accession_number,
-        document=primary_document,
+        document=_raw_xml_document_path(primary_document),
     )
     return FilingMetadata(
         cik=cik,

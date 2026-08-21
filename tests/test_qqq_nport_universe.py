@@ -31,6 +31,22 @@ def test_build_sec_archive_urls_for_qqq_nport_filing():
     )
 
 
+def test_build_sec_archive_xml_url_uses_raw_document_for_xsl_wrapper_path():
+    row = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="xslFormNPORT-P_X01/primary_doc.xml",
+    )
+
+    assert row.primary_document == "xslFormNPORT-P_X01/primary_doc.xml"
+    assert row.sec_xml_url == (
+        "https://www.sec.gov/Archives/edgar/data/1067839/"
+        "000106783926000024/primary_doc.xml"
+    )
+
+
 def test_discover_nport_filings_from_submissions_json_filters_and_sorts():
     submissions = {
         "filings": {
