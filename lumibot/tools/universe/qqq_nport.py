@@ -755,9 +755,14 @@ def collect_qqq_nport_snapshots(
                 downloaded_at=downloaded_at,
             )
             mapping_warnings: list[str] = []
-            if resolve_symbols and snapshot.holding_count == 0 and snapshot.excluded_holdings:
+            unresolved_equity_identifiers = [
+                holding
+                for holding in snapshot.excluded_holdings
+                if _is_equity_like(holding) and (holding.cusip or holding.isin)
+            ]
+            if resolve_symbols and unresolved_equity_identifiers:
                 symbol_map, mapping_warnings = build_openfigi_symbol_map(
-                    snapshot.excluded_holdings,
+                    unresolved_equity_identifiers,
                     data_dir=data_dir,
                     openfigi_client=openfigi_client,
                     openfigi_api_key=openfigi_api_key,

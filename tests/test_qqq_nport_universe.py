@@ -557,6 +557,43 @@ def test_collect_qqq_nport_snapshots_resolves_identifiers_with_openfigi(tmp_path
     assert snapshot["excluded_count"] == 1
 
 
+def test_collect_qqq_nport_snapshots_resolves_mixed_ticker_and_identifier_rows(tmp_path):
+    xml_text = NPORT_FIXTURE.read_text(encoding="utf-8").replace('<ticker value="AAPL"/>', "")
+    submissions = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001067839-26-000024"],
+                "filingDate": ["2026-05-28"],
+                "reportDate": ["2026-03-31"],
+                "form": ["NPORT-P"],
+                "primaryDocument": ["primary_doc.xml"],
+            }
+        }
+    }
+    metadata = qqq_nport.build_filing_metadata(
+        cik="0001067839",
+        accession_number="0001067839-26-000024",
+        filing_date="2026-05-28",
+        report_date="2026-03-31",
+        primary_document="primary_doc.xml",
+    )
+    sec_client = FakeSecClient(submissions, {metadata.sec_xml_url: xml_text})
+    openfigi_client = FakeOpenFigiClient({"037833100": "AAPL"})
+
+    result = qqq_nport.collect_qqq_nport_snapshots(
+        limit=1,
+        data_dir=tmp_path,
+        sec_client=sec_client,
+        openfigi_client=openfigi_client,
+    )
+    snapshot = qqq_nport.load_snapshot(result["snapshot_paths"][0])
+
+    assert [holding["symbol"] for holding in snapshot["holdings"]] == ["AAPL", "MSFT"]
+    assert openfigi_client.requested_jobs == [
+        [{"idType": "ID_CUSIP", "idValue": "037833100", "exchCode": "US"}]
+    ]
+
+
 def test_collect_qqq_nport_snapshots_reuses_cached_identifier_mappings(tmp_path):
     xml_text = (
         NPORT_FIXTURE.read_text(encoding="utf-8")
