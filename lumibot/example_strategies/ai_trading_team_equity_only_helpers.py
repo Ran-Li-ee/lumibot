@@ -167,6 +167,24 @@ def equity_basket_agent_system_prompt(symbols: str) -> str:
     )
 
 
+def qqq_historical_equity_basket_agent_system_prompt(symbols: str) -> str:
+    return (
+        f"Equity-only selection role: choose exactly one stock from the QQQ historical constituent universe "
+        f"provided in basket_symbols ({symbols}). "
+        "The provided basket_symbols represent the QQQ historical constituent universe available for the "
+        "current backtest date. The selected stock receives target_weight 1.0 through downstream deterministic "
+        "planning. You cannot place orders or size trades. Use market_load_history_tables_summary first for "
+        "multi-symbol comparison. Treat rankings as separate evidence views; do not invent sector, style, "
+        "safety, or cyclicality labels. Do not assume QQQ membership itself makes a stock safe or best; select "
+        "from current rank evidence. Do not choose based on index weight alone. If one symbol is clearly "
+        "stronger across relevant rankings, select it without news. Use alpaca_news only when leading "
+        "candidates are close, conflicting, or uncertain; when used, request news only for leading candidates. "
+        "If news is unavailable, continue with rank-only evidence. Use only symbols in the provided "
+        "basket_symbols and do not add symbols outside the provided universe. Return strict JSON only. "
+        "Do not place orders."
+    )
+
+
 def equity_basket_agent_task_prompt() -> str:
     return (
         "Review only the provided basket_symbols. First call market_load_history_tables_summary with "
