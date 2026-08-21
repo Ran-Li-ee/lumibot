@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -739,6 +740,55 @@ def write_validation_report(
     )
     write_json(json_path, collection_result)
     return {"markdown": markdown_path, "json": json_path}
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Collect QQQ historical holdings snapshots from SEC N-PORT filings."
+    )
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--start-date", default=None)
+    parser.add_argument("--end-date", default=None)
+    parser.add_argument("--mode", choices=["strict", "prototype"], default="strict")
+    parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
+    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--write-report", action="store_true")
+    parser.add_argument("--as-of", default=None)
+    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    client = SecClient(user_agent=args.user_agent)
+    result = collect_qqq_nport_snapshots(
+        limit=args.limit,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        data_dir=args.data_dir,
+        sec_client=client,
+        refresh=args.refresh,
+    )
+    print(
+        f"Discovered {result['summary']['filings_discovered']} filings; "
+        f"normalized {result['summary']['snapshots_normalized']} snapshots."
+    )
+    if args.write_report:
+        example_dates = [args.as_of] if args.as_of else []
+        paths = write_validation_report(
+            result,
+            data_dir=args.data_dir,
+            example_as_of_dates=example_dates,
+        )
+        print(f"Wrote report: {paths['markdown']}")
+    if args.as_of:
+        resolution = resolve_qqq_snapshot(args.as_of, mode=args.mode, data_dir=args.data_dir)
+        print(
+            f"{args.as_of} {args.mode}: {resolution.accession_number} "
+            f"{resolution.selected_report_date.isoformat()} "
+            f"{len(resolution.symbols)} symbols"
+        )
+    return 0
 
 
 def _local_name(tag: str) -> str:

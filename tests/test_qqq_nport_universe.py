@@ -581,3 +581,42 @@ def test_write_validation_report_writes_markdown_and_json(tmp_path):
     assert paths["json"].exists()
     assert paths["markdown"].parent == qqq_nport.reports_dir(tmp_path)
     assert qqq_nport.load_snapshot(paths["json"]) == result
+
+
+def test_parse_cli_args_defaults():
+    args = qqq_nport.parse_args([])
+
+    assert args.limit is None
+    assert args.mode == "strict"
+    assert args.data_dir == str(qqq_nport.DEFAULT_DATA_DIR)
+    assert args.write_report is False
+
+
+def test_parse_cli_args_accepts_collection_options():
+    args = qqq_nport.parse_args(
+        [
+            "--limit",
+            "12",
+            "--start-date",
+            "2025-01-01",
+            "--end-date",
+            "2026-01-01",
+            "--mode",
+            "prototype",
+            "--data-dir",
+            "tmp/qqq",
+            "--refresh",
+            "--write-report",
+            "--as-of",
+            "2025-04-15",
+        ]
+    )
+
+    assert args.limit == 12
+    assert args.start_date == "2025-01-01"
+    assert args.end_date == "2026-01-01"
+    assert args.mode == "prototype"
+    assert args.data_dir == "tmp/qqq"
+    assert args.refresh is True
+    assert args.write_report is True
+    assert args.as_of == "2025-04-15"
