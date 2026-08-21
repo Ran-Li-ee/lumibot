@@ -1,6 +1,6 @@
 import importlib
 import json
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -139,6 +139,29 @@ def tool_names(agent_config):
     return [tool.name for tool in agent_config.get("tools", [])]
 
 
+def qqq_resolution(
+    *,
+    as_of_date="2024-09-05",
+    mode="strict",
+    selected_report_date="2024-06-30",
+    selected_filing_date="2024-08-28",
+    accession_number="0001752724-24-196011",
+    symbols=("MSFT", "AAPL", "NVDA", "AMZN"),
+    snapshot_path="C:/cache/qqq_nport_2024-06-30.json",
+    source_url="https://www.sec.gov/example.xml",
+):
+    return SimpleNamespace(
+        as_of_date=date.fromisoformat(as_of_date),
+        mode=mode,
+        selected_report_date=date.fromisoformat(selected_report_date),
+        selected_filing_date=date.fromisoformat(selected_filing_date),
+        accession_number=accession_number,
+        symbols=tuple(symbols),
+        snapshot_path=Path(snapshot_path),
+        source_url=source_url,
+    )
+
+
 def test_equity_only_target_portfolio_uses_selected_symbol_at_full_weight():
     module = load_module()
 
@@ -211,6 +234,23 @@ def test_equity_universe_contains_50_us_stock_symbols_without_old_etfs():
     assert all(symbol == symbol.upper() for symbol in universe)
     assert all(symbol.isalpha() for symbol in universe)
     assert not {"SPY", "QQQ", "IWM", "EEM", "FXI"} & set(universe)
+
+
+def test_qqq_historical_equity_strategy_defaults_to_weekly_strict_without_changing_fixed_baseline():
+    module = load_module()
+
+    fixed = module.AITradingTeamEquityOnlyLLMStrategy
+    qqq = module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy
+
+    assert fixed.parameters["run_frequency"] == "monthly"
+    assert fixed.parameters["basket_universes"]["equity"] == EXPECTED_EQUITY_UNIVERSE
+    assert "qqq_universe_mode" not in fixed.parameters
+
+    assert qqq.parameters["run_frequency"] == "weekly"
+    assert qqq.parameters["weekly_run_weekday"] == "MON"
+    assert qqq.parameters["weekly_holiday_policy"] == "first_open_trading_day"
+    assert qqq.parameters["qqq_universe_mode"] == "strict"
+    assert qqq.parameters["qqq_universe_data_dir"] is None
 
 
 def test_equity_only_target_portfolio_rejects_inactive_report():
@@ -412,6 +452,201 @@ def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(mo
     assert "return exactly one strict json object" in task_prompt
 
 
+def test_qqq_historical_strategy_resolves_snapshot_and_passes_metadata_to_equity_agent(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)
+    strategy.get_datetime = lambda: datetime(2024, 9, 5, 9, 30)
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": ["MSFT", "AAPL", "NVDA", "AMZN"],
+            "selected_symbol": "NVDA",
+            "reason_brief": "NVDA has the strongest QQQ constituent evidence.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+    resolver_calls = []
+
+    def fake_resolve_qqq_snapshot(as_of_date, *, mode="strict", data_dir=None):
+        resolver_calls.append({"as_of_date": as_of_date, "mode": mode, "data_dir": data_dir})
+        return qqq_resolution(symbols=("MSFT", "AAPL", "NVDA", "AMZN"))
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 0.0,
+                "cash_after_estimate": 100000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []},
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "resolve_qqq_snapshot", fake_resolve_qqq_snapshot)
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    assert resolver_calls == [{"as_of_date": "2024-09-05", "mode": "strict", "data_dir": None}]
+    equity_call = strategy.agents["equity_basket_agent"].calls[0]
+    assert equity_call["context"]["basket_symbols"] == ["MSFT", "AAPL", "NVDA", "AMZN"]
+    assert equity_call["context"]["universe_source"] == {
+        "type": "qqq_nport",
+        "mode": "strict",
+        "as_of_date": "2024-09-05",
+        "selected_report_date": "2024-06-30",
+        "selected_filing_date": "2024-08-28",
+        "accession_number": "0001752724-24-196011",
+        "holding_count": 4,
+        "snapshot_path": "C:/cache/qqq_nport_2024-06-30.json",
+        "source_url": "https://www.sec.gov/example.xml",
+    }
+
+
+def test_qqq_historical_strategy_supports_prototype_mode_data_dir_and_symbol_normalization(
+    monkeypatch, tmp_path
+):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)
+    strategy.parameters["qqq_universe_mode"] = "prototype"
+    strategy.parameters["qqq_universe_data_dir"] = str(tmp_path)
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": ["AAPL", "MSFT", "NVDA"],
+            "selected_symbol": "AAPL",
+            "reason_brief": "AAPL is selected.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+    resolver_calls = []
+
+    def fake_resolve_qqq_snapshot(as_of_date, *, mode="strict", data_dir=None):
+        resolver_calls.append({"as_of_date": as_of_date, "mode": mode, "data_dir": data_dir})
+        return qqq_resolution(
+            mode="prototype",
+            selected_report_date="2024-09-30",
+            selected_filing_date="2024-11-27",
+            symbols=(" aapl ", "", "MSFT", "AAPL", "nvda"),
+        )
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 0.0,
+                "cash_after_estimate": 100000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []},
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "resolve_qqq_snapshot", fake_resolve_qqq_snapshot)
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    assert resolver_calls == [
+        {"as_of_date": "2024-09-05", "mode": "prototype", "data_dir": str(tmp_path)}
+    ]
+    equity_call = strategy.agents["equity_basket_agent"].calls[0]
+    assert equity_call["context"]["basket_symbols"] == ["AAPL", "MSFT", "NVDA"]
+    assert equity_call["context"]["universe_source"]["mode"] == "prototype"
+    assert equity_call["context"]["universe_source"]["holding_count"] == 3
+
+
+def test_qqq_historical_strategy_blocks_without_fallback_when_snapshot_missing(monkeypatch):
+    module = load_module()
+    qqq_nport = importlib.import_module("lumibot.tools.universe.qqq_nport")
+    strategy = make_running_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)
+
+    def fake_resolve_qqq_snapshot(as_of_date, *, mode="strict", data_dir=None):
+        raise qqq_nport.NoSnapshotAvailableError("No QQQ snapshot available")
+
+    monkeypatch.setattr(module, "resolve_qqq_snapshot", fake_resolve_qqq_snapshot)
+
+    strategy.on_trading_iteration()
+
+    assert strategy.agents["equity_basket_agent"].calls == []
+    assert strategy.agents["execution_agent"].calls == []
+    assert strategy._last_execution_plan_error == "No QQQ snapshot available"
+    assert strategy._scheduled_workflow_events[-1]["reason"] == "qqq_historical_universe_unavailable"
+    assert strategy._scheduled_workflow_events[-1]["status"] == "blocked"
+
+
+def test_qqq_historical_strategy_rejects_selected_symbol_outside_resolved_universe(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": ["MSFT", "AAPL", "NVDA"],
+            "selected_symbol": "ORCL",
+            "reason_brief": "ORCL was incorrectly selected.",
+        }
+    )
+
+    def fake_resolve_qqq_snapshot(as_of_date, *, mode="strict", data_dir=None):
+        return qqq_resolution(symbols=("MSFT", "AAPL", "NVDA"))
+
+    monkeypatch.setattr(module, "resolve_qqq_snapshot", fake_resolve_qqq_snapshot)
+
+    strategy.on_trading_iteration()
+
+    assert strategy._last_execution_plan_error == "selected equity symbol must be in equity universe."
+    assert strategy.agents["execution_agent"].calls == []
+
+
+def test_qqq_historical_equity_agent_prompt_mentions_historical_constituents_without_weight_bias(monkeypatch):
+    module = load_module()
+    strategy = make_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)
+
+    strategy.initialize()
+
+    equity_agent = created_agent_config(strategy, "equity_basket_agent")
+    prompt = equity_agent["system_prompt"].lower()
+
+    for required in (
+        "qqq historical constituent universe",
+        "provided basket_symbols",
+        "current backtest date",
+        "current rank evidence",
+        "do not add symbols",
+        "index weight",
+    ):
+        assert required in prompt
+
+    for forbidden in (
+        "automatically high quality",
+        "always prefer",
+        "buy qqq",
+        "sector",
+        "style",
+        "safety label",
+    ):
+        assert forbidden not in prompt
+
+
 def test_equity_only_order_cash_check_price_uses_planner_sizing_policy(monkeypatch):
     module = load_module()
     strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
@@ -553,11 +788,16 @@ def test_iteration_builds_full_weight_target_and_runs_execution(monkeypatch):
     assert execution_plan["orders"][0]["symbol"] == "ORCL"
 
 
-def test_benchmark_runner_exposes_neutral_equity_only_strategy():
+def test_benchmark_runner_exposes_fixed_and_qqq_historical_equity_only_strategies():
     benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
 
     assert "equity-only-llm" in benchmark.STRATEGIES
     assert benchmark.STRATEGIES["equity-only-llm"].__name__ == "AITradingTeamEquityOnlyLLMStrategy"
+    assert "qqq-historical-equity-only-llm" in benchmark.STRATEGIES
+    assert (
+        benchmark.STRATEGIES["qqq-historical-equity-only-llm"].__name__
+        == "AITradingTeamQQQHistoricalEquityOnlyLLMStrategy"
+    )
 
 
 def test_benchmark_runner_does_not_expose_quadrant_strategies_on_equity_mainline():
