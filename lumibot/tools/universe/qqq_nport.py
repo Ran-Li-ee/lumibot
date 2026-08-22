@@ -23,6 +23,12 @@ DEFAULT_USER_AGENT = "LumiBot qqq-nport universe discovery contact@example.com"
 DEFAULT_DATA_DIR = Path(LUMIBOT_CACHE_FOLDER) / "universe" / "qqq_nport"
 SNAPSHOT_SCHEMA_VERSION = 1
 DEFAULT_OPENFIGI_BATCH_SIZE = 10
+QQQ_SYMBOL_ALIASES = {
+    "CPW": "CHKP",
+    "MRVLEUR": "MRVL",
+    "TRI4EUR": "TRI",
+    "STXN": "STX",
+}
 
 
 @dataclass(frozen=True)
@@ -1047,6 +1053,50 @@ def normalize_symbol(value: object) -> str | None:
     if not all(character.isalnum() or character in {".", "-"} for character in symbol):
         return None
     return symbol
+
+
+def repair_qqq_symbols(symbols: Iterable[object]) -> tuple[tuple[str, ...], dict[str, Any]]:
+    raw_count = 0
+    repaired_count = 0
+    deduped_count = 0
+    dropped_count = 0
+    repaired_symbols: list[str] = []
+    seen: set[str] = set()
+    aliases: list[dict[str, str]] = []
+
+    for raw_symbol in symbols:
+        raw_count += 1
+        normalized = normalize_symbol(raw_symbol)
+        if normalized is None:
+            dropped_count += 1
+            continue
+
+        repaired = normalize_symbol(QQQ_SYMBOL_ALIASES.get(normalized, normalized))
+        if repaired is None:
+            dropped_count += 1
+            continue
+
+        if repaired != normalized:
+            repaired_count += 1
+            aliases.append({"from": normalized, "to": repaired})
+
+        if repaired in seen:
+            deduped_count += 1
+            continue
+
+        seen.add(repaired)
+        repaired_symbols.append(repaired)
+
+    repair = {
+        "applied": bool(repaired_count or deduped_count or dropped_count),
+        "raw_count": raw_count,
+        "repaired_count": repaired_count,
+        "deduped_count": deduped_count,
+        "dropped_count": dropped_count,
+        "final_count": len(repaired_symbols),
+        "aliases": aliases,
+    }
+    return tuple(repaired_symbols), repair
 
 
 def _to_float(value: str | None) -> float | None:
