@@ -82,7 +82,7 @@ def _month_key(value: date_type) -> str:
 
 
 def _qqq_universe_source_payload(resolution: Any, symbols: list[str]) -> dict[str, Any]:
-    return {
+    payload = {
         "type": "qqq_nport",
         "mode": str(resolution.mode),
         "as_of_date": resolution.as_of_date.isoformat(),
@@ -93,6 +93,10 @@ def _qqq_universe_source_payload(resolution: Any, symbols: list[str]) -> dict[st
         "snapshot_path": str(resolution.snapshot_path),
         "source_url": str(resolution.source_url) if resolution.source_url else None,
     }
+    symbol_repair = getattr(resolution, "symbol_repair", None)
+    if isinstance(symbol_repair, dict):
+        payload["symbol_repair"] = symbol_repair
+    return payload
 
 
 def equity_only_scheduled_workflow_decision(

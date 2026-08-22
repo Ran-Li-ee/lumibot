@@ -149,6 +149,7 @@ def qqq_resolution(
     symbols=("MSFT", "AAPL", "NVDA", "AMZN"),
     snapshot_path="C:/cache/qqq_nport_2024-06-30.json",
     source_url="https://www.sec.gov/example.xml",
+    symbol_repair=None,
 ):
     return SimpleNamespace(
         as_of_date=date.fromisoformat(as_of_date),
@@ -159,6 +160,15 @@ def qqq_resolution(
         symbols=tuple(symbols),
         snapshot_path=Path(snapshot_path),
         source_url=source_url,
+        symbol_repair=symbol_repair or {
+            "applied": False,
+            "raw_count": len(symbols),
+            "repaired_count": 0,
+            "deduped_count": 0,
+            "dropped_count": 0,
+            "final_count": len(symbols),
+            "aliases": [],
+        },
     )
 
 
@@ -594,6 +604,15 @@ def test_qqq_historical_strategy_resolves_snapshot_and_passes_metadata_to_equity
         "holding_count": 4,
         "snapshot_path": str(Path("C:/cache/qqq_nport_2024-06-30.json")),
         "source_url": "https://www.sec.gov/example.xml",
+        "symbol_repair": {
+            "applied": False,
+            "raw_count": 4,
+            "repaired_count": 0,
+            "deduped_count": 0,
+            "dropped_count": 0,
+            "final_count": 4,
+            "aliases": [],
+        },
     }
 
 
@@ -656,6 +675,77 @@ def test_qqq_historical_strategy_supports_prototype_mode_data_dir_and_symbol_nor
     assert equity_call["context"]["basket_symbols"] == ["AAPL", "MSFT", "NVDA"]
     assert equity_call["context"]["universe_source"]["mode"] == "prototype"
     assert equity_call["context"]["universe_source"]["holding_count"] == 3
+
+
+def test_qqq_historical_strategy_passes_repair_metadata_to_equity_agent(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": ["AAPL", "CHKP", "MRVL"],
+            "selected_symbol": "CHKP",
+            "reason_brief": "CHKP is selected.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+
+    def fake_resolve_qqq_snapshot(as_of_date, *, mode="strict", data_dir=None):
+        return qqq_resolution(
+            symbols=("AAPL", "CHKP", "MRVL"),
+            symbol_repair={
+                "applied": True,
+                "raw_count": 4,
+                "repaired_count": 2,
+                "deduped_count": 1,
+                "dropped_count": 0,
+                "final_count": 3,
+                "aliases": [
+                    {"from": "CPW", "to": "CHKP"},
+                    {"from": "MRVLEUR", "to": "MRVL"},
+                ],
+            },
+        )
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 0.0,
+                "cash_after_estimate": 100000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []},
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "resolve_qqq_snapshot", fake_resolve_qqq_snapshot)
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    equity_context = strategy.agents["equity_basket_agent"].calls[0]["context"]
+    assert equity_context["basket_symbols"] == ["AAPL", "CHKP", "MRVL"]
+    assert equity_context["universe_source"]["symbol_repair"] == {
+        "applied": True,
+        "raw_count": 4,
+        "repaired_count": 2,
+        "deduped_count": 1,
+        "dropped_count": 0,
+        "final_count": 3,
+        "aliases": [
+            {"from": "CPW", "to": "CHKP"},
+            {"from": "MRVLEUR", "to": "MRVL"},
+        ],
+    }
 
 
 def test_qqq_historical_strategy_blocks_without_fallback_when_snapshot_missing(monkeypatch):
