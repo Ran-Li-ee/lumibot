@@ -290,14 +290,39 @@ def _computed_history_summary(raw_summary: Any) -> str:
 
 def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -> str:
     result = _as_dict(raw_result)
-    count = len(_collection(raw_result, "universe_summary"))
+    universe_summary = _collection(raw_result, "universe_summary")
+    count = len(universe_summary)
     parts = [
         f"Loaded market history summaries for {_rows_label(count, 'symbol')}",
         f"{_rows_label(count, 'detailed symbol')} retained",
     ]
-    requested_symbols = args.get("symbols")
-    if isinstance(requested_symbols, list):
-        parts.append(f"{_rows_label(len(requested_symbols), 'requested symbol')}")
+
+    coverage = _as_dict(result.get("coverage"))
+    if coverage:
+        requested = coverage.get("requested_count")
+        loaded = coverage.get("loaded_count")
+        failed = coverage.get("failed_count")
+        if isinstance(requested, int):
+            parts.append(f"{_rows_label(requested, 'requested symbol')}")
+        if isinstance(loaded, int):
+            parts.append(f"{loaded} loaded")
+        if isinstance(failed, int) and failed:
+            parts.append(f"{failed} failed")
+        top_n = coverage.get("top_n")
+        if isinstance(top_n, int):
+            parts.append(f"rankings capped at top {top_n}")
+        candidate_summary_limit = coverage.get("candidate_summary_limit")
+        if isinstance(candidate_summary_limit, int):
+            parts.append(f"candidate summary limit {candidate_summary_limit}")
+    else:
+        requested_symbols = args.get("symbols")
+        if isinstance(requested_symbols, list):
+            parts.append(f"{_rows_label(len(requested_symbols), 'requested symbol')}")
+
+    candidate_summary = _collection(raw_result, "candidate_summary")
+    if candidate_summary:
+        parts.append(_rows_label(len(candidate_summary), "candidate summary row"))
+
     ranking_limit = result.get("ranking_limit")
     if isinstance(ranking_limit, int):
         parts.append(f"rankings capped at top {ranking_limit}")
@@ -307,15 +332,42 @@ def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -
     if isinstance(candidate_count, int) and isinstance(summary_limit, int):
         parts.append(f"{candidate_count} ranked candidates before the {summary_limit}-symbol detail limit")
 
-    rankings = _as_dict(result.get("rankings"))
-    for label, key in (
-        ("return_63", "by_return_63"),
-        ("momentum_composite", "by_momentum_composite"),
-        ("composite_score", "by_composite_score"),
-    ):
-        symbols = _symbol_list(rankings.get(key))
-        if symbols:
-            parts.append(f"{label}: {', '.join(symbols[:3])}")
+    rank_groups = _as_dict(result.get("rank_groups"))
+    ranking_details = _as_dict(result.get("ranking_details"))
+    if rank_groups and ranking_details:
+        for group_name, ranking_names in list(rank_groups.items())[:5]:
+            if not isinstance(ranking_names, list):
+                continue
+            shown_rankings = []
+            for ranking_name in ranking_names[:2]:
+                entries = ranking_details.get(ranking_name)
+                if not isinstance(entries, list):
+                    continue
+                pairs = []
+                for entry in entries[:3]:
+                    entry_dict = _as_dict(entry)
+                    symbol = entry_dict.get("symbol")
+                    value = entry_dict.get("value")
+                    if symbol is None:
+                        continue
+                    if value is None:
+                        pairs.append(str(symbol))
+                    else:
+                        pairs.append(f"{symbol}={value}")
+                if pairs:
+                    shown_rankings.append(f"{ranking_name}: {', '.join(pairs)}")
+            if shown_rankings:
+                parts.append(f"{group_name}: " + " | ".join(shown_rankings))
+    else:
+        rankings = _as_dict(result.get("rankings"))
+        for label, key in (
+            ("return_63", "by_return_63"),
+            ("momentum_composite", "by_momentum_composite"),
+            ("composite_score", "by_composite_score"),
+        ):
+            symbols = _symbol_list(rankings.get(key))
+            if symbols:
+                parts.append(f"{label}: {', '.join(symbols[:3])}")
 
     warnings = result.get("warnings")
     if isinstance(warnings, list) and warnings:

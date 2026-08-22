@@ -156,6 +156,47 @@ def test_market_load_history_tables_summary_formatter_explains_limited_summary_r
     assert "20 ranked candidates before the 15-symbol detail limit" in text
 
 
+def test_market_load_history_tables_summary_formatter_shows_rank_groups_and_candidate_summary():
+    explanation = explain_tool_result(
+        "market_load_history_tables_summary",
+        {"symbols": ["AAA", "BBB", "CCC"], "top_n": 2, "candidate_summary_limit": 2},
+        {
+            "coverage": {
+                "requested_count": 3,
+                "loaded_count": 3,
+                "failed_count": 0,
+                "top_n": 2,
+                "candidate_summary_limit": 2,
+                "ranking_count": 3,
+            },
+            "rank_groups": {
+                "momentum": ["by_return_63"],
+                "trend_quality": ["by_adjusted_slope_90"],
+            },
+            "ranking_details": {
+                "by_return_63": [
+                    {"rank": 1, "symbol": "AAA", "value": 0.3},
+                    {"rank": 2, "symbol": "BBB", "value": 0.2},
+                ],
+                "by_adjusted_slope_90": [
+                    {"rank": 1, "symbol": "BBB", "value": 0.9},
+                ],
+            },
+            "candidate_summary": [{"symbol": "AAA"}, {"symbol": "BBB"}],
+            "warnings": [],
+        },
+        None,
+    )
+
+    assert "3 requested symbols" in explanation
+    assert "3 loaded" in explanation
+    assert "top 2" in explanation
+    assert "2 candidate summary rows" in explanation
+    assert "momentum" in explanation
+    assert "by_return_63: AAA=0.3, BBB=0.2" in explanation
+    assert "trend_quality" in explanation
+
+
 def test_market_load_history_tables_summary_formatter_counts_empty_summary_rows():
     text = explain_tool_result(
         "market_load_history_tables_summary",
