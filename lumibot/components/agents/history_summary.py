@@ -31,6 +31,7 @@ def compute_history_summary(
     warnings: list[str] = []
     notes: list[str] = []
     data = _sort_frame(frame)
+    data = _truncate_to_last_finite_close(data)
     close = _numeric_series(data, "close")
     high = _numeric_series(data, "high")
     low = _numeric_series(data, "low")
@@ -471,6 +472,17 @@ def _data_window(frame: pd.DataFrame) -> dict[str, Any]:
         "start": start,
         "end": end,
     }
+
+
+def _truncate_to_last_finite_close(frame: pd.DataFrame) -> pd.DataFrame:
+    if "close" not in frame.columns:
+        return frame
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    finite_close = close.map(lambda value: _finite_float(value) is not None)
+    if not finite_close.any():
+        return frame
+    last_position = int(finite_close.to_numpy().nonzero()[0][-1])
+    return frame.iloc[: last_position + 1].copy()
 
 
 def _numeric_series(frame: pd.DataFrame, column: str) -> pd.Series | None:

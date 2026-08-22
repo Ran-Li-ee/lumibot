@@ -221,6 +221,38 @@ def test_compute_history_summary_adds_breakout_and_volume_confirmation_metrics()
     assert summary["scores"]["volume_confirmed_momentum"] is not None
 
 
+def test_compute_history_summary_ignores_trailing_rows_without_finite_close_for_dependent_metrics():
+    frame = _breakout_frame()
+    frame.loc[79, "close"] = 119.0
+    frame.loc[79, "high"] = 120.0
+    frame.loc[79, "volume"] = 1_000.0
+    frame.loc[80] = {
+        "Date": pd.Timestamp("2024-03-21"),
+        "close": float("nan"),
+        "high": 500.0,
+        "low": 10.0,
+        "volume": 1_000_000.0,
+    }
+    frame.loc[81] = {
+        "Date": pd.Timestamp("2024-03-22"),
+        "close": float("nan"),
+        "high": 600.0,
+        "low": 10.0,
+        "volume": 2_000_000.0,
+    }
+
+    summary = compute_history_summary(frame, symbol="ALIGN", timestep="day", as_of=None)
+
+    assert summary["data_window"]["end"] == "2024-03-20T00:00:00"
+    assert summary["price"]["latest_close"] == 119.0
+    assert summary["range"]["distance_to_high_63"] == pytest.approx(119.0 / 120.0 - 1.0)
+    assert summary["range"]["breakout_20_high_score"] == pytest.approx(119.0 / 120.0 - 1.0)
+    assert summary["range"]["breakout_63_high_score"] == pytest.approx(119.0 / 120.0 - 1.0)
+    assert summary["volume"]["latest_volume"] == 1_000.0
+    assert summary["volume"]["avg_volume_20"] == pytest.approx(1_000.0)
+    assert summary["volume"]["dollar_volume_20"] == pytest.approx(119_000.0)
+
+
 def test_compute_history_summary_new_fixed_window_metrics_require_full_lookbacks():
     summary = compute_history_summary(_trend_frame(63), symbol="SHORT", timestep="day", as_of=None)
 
