@@ -253,6 +253,47 @@ def test_qqq_historical_equity_strategy_defaults_to_weekly_strict_without_changi
     assert qqq.parameters["qqq_universe_data_dir"] is None
 
 
+def test_qqq_symbol_repair_aliases_and_deduplicates_preserving_order():
+    qqq_nport = importlib.import_module("lumibot.tools.universe.qqq_nport")
+
+    symbols, repair = qqq_nport.repair_qqq_symbols(
+        ["AAPL", "CPW", "CHKP", "MRVLEUR", "MRVL", "TRI4EUR", "STXN", "", "AAPL"]
+    )
+
+    assert symbols == ("AAPL", "CHKP", "MRVL", "TRI", "STX")
+    assert repair == {
+        "applied": True,
+        "raw_count": 9,
+        "repaired_count": 4,
+        "deduped_count": 3,
+        "dropped_count": 1,
+        "final_count": 5,
+        "aliases": [
+            {"from": "CPW", "to": "CHKP"},
+            {"from": "MRVLEUR", "to": "MRVL"},
+            {"from": "TRI4EUR", "to": "TRI"},
+            {"from": "STXN", "to": "STX"},
+        ],
+    }
+
+
+def test_qqq_symbol_repair_reports_noop_for_clean_symbols():
+    qqq_nport = importlib.import_module("lumibot.tools.universe.qqq_nport")
+
+    symbols, repair = qqq_nport.repair_qqq_symbols(["MSFT", "AAPL", "NVDA"])
+
+    assert symbols == ("MSFT", "AAPL", "NVDA")
+    assert repair == {
+        "applied": False,
+        "raw_count": 3,
+        "repaired_count": 0,
+        "deduped_count": 0,
+        "dropped_count": 0,
+        "final_count": 3,
+        "aliases": [],
+    }
+
+
 def test_equity_only_target_portfolio_rejects_inactive_report():
     module = load_module()
 
