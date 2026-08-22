@@ -777,7 +777,7 @@ def test_build_universe_history_summary_honors_top_n_and_candidate_summary_limit
     assert len(summary["candidate_summary"]) <= 4
 
 
-def test_build_universe_history_summary_pruned_excerpt_starts_with_rank_metadata():
+def test_build_universe_history_summary_pruned_excerpt_includes_candidate_summary():
     symbols = [f"S{i:02d}" for i in range(1, 36)]
     history_summaries = {
         symbol: _rankable_summary(
@@ -824,13 +824,16 @@ def test_build_universe_history_summary_pruned_excerpt_starts_with_rank_metadata
     pruned = _prune_tool_response_for_context_window(
         summary,
         tool_name="market_load_history_tables_summary",
-        max_chars=1_000,
+        max_chars=6_000,
     )
 
     assert pruned is not None
     excerpt = pruned["excerpt"]
-    for essential_key in ('"coverage"', '"rank_groups"', '"rankings"', '"ranking_details"'):
+    assert len(excerpt) <= 6_000
+    for essential_key in ('"coverage"', '"rank_groups"', '"rankings"', '"ranking_details"', '"candidate_summary"'):
         assert essential_key in excerpt
+    parsed_excerpt = json.loads(excerpt)
+    assert parsed_excerpt["candidate_summary"]
     serialized = json.dumps(summary, sort_keys=False)
     assert serialized.index('"coverage"') < serialized.index('"candidate_summary"')
     assert serialized.index('"rank_groups"') < serialized.index('"candidate_summary"')

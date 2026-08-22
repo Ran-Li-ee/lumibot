@@ -2791,6 +2791,102 @@ def _is_pruned_tool_response_envelope(tool_response: Any) -> bool:
     )
 
 
+def _market_history_tables_summary_excerpt(
+    tool_response: Any,
+    *,
+    max_chars: int,
+) -> str | None:
+    if not isinstance(tool_response, dict):
+        return None
+    result = _json_safe_value(tool_response)
+    if not isinstance(result, dict):
+        return None
+
+    candidate_rows = result.get("candidate_summary")
+    ranking_details = result.get("ranking_details")
+    rankings = result.get("rankings")
+    candidate_count = len(candidate_rows) if isinstance(candidate_rows, list) else None
+    detail_limit = 3
+    candidate_limit = min(candidate_count or 0, 10)
+    use_ranking_metadata = False
+
+    def limited_rankings() -> Any:
+        if not use_ranking_metadata or not isinstance(rankings, dict):
+            return rankings
+        return {
+            str(name): {
+                "count": len(symbols) if isinstance(symbols, list) else None,
+                "top_symbols": symbols[:3] if isinstance(symbols, list) else symbols,
+            }
+            for name, symbols in rankings.items()
+        }
+
+    def limited_ranking_details() -> Any:
+        if not isinstance(ranking_details, dict):
+            return ranking_details
+        return {
+            str(name): entries[:detail_limit] if isinstance(entries, list) else entries
+            for name, entries in ranking_details.items()
+        }
+
+    def payload() -> dict[str, Any]:
+        excerpt_payload: dict[str, Any] = {
+            "schema_version": result.get("schema_version"),
+            "coverage": result.get("coverage"),
+            "rank_groups": result.get("rank_groups"),
+            "ranking_limit": result.get("ranking_limit"),
+            "candidate_summary_limit": result.get("candidate_summary_limit"),
+            "rankings": limited_rankings(),
+            "ranking_details": limited_ranking_details(),
+            "candidate_summary": (
+                candidate_rows[:candidate_limit]
+                if isinstance(candidate_rows, list)
+                else candidate_rows
+            ),
+        }
+        if isinstance(ranking_details, dict):
+            excerpt_payload["ranking_details_excerpt"] = {
+                "included_per_ranking": detail_limit,
+                "ranking_count": len(ranking_details),
+                "truncated": any(
+                    isinstance(entries, list) and len(entries) > detail_limit
+                    for entries in ranking_details.values()
+                ),
+            }
+        if isinstance(candidate_rows, list):
+            excerpt_payload["candidate_summary_excerpt"] = {
+                "included": candidate_limit,
+                "available": len(candidate_rows),
+                "truncated": len(candidate_rows) > candidate_limit,
+            }
+        if use_ranking_metadata and isinstance(rankings, dict):
+            excerpt_payload["rankings_excerpt"] = {
+                "mode": "top_symbol_metadata",
+                "ranking_count": len(rankings),
+                "truncated": True,
+            }
+        return excerpt_payload
+
+    while True:
+        serialized = json.dumps(payload(), sort_keys=False, separators=(",", ":"), default=str)
+        if len(serialized) <= max_chars:
+            return serialized
+        if detail_limit > 1:
+            detail_limit -= 1
+            continue
+        if candidate_limit > 1:
+            candidate_limit = max(1, candidate_limit // 2)
+            continue
+        if not use_ranking_metadata:
+            use_ranking_metadata = True
+            continue
+        return _truncate_preserving_start(
+            serialized,
+            max_chars,
+            label="tool_response.market_load_history_tables_summary",
+        )
+
+
 def _prune_tool_response_for_context_window(
     tool_response: Any,
     *,
@@ -2809,20 +2905,35 @@ def _prune_tool_response_for_context_window(
     if response_chars <= max_chars:
         return None
     preserve_summary_order = tool_name == "market_load_history_tables_summary"
+    market_history_excerpt = (
+        _market_history_tables_summary_excerpt(tool_response, max_chars=max_chars)
+        if preserve_summary_order
+        else None
+    )
     serialized = json.dumps(
         _json_safe_value(tool_response),
         sort_keys=not preserve_summary_order,
         default=str,
     )
+    if market_history_excerpt is not None:
+        excerpt = market_history_excerpt
+    elif preserve_summary_order:
+        excerpt = _truncate_preserving_start(
+            serialized,
+            max_chars,
+            label=f"tool_response.{tool_name or 'unknown'}",
+        )
+    else:
+        excerpt = _truncate_preserving_edges(
+            serialized,
+            max_chars,
+            label=f"tool_response.{tool_name or 'unknown'}",
+        )
     return {
         "lumibot_tool_result_pruned": True,
         "tool_name": tool_name,
         "original_chars": response_chars,
-        "excerpt": (
-            _truncate_preserving_start(serialized, max_chars, label=f"tool_response.{tool_name or 'unknown'}")
-            if preserve_summary_order
-            else _truncate_preserving_edges(serialized, max_chars, label=f"tool_response.{tool_name or 'unknown'}")
-        ),
+        "excerpt": excerpt,
         "message": (
             "Tool response was shortened by Lumibot before sending it back to this model "
             "because the provider context window would otherwise be exceeded. Call a targeted tool "
