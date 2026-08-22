@@ -100,9 +100,9 @@ def compute_history_summary(
     high_252 = _window_extreme(high if high is not None else close, 252, "max")
     low_252 = _window_extreme(low if low is not None else close, 252, "min")
     max_drawdown_60 = _max_drawdown(close, 60)
-    max_drawdown_126 = _max_drawdown(close, 126)
+    max_drawdown_126 = _max_drawdown_strict(close, 126)
     volatility_20 = _volatility(close, 20)
-    volatility_63 = _volatility(close, 63)
+    volatility_63 = _volatility_strict(close, 63)
     avg_volume_20 = _sma(volume, 20)
     latest_volume = _last_value(volume)
     volume_summary = {
@@ -117,25 +117,28 @@ def compute_history_summary(
     drawdown_from_high_20 = _drawdown_from_high(high if high is not None else close, close, 20)
     drawdown_from_high_60 = _drawdown_from_high(high if high is not None else close, close, 60)
     drawdown_from_high_252 = _drawdown_from_high(high if high is not None else close, close, 252)
-    distance_to_high_63 = _relative_to(latest_close, _window_extreme(high if high is not None else close, 63, "max"))
+    distance_to_high_63 = _relative_to(
+        latest_close,
+        _window_extreme_strict(high if high is not None else close, 63, "max"),
+    )
     breakout_20_high_score = _breakout_score(high if high is not None else close, close, 20)
     breakout_63_high_score = _breakout_score(high if high is not None else close, close, 63)
+    volume_confirmed_momentum = None
+    if momentum["return_63"] is not None and volume_summary["up_volume_ratio_20"] is not None:
+        volume_confirmed_momentum = _finite_float(
+            (momentum["return_63"] + volume_summary["up_volume_ratio_20"]) / 2.0
+        )
     scores.update(
         {
             "return_63_over_volatility_20": _ratio(momentum["return_63"], volatility_20),
             "return_126_over_volatility_20": _ratio(momentum["return_126"], volatility_20),
             "return_252_over_volatility_63": _ratio(momentum["return_252"], volatility_63),
-            "sharpe_like_63": _sharpe_like(close, 63),
+            "sharpe_like_63": _sharpe_like_strict(close, 63),
             "calmar_like_126": _ratio(
                 momentum["return_126"],
                 abs(max_drawdown_126) if max_drawdown_126 is not None else None,
             ),
-            "volume_confirmed_momentum": _mean_available(
-                [
-                    momentum["return_63"],
-                    volume_summary["up_volume_ratio_20"],
-                ]
-            ),
+            "volume_confirmed_momentum": volume_confirmed_momentum,
         }
     )
     scores["composite_score"] = _composite_score(
@@ -546,6 +549,20 @@ def _window_extreme(series: pd.Series | None, window: int, method: str) -> float
     raise ValueError(f"Unsupported extreme method: {method}")
 
 
+def _window_extreme_strict(series: pd.Series | None, window: int, method: str) -> float | None:
+    if series is None or len(series) < window:
+        return None
+    values = series.tail(window).dropna()
+    values = values[values.map(lambda value: _finite_float(value) is not None)]
+    if len(values) < window:
+        return None
+    if method == "max":
+        return float(values.max())
+    if method == "min":
+        return float(values.min())
+    raise ValueError(f"Unsupported extreme method: {method}")
+
+
 def _drawdown_from_high(
     high_series: pd.Series | None,
     close_series: pd.Series | None,
@@ -605,12 +622,34 @@ def _max_drawdown(series: pd.Series | None, window: int) -> float | None:
     return _finite_float(drawdowns.min())
 
 
+def _max_drawdown_strict(series: pd.Series | None, window: int) -> float | None:
+    if series is None or len(series) < window:
+        return None
+    values = series.tail(window).astype("float64").dropna()
+    values = values[values.map(lambda value: _finite_float(value) is not None)]
+    if len(values) < window:
+        return None
+    running_peak = values.cummax()
+    drawdowns = values / running_peak - 1.0
+    return _finite_float(drawdowns.min())
+
+
 def _volatility(series: pd.Series | None, window: int) -> float | None:
     if series is None or len(series) <= 1:
         return None
     returns = series.pct_change().dropna()
     returns = returns[returns.map(lambda value: _finite_float(value) is not None)].tail(window)
     if len(returns) < 2:
+        return None
+    return _finite_float(returns.std())
+
+
+def _volatility_strict(series: pd.Series | None, window: int) -> float | None:
+    if series is None or len(series) <= window:
+        return None
+    returns = series.pct_change().dropna()
+    returns = returns[returns.map(lambda value: _finite_float(value) is not None)].tail(window)
+    if len(returns) < window:
         return None
     return _finite_float(returns.std())
 
@@ -693,6 +732,20 @@ def _sharpe_like(series: pd.Series | None, window: int) -> float | None:
     return _finite_float(mean_return / volatility)
 
 
+def _sharpe_like_strict(series: pd.Series | None, window: int) -> float | None:
+    if series is None or len(series) <= window:
+        return None
+    returns = series.pct_change().dropna()
+    returns = returns[returns.map(lambda value: _finite_float(value) is not None)].tail(window)
+    if len(returns) < window:
+        return None
+    volatility = _finite_float(returns.std())
+    mean_return = _finite_float(returns.mean())
+    if mean_return is None or volatility in (None, 0):
+        return None
+    return _finite_float(mean_return / volatility)
+
+
 def _breakout_score(high_series: pd.Series | None, close_series: pd.Series | None, window: int) -> float | None:
     if close_series is None or high_series is None or len(close_series) <= window or len(high_series) <= window:
         return None
@@ -709,10 +762,12 @@ def _up_volume_ratio(close_series: pd.Series | None, volume_series: pd.Series | 
         data["close"].map(lambda value: _finite_float(value) is not None)
         & data["volume"].map(lambda value: _finite_float(value) is not None)
     ].reset_index(drop=True)
-    if len(data) < 2:
+    if len(data) <= window:
         return None
     returns = data["close"].pct_change().dropna()
     volumes = data["volume"].iloc[1:]
+    if len(returns) < window or len(volumes) < window:
+        return None
     total_volume = _finite_float(volumes.sum())
     if total_volume in (None, 0):
         return None

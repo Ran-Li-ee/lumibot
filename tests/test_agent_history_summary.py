@@ -221,6 +221,43 @@ def test_compute_history_summary_adds_breakout_and_volume_confirmation_metrics()
     assert summary["scores"]["volume_confirmed_momentum"] is not None
 
 
+def test_compute_history_summary_new_fixed_window_metrics_require_full_lookbacks():
+    summary = compute_history_summary(_trend_frame(63), symbol="SHORT", timestep="day", as_of=None)
+
+    assert summary["risk"]["volatility_63"] is None
+    assert summary["scores"]["sharpe_like_63"] is None
+    assert summary["range"]["distance_to_high_63"] is not None
+    assert summary["range"]["breakout_63_high_score"] is None
+    assert summary["volume"]["dollar_volume_20"] is not None
+    assert summary["volume"]["up_volume_ratio_20"] is not None
+
+    summary = compute_history_summary(_trend_frame(62), symbol="SHORT", timestep="day", as_of=None)
+
+    assert summary["range"]["distance_to_high_63"] is None
+
+    summary = compute_history_summary(_trend_frame(125), symbol="SHORT", timestep="day", as_of=None)
+
+    assert summary["risk"]["max_drawdown_126"] is None
+    assert summary["scores"]["calmar_like_126"] is None
+    assert summary["risk"]["max_drawdown_60"] is not None
+
+
+def test_compute_history_summary_volume_confirmation_requires_full_twenty_returns():
+    summary = compute_history_summary(_trend_frame(20), symbol="SHORT", timestep="day", as_of=None)
+
+    assert summary["volume"]["dollar_volume_20"] is not None
+    assert summary["volume"]["up_volume_ratio_20"] is None
+    assert summary["scores"]["volume_confirmed_momentum"] is None
+    assert summary["availability"]["up_volume_ratio_20"] is False
+    assert summary["availability"]["volume_confirmed_momentum"] is False
+
+    summary = compute_history_summary(_trend_frame(64), symbol="ENOUGH", timestep="day", as_of=None)
+
+    assert summary["momentum"]["return_63"] is not None
+    assert summary["volume"]["up_volume_ratio_20"] is not None
+    assert summary["scores"]["volume_confirmed_momentum"] is not None
+
+
 def test_compute_history_summary_calculates_range_and_drawdown():
     frame = _frame(260)
 
