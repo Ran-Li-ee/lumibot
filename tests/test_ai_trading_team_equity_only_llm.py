@@ -294,6 +294,50 @@ def test_qqq_symbol_repair_reports_noop_for_clean_symbols():
     }
 
 
+def test_resolve_qqq_snapshot_returns_repaired_symbols_and_metadata(tmp_path):
+    qqq_nport = importlib.import_module("lumibot.tools.universe.qqq_nport")
+    normalized = tmp_path / "normalized"
+    normalized.mkdir()
+    snapshot = {
+        "report_date": "2026-03-31",
+        "filing_date": "2026-05-28",
+        "accession_number": "0001067839-26-000024",
+        "source_url": "https://www.sec.gov/example.xml",
+        "holdings": [
+            {"symbol": "AAPL"},
+            {"symbol": "TRI4EUR"},
+            {"symbol": "TRI"},
+            {"symbol": "STXN"},
+            {"symbol": "CPW"},
+        ],
+    }
+    (normalized / "qqq_nport_2026-03-31_0001067839-26-000024.json").write_text(
+        json.dumps(snapshot),
+        encoding="utf-8",
+    )
+
+    resolution = qqq_nport.resolve_qqq_snapshot(
+        "2026-06-01",
+        mode="strict",
+        data_dir=tmp_path,
+    )
+
+    assert resolution.symbols == ("AAPL", "TRI", "STX", "CHKP")
+    assert resolution.symbol_repair == {
+        "applied": True,
+        "raw_count": 5,
+        "repaired_count": 3,
+        "deduped_count": 1,
+        "dropped_count": 0,
+        "final_count": 4,
+        "aliases": [
+            {"from": "TRI4EUR", "to": "TRI"},
+            {"from": "STXN", "to": "STX"},
+            {"from": "CPW", "to": "CHKP"},
+        ],
+    }
+
+
 def test_equity_only_target_portfolio_rejects_inactive_report():
     module = load_module()
 

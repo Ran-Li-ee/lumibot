@@ -160,6 +160,7 @@ class AsOfSnapshotResolution:
     symbols: tuple[str, ...]
     snapshot_path: Path
     source_url: str | None = None
+    symbol_repair: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -171,6 +172,7 @@ class AsOfSnapshotResolution:
             "symbols": list(self.symbols),
             "snapshot_path": str(self.snapshot_path),
             "source_url": self.source_url,
+            "symbol_repair": _json_ready(self.symbol_repair),
         }
 
 
@@ -463,15 +465,17 @@ def resolve_qqq_snapshot(
             candidates,
             key=lambda item: (item[0], item[1]),
         )
+    symbols, symbol_repair = repair_qqq_symbols(_snapshot_symbols(snapshot))
     return AsOfSnapshotResolution(
         as_of_date=as_of,
         mode=mode,
         selected_report_date=report,
         selected_filing_date=filing,
         accession_number=accession_number,
-        symbols=_snapshot_symbols(snapshot),
+        symbols=symbols,
         snapshot_path=path,
         source_url=source_url,
+        symbol_repair=symbol_repair,
     )
 
 
