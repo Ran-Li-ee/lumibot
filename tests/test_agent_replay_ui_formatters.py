@@ -190,11 +190,34 @@ def test_market_load_history_tables_summary_formatter_shows_rank_groups_and_cand
 
     assert "3 requested symbols" in explanation
     assert "3 loaded" in explanation
+    assert "0 failed" in explanation
     assert "top 2" in explanation
     assert "2 candidate summary rows" in explanation
     assert "momentum" in explanation
     assert "by_return_63: AAA=0.3, BBB=0.2" in explanation
     assert "trend_quality" in explanation
+
+
+def test_market_load_history_tables_summary_formatter_shows_empty_candidate_summary_rows():
+    explanation = explain_tool_result(
+        "market_load_history_tables_summary",
+        {"symbols": ["AAA", "BBB"]},
+        {
+            "coverage": {
+                "requested_count": 2,
+                "loaded_count": 0,
+                "failed_count": 2,
+            },
+            "candidate_summary": [],
+            "warnings": ["No ranked candidates"],
+        },
+        None,
+    )
+
+    assert "2 requested symbols" in explanation
+    assert "0 loaded" in explanation
+    assert "2 failed" in explanation
+    assert "0 candidate summary rows" in explanation
 
 
 def test_market_load_history_tables_summary_formatter_counts_empty_summary_rows():

@@ -306,7 +306,7 @@ def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -
             parts.append(f"{_rows_label(requested, 'requested symbol')}")
         if isinstance(loaded, int):
             parts.append(f"{loaded} loaded")
-        if isinstance(failed, int) and failed:
+        if isinstance(failed, int):
             parts.append(f"{failed} failed")
         top_n = coverage.get("top_n")
         if isinstance(top_n, int):
@@ -319,8 +319,9 @@ def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -
         if isinstance(requested_symbols, list):
             parts.append(f"{_rows_label(len(requested_symbols), 'requested symbol')}")
 
+    candidate_summary_value = result.get("candidate_summary")
     candidate_summary = _collection(raw_result, "candidate_summary")
-    if candidate_summary:
+    if isinstance(candidate_summary_value, list):
         parts.append(_rows_label(len(candidate_summary), "candidate summary row"))
 
     ranking_limit = result.get("ranking_limit")
