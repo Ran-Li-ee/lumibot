@@ -57,6 +57,23 @@ def _rankable_summary(
     return_63: float,
     return_126: float,
     trend_alignment: float,
+    return_252: float | None = None,
+    return_252_ex_skip_21: float | None = None,
+    sma_stack_score: float | None = None,
+    adjusted_slope_90: float | None = None,
+    linear_regression_r2_90: float | None = None,
+    return_252_over_volatility_63: float | None = None,
+    sharpe_like_63: float | None = None,
+    calmar_like_126: float | None = None,
+    distance_to_high_252: float | None = None,
+    distance_to_high_63: float | None = None,
+    breakout_20_high_score: float | None = None,
+    breakout_63_high_score: float | None = None,
+    drawdown_from_high_60: float | None = None,
+    volume_vs_avg_20: float | None = None,
+    dollar_volume_20: float | None = None,
+    up_volume_ratio_20: float | None = None,
+    volume_confirmed_momentum: float | None = None,
 ) -> dict:
     return {
         "symbol": symbol,
@@ -66,15 +83,38 @@ def _rankable_summary(
             "return_21": return_21,
             "return_63": return_63,
             "return_126": return_126,
+            "return_252": return_252,
+            "return_252_ex_skip_21": return_252_ex_skip_21,
+        },
+        "trend": {
+            "linear_regression_r2_90": linear_regression_r2_90,
         },
         "scores": {
             "composite_score": composite_score,
             "momentum_composite": momentum_composite,
             "trend_alignment": trend_alignment,
+            "sma_stack_score": sma_stack_score,
+            "adjusted_slope_90": adjusted_slope_90,
+            "return_63_over_volatility_20": return_63 / 0.1,
+            "return_126_over_volatility_20": return_126 / 0.1,
+            "return_252_over_volatility_63": return_252_over_volatility_63,
+            "sharpe_like_63": sharpe_like_63,
+            "calmar_like_126": calmar_like_126,
+            "volume_confirmed_momentum": volume_confirmed_momentum,
         },
-        "volume": {"volume_vs_avg_20": 0.0},
+        "volume": {
+            "volume_vs_avg_20": volume_vs_avg_20,
+            "dollar_volume_20": dollar_volume_20,
+            "up_volume_ratio_20": up_volume_ratio_20,
+        },
         "risk": {"volatility_20": 0.01},
-        "range": {"drawdown_from_high_60": -0.01},
+        "range": {
+            "distance_to_high_252": distance_to_high_252,
+            "distance_to_high_63": distance_to_high_63,
+            "breakout_20_high_score": breakout_20_high_score,
+            "breakout_63_high_score": breakout_63_high_score,
+            "drawdown_from_high_60": drawdown_from_high_60,
+        },
     }
 
 
@@ -538,6 +578,320 @@ def test_build_universe_history_summary_flattens_rows_and_rankings():
     assert summary["rankings"]["by_trend_alignment"] == ["QQQ", "SPY"]
 
 
+def test_build_universe_history_summary_returns_five_rank_groups_and_details():
+    symbols = ["AAA", "BBB", "CCC"]
+    history_summaries = {
+        "AAA": _rankable_summary(
+            "AAA",
+            composite_score=0.1,
+            momentum_composite=0.3,
+            return_21=0.2,
+            return_63=0.4,
+            return_126=0.5,
+            trend_alignment=3,
+            return_252=0.8,
+            return_252_ex_skip_21=0.7,
+            sma_stack_score=4,
+            adjusted_slope_90=0.9,
+            linear_regression_r2_90=0.95,
+            return_252_over_volatility_63=8.0,
+            sharpe_like_63=1.5,
+            calmar_like_126=4.0,
+            distance_to_high_252=-0.01,
+            distance_to_high_63=-0.02,
+            breakout_20_high_score=0.03,
+            breakout_63_high_score=0.01,
+            drawdown_from_high_60=-0.02,
+            volume_vs_avg_20=0.4,
+            dollar_volume_20=1000000,
+            up_volume_ratio_20=0.7,
+            volume_confirmed_momentum=0.55,
+        ),
+        "BBB": _rankable_summary(
+            "BBB",
+            composite_score=0.2,
+            momentum_composite=0.2,
+            return_21=0.1,
+            return_63=0.2,
+            return_126=0.3,
+            trend_alignment=2,
+            return_252=0.4,
+            return_252_ex_skip_21=0.35,
+            sma_stack_score=3,
+            adjusted_slope_90=0.4,
+            linear_regression_r2_90=0.8,
+            return_252_over_volatility_63=5.0,
+            sharpe_like_63=1.0,
+            calmar_like_126=2.0,
+            distance_to_high_252=-0.10,
+            distance_to_high_63=-0.08,
+            breakout_20_high_score=-0.01,
+            breakout_63_high_score=-0.02,
+            drawdown_from_high_60=-0.08,
+            volume_vs_avg_20=0.1,
+            dollar_volume_20=500000,
+            up_volume_ratio_20=0.6,
+            volume_confirmed_momentum=0.3,
+        ),
+        "CCC": _rankable_summary(
+            "CCC",
+            composite_score=0.3,
+            momentum_composite=0.1,
+            return_21=0.05,
+            return_63=0.1,
+            return_126=0.2,
+            trend_alignment=1,
+            return_252=0.2,
+            return_252_ex_skip_21=0.1,
+            sma_stack_score=1,
+            adjusted_slope_90=0.1,
+            linear_regression_r2_90=0.2,
+            return_252_over_volatility_63=2.0,
+            sharpe_like_63=0.2,
+            calmar_like_126=0.5,
+            distance_to_high_252=-0.30,
+            distance_to_high_63=-0.20,
+            breakout_20_high_score=-0.05,
+            breakout_63_high_score=-0.07,
+            drawdown_from_high_60=-0.20,
+            volume_vs_avg_20=-0.1,
+            dollar_volume_20=100000,
+            up_volume_ratio_20=0.4,
+            volume_confirmed_momentum=0.1,
+        ),
+    }
+
+    summary = build_universe_history_summary(
+        history_summaries,
+        symbols=symbols,
+        timestep="day",
+        length=252,
+        as_of="2024-09-05",
+        loaded_tables={"AAA": "aaa_hist"},
+        warnings=[],
+        top_n=2,
+        candidate_summary_limit=2,
+    )
+
+    assert summary["rank_groups"] == {
+        "momentum": [
+            "by_return_21",
+            "by_return_63",
+            "by_return_126",
+            "by_return_252",
+            "by_return_252_ex_skip_21",
+        ],
+        "trend_quality": [
+            "by_trend_alignment",
+            "by_sma_stack_score",
+            "by_adjusted_slope_90",
+            "by_regression_r2_90",
+        ],
+        "risk_adjusted_momentum": [
+            "by_return_63_over_volatility_20",
+            "by_return_126_over_volatility_20",
+            "by_return_252_over_volatility_63",
+            "by_sharpe_like_63",
+            "by_calmar_like_126",
+        ],
+        "breakout_near_high": [
+            "by_near_252_high",
+            "by_near_63_high",
+            "by_breakout_20_high",
+            "by_breakout_63_high",
+            "by_drawdown_from_high_60",
+        ],
+        "volume_confirmation": [
+            "by_volume_vs_avg_20",
+            "by_dollar_volume_20",
+            "by_up_volume_ratio_20",
+            "by_volume_confirmed_momentum",
+        ],
+    }
+    assert summary["coverage"] == {
+        "requested_count": 3,
+        "loaded_count": 3,
+        "failed_count": 0,
+        "top_n": 2,
+        "candidate_summary_limit": 2,
+        "ranking_count": len(summary["rankings"]),
+    }
+    assert summary["rankings"]["by_return_252"] == ["AAA", "BBB"]
+    assert summary["rankings"]["by_momentum_composite"] == ["AAA", "BBB"]
+    assert summary["rankings"]["by_composite_score"] == ["CCC", "BBB"]
+    assert summary["ranking_details"]["by_return_252"][0] == {"rank": 1, "symbol": "AAA", "value": 0.8}
+    assert summary["rankings"]["by_near_252_high"] == ["AAA", "BBB"]
+    assert len(summary["candidate_summary"]) == 2
+    assert summary["candidate_summary"][0]["symbol"] == "AAA"
+    assert summary["universe_summary"] == summary["candidate_summary"]
+    assert summary["loaded_tables"] == {"AAA": "aaa_hist"}
+
+
+def test_build_universe_history_summary_honors_top_n_and_candidate_summary_limit():
+    symbols = [f"S{i:02d}" for i in range(1, 8)]
+    history_summaries = {
+        symbol: _rankable_summary(
+            symbol,
+            composite_score=index,
+            momentum_composite=index,
+            return_21=index,
+            return_63=index,
+            return_126=index,
+            trend_alignment=index,
+            return_252=index,
+            return_252_ex_skip_21=index,
+            adjusted_slope_90=index,
+        )
+        for index, symbol in enumerate(symbols, start=1)
+    }
+
+    summary = build_universe_history_summary(
+        history_summaries,
+        symbols=symbols,
+        timestep="day",
+        length=252,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=3,
+        candidate_summary_limit=4,
+    )
+
+    assert summary["ranking_limit"] == 3
+    assert summary["universe_summary_limit"] == 4
+    assert summary["candidate_summary_limit"] == 4
+    assert all(len(ranking) <= 3 for ranking in summary["rankings"].values())
+    assert all(len(details) <= 3 for details in summary["ranking_details"].values())
+    assert len(summary["candidate_summary"]) <= 4
+
+
+def test_build_universe_history_summary_prioritizes_repeated_and_priority_ranking_candidates():
+    symbols = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    summary = build_universe_history_summary(
+        {
+            "AAA": _rankable_summary(
+                "AAA",
+                composite_score=1.0,
+                momentum_composite=0.1,
+                return_21=0.1,
+                return_63=0.1,
+                return_126=0.1,
+                trend_alignment=1,
+                adjusted_slope_90=0.1,
+            ),
+            "BBB": _rankable_summary(
+                "BBB",
+                composite_score=0.1,
+                momentum_composite=0.9,
+                return_21=0.9,
+                return_63=0.9,
+                return_126=0.9,
+                trend_alignment=3,
+                adjusted_slope_90=0.9,
+            ),
+            "CCC": _rankable_summary(
+                "CCC",
+                composite_score=0.2,
+                momentum_composite=0.8,
+                return_21=0.8,
+                return_63=0.8,
+                return_126=0.8,
+                trend_alignment=2,
+                adjusted_slope_90=0.8,
+            ),
+            "DDD": _rankable_summary(
+                "DDD",
+                composite_score=0.3,
+                momentum_composite=0.7,
+                return_21=0.7,
+                return_63=0.7,
+                return_126=0.7,
+                trend_alignment=1,
+                adjusted_slope_90=0.7,
+            ),
+            "EEE": _rankable_summary(
+                "EEE",
+                composite_score=0.4,
+                momentum_composite=0.6,
+                return_21=0.6,
+                return_63=0.6,
+                return_126=0.6,
+                trend_alignment=1,
+                adjusted_slope_90=0.6,
+            ),
+        },
+        symbols=symbols,
+        timestep="day",
+        length=252,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=2,
+        candidate_summary_limit=2,
+    )
+
+    assert [row["symbol"] for row in summary["candidate_summary"]] == ["BBB", "CCC"]
+
+
+def test_build_universe_history_summary_missing_metric_excludes_only_that_ranking():
+    summary = build_universe_history_summary(
+        {
+            "AAA": _rankable_summary(
+                "AAA",
+                composite_score=1,
+                momentum_composite=1,
+                return_21=1,
+                return_63=1,
+                return_126=1,
+                trend_alignment=3,
+                return_252=None,
+                adjusted_slope_90=1,
+            )
+        },
+        symbols=["AAA"],
+        timestep="day",
+        length=252,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=10,
+        candidate_summary_limit=25,
+    )
+
+    assert summary["rankings"]["by_return_252"] == []
+    assert summary["rankings"]["by_adjusted_slope_90"] == ["AAA"]
+    assert summary["candidate_summary"][0]["symbol"] == "AAA"
+
+
+def test_build_universe_history_summary_result_is_json_safe():
+    summary = build_universe_history_summary(
+        {
+            "BAD": _rankable_summary(
+                "BAD",
+                composite_score=float("nan"),
+                momentum_composite=float("inf"),
+                return_21=float("-inf"),
+                return_63=0.1,
+                return_126=0.2,
+                trend_alignment=1,
+                return_252=0.3,
+                adjusted_slope_90=0.4,
+            )
+        },
+        symbols=["BAD", "MISS"],
+        timestep="day",
+        length=252,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=10,
+        candidate_summary_limit=25,
+    )
+
+    json.dumps(summary, allow_nan=False)
+    assert summary["coverage"]["failed_count"] == 1
+
+
 def test_build_universe_history_summary_limits_rankings_and_detail_rows():
     symbols = [f"S{i:02d}" for i in range(1, 21)]
     history_summaries = {}
@@ -563,22 +917,24 @@ def test_build_universe_history_summary_limits_rankings_and_detail_rows():
     )
 
     assert summary["ranking_limit"] == 10
-    assert summary["universe_summary_limit"] == 15
+    assert summary["universe_summary_limit"] == 25
     assert summary["symbols"] == symbols
     assert summary["rankings"]["by_composite_score"] == symbols[:10]
     assert summary["rankings"]["by_momentum_composite"] == list(reversed(symbols[-10:]))
     assert all(len(ranking) <= 10 for ranking in summary["rankings"].values())
 
     detail_symbols = [row["symbol"] for row in summary["universe_summary"]]
-    assert len(detail_symbols) == 15
-    assert detail_symbols == symbols[:10] + list(reversed(symbols[-5:]))
+    assert len(detail_symbols) == 20
+    assert set(detail_symbols) == set(symbols)
     assert summary["universe_summary_selection"] == {
         "mode": "top_rank_union",
         "candidate_count_before_limit": 20,
         "included_symbols": detail_symbols,
         "priority": [
-            "by_composite_score",
             "by_momentum_composite",
+            "by_adjusted_slope_90",
+            "by_return_252_over_volatility_63",
+            "by_composite_score",
             "multi_ranking_overlap",
         ],
     }
@@ -657,30 +1013,34 @@ def test_build_universe_history_summary_sanitizes_non_finite_row_values():
     assert row["return_21"] is None
     assert row["return_63"] is None
     assert row["return_126"] == 0.12
-    assert "return_252" not in row
+    assert row["return_252"] is None
+    assert row["return_252_ex_skip_21"] is None
     assert row["momentum_composite"] is None
     assert row["composite_score"] is None
-    assert "sma_20" not in row
-    assert "sma_50" not in row
-    assert "sma_200" not in row
-    assert "price_vs_sma_20" not in row
-    assert "price_vs_sma_50" not in row
-    assert "price_vs_sma_200" not in row
     assert row["trend_alignment"] is None
-    assert "max_drawdown_60" not in row
+    assert row["sma_stack_score"] is None
+    assert row["adjusted_slope_90"] is None
+    assert row["linear_regression_r2_90"] is None
+    assert row["return_252_over_volatility_63"] is None
+    assert row["sharpe_like_63"] is None
+    assert row["calmar_like_126"] is None
+    assert row["volume_confirmed_momentum"] is None
     assert row["volatility_20"] is None
-    assert "distance_to_high_252" not in row
-    assert "distance_to_low_252" not in row
+    assert row["distance_to_high_252"] is None
+    assert row["distance_to_high_63"] is None
+    assert row["breakout_20_high_score"] is None
+    assert row["breakout_63_high_score"] is None
     assert row["volume_vs_avg_20"] is None
+    assert row["dollar_volume_20"] is None
+    assert row["up_volume_ratio_20"] is None
     assert row["drawdown_from_high_60"] is None
-    assert summary["rankings"] == {
-        "by_return_21": [],
-        "by_return_63": [],
-        "by_return_126": ["BAD"],
-        "by_momentum_composite": [],
-        "by_composite_score": [],
-        "by_trend_alignment": [],
-    }
+    assert summary["rankings"]["by_return_21"] == []
+    assert summary["rankings"]["by_return_63"] == []
+    assert summary["rankings"]["by_return_126"] == ["BAD"]
+    assert summary["rankings"]["by_momentum_composite"] == []
+    assert summary["rankings"]["by_composite_score"] == []
+    assert summary["rankings"]["by_trend_alignment"] == []
+    assert summary["rankings"]["by_adjusted_slope_90"] == []
     json.dumps(summary, allow_nan=False)
 
 

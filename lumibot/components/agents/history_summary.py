@@ -7,16 +7,78 @@ from typing import Any
 import pandas as pd
 
 SCHEMA_VERSION = "1.0"
-RANKING_LIMIT = 10
-UNIVERSE_SUMMARY_LIMIT = 15
-UNIVERSE_SUMMARY_SELECTION_PRIORITY = [
-    "by_composite_score",
+DEFAULT_RANKING_LIMIT = 10
+DEFAULT_CANDIDATE_SUMMARY_LIMIT = 25
+
+RANK_GROUPS = {
+    "momentum": [
+        "by_return_21",
+        "by_return_63",
+        "by_return_126",
+        "by_return_252",
+        "by_return_252_ex_skip_21",
+    ],
+    "trend_quality": [
+        "by_trend_alignment",
+        "by_sma_stack_score",
+        "by_adjusted_slope_90",
+        "by_regression_r2_90",
+    ],
+    "risk_adjusted_momentum": [
+        "by_return_63_over_volatility_20",
+        "by_return_126_over_volatility_20",
+        "by_return_252_over_volatility_63",
+        "by_sharpe_like_63",
+        "by_calmar_like_126",
+    ],
+    "breakout_near_high": [
+        "by_near_252_high",
+        "by_near_63_high",
+        "by_breakout_20_high",
+        "by_breakout_63_high",
+        "by_drawdown_from_high_60",
+    ],
+    "volume_confirmation": [
+        "by_volume_vs_avg_20",
+        "by_dollar_volume_20",
+        "by_up_volume_ratio_20",
+        "by_volume_confirmed_momentum",
+    ],
+}
+
+RANKING_METRICS = {
+    "by_return_21": "return_21",
+    "by_return_63": "return_63",
+    "by_return_126": "return_126",
+    "by_return_252": "return_252",
+    "by_return_252_ex_skip_21": "return_252_ex_skip_21",
+    "by_momentum_composite": "momentum_composite",
+    "by_composite_score": "composite_score",
+    "by_trend_alignment": "trend_alignment",
+    "by_sma_stack_score": "sma_stack_score",
+    "by_adjusted_slope_90": "adjusted_slope_90",
+    "by_regression_r2_90": "linear_regression_r2_90",
+    "by_return_63_over_volatility_20": "return_63_over_volatility_20",
+    "by_return_126_over_volatility_20": "return_126_over_volatility_20",
+    "by_return_252_over_volatility_63": "return_252_over_volatility_63",
+    "by_sharpe_like_63": "sharpe_like_63",
+    "by_calmar_like_126": "calmar_like_126",
+    "by_near_252_high": "distance_to_high_252",
+    "by_near_63_high": "distance_to_high_63",
+    "by_breakout_20_high": "breakout_20_high_score",
+    "by_breakout_63_high": "breakout_63_high_score",
+    "by_drawdown_from_high_60": "drawdown_from_high_60",
+    "by_volume_vs_avg_20": "volume_vs_avg_20",
+    "by_dollar_volume_20": "dollar_volume_20",
+    "by_up_volume_ratio_20": "up_volume_ratio_20",
+    "by_volume_confirmed_momentum": "volume_confirmed_momentum",
+}
+
+CANDIDATE_PRIORITY_RANKINGS = [
     "by_momentum_composite",
-    "multi_ranking_overlap",
-]
-_DETAIL_SELECTION_RANKING_PRIORITY = [
+    "by_adjusted_slope_90",
+    "by_return_252_over_volatility_63",
     "by_composite_score",
-    "by_momentum_composite",
 ]
 
 
@@ -248,28 +310,33 @@ def build_universe_history_summary(
     as_of: str | None,
     loaded_tables: dict[str, Any] | None,
     warnings: list[str] | None,
+    top_n: int = DEFAULT_RANKING_LIMIT,
+    candidate_summary_limit: int = DEFAULT_CANDIDATE_SUMMARY_LIMIT,
 ) -> dict[str, Any]:
     """Return a compact, model-facing batch summary for a symbol universe."""
+    top_n = max(1, int(top_n))
+    candidate_summary_limit = max(1, int(candidate_summary_limit))
     all_universe_rows = [
         _summary_to_universe_row(history_summaries[symbol])
         for symbol in symbols
         if symbol in history_summaries
     ]
     full_rankings = _rankings(all_universe_rows)
-    rankings = _limit_rankings(full_rankings, RANKING_LIMIT)
-    selected_symbols = _select_universe_summary_symbols(rankings, limit=UNIVERSE_SUMMARY_LIMIT)
+    rankings = _limit_rankings(full_rankings, top_n)
+    ranking_details = _ranking_details(all_universe_rows, rankings)
+    selected_symbols = _select_candidate_summary_symbols(rankings, limit=candidate_summary_limit)
     if not selected_symbols:
         selected_symbols = [
             str(row["symbol"])
             for row in all_universe_rows
             if row.get("symbol")
-        ][:UNIVERSE_SUMMARY_LIMIT]
+        ][:candidate_summary_limit]
     rows_by_symbol = {
         str(row["symbol"]): row
         for row in all_universe_rows
         if row.get("symbol")
     }
-    universe_summary = [
+    candidate_summary = [
         rows_by_symbol[symbol]
         for symbol in selected_symbols
         if symbol in rows_by_symbol
@@ -280,16 +347,28 @@ def build_universe_history_summary(
         "timestep": timestep,
         "length": length,
         "as_of": as_of,
-        "ranking_limit": RANKING_LIMIT,
+        "rank_groups": RANK_GROUPS,
+        "ranking_limit": top_n,
         "rankings": rankings,
-        "universe_summary_limit": UNIVERSE_SUMMARY_LIMIT,
+        "ranking_details": ranking_details,
+        "candidate_summary_limit": candidate_summary_limit,
+        "candidate_summary": candidate_summary,
+        "universe_summary_limit": candidate_summary_limit,
         "universe_summary_selection": {
             "mode": "top_rank_union",
             "candidate_count_before_limit": len(_unique_ranked_symbols(rankings)),
             "included_symbols": selected_symbols,
-            "priority": UNIVERSE_SUMMARY_SELECTION_PRIORITY,
+            "priority": CANDIDATE_PRIORITY_RANKINGS + ["multi_ranking_overlap"],
         },
-        "universe_summary": universe_summary,
+        "universe_summary": candidate_summary,
+        "coverage": {
+            "requested_count": len(symbols),
+            "loaded_count": len(all_universe_rows),
+            "failed_count": max(0, len(symbols) - len(all_universe_rows)),
+            "top_n": top_n,
+            "candidate_summary_limit": candidate_summary_limit,
+            "ranking_count": len(rankings),
+        },
         "loaded_tables": loaded_tables or {},
         "warnings": warnings or [],
     }
@@ -299,6 +378,7 @@ def _summary_to_universe_row(summary: dict[str, Any]) -> dict[str, Any]:
     price = _dict(summary.get("price"))
     momentum = _dict(summary.get("momentum"))
     volume = _dict(summary.get("volume"))
+    trend = _dict(summary.get("trend"))
     scores = _dict(summary.get("scores"))
     range_metrics = _dict(summary.get("range"))
     risk = _dict(summary.get("risk"))
@@ -310,23 +390,36 @@ def _summary_to_universe_row(summary: dict[str, Any]) -> dict[str, Any]:
         "return_21": _compact_number(momentum.get("return_21")),
         "return_63": _compact_number(momentum.get("return_63")),
         "return_126": _compact_number(momentum.get("return_126")),
+        "return_252": _compact_number(momentum.get("return_252")),
+        "return_252_ex_skip_21": _compact_number(momentum.get("return_252_ex_skip_21")),
         "momentum_composite": _compact_number(scores.get("momentum_composite")),
         "composite_score": _compact_number(scores.get("composite_score")),
         "volume_vs_avg_20": _compact_number(volume.get("volume_vs_avg_20")),
+        "dollar_volume_20": _compact_number(volume.get("dollar_volume_20")),
+        "up_volume_ratio_20": _compact_number(volume.get("up_volume_ratio_20")),
         "trend_alignment": _compact_number(scores.get("trend_alignment")),
+        "sma_stack_score": _compact_number(scores.get("sma_stack_score")),
+        "adjusted_slope_90": _compact_number(scores.get("adjusted_slope_90")),
+        "linear_regression_r2_90": _compact_number(trend.get("linear_regression_r2_90")),
+        "return_63_over_volatility_20": _compact_number(scores.get("return_63_over_volatility_20")),
+        "return_126_over_volatility_20": _compact_number(scores.get("return_126_over_volatility_20")),
+        "return_252_over_volatility_63": _compact_number(scores.get("return_252_over_volatility_63")),
+        "sharpe_like_63": _compact_number(scores.get("sharpe_like_63")),
+        "calmar_like_126": _compact_number(scores.get("calmar_like_126")),
+        "volume_confirmed_momentum": _compact_number(scores.get("volume_confirmed_momentum")),
         "volatility_20": _compact_number(risk.get("volatility_20")),
+        "distance_to_high_252": _compact_number(range_metrics.get("distance_to_high_252")),
+        "distance_to_high_63": _compact_number(range_metrics.get("distance_to_high_63")),
+        "breakout_20_high_score": _compact_number(range_metrics.get("breakout_20_high_score")),
+        "breakout_63_high_score": _compact_number(range_metrics.get("breakout_63_high_score")),
         "drawdown_from_high_60": _compact_number(range_metrics.get("drawdown_from_high_60")),
     }
 
 
 def _rankings(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
     return {
-        "by_return_21": _rank_symbols(rows, "return_21"),
-        "by_return_63": _rank_symbols(rows, "return_63"),
-        "by_return_126": _rank_symbols(rows, "return_126"),
-        "by_momentum_composite": _rank_symbols(rows, "momentum_composite"),
-        "by_composite_score": _rank_symbols(rows, "composite_score"),
-        "by_trend_alignment": _rank_symbols(rows, "trend_alignment"),
+        ranking_name: _rank_symbols(rows, metric_name)
+        for ranking_name, metric_name in RANKING_METRICS.items()
     }
 
 
@@ -337,52 +430,74 @@ def _limit_rankings(rankings: dict[str, list[str]], limit: int) -> dict[str, lis
     }
 
 
-def _select_universe_summary_symbols(rankings: dict[str, list[str]], *, limit: int) -> list[str]:
+def _ranking_details(
+    rows: list[dict[str, Any]],
+    rankings: dict[str, list[str]],
+) -> dict[str, list[dict[str, Any]]]:
+    rows_by_symbol = {
+        str(row["symbol"]): row
+        for row in rows
+        if row.get("symbol")
+    }
+    details: dict[str, list[dict[str, Any]]] = {}
+    for ranking_name, symbols in rankings.items():
+        metric_name = RANKING_METRICS[ranking_name]
+        entries = []
+        for index, symbol in enumerate(symbols, start=1):
+            row = rows_by_symbol.get(symbol)
+            if row is None:
+                continue
+            entries.append(
+                {
+                    "rank": index,
+                    "symbol": symbol,
+                    "value": _compact_number(row.get(metric_name)),
+                }
+            )
+        details[ranking_name] = entries
+    return details
+
+
+def _select_candidate_summary_symbols(rankings: dict[str, list[str]], *, limit: int) -> list[str]:
     candidates = _unique_ranked_symbols(rankings)
     if len(candidates) <= limit:
         return candidates
 
-    selected: list[str] = []
-    seen: set[str] = set()
-
-    def add(symbol: str) -> None:
-        if len(selected) >= limit or symbol in seen:
-            return
-        selected.append(symbol)
-        seen.add(symbol)
-
-    for ranking_name in _DETAIL_SELECTION_RANKING_PRIORITY:
-        for symbol in rankings.get(ranking_name, []):
-            add(symbol)
-
-    if len(selected) >= limit:
-        return selected
-
-    first_seen_order = {symbol: index for index, symbol in enumerate(candidates)}
     appearance_counts: dict[str, int] = {}
     best_rank: dict[str, int] = {}
-    for ranking in rankings.values():
+    priority_best_rank: dict[str, int] = {}
+    first_seen_order: dict[str, int] = {}
+    official_rankings = {
+        ranking_name
+        for ranking_names in RANK_GROUPS.values()
+        for ranking_name in ranking_names
+    }
+    for ranking_name, ranking in rankings.items():
         for index, symbol in enumerate(ranking):
-            appearance_counts[symbol] = appearance_counts.get(symbol, 0) + 1
+            first_seen_order.setdefault(symbol, len(first_seen_order))
+            if ranking_name in official_rankings:
+                appearance_counts[symbol] = appearance_counts.get(symbol, 0) + 1
             best_rank[symbol] = min(best_rank.get(symbol, index), index)
+            if ranking_name in CANDIDATE_PRIORITY_RANKINGS:
+                priority_best_rank[symbol] = min(priority_best_rank.get(symbol, index), index)
 
-    remaining = [symbol for symbol in candidates if symbol not in seen]
-    remaining.sort(
+    ordered = list(candidates)
+    ordered.sort(
         key=lambda symbol: (
             -appearance_counts.get(symbol, 0),
+            priority_best_rank.get(symbol, len(candidates)),
             best_rank.get(symbol, len(candidates)),
             first_seen_order.get(symbol, len(candidates)),
+            symbol,
         )
     )
-    for symbol in remaining:
-        add(symbol)
-    return selected
+    return ordered[:limit]
 
 
 def _unique_ranked_symbols(rankings: dict[str, list[str]]) -> list[str]:
     symbols: list[str] = []
     seen: set[str] = set()
-    for ranking_name in _DETAIL_SELECTION_RANKING_PRIORITY:
+    for ranking_name in CANDIDATE_PRIORITY_RANKINGS:
         for symbol in rankings.get(ranking_name, []):
             if symbol not in seen:
                 symbols.append(symbol)
