@@ -1228,6 +1228,8 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
         asset_type: AssetTypeArg = "stock",
         table_prefix: str | None = None,
         include_after_hours: bool = True,
+        top_n: int = 10,
+        candidate_summary_limit: int = 25,
     ) -> dict[str, Any]:
         if not isinstance(symbols, list) or not symbols:
             raise ValueError("symbols must be a non-empty list.")
@@ -1236,6 +1238,8 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
         if len(normalized_symbol_keys) != len(set(normalized_symbol_keys)):
             raise ValueError("duplicate symbols are not allowed.")
         length = _require_positive_int("length", length)
+        top_n = _require_positive_int("top_n", top_n)
+        candidate_summary_limit = _require_positive_int("candidate_summary_limit", candidate_summary_limit)
         timestep = _require_non_empty_text("timestep", timestep)
         return manager.duckdb.load_history_tables_summary(
             symbols=symbols,
@@ -1244,24 +1248,27 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
             asset_type=asset_type,
             table_prefix=table_prefix,
             include_after_hours=include_after_hours,
+            top_n=top_n,
+            candidate_summary_limit=candidate_summary_limit,
         )
 
     return BoundTool(
         name="market_load_history_tables_summary",
         description=(
             "Load visible historical bars for multiple symbols into DuckDB and return a cross-symbol summary. "
-            "Arguments: symbols, optional length, timestep, asset_type, table_prefix, include_after_hours. "
+            "Arguments: symbols, optional length, timestep, asset_type, table_prefix, include_after_hours, "
+            "top_n default 10, and candidate_summary_limit default 25. "
             "This is the default tool for multi-symbol price-history comparison and universe ranking. "
             "Use it before per-symbol raw history tables for common cross-symbol comparison and ranking tasks. "
-            "This summary-first tool returns factual rankings, including by_composite_score, plus recent returns, "
-            "moving averages, trend alignment, drawdown, volatility, volume context, and range position "
-            "for the requested universe. "
-            "Each ranking list is capped at the top 10 symbols, and detailed universe_summary rows are limited "
-            "to a top-ranked candidate subset of at most 15 symbols while the full requested symbols list remains visible. "
-            "Prefer this tool before writing DuckDB SQL for common universe ranking. "
+            "This summary-first tool returns five evidence groups: momentum, trend quality, risk-adjusted "
+            "momentum, breakout / near-high, and volume confirmation. Each ranking list is capped by top_n "
+            "and includes ranking values in ranking_details. candidate_summary contains a compact top-ranked "
+            "candidate subset capped by candidate_summary_limit. Prefer this tool before writing DuckDB SQL "
+            "for ordinary universe ranking; use DuckDB only as targeted follow-up when the computed summaries "
+            "are insufficient. "
             "Caveat: this only loads bars visible at the current LumiBot runtime datetime. "
             "Example: market_load_history_tables_summary("
-            "symbols=['QQQ', 'SPY'], length=252, timestep='day', table_prefix='cmp')."
+            "symbols=['MSFT', 'AAPL'], length=252, timestep='day', top_n=10, candidate_summary_limit=25)."
         ),
         function=load_history_tables_summary,
         metadata={"kind": "builtin", "replay_on_cache": True},

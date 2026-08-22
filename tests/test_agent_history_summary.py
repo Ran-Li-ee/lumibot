@@ -139,11 +139,21 @@ def test_history_tool_descriptions_are_summary_first():
     assert "summary-first" in single
     assert "cross-symbol comparison" in multi
     assert "default tool for multi-symbol" in multi
+    assert "five evidence groups" in multi
+    assert "momentum" in multi
+    assert "trend quality" in multi
+    assert "risk-adjusted momentum" in multi
+    assert "breakout / near-high" in multi
+    assert "volume confirmation" in multi
+    assert "top_n" in multi
+    assert "candidate_summary_limit" in multi
+    assert "ranking_details" in multi
+    assert "summary-first" in multi
+    assert "duckdb only as targeted follow-up" in multi
+    assert "by_composite_score" not in multi
     assert "targeted follow-up" in duckdb
     assert "computed summaries or rankings are insufficient" in duckdb
     assert "load a table first with market_load_history_table, then analyze it here" not in duckdb
-    assert "top 10" in multi
-    assert "top-ranked candidate subset" in multi
 
 
 def test_compute_history_summary_returns_core_groups():

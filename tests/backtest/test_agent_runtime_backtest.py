@@ -1983,7 +1983,11 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
     assert "Raw rows remain queryable in DuckDB" in history_tool.description
     assert "market_load_history_tables_summary" in tool_names
     assert "cross-symbol summary" in batch_tool.description
-    assert "by_composite_score" in batch_tool.description
+    assert "five evidence groups" in batch_tool.description
+    assert "top_n default 10" in batch_tool.description
+    assert "candidate_summary_limit default 25" in batch_tool.description
+    assert "ranking_details" in batch_tool.description
+    assert "by_composite_score" not in batch_tool.description
     assert "Prefer this tool before writing DuckDB SQL" in batch_tool.description
     assert "exact column names" in query_tool.description
     assert "market_load_history_table" in query_tool.description
@@ -2113,17 +2117,31 @@ def test_duckdb_history_tables_summary_returns_rankings_and_queryable_tables(mon
         length=30,
         timestep="minute",
         table_prefix="cmp",
+        top_n=1,
+        candidate_summary_limit=1,
     )
 
     assert summary["schema_version"] == "1.0"
     assert summary["symbols"] == ["AGST", "AGST2"]
     assert len(summary["loaded_tables"]) == 2
-    assert len(summary["universe_summary"]) == 2
+    assert len(summary["universe_summary"]) <= 1
     assert "by_return_21" in summary["rankings"]
     assert "by_return_63" in summary["rankings"]
     assert "by_momentum_composite" in summary["rankings"]
     assert "by_composite_score" in summary["rankings"]
     assert summary["rankings"]["by_composite_score"]
+    assert "rank_groups" in summary
+    assert "ranking_details" in summary
+    assert "candidate_summary" in summary
+    assert "coverage" in summary
+    assert summary["coverage"]["top_n"] == 1
+    assert summary["coverage"]["candidate_summary_limit"] == 1
+    assert "by_return_252" in summary["rankings"]
+    assert "by_adjusted_slope_90" in summary["rankings"]
+    assert "by_volume_confirmed_momentum" in summary["rankings"]
+    assert all(len(values) <= 1 for values in summary["rankings"].values())
+    assert all(len(values) <= 1 for values in summary["ranking_details"].values())
+    assert len(summary["candidate_summary"]) <= 1
     for row in summary["universe_summary"]:
         assert "composite_score" in row
         assert "return_5" in row

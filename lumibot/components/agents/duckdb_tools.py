@@ -401,6 +401,8 @@ class DuckDBQueryLayer:
         asset_type: str = "stock",
         table_prefix: str | None = None,
         include_after_hours: bool = True,
+        top_n: int = 10,
+        candidate_summary_limit: int = 25,
     ) -> dict[str, Any]:
         if not isinstance(symbols, list) or not symbols:
             raise ValueError("symbols must be a non-empty list.")
@@ -460,6 +462,8 @@ class DuckDBQueryLayer:
             as_of=as_of,
             loaded_tables=loaded_tables,
             warnings=warnings,
+            top_n=top_n,
+            candidate_summary_limit=candidate_summary_limit,
         )
         return result
 

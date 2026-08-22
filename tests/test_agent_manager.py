@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -580,6 +581,37 @@ def test_research_agent_with_history_tools_receives_summary_first_policy():
     assert "market_load_history_table is targeted single-symbol follow-up" in prompt_lower
     assert "duckdb_query is targeted follow-up only" in prompt_lower
     assert "do not load raw history tables for every symbol" in prompt_lower
+
+
+def test_market_load_history_tables_summary_tool_accepts_rank_limits():
+    tool = BuiltinTools.market.load_history_tables_summary().binder(DummyStrategy(), DummyManager())
+    signature = inspect.signature(tool.function)
+
+    assert "top_n" in signature.parameters
+    assert signature.parameters["top_n"].default == 10
+    assert "candidate_summary_limit" in signature.parameters
+    assert signature.parameters["candidate_summary_limit"].default == 25
+
+
+def test_market_load_history_tables_summary_tool_forwards_and_validates_rank_limits():
+    captured = {}
+
+    class FakeDuckDB:
+        def load_history_tables_summary(self, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+    manager = SimpleNamespace(duckdb=FakeDuckDB())
+    tool = BuiltinTools.market.load_history_tables_summary().binder(DummyStrategy(), manager)
+
+    assert tool.function(symbols=["MSFT"], top_n=7, candidate_summary_limit=11) == {"ok": True}
+    assert captured["top_n"] == 7
+    assert captured["candidate_summary_limit"] == 11
+
+    with pytest.raises(ValueError, match="top_n"):
+        tool.function(symbols=["MSFT"], top_n=0)
+    with pytest.raises(ValueError, match="candidate_summary_limit"):
+        tool.function(symbols=["MSFT"], candidate_summary_limit=0)
 
 
 def test_execution_agent_with_order_tools_does_not_receive_history_policy():

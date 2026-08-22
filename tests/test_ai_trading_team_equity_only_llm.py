@@ -543,6 +543,14 @@ def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_ne
         "equal target weights",
         "market_load_history_tables_summary",
         "separate evidence",
+        "momentum",
+        "trend quality",
+        "risk-adjusted momentum",
+        "breakout",
+        "near-high",
+        "volume confirmation",
+        "do not treat composite_score as the final answer",
+        "do not blindly copy",
         "alpaca_news",
         "leading candidates",
         "strict json",
@@ -557,6 +565,7 @@ def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_ne
         "tips",
         "nominal bond",
         "defensive posture",
+        "safest",
         "duckdb",
     ):
         assert forbidden not in prompt
@@ -615,6 +624,10 @@ def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(mo
     assert "length=252" in task_prompt
     assert "timestep='day'" in task_prompt
     assert "top_n=10" in task_prompt
+    assert "candidate_summary_limit=25" in task_prompt
+    assert "five rank groups" in task_prompt
+    assert "which evidence groups support" in task_prompt
+    assert "do not assign per-symbol weights" in task_prompt
     assert "alpaca_news" in task_prompt
     assert "close, conflicting, or uncertain" in task_prompt
     assert "candidate_symbols must copy the assigned basket_symbols exactly" in task_prompt
@@ -958,6 +971,14 @@ def test_qqq_historical_equity_agent_prompt_mentions_historical_constituents_wit
         "do not invent sector",
         "do not add symbols",
         "index weight",
+        "momentum",
+        "trend quality",
+        "risk-adjusted momentum",
+        "breakout",
+        "near-high",
+        "volume confirmation",
+        "do not treat composite_score as the final answer",
+        "do not blindly copy",
     ):
         assert required in prompt
 
