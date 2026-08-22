@@ -23,6 +23,8 @@ def make_strategy(*, positions, prices, historical_prices=None):
         price = prices[symbol_text] if historical_prices is None else historical_prices.get(symbol_text)
         if price is None:
             return SimpleNamespace(pandas_df=pd.DataFrame())
+        if isinstance(price, list):
+            return SimpleNamespace(pandas_df=pd.DataFrame(price[-length:]))
         return SimpleNamespace(
             pandas_df=pd.DataFrame(
                 [
@@ -108,9 +110,47 @@ def test_trailing_stop_generates_full_position_sell_when_threshold_breached():
             "trailing_stop_pct": 0.2,
             "stop_price": 120.0,
             "triggered": True,
-            "price_source": "daily_close",
+            "price_source": "daily_close_window",
+            "history_start_date": "2024-09-02",
+            "history_end_date": "2024-09-05",
+            "history_bar_count": 1,
         }
     ]
+
+
+def test_trailing_stop_uses_highest_close_from_holding_window():
+    module = load_module()
+    strategy = make_strategy(
+        positions=[make_position("NVDA", 10)],
+        prices={"NVDA": 118.0},
+        historical_prices={
+            "NVDA": [
+                {"Date": "2024-08-30", "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0},
+                {"Date": "2024-09-02", "open": 130.0, "high": 130.0, "low": 130.0, "close": 130.0},
+                {"Date": "2024-09-03", "open": 150.0, "high": 150.0, "low": 150.0, "close": 150.0},
+                {"Date": "2024-09-04", "open": 140.0, "high": 140.0, "low": 140.0, "close": 140.0},
+                {"Date": "2024-09-05", "open": 118.0, "high": 118.0, "low": 118.0, "close": 118.0},
+            ],
+        },
+    )
+    state = {"NVDA": {"entry_date": "2024-09-02", "peak_close": 130.0}}
+
+    result = module.trailing_stop_to_execution_plan(
+        strategy,
+        date="2024-09-05",
+        trailing_stop_pct=0.20,
+        position_state=state,
+    )
+
+    check = result["stop_checks"][0]
+    assert check["previous_peak_close"] == 130.0
+    assert check["peak_close"] == 150.0
+    assert check["current_check_price"] == 118.0
+    assert check["stop_price"] == 120.0
+    assert check["triggered"] is True
+    assert check["history_start_date"] == "2024-09-02"
+    assert check["history_end_date"] == "2024-09-05"
+    assert check["history_bar_count"] == 4
 
 
 def test_trailing_stop_updates_peak_when_current_close_sets_new_high():
@@ -149,6 +189,7 @@ def test_trailing_stop_falls_back_to_last_price_when_daily_close_is_unavailable(
 
     assert result["execution_plan"] == {"schema_version": 1, "intent": "hold", "orders": []}
     assert result["stop_checks"][0]["price_source"] == "last_price_fallback"
+    assert result["stop_checks"][0]["holding_start_date"] == "2024-09-05"
     assert result["updated_position_state"]["NVDA"] == {
         "entry_date": "2024-09-05",
         "peak_close": 149.0,
