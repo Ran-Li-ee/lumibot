@@ -892,6 +892,67 @@ def test_build_universe_history_summary_result_is_json_safe():
     assert summary["coverage"]["failed_count"] == 1
 
 
+def test_build_universe_history_summary_tie_order_is_independent_of_input_symbol_order():
+    symbols = ["AAA", "BBB", "CCC"]
+    history_summaries = {
+        symbol: _rankable_summary(
+            symbol,
+            composite_score=1,
+            momentum_composite=1,
+            return_21=1,
+            return_63=1,
+            return_126=1,
+            trend_alignment=1,
+            return_252=1,
+            return_252_ex_skip_21=1,
+            sma_stack_score=1,
+            adjusted_slope_90=1,
+            linear_regression_r2_90=1,
+            return_252_over_volatility_63=1,
+            sharpe_like_63=1,
+            calmar_like_126=1,
+            distance_to_high_252=1,
+            distance_to_high_63=1,
+            breakout_20_high_score=1,
+            breakout_63_high_score=1,
+            drawdown_from_high_60=1,
+            volume_vs_avg_20=1,
+            dollar_volume_20=1,
+            up_volume_ratio_20=1,
+            volume_confirmed_momentum=1,
+        )
+        for symbol in symbols
+    }
+
+    forward_summary = build_universe_history_summary(
+        history_summaries,
+        symbols=symbols,
+        timestep="day",
+        length=252,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=3,
+        candidate_summary_limit=3,
+    )
+    reversed_summary = build_universe_history_summary(
+        history_summaries,
+        symbols=list(reversed(symbols)),
+        timestep="day",
+        length=252,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=3,
+        candidate_summary_limit=3,
+    )
+
+    assert forward_summary["rankings"]["by_return_21"] == symbols
+    assert reversed_summary["rankings"]["by_return_21"] == symbols
+    assert [row["symbol"] for row in forward_summary["candidate_summary"]] == symbols
+    assert [row["symbol"] for row in reversed_summary["candidate_summary"]] == symbols
+
+
 def test_build_universe_history_summary_limits_rankings_and_detail_rows():
     symbols = [f"S{i:02d}" for i in range(1, 21)]
     history_summaries = {}
@@ -959,9 +1020,9 @@ def test_build_universe_history_summary_skips_unavailable_ranking_values():
     )
 
     assert summary["rankings"]["by_return_21"] == ["QQQ"]
-    assert summary["rankings"]["by_return_63"] == ["QQQ", "BAD"]
-    assert summary["rankings"]["by_return_126"] == ["QQQ", "BAD"]
-    assert summary["rankings"]["by_momentum_composite"] == ["QQQ", "BAD"]
+    assert summary["rankings"]["by_return_63"] == ["BAD", "QQQ"]
+    assert summary["rankings"]["by_return_126"] == ["BAD", "QQQ"]
+    assert summary["rankings"]["by_momentum_composite"] == ["BAD", "QQQ"]
     assert summary["rankings"]["by_trend_alignment"] == ["QQQ"]
 
 

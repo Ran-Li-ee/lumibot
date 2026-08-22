@@ -516,7 +516,7 @@ def _rank_symbols(rows: list[dict[str, Any]], key: str) -> list[str]:
         for row in rows
         if row.get("symbol") and _is_rankable(row.get(key))
     ]
-    return [symbol for symbol, _ in sorted(rankable, key=lambda item: item[1], reverse=True)]
+    return [symbol for symbol, _ in sorted(rankable, key=lambda item: (-item[1], item[0]))]
 
 
 def _dict(value: Any) -> dict[str, Any]:
