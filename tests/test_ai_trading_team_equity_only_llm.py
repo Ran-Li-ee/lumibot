@@ -1117,6 +1117,133 @@ def test_iteration_builds_top5_equal_weight_targets_and_runs_execution(monkeypat
     assert execution_plan["orders"][0]["symbol"] == "ORCL"
 
 
+def test_trailing_stop_executes_and_skips_weekly_equity_agent(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    strategy.parameters["run_frequency"] = "daily"
+    strategy._run_frequency = "daily"
+    strategy.agents.summaries["execution_agent"] = "Executed trailing stop."
+
+    def fake_trailing_stop_to_execution_plan(strategy_arg, *, date, trailing_stop_pct, position_state):
+        assert strategy_arg is strategy
+        assert date == "2024-09-05"
+        assert trailing_stop_pct == pytest.approx(0.20)
+        assert position_state == {}
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "trailing_stop_pct": trailing_stop_pct,
+            "stop_checks": [
+                {
+                    "symbol": "NVDA",
+                    "quantity": 10.0,
+                    "holding_start_date": "2024-09-02",
+                    "previous_peak_close": 150.0,
+                    "peak_close": 150.0,
+                    "current_check_price": 118.0,
+                    "trailing_stop_pct": 0.2,
+                    "stop_price": 120.0,
+                    "triggered": True,
+                    "price_source": "daily_close",
+                }
+            ],
+            "updated_position_state": {},
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "NVDA",
+                        "side": "sell",
+                        "quantity_mode": "shares",
+                        "quantity": 10,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            },
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "trailing_stop_to_execution_plan", fake_trailing_stop_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    assert strategy.agents["equity_basket_agent"].calls == []
+    assert len(strategy.agents["execution_agent"].calls) == 1
+    execution_call = strategy.agents["execution_agent"].calls[0]
+    assert execution_call["context"]["execution_reason"] == "trailing_stop"
+    assert execution_call["context"]["execution_plan"]["orders"][0]["symbol"] == "NVDA"
+    assert strategy._last_trailing_stop_result["stop_checks"][0]["triggered"] is True
+
+
+def test_no_trailing_stop_allows_weekly_equity_workflow(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)
+    strategy.get_datetime = lambda: datetime(2024, 9, 9, 9, 30)
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": ["AAPL", "MSFT", "NVDA", "AMZN", "META"],
+            "selected_symbols": ["AAPL", "MSFT", "NVDA", "AMZN", "META"],
+            "reason_brief": "Five strongest names.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+
+    monkeypatch.setattr(
+        module,
+        "trailing_stop_to_execution_plan",
+        lambda strategy_arg, *, date, trailing_stop_pct, position_state: {
+            "schema_version": "1.0",
+            "date": date,
+            "trailing_stop_pct": trailing_stop_pct,
+            "stop_checks": [],
+            "updated_position_state": {},
+            "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []},
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "resolve_qqq_snapshot",
+        lambda as_of_date, *, mode="strict", data_dir=None: qqq_resolution(
+            as_of_date=as_of_date,
+            symbols=("AAPL", "MSFT", "NVDA", "AMZN", "META"),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "target_portfolio_to_execution_plan",
+        lambda strategy_arg, *, date, target_portfolio: {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 0.0,
+                "cash_after_estimate": 100000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []},
+            "warnings": [],
+        },
+    )
+
+    strategy.on_trading_iteration()
+
+    assert len(strategy.agents["equity_basket_agent"].calls) == 1
+    assert strategy._last_trailing_stop_result["execution_plan"]["intent"] == "hold"
+
+
 def test_benchmark_runner_exposes_fixed_and_qqq_historical_equity_only_strategies():
     benchmark = importlib.import_module("scripts.run_ai_trading_team_examples_benchmark")
 

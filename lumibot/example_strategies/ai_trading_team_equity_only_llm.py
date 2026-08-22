@@ -29,6 +29,10 @@ from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
     validate_decision_buy_sizing,
     validate_execution_plan_cash_safety,
 )
+from lumibot.example_strategies.equity_trailing_stop_to_execution_plan import (
+    DEFAULT_TRAILING_STOP_PCT,
+    trailing_stop_to_execution_plan,
+)
 from lumibot.example_strategies.target_portfolio_to_execution_plan import (
     get_agent_order_cash_check_price as target_portfolio_order_cash_check_price,
 )
@@ -248,6 +252,12 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         self._last_scheduled_workflow_run_date: str | None = None
         self._last_target_portfolio_planner_result = None
         self._last_execution_plan_error = None
+        self._equity_trailing_stop_pct = float(
+            self.parameters.get("equity_trailing_stop_pct", DEFAULT_TRAILING_STOP_PCT)
+        )
+        self._equity_trailing_stop_position_state: dict[str, dict[str, Any]] = {}
+        self._trailing_stop_events: list[dict[str, Any]] = []
+        self._last_trailing_stop_result = None
 
     def _equity_agent_system_prompt(self, symbols: str) -> str:
         return equity_basket_agent_system_prompt(symbols)
@@ -367,6 +377,54 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             return False
         return True
 
+    def _execute_plan_with_execution_agent(
+        self,
+        *,
+        current_date: str,
+        execution_plan: dict[str, Any],
+        reason: str,
+    ) -> None:
+        self.agents["execution_agent"].run(
+            task_prompt=(
+                "Execute the provided execution_plan by calling execution_plan_execute exactly once with the "
+                "complete execution_plan. Use the returned concise execution summary to write the final result. "
+                "Do not infer missing order details beyond the tool response. Do not call per-order tools. "
+                f"This execution_plan reason is {reason}."
+            ),
+            context={
+                "date": current_date,
+                "execution_reason": reason,
+                "execution_plan": execution_plan_execute_payload(execution_plan),
+            },
+        )
+
+    def _run_daily_trailing_stop_check(self, current_date: str) -> bool:
+        result = trailing_stop_to_execution_plan(
+            self,
+            date=current_date,
+            trailing_stop_pct=self._equity_trailing_stop_pct,
+            position_state=self._equity_trailing_stop_position_state,
+        )
+        self._last_trailing_stop_result = result
+        self._trailing_stop_events.append(result)
+        self._equity_trailing_stop_position_state = dict(result.get("updated_position_state") or {})
+
+        execution_plan = normalize_execution_plan(result.get("execution_plan"))
+        if execution_plan["intent"] == "hold" or not execution_plan["orders"]:
+            return False
+
+        self._last_target_portfolio_planner_result = {
+            "execution_plan": execution_plan,
+            "trailing_stop_result": result,
+        }
+        self._last_execution_plan_error = None
+        self._execute_plan_with_execution_agent(
+            current_date=current_date,
+            execution_plan=execution_plan,
+            reason="trailing_stop",
+        )
+        return True
+
     def _run_equity_only_workflow(
         self,
         current_date: str,
@@ -476,22 +534,18 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         if execution_plan["intent"] == "hold" or not execution_plan["orders"]:
             return
 
-        self.agents["execution_agent"].run(
-            task_prompt=(
-                "Execute the provided execution_plan by calling execution_plan_execute exactly once with the "
-                "complete execution_plan. Use the returned concise execution summary to write the final result. "
-                "Do not infer missing order details beyond the tool response. Do not call per-order tools."
-            ),
-            context={
-                "date": current_date,
-                "execution_plan": execution_plan_execute_payload(execution_plan),
-            },
+        self._execute_plan_with_execution_agent(
+            current_date=current_date,
+            execution_plan=execution_plan,
+            reason="scheduled_rebalance",
         )
 
     def on_trading_iteration(self):
         current_datetime = self.get_datetime()
         current_date_obj = current_datetime.date()
         current_date = current_date_obj.isoformat()
+        if self._run_daily_trailing_stop_check(current_date):
+            return
         cadence_event = self._scheduled_workflow_decision(current_date_obj)
         if not cadence_event["should_run"]:
             self._record_scheduled_workflow_event(cadence_event)
