@@ -2791,6 +2791,44 @@ def _is_pruned_tool_response_envelope(tool_response: Any) -> bool:
     )
 
 
+def _tool_error_excerpt(tool_response: Any, *, max_chars: int) -> str | None:
+    if not isinstance(tool_response, dict) or tool_response.get("tool_error") is not True:
+        return None
+    result = _json_safe_value(tool_response)
+    if not isinstance(result, dict):
+        return None
+
+    preserved_keys = ("ok", "tool_error", "tool_name", "error", "error_type", "message")
+    excerpt_payload = {key: result[key] for key in preserved_keys if key in result}
+    if "arguments" in result:
+        arguments = json.dumps(result["arguments"], sort_keys=True, default=str)
+        excerpt_payload["arguments_excerpt"] = _truncate_preserving_start(
+            arguments,
+            max(max_chars // 3, 200),
+            label="tool_response.arguments",
+        )
+    serialized = json.dumps(excerpt_payload, sort_keys=False, default=str)
+    if len(serialized) <= max_chars:
+        return serialized
+    return _truncate_preserving_start(
+        serialized,
+        max_chars,
+        label="tool_response.error",
+    )
+
+
+def _has_market_history_tables_summary_shape(result: dict[str, Any]) -> bool:
+    if result.get("tool_error") is True:
+        return False
+    return (
+        isinstance(result.get("coverage"), dict)
+        and isinstance(result.get("rank_groups"), dict)
+        and isinstance(result.get("rankings"), dict)
+        and isinstance(result.get("ranking_details"), dict)
+        and isinstance(result.get("candidate_summary"), list)
+    )
+
+
 def _market_history_tables_summary_excerpt(
     tool_response: Any,
     *,
@@ -2800,6 +2838,8 @@ def _market_history_tables_summary_excerpt(
         return None
     result = _json_safe_value(tool_response)
     if not isinstance(result, dict):
+        return None
+    if not _has_market_history_tables_summary_shape(result):
         return None
 
     candidate_rows = result.get("candidate_summary")
@@ -2917,6 +2957,8 @@ def _prune_tool_response_for_context_window(
     )
     if market_history_excerpt is not None:
         excerpt = market_history_excerpt
+    elif (tool_error_excerpt := _tool_error_excerpt(tool_response, max_chars=max_chars)) is not None:
+        excerpt = tool_error_excerpt
     elif preserve_summary_order:
         excerpt = _truncate_preserving_start(
             serialized,

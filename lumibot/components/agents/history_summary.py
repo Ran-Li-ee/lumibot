@@ -486,6 +486,11 @@ def _candidate_summary_row(
     return {
         "symbol": symbol,
         "latest_close": _compact_number(row.get("latest_close")),
+        "return_5": _compact_number(row.get("return_5")),
+        "momentum_composite": _compact_number(row.get("momentum_composite")),
+        "composite_score": _compact_number(row.get("composite_score")),
+        "volume_vs_avg_20": _compact_number(row.get("volume_vs_avg_20")),
+        "drawdown_from_high_60": _compact_number(row.get("drawdown_from_high_60")),
         "evidence_groups": list(best_rank_by_group),
         "ranking_count": ranking_count,
         "best_rank": best_rank,

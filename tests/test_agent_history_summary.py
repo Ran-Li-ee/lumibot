@@ -574,7 +574,7 @@ def test_build_universe_history_summary_flattens_rows_and_rankings():
     assert rows["QQQ"]["evidence_groups"]
     assert rows["QQQ"]["ranking_count"] > 0
     assert "return_21" not in rows["QQQ"]
-    assert "composite_score" not in rows["QQQ"]
+    assert rows["QQQ"]["composite_score"] == pytest.approx(qqq["scores"]["composite_score"])
     assert rows["SPY"]["latest_close"] == pytest.approx(spy["price"]["latest_close"])
     assert rows["SPY"]["evidence_groups"]
     assert rows["SPY"]["ranking_count"] > 0
@@ -830,14 +830,46 @@ def test_build_universe_history_summary_pruned_excerpt_includes_candidate_summar
     assert pruned is not None
     excerpt = pruned["excerpt"]
     assert len(excerpt) <= 6_000
-    for essential_key in ('"coverage"', '"rank_groups"', '"rankings"', '"ranking_details"', '"candidate_summary"'):
-        assert essential_key in excerpt
     parsed_excerpt = json.loads(excerpt)
+    assert list(parsed_excerpt)[:5] == [
+        "schema_version",
+        "coverage",
+        "rank_groups",
+        "ranking_limit",
+        "candidate_summary_limit",
+    ]
+    for essential_key in ("coverage", "rank_groups", "rankings", "ranking_details", "candidate_summary"):
+        assert essential_key in parsed_excerpt
     assert parsed_excerpt["candidate_summary"]
-    serialized = json.dumps(summary, sort_keys=False)
-    assert serialized.index('"coverage"') < serialized.index('"candidate_summary"')
-    assert serialized.index('"rank_groups"') < serialized.index('"candidate_summary"')
-    assert serialized.index('"ranking_details"') < serialized.index('"candidate_summary"')
+    assert parsed_excerpt["coverage"]["loaded_count"] == len(symbols)
+    assert parsed_excerpt["rank_groups"] == summary["rank_groups"]
+    assert parsed_excerpt["rankings"]
+    assert parsed_excerpt["ranking_details"]
+
+
+def test_market_history_summary_pruning_preserves_error_envelope_fields():
+    response = {
+        "tool_error": True,
+        "error": "DuckDB query failed",
+        "error_type": "RuntimeError",
+        "arguments": {
+            "symbols": [f"S{i:03d}" for i in range(250)],
+            "sql": "SELECT * FROM missing_table " * 250,
+        },
+    }
+
+    pruned = _prune_tool_response_for_context_window(
+        response,
+        tool_name="market_load_history_tables_summary",
+        max_chars=1_000,
+    )
+
+    assert pruned is not None
+    excerpt = pruned["excerpt"]
+    assert "tool_error" in excerpt
+    assert "DuckDB query failed" in excerpt
+    assert "coverage" not in excerpt
+    assert "candidate_summary" not in excerpt
 
 
 def test_build_universe_history_summary_candidate_summary_rows_are_compact():
@@ -888,13 +920,17 @@ def test_build_universe_history_summary_candidate_summary_rows_are_compact():
     assert set(first_row) == {
         "symbol",
         "latest_close",
+        "return_5",
+        "momentum_composite",
+        "composite_score",
+        "volume_vs_avg_20",
+        "drawdown_from_high_60",
         "evidence_groups",
         "ranking_count",
         "best_rank",
         "best_rank_by_group",
     }
     assert "return_21" not in first_row
-    assert "composite_score" not in first_row
     assert len(json.dumps(summary["candidate_summary"], sort_keys=True)) < 6_000
 
 
