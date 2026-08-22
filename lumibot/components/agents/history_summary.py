@@ -52,11 +52,15 @@ def compute_history_summary(
         "return_120": _period_return(close, 120),
         "return_126": _period_return(close, 126),
         "return_252": _period_return(close, 252),
+        "return_252_ex_skip_21": _period_return_excluding_recent(close, total_window=252, skip_recent=21),
     }
+    regression_90 = _linear_regression_log_price(close, 90)
     trend = {
         "sma_20": _sma(close, 20),
         "sma_50": _sma(close, 50),
         "sma_200": _sma(close, 200),
+        "linear_regression_slope_90": regression_90["annualized_slope"],
+        "linear_regression_r2_90": regression_90["r2"],
     }
     trend.update(
         {
@@ -80,25 +84,58 @@ def compute_history_summary(
                 trend["price_vs_sma_200"],
             ]
         ),
+        "sma_stack_score": _sma_stack_score(
+            latest_close,
+            trend["sma_20"],
+            trend["sma_50"],
+            trend["sma_200"],
+        ),
     }
+    adjusted_slope_90 = None
+    if trend["linear_regression_slope_90"] is not None and trend["linear_regression_r2_90"] is not None:
+        adjusted_slope_90 = _finite_float(
+            trend["linear_regression_slope_90"] * trend["linear_regression_r2_90"]
+        )
+    scores["adjusted_slope_90"] = adjusted_slope_90
     high_252 = _window_extreme(high if high is not None else close, 252, "max")
     low_252 = _window_extreme(low if low is not None else close, 252, "min")
     max_drawdown_60 = _max_drawdown(close, 60)
+    max_drawdown_126 = _max_drawdown(close, 126)
     volatility_20 = _volatility(close, 20)
+    volatility_63 = _volatility(close, 63)
     avg_volume_20 = _sma(volume, 20)
     latest_volume = _last_value(volume)
     volume_summary = {
         "latest_volume": latest_volume,
         "avg_volume_20": avg_volume_20,
         "volume_vs_avg_20": _relative_to(latest_volume, avg_volume_20),
+        "dollar_volume_20": _finite_float(avg_volume_20 * latest_close)
+        if avg_volume_20 is not None and latest_close is not None
+        else None,
+        "up_volume_ratio_20": _up_volume_ratio(close, volume, 20),
     }
     drawdown_from_high_20 = _drawdown_from_high(high if high is not None else close, close, 20)
     drawdown_from_high_60 = _drawdown_from_high(high if high is not None else close, close, 60)
     drawdown_from_high_252 = _drawdown_from_high(high if high is not None else close, close, 252)
+    distance_to_high_63 = _relative_to(latest_close, _window_extreme(high if high is not None else close, 63, "max"))
+    breakout_20_high_score = _breakout_score(high if high is not None else close, close, 20)
+    breakout_63_high_score = _breakout_score(high if high is not None else close, close, 63)
     scores.update(
         {
             "return_63_over_volatility_20": _ratio(momentum["return_63"], volatility_20),
             "return_126_over_volatility_20": _ratio(momentum["return_126"], volatility_20),
+            "return_252_over_volatility_63": _ratio(momentum["return_252"], volatility_63),
+            "sharpe_like_63": _sharpe_like(close, 63),
+            "calmar_like_126": _ratio(
+                momentum["return_126"],
+                abs(max_drawdown_126) if max_drawdown_126 is not None else None,
+            ),
+            "volume_confirmed_momentum": _mean_available(
+                [
+                    momentum["return_63"],
+                    volume_summary["up_volume_ratio_20"],
+                ]
+            ),
         }
     )
     scores["composite_score"] = _composite_score(
@@ -125,24 +162,40 @@ def compute_history_summary(
         "return_120": momentum["return_120"] is not None,
         "return_126": momentum["return_126"] is not None,
         "return_252": momentum["return_252"] is not None,
+        "return_252_ex_skip_21": momentum["return_252_ex_skip_21"] is not None,
         "momentum_composite": scores["momentum_composite"] is not None,
         "trend_alignment": scores["trend_alignment"] is not None,
+        "sma_stack_score": scores["sma_stack_score"] is not None,
+        "adjusted_slope_90": scores["adjusted_slope_90"] is not None,
         "return_63_over_volatility_20": scores["return_63_over_volatility_20"] is not None,
         "return_126_over_volatility_20": scores["return_126_over_volatility_20"] is not None,
+        "return_252_over_volatility_63": scores["return_252_over_volatility_63"] is not None,
+        "sharpe_like_63": scores["sharpe_like_63"] is not None,
+        "calmar_like_126": scores["calmar_like_126"] is not None,
+        "volume_confirmed_momentum": scores["volume_confirmed_momentum"] is not None,
         "composite_score": scores["composite_score"] is not None,
         "latest_volume": latest_volume is not None,
         "avg_volume_20": avg_volume_20 is not None,
         "volume_vs_avg_20": volume_summary["volume_vs_avg_20"] is not None,
+        "dollar_volume_20": volume_summary["dollar_volume_20"] is not None,
+        "up_volume_ratio_20": volume_summary["up_volume_ratio_20"] is not None,
         "sma_20": trend["sma_20"] is not None,
         "sma_50": trend["sma_50"] is not None,
         "sma_200": trend["sma_200"] is not None,
+        "linear_regression_slope_90": trend["linear_regression_slope_90"] is not None,
+        "linear_regression_r2_90": trend["linear_regression_r2_90"] is not None,
         "high_252": high_252 is not None,
         "low_252": low_252 is not None,
+        "distance_to_high_63": distance_to_high_63 is not None,
+        "breakout_20_high_score": breakout_20_high_score is not None,
+        "breakout_63_high_score": breakout_63_high_score is not None,
         "drawdown_from_high_20": drawdown_from_high_20 is not None,
         "drawdown_from_high_60": drawdown_from_high_60 is not None,
         "drawdown_from_high_252": drawdown_from_high_252 is not None,
         "max_drawdown_60": max_drawdown_60 is not None,
+        "max_drawdown_126": max_drawdown_126 is not None,
         "volatility_20": volatility_20 is not None,
+        "volatility_63": volatility_63 is not None,
     }
 
     return {
@@ -163,13 +216,18 @@ def compute_history_summary(
             "low_252": low_252,
             "distance_to_high_252": _relative_to(latest_close, high_252),
             "distance_to_low_252": _relative_to(latest_close, low_252),
+            "distance_to_high_63": distance_to_high_63,
+            "breakout_20_high_score": breakout_20_high_score,
+            "breakout_63_high_score": breakout_63_high_score,
             "drawdown_from_high_20": drawdown_from_high_20,
             "drawdown_from_high_60": drawdown_from_high_60,
             "drawdown_from_high_252": drawdown_from_high_252,
         },
         "risk": {
             "max_drawdown_60": max_drawdown_60,
+            "max_drawdown_126": max_drawdown_126,
             "volatility_20": volatility_20,
+            "volatility_63": volatility_63,
         },
         "availability": availability,
         "warnings": warnings,
@@ -555,3 +613,110 @@ def _volatility(series: pd.Series | None, window: int) -> float | None:
     if len(returns) < 2:
         return None
     return _finite_float(returns.std())
+
+
+def _period_return_excluding_recent(series: pd.Series | None, *, total_window: int, skip_recent: int) -> float | None:
+    if series is None or len(series) <= total_window:
+        return None
+    endpoint_index = -skip_recent - 1
+    start_index = -total_window - 1
+    endpoint = _finite_float(series.iloc[endpoint_index])
+    start = _finite_float(series.iloc[start_index])
+    if endpoint is None or start in (None, 0):
+        return None
+    return _finite_float(endpoint / start - 1.0)
+
+
+def _sma_stack_score(
+    close: float | None,
+    sma_20: float | None,
+    sma_50: float | None,
+    sma_200: float | None,
+) -> int | None:
+    values = [close, sma_20, sma_50, sma_200]
+    if any(_finite_float(value) is None for value in values):
+        return None
+    score = 0
+    if float(close) > float(sma_20):
+        score += 1
+    if float(sma_20) > float(sma_50):
+        score += 1
+    if float(sma_50) > float(sma_200):
+        score += 1
+    if float(close) > float(sma_200):
+        score += 1
+    return score
+
+
+def _linear_regression_log_price(series: pd.Series | None, window: int) -> dict[str, float | None]:
+    empty_result = {"slope": None, "r2": None, "annualized_slope": None}
+    if series is None or len(series) < window:
+        return empty_result
+    values = pd.Series(
+        [_finite_float(value) for value in series.tail(window)],
+        dtype="float64",
+    ).dropna()
+    values = values[values > 0].reset_index(drop=True)
+    if len(values) < window:
+        return empty_result
+    y = values.map(math.log)
+    x = pd.Series(range(len(y)), dtype="float64")
+    x_mean = x.mean()
+    y_mean = y.mean()
+    denominator = ((x - x_mean) ** 2).sum()
+    if denominator == 0:
+        return empty_result
+    slope = ((x - x_mean) * (y - y_mean)).sum() / denominator
+    fitted = y_mean + slope * (x - x_mean)
+    ss_total = ((y - y_mean) ** 2).sum()
+    ss_residual = ((y - fitted) ** 2).sum()
+    r2 = 1.0 if ss_total == 0 else 1.0 - ss_residual / ss_total
+    annualized_slope = math.exp(slope * 252.0) - 1.0
+    return {
+        "slope": _finite_float(slope),
+        "r2": _finite_float(r2),
+        "annualized_slope": _finite_float(annualized_slope),
+    }
+
+
+def _sharpe_like(series: pd.Series | None, window: int) -> float | None:
+    if series is None or len(series) <= 1:
+        return None
+    returns = series.pct_change().dropna()
+    returns = returns[returns.map(lambda value: _finite_float(value) is not None)].tail(window)
+    if len(returns) < 2:
+        return None
+    volatility = _finite_float(returns.std())
+    mean_return = _finite_float(returns.mean())
+    if mean_return is None or volatility in (None, 0):
+        return None
+    return _finite_float(mean_return / volatility)
+
+
+def _breakout_score(high_series: pd.Series | None, close_series: pd.Series | None, window: int) -> float | None:
+    if close_series is None or high_series is None or len(close_series) <= window or len(high_series) <= window:
+        return None
+    latest = _last_value(close_series)
+    prior_high = _window_extreme(high_series.iloc[:-1], window, "max")
+    return _relative_to(latest, prior_high)
+
+
+def _up_volume_ratio(close_series: pd.Series | None, volume_series: pd.Series | None, window: int) -> float | None:
+    if close_series is None or volume_series is None or len(close_series) <= 1:
+        return None
+    data = pd.DataFrame({"close": close_series, "volume": volume_series}).dropna().tail(window + 1)
+    data = data[
+        data["close"].map(lambda value: _finite_float(value) is not None)
+        & data["volume"].map(lambda value: _finite_float(value) is not None)
+    ].reset_index(drop=True)
+    if len(data) < 2:
+        return None
+    returns = data["close"].pct_change().dropna()
+    volumes = data["volume"].iloc[1:]
+    total_volume = _finite_float(volumes.sum())
+    if total_volume in (None, 0):
+        return None
+    up_volume = _finite_float(volumes[returns > 0].sum())
+    if up_volume is None:
+        return None
+    return _finite_float(up_volume / total_volume)

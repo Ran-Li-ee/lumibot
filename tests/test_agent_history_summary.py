@@ -24,6 +24,30 @@ def _frame(length: int = 260) -> pd.DataFrame:
     )
 
 
+def _trend_frame(length: int = 260, *, start: float = 100.0, step: float = 1.0) -> pd.DataFrame:
+    dates = pd.date_range("2024-01-01", periods=length, freq="D")
+    close = pd.Series([start + step * index for index in range(length)], dtype="float64")
+    return pd.DataFrame(
+        {
+            "Date": dates,
+            "open": close - 0.25,
+            "high": close + 0.75,
+            "low": close - 0.75,
+            "close": close,
+            "volume": [1000 + index * 10 for index in range(length)],
+        }
+    )
+
+
+def _breakout_frame() -> pd.DataFrame:
+    dates = pd.date_range("2024-01-01", periods=80, freq="D")
+    close = [100.0] * 79 + [121.0]
+    high = [120.0] * 79 + [121.5]
+    low = [99.0] * 80
+    volume = [1000] * 80
+    return pd.DataFrame({"Date": dates, "close": close, "high": high, "low": low, "volume": volume})
+
+
 def _rankable_summary(
     symbol: str,
     *,
@@ -151,6 +175,52 @@ def test_compute_history_summary_adds_ranking_windows_and_scores():
     assert summary["availability"]["trend_alignment"] is True
 
 
+def test_compute_history_summary_adds_five_group_momentum_and_trend_quality_metrics():
+    frame = _trend_frame(260)
+    summary = compute_history_summary(frame, symbol="TREND", timestep="day", as_of=None)
+
+    skip_endpoint = float(frame["close"].iloc[-22])
+    skip_start = float(frame["close"].iloc[-253])
+
+    assert summary["momentum"]["return_252_ex_skip_21"] == pytest.approx(skip_endpoint / skip_start - 1.0)
+    assert summary["scores"]["sma_stack_score"] == 4
+    assert summary["trend"]["linear_regression_slope_90"] is not None
+    assert summary["trend"]["linear_regression_r2_90"] > 0.99
+    assert summary["scores"]["adjusted_slope_90"] is not None
+    assert summary["availability"]["return_252_ex_skip_21"] is True
+    assert summary["availability"]["sma_stack_score"] is True
+    assert summary["availability"]["adjusted_slope_90"] is True
+
+
+def test_compute_history_summary_adds_risk_adjusted_momentum_metrics():
+    frame = _trend_frame(260)
+    summary = compute_history_summary(frame, symbol="RISK", timestep="day", as_of=None)
+
+    assert summary["risk"]["volatility_63"] is not None
+    assert summary["risk"]["max_drawdown_126"] == pytest.approx(0.0)
+    assert summary["scores"]["return_252_over_volatility_63"] is not None
+    assert summary["scores"]["sharpe_like_63"] is not None
+    assert summary["scores"]["calmar_like_126"] is None
+    assert summary["availability"]["return_252_over_volatility_63"] is True
+    assert summary["availability"]["sharpe_like_63"] is True
+    assert summary["availability"]["calmar_like_126"] is False
+
+
+def test_compute_history_summary_adds_breakout_and_volume_confirmation_metrics():
+    frame = _breakout_frame()
+    frame.loc[60:79, "volume"] = [1000, 1200, 900, 1300, 1100, 1400, 1000, 1500, 1200, 1600] * 2
+
+    summary = compute_history_summary(frame, symbol="BREAK", timestep="day", as_of=None)
+
+    assert summary["range"]["distance_to_high_63"] == pytest.approx(121.0 / 121.5 - 1.0)
+    assert summary["range"]["breakout_20_high_score"] == pytest.approx(121.0 / 120.0 - 1.0)
+    assert summary["range"]["breakout_63_high_score"] == pytest.approx(121.0 / 120.0 - 1.0)
+    assert summary["range"]["drawdown_from_high_60"] == pytest.approx(121.0 / 121.5 - 1.0)
+    assert summary["volume"]["dollar_volume_20"] is not None
+    assert summary["volume"]["up_volume_ratio_20"] is not None
+    assert summary["scores"]["volume_confirmed_momentum"] is not None
+
+
 def test_compute_history_summary_calculates_range_and_drawdown():
     frame = _frame(260)
 
@@ -238,6 +308,7 @@ def test_compute_history_summary_sanitizes_non_finite_source_values():
         "return_120",
         "return_126",
         "return_252",
+        "return_252_ex_skip_21",
     ):
         assert summary["momentum"][key] is None
     assert summary["trend"] == {
@@ -247,31 +318,46 @@ def test_compute_history_summary_sanitizes_non_finite_source_values():
         "price_vs_sma_20": None,
         "price_vs_sma_50": None,
         "price_vs_sma_200": None,
+        "linear_regression_slope_90": None,
+        "linear_regression_r2_90": None,
     }
     assert summary["range"] == {
         "high_252": None,
         "low_252": None,
         "distance_to_high_252": None,
         "distance_to_low_252": None,
+        "distance_to_high_63": None,
+        "breakout_20_high_score": None,
+        "breakout_63_high_score": None,
         "drawdown_from_high_20": None,
         "drawdown_from_high_60": None,
         "drawdown_from_high_252": None,
     }
     assert summary["risk"] == {
         "max_drawdown_60": None,
+        "max_drawdown_126": None,
         "volatility_20": None,
+        "volatility_63": None,
     }
     assert summary["scores"] == {
         "momentum_composite": None,
         "trend_alignment": None,
+        "sma_stack_score": None,
+        "adjusted_slope_90": None,
         "return_63_over_volatility_20": None,
         "return_126_over_volatility_20": None,
+        "return_252_over_volatility_63": None,
+        "sharpe_like_63": None,
+        "calmar_like_126": None,
+        "volume_confirmed_momentum": None,
         "composite_score": None,
     }
     assert summary["volume"] == {
         "latest_volume": None,
         "avg_volume_20": None,
         "volume_vs_avg_20": None,
+        "dollar_volume_20": None,
+        "up_volume_ratio_20": None,
     }
     assert summary["availability"]["latest_close"] is False
     assert summary["availability"]["momentum_composite"] is False
@@ -280,6 +366,12 @@ def test_compute_history_summary_sanitizes_non_finite_source_values():
     assert summary["availability"]["low_252"] is False
     assert summary["availability"]["max_drawdown_60"] is False
     assert summary["availability"]["volatility_20"] is False
+    assert summary["availability"]["return_252_ex_skip_21"] is False
+    assert summary["availability"]["sma_stack_score"] is False
+    assert summary["availability"]["adjusted_slope_90"] is False
+    assert summary["availability"]["return_252_over_volatility_63"] is False
+    assert summary["availability"]["sharpe_like_63"] is False
+    assert summary["availability"]["calmar_like_126"] is False
 
 
 def test_compute_history_summary_invalid_trend_comparisons_are_unavailable():
