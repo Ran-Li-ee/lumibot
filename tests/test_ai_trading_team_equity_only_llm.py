@@ -1117,6 +1117,78 @@ def test_iteration_builds_top5_equal_weight_targets_and_runs_execution(monkeypat
     assert execution_plan["orders"][0]["symbol"] == "ORCL"
 
 
+def test_scheduled_buy_seeds_trailing_stop_state(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    strategy.parameters["basket_universes"] = {
+        **strategy.parameters["basket_universes"],
+        "equity": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN", "META"],
+    }
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": strategy.parameters["basket_universes"]["equity"],
+            "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+            "reason_brief": "Five strongest setup names.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [
+                {
+                    "symbol": "ORCL",
+                    "planned_side": "buy",
+                    "planned_quantity": 10,
+                    "sizing_price": 100.0,
+                }
+            ],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 1000.0,
+                "cash_after_estimate": 99000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "ORCL",
+                        "asset_type": "stock",
+                        "side": "buy",
+                        "quantity": 10,
+                        "quantity_mode": "shares",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            },
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    assert strategy._equity_trailing_stop_position_state["ORCL"] == {
+        "entry_date": "2024-09-05",
+        "peak_close": 100.0,
+        "last_check_date": "2024-09-05",
+        "last_check_price": 100.0,
+    }
+
+
 def test_trailing_stop_executes_and_skips_weekly_equity_agent(monkeypatch):
     module = load_module()
     strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)

@@ -425,6 +425,40 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         )
         return True
 
+    def _seed_trailing_stop_state_from_scheduled_plan(
+        self,
+        *,
+        current_date: str,
+        planner_result: dict[str, Any],
+        execution_plan: dict[str, Any],
+    ) -> None:
+        sizing_prices_by_symbol = {}
+        for row in planner_result.get("current_vs_target", []):
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").strip().upper()
+            sizing_price = row.get("sizing_price")
+            if symbol and sizing_price is not None:
+                sizing_prices_by_symbol[symbol] = float(sizing_price)
+
+        for order in execution_plan.get("orders", []):
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("side") or "").strip().lower() != "buy":
+                continue
+            symbol = str(order.get("symbol") or "").strip().upper()
+            if not symbol or symbol in self._equity_trailing_stop_position_state:
+                continue
+            sizing_price = sizing_prices_by_symbol.get(symbol)
+            if sizing_price is None:
+                continue
+            self._equity_trailing_stop_position_state[symbol] = {
+                "entry_date": current_date,
+                "peak_close": sizing_price,
+                "last_check_date": current_date,
+                "last_check_price": sizing_price,
+            }
+
     def _run_equity_only_workflow(
         self,
         current_date: str,
@@ -538,6 +572,11 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             current_date=current_date,
             execution_plan=execution_plan,
             reason="scheduled_rebalance",
+        )
+        self._seed_trailing_stop_state_from_scheduled_plan(
+            current_date=current_date,
+            planner_result=planner_result,
+            execution_plan=execution_plan,
         )
 
     def on_trading_iteration(self):
