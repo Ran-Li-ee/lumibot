@@ -146,7 +146,7 @@ def qqq_resolution(
     selected_report_date="2024-06-30",
     selected_filing_date="2024-08-28",
     accession_number="0001752724-24-196011",
-    symbols=("MSFT", "AAPL", "NVDA", "AMZN"),
+    symbols=("MSFT", "AAPL", "NVDA", "AMZN", "META"),
     snapshot_path="C:/cache/qqq_nport_2024-06-30.json",
     source_url="https://www.sec.gov/example.xml",
     symbol_repair=None,
@@ -172,39 +172,51 @@ def qqq_resolution(
     )
 
 
-def test_equity_only_target_portfolio_uses_selected_symbol_at_full_weight():
+def test_equity_only_target_portfolio_uses_five_selected_symbols_at_equal_weights():
     module = load_module()
 
     result = module.equity_only_target_portfolio(
         {
             "basket_id": "equity",
             "status": "active",
-            "selected_symbol": "orcl",
-            "reason_brief": "Strongest equity candidate.",
+            "selected_symbols": ["orcl", "msft", "nvda", "aapl", "amzn"],
+            "reason_brief": "Five strongest equity candidates.",
         },
-        equity_universe=["SPY", "ORCL", "MSFT"],
+        equity_universe=["AAPL", "AMZN", "MSFT", "NVDA", "ORCL", "TSLA"],
     )
 
-    assert result == [{"basket_id": "equity", "symbol": "ORCL", "target_weight": 1.0}]
+    assert result == [
+        {"basket_id": "equity", "symbol": "ORCL", "target_weight": 0.2},
+        {"basket_id": "equity", "symbol": "MSFT", "target_weight": 0.2},
+        {"basket_id": "equity", "symbol": "NVDA", "target_weight": 0.2},
+        {"basket_id": "equity", "symbol": "AAPL", "target_weight": 0.2},
+        {"basket_id": "equity", "symbol": "AMZN", "target_weight": 0.2},
+    ]
 
 
-def test_equity_only_target_portfolio_accepts_selected_status_synonym():
+def test_equity_only_target_portfolio_accepts_selected_status_synonym_for_top5():
     module = load_module()
 
     result = module.equity_only_target_portfolio(
         {
             "basket_id": "equity",
             "status": "selected",
-            "selected_symbol": "spy",
-            "reason_brief": "SPY is selected from the equity basket.",
+            "selected_symbols": ["spy", "orcl", "msft", "aapl", "nvda"],
+            "reason_brief": "Five active selections.",
         },
-        equity_universe=["SPY", "ORCL", "MSFT"],
+        equity_universe=["SPY", "ORCL", "MSFT", "AAPL", "NVDA", "AMZN"],
     )
 
-    assert result == [{"basket_id": "equity", "symbol": "SPY", "target_weight": 1.0}]
+    assert result == [
+        {"basket_id": "equity", "symbol": "SPY", "target_weight": 0.2},
+        {"basket_id": "equity", "symbol": "ORCL", "target_weight": 0.2},
+        {"basket_id": "equity", "symbol": "MSFT", "target_weight": 0.2},
+        {"basket_id": "equity", "symbol": "AAPL", "target_weight": 0.2},
+        {"basket_id": "equity", "symbol": "NVDA", "target_weight": 0.2},
+    ]
 
 
-def test_validate_execution_plan_symbols_accepts_selected_status_synonym():
+def test_validate_execution_plan_symbols_accepts_any_top5_selected_symbol():
     module = load_module()
 
     module.validate_execution_plan_symbols(
@@ -222,13 +234,24 @@ def test_validate_execution_plan_symbols_accepts_selected_status_synonym():
                     "quantity_mode": "shares",
                     "order_type": "market",
                     "time_in_force": "day",
+                },
+                {
+                    "sequence": 2,
+                    "action": "submit_order",
+                    "symbol": "MSFT",
+                    "asset_type": "stock",
+                    "side": "buy",
+                    "quantity": 5,
+                    "quantity_mode": "shares",
+                    "order_type": "market",
+                    "time_in_force": "day",
                 }
             ],
         },
         {
             "basket_id": "equity",
             "status": "selected",
-            "selected_symbol": "SPY",
+            "selected_symbols": ["SPY", "ORCL", "MSFT", "AAPL", "NVDA"],
         },
     )
 
@@ -353,18 +376,64 @@ def test_equity_only_target_portfolio_rejects_inactive_report():
 
     with pytest.raises(ValueError, match="equity report must be active"):
         module.equity_only_target_portfolio(
-            {"basket_id": "equity", "status": "inactive", "selected_symbol": "ORCL"},
-            equity_universe=["SPY", "ORCL"],
+            {
+                "basket_id": "equity",
+                "status": "inactive",
+                "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+            },
+            equity_universe=["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+        )
+
+
+def test_equity_only_target_portfolio_rejects_missing_selected_symbols():
+    module = load_module()
+
+    with pytest.raises(ValueError, match="selected_symbols must contain exactly 5 symbols"):
+        module.equity_only_target_portfolio(
+            {"basket_id": "equity", "status": "active", "selected_symbol": "ORCL"},
+            equity_universe=["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+        )
+
+
+def test_equity_only_target_portfolio_rejects_duplicate_selected_symbols():
+    module = load_module()
+
+    with pytest.raises(ValueError, match="selected_symbols must be unique"):
+        module.equity_only_target_portfolio(
+            {
+                "basket_id": "equity",
+                "status": "active",
+                "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "ORCL"],
+            },
+            equity_universe=["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+        )
+
+
+def test_equity_only_target_portfolio_rejects_wrong_selected_symbol_count():
+    module = load_module()
+
+    with pytest.raises(ValueError, match="selected_symbols must contain exactly 5 symbols"):
+        module.equity_only_target_portfolio(
+            {
+                "basket_id": "equity",
+                "status": "active",
+                "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL"],
+            },
+            equity_universe=["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
         )
 
 
 def test_equity_only_target_portfolio_rejects_symbol_outside_universe():
     module = load_module()
 
-    with pytest.raises(ValueError, match="selected equity symbol must be in equity universe"):
+    with pytest.raises(ValueError, match="selected equity symbols must be in equity universe: GLD"):
         module.equity_only_target_portfolio(
-            {"basket_id": "equity", "status": "active", "selected_symbol": "GLD"},
-            equity_universe=["SPY", "ORCL"],
+            {
+                "basket_id": "equity",
+                "status": "active",
+                "selected_symbols": ["GLD", "ORCL", "MSFT", "NVDA", "AAPL"],
+            },
+            equity_universe=["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
         )
 
 
@@ -373,8 +442,12 @@ def test_equity_only_target_portfolio_rejects_non_equity_report():
 
     with pytest.raises(ValueError, match="basket_id must be 'equity'"):
         module.equity_only_target_portfolio(
-            {"basket_id": "commodity", "status": "active", "selected_symbol": "GLD"},
-            equity_universe=["SPY", "ORCL"],
+            {
+                "basket_id": "commodity",
+                "status": "active",
+                "selected_symbols": ["GLD", "ORCL", "MSFT", "NVDA", "AAPL"],
+            },
+            equity_universe=["GLD", "ORCL", "MSFT", "NVDA", "AAPL"],
         )
 
 
@@ -466,7 +539,8 @@ def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_ne
 
     for required in (
         "equity-only",
-        "choose exactly one stock",
+        "choose exactly five stocks",
+        "equal target weights",
         "market_load_history_tables_summary",
         "separate evidence",
         "alpaca_news",
@@ -501,8 +575,8 @@ def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(mo
             "target_weight": 1.0,
             "status": "active",
             "candidate_symbols": EXPECTED_EQUITY_UNIVERSE,
-            "selected_symbol": "ORCL",
-            "reason_brief": "ORCL has the strongest setup.",
+            "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+            "reason_brief": "Five strongest setup names.",
         }
     )
     strategy.agents.summaries["execution_agent"] = "Executed plan."
@@ -544,6 +618,7 @@ def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(mo
     assert "alpaca_news" in task_prompt
     assert "close, conflicting, or uncertain" in task_prompt
     assert "candidate_symbols must copy the assigned basket_symbols exactly" in task_prompt
+    assert "selected_symbols" in task_prompt
     assert "return exactly one strict json object" in task_prompt
 
 
@@ -556,9 +631,9 @@ def test_qqq_historical_strategy_resolves_snapshot_and_passes_metadata_to_equity
             "basket_id": "equity",
             "target_weight": 1.0,
             "status": "active",
-            "candidate_symbols": ["MSFT", "AAPL", "NVDA", "AMZN"],
-            "selected_symbol": "NVDA",
-            "reason_brief": "NVDA has the strongest QQQ constituent evidence.",
+            "candidate_symbols": ["MSFT", "AAPL", "NVDA", "AMZN", "META"],
+            "selected_symbols": ["MSFT", "AAPL", "NVDA", "AMZN", "META"],
+            "reason_brief": "Five QQQ constituents have the strongest evidence.",
         }
     )
     strategy.agents.summaries["execution_agent"] = "Executed plan."
@@ -566,7 +641,7 @@ def test_qqq_historical_strategy_resolves_snapshot_and_passes_metadata_to_equity
 
     def fake_resolve_qqq_snapshot(as_of_date, *, mode="strict", data_dir=None):
         resolver_calls.append({"as_of_date": as_of_date, "mode": mode, "data_dir": data_dir})
-        return qqq_resolution(symbols=("MSFT", "AAPL", "NVDA", "AMZN"))
+        return qqq_resolution(symbols=("MSFT", "AAPL", "NVDA", "AMZN", "META"))
 
     def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
         return {
@@ -593,7 +668,7 @@ def test_qqq_historical_strategy_resolves_snapshot_and_passes_metadata_to_equity
 
     assert resolver_calls == [{"as_of_date": "2024-09-05", "mode": "strict", "data_dir": None}]
     equity_call = strategy.agents["equity_basket_agent"].calls[0]
-    assert equity_call["context"]["basket_symbols"] == ["MSFT", "AAPL", "NVDA", "AMZN"]
+    assert equity_call["context"]["basket_symbols"] == ["MSFT", "AAPL", "NVDA", "AMZN", "META"]
     assert equity_call["context"]["universe_source"] == {
         "type": "qqq_nport",
         "mode": "strict",
@@ -601,16 +676,16 @@ def test_qqq_historical_strategy_resolves_snapshot_and_passes_metadata_to_equity
         "selected_report_date": "2024-06-30",
         "selected_filing_date": "2024-08-28",
         "accession_number": "0001752724-24-196011",
-        "holding_count": 4,
+        "holding_count": 5,
         "snapshot_path": str(Path("C:/cache/qqq_nport_2024-06-30.json")),
         "source_url": "https://www.sec.gov/example.xml",
         "symbol_repair": {
             "applied": False,
-            "raw_count": 4,
+            "raw_count": 5,
             "repaired_count": 0,
             "deduped_count": 0,
             "dropped_count": 0,
-            "final_count": 4,
+            "final_count": 5,
             "aliases": [],
         },
     }
@@ -628,9 +703,9 @@ def test_qqq_historical_strategy_supports_prototype_mode_data_dir_and_symbol_nor
             "basket_id": "equity",
             "target_weight": 1.0,
             "status": "active",
-            "candidate_symbols": ["AAPL", "MSFT", "NVDA"],
-            "selected_symbol": "AAPL",
-            "reason_brief": "AAPL is selected.",
+            "candidate_symbols": ["AAPL", "MSFT", "NVDA", "AMZN", "META"],
+            "selected_symbols": ["AAPL", "MSFT", "NVDA", "AMZN", "META"],
+            "reason_brief": "Five symbols are selected.",
         }
     )
     strategy.agents.summaries["execution_agent"] = "Executed plan."
@@ -642,7 +717,7 @@ def test_qqq_historical_strategy_supports_prototype_mode_data_dir_and_symbol_nor
             mode="prototype",
             selected_report_date="2024-09-30",
             selected_filing_date="2024-11-27",
-            symbols=(" aapl ", "", "MSFT", "AAPL", "nvda"),
+            symbols=(" aapl ", "", "MSFT", "AAPL", "nvda", "AMZN", "META"),
         )
 
     def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
@@ -672,9 +747,9 @@ def test_qqq_historical_strategy_supports_prototype_mode_data_dir_and_symbol_nor
         {"as_of_date": "2024-09-05", "mode": "prototype", "data_dir": str(tmp_path)}
     ]
     equity_call = strategy.agents["equity_basket_agent"].calls[0]
-    assert equity_call["context"]["basket_symbols"] == ["AAPL", "MSFT", "NVDA"]
+    assert equity_call["context"]["basket_symbols"] == ["AAPL", "MSFT", "NVDA", "AMZN", "META"]
     assert equity_call["context"]["universe_source"]["mode"] == "prototype"
-    assert equity_call["context"]["universe_source"]["holding_count"] == 3
+    assert equity_call["context"]["universe_source"]["holding_count"] == 5
 
 
 def test_qqq_historical_strategy_passes_repair_metadata_to_equity_agent(monkeypatch):
@@ -685,23 +760,23 @@ def test_qqq_historical_strategy_passes_repair_metadata_to_equity_agent(monkeypa
             "basket_id": "equity",
             "target_weight": 1.0,
             "status": "active",
-            "candidate_symbols": ["AAPL", "CHKP", "MRVL"],
-            "selected_symbol": "CHKP",
-            "reason_brief": "CHKP is selected.",
+            "candidate_symbols": ["AAPL", "CHKP", "MRVL", "MSFT", "NVDA"],
+            "selected_symbols": ["AAPL", "CHKP", "MRVL", "MSFT", "NVDA"],
+            "reason_brief": "Five symbols are selected.",
         }
     )
     strategy.agents.summaries["execution_agent"] = "Executed plan."
 
     def fake_resolve_qqq_snapshot(as_of_date, *, mode="strict", data_dir=None):
         return qqq_resolution(
-            symbols=("AAPL", "CHKP", "MRVL"),
+            symbols=("AAPL", "CHKP", "MRVL", "MSFT", "NVDA"),
             symbol_repair={
                 "applied": True,
-                "raw_count": 4,
+                "raw_count": 6,
                 "repaired_count": 2,
                 "deduped_count": 1,
                 "dropped_count": 0,
-                "final_count": 3,
+                "final_count": 5,
                 "aliases": [
                     {"from": "CPW", "to": "CHKP"},
                     {"from": "MRVLEUR", "to": "MRVL"},
@@ -733,14 +808,14 @@ def test_qqq_historical_strategy_passes_repair_metadata_to_equity_agent(monkeypa
     strategy.on_trading_iteration()
 
     equity_context = strategy.agents["equity_basket_agent"].calls[0]["context"]
-    assert equity_context["basket_symbols"] == ["AAPL", "CHKP", "MRVL"]
+    assert equity_context["basket_symbols"] == ["AAPL", "CHKP", "MRVL", "MSFT", "NVDA"]
     assert equity_context["universe_source"]["symbol_repair"] == {
         "applied": True,
-        "raw_count": 4,
+        "raw_count": 6,
         "repaired_count": 2,
         "deduped_count": 1,
         "dropped_count": 0,
-        "final_count": 3,
+        "final_count": 5,
         "aliases": [
             {"from": "CPW", "to": "CHKP"},
             {"from": "MRVLEUR", "to": "MRVL"},
@@ -787,9 +862,9 @@ def test_qqq_historical_strategy_retries_same_week_after_missing_snapshot(monkey
             "basket_id": "equity",
             "target_weight": 1.0,
             "status": "active",
-            "candidate_symbols": ["MSFT", "AAPL", "NVDA"],
-            "selected_symbol": "AAPL",
-            "reason_brief": "AAPL has the strongest QQQ constituent evidence.",
+            "candidate_symbols": ["MSFT", "AAPL", "NVDA", "AMZN", "META"],
+            "selected_symbols": ["MSFT", "AAPL", "NVDA", "AMZN", "META"],
+            "reason_brief": "Five QQQ constituents have the strongest evidence.",
         }
     )
     strategy.agents.summaries["execution_agent"] = "Executed plan."
@@ -799,7 +874,7 @@ def test_qqq_historical_strategy_retries_same_week_after_missing_snapshot(monkey
         resolver_calls.append(as_of_date)
         if as_of_date == "2024-09-02":
             raise qqq_nport.NoSnapshotAvailableError("No QQQ snapshot available")
-        return qqq_resolution(as_of_date="2024-09-03", symbols=("MSFT", "AAPL", "NVDA"))
+        return qqq_resolution(as_of_date="2024-09-03", symbols=("MSFT", "AAPL", "NVDA", "AMZN", "META"))
 
     def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
         return {
@@ -849,20 +924,20 @@ def test_qqq_historical_strategy_rejects_selected_symbol_outside_resolved_univer
             "basket_id": "equity",
             "target_weight": 1.0,
             "status": "active",
-            "candidate_symbols": ["MSFT", "AAPL", "NVDA"],
-            "selected_symbol": "ORCL",
+            "candidate_symbols": ["MSFT", "AAPL", "NVDA", "AMZN", "META"],
+            "selected_symbols": ["ORCL", "MSFT", "AAPL", "NVDA", "AMZN"],
             "reason_brief": "ORCL was incorrectly selected.",
         }
     )
 
     def fake_resolve_qqq_snapshot(as_of_date, *, mode="strict", data_dir=None):
-        return qqq_resolution(symbols=("MSFT", "AAPL", "NVDA"))
+        return qqq_resolution(symbols=("MSFT", "AAPL", "NVDA", "AMZN", "META"))
 
     monkeypatch.setattr(module, "resolve_qqq_snapshot", fake_resolve_qqq_snapshot)
 
     strategy.on_trading_iteration()
 
-    assert strategy._last_execution_plan_error == "selected equity symbol must be in equity universe."
+    assert strategy._last_execution_plan_error == "selected equity symbols must be in equity universe: ORCL."
     assert strategy.agents["execution_agent"].calls == []
 
 
@@ -945,24 +1020,24 @@ def test_monthly_cadence_runs_once_per_month():
     assert third["should_run"] is True
 
 
-def test_iteration_builds_full_weight_target_and_runs_execution(monkeypatch):
+def test_iteration_builds_top5_equal_weight_targets_and_runs_execution(monkeypatch):
     module = load_module()
     strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    strategy.parameters["basket_universes"] = {
+        **strategy.parameters["basket_universes"],
+        "equity": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN", "META"],
+    }
     strategy.agents.summaries["equity_basket_agent"] = json.dumps(
         {
             "basket_id": "equity",
             "target_weight": 1.0,
             "status": "active",
             "candidate_symbols": strategy.parameters["basket_universes"]["equity"],
-            "selected_symbol": "ORCL",
-            "reason_brief": "ORCL has the strongest setup.",
+            "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+            "reason_brief": "Five strongest setup names.",
         }
     )
     strategy.agents.summaries["execution_agent"] = "Executed plan."
-    strategy.parameters["basket_universes"] = {
-        **strategy.parameters["basket_universes"],
-        "equity": ["ORCL", "MSFT"],
-    }
     planner_calls = []
 
     def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
@@ -1021,7 +1096,13 @@ def test_iteration_builds_full_weight_target_and_runs_execution(monkeypatch):
         {
             "strategy": strategy,
             "date": "2024-09-05",
-            "target_portfolio": [{"basket_id": "equity", "symbol": "ORCL", "target_weight": 1.0}],
+            "target_portfolio": [
+                {"basket_id": "equity", "symbol": "ORCL", "target_weight": 0.2},
+                {"basket_id": "equity", "symbol": "MSFT", "target_weight": 0.2},
+                {"basket_id": "equity", "symbol": "NVDA", "target_weight": 0.2},
+                {"basket_id": "equity", "symbol": "AAPL", "target_weight": 0.2},
+                {"basket_id": "equity", "symbol": "AMZN", "target_weight": 0.2},
+            ],
         }
     ]
     equity_agent = strategy.agents["equity_basket_agent"]

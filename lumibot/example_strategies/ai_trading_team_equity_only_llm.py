@@ -36,6 +36,8 @@ from lumibot.example_strategies.target_portfolio_to_execution_plan import target
 from lumibot.tools.universe.qqq_nport import NoSnapshotAvailableError, resolve_qqq_snapshot
 
 EQUITY_ONLY_TARGET_WEIGHT = 1.0
+EQUITY_ONLY_SELECTION_COUNT = 5
+EQUITY_ONLY_EQUAL_WEIGHT = EQUITY_ONLY_TARGET_WEIGHT / EQUITY_ONLY_SELECTION_COUNT
 ALLOWED_EQUITY_RUN_FREQUENCIES = {"daily", "weekly", "monthly"}
 
 
@@ -57,6 +59,39 @@ def _normalized_symbol_list(symbols: Any) -> list[str]:
         seen.add(clean)
         normalized.append(clean)
     return normalized
+
+
+def _selected_equity_symbols(
+    equity_report: dict[str, Any],
+    *,
+    equity_universe: list[str],
+    expected_count: int = EQUITY_ONLY_SELECTION_COUNT,
+) -> list[str]:
+    raw_symbols = equity_report.get("selected_symbols")
+    if not isinstance(raw_symbols, list):
+        raise ValueError(f"selected_symbols must contain exactly {expected_count} symbols.")
+
+    normalized_symbols = []
+    for symbol in raw_symbols:
+        if not isinstance(symbol, str):
+            raise ValueError("selected_symbols must contain only strings.")
+        clean = symbol.strip().upper()
+        if not clean:
+            raise ValueError("selected_symbols must contain only non-empty symbols.")
+        normalized_symbols.append(clean)
+
+    if len(normalized_symbols) != expected_count:
+        raise ValueError(f"selected_symbols must contain exactly {expected_count} symbols.")
+    if len(set(normalized_symbols)) != len(normalized_symbols):
+        raise ValueError("selected_symbols must be unique.")
+
+    allowed = _normalized_universe(equity_universe)
+    outside = [symbol for symbol in normalized_symbols if symbol not in allowed]
+    if outside:
+        joined = ", ".join(outside)
+        raise ValueError(f"selected equity symbols must be in equity universe: {joined}.")
+
+    return normalized_symbols
 
 
 def _normalize_equity_run_frequency(value: Any) -> str:
@@ -175,14 +210,16 @@ def equity_only_target_portfolio(
     if status not in ACTIVE_SELECTION_STATUSES:
         raise ValueError("equity report must be active.")
 
-    selected_symbol = str(equity_report.get("selected_symbol") or "").strip().upper()
-    if not selected_symbol:
-        raise ValueError("selected_symbol must be non-empty.")
+    selected_symbols = _selected_equity_symbols(equity_report, equity_universe=equity_universe)
 
-    if selected_symbol not in _normalized_universe(equity_universe):
-        raise ValueError("selected equity symbol must be in equity universe.")
-
-    return [{"basket_id": EQUITY_BASKET_ID, "symbol": selected_symbol, "target_weight": EQUITY_ONLY_TARGET_WEIGHT}]
+    return [
+        {
+            "basket_id": EQUITY_BASKET_ID,
+            "symbol": symbol,
+            "target_weight": EQUITY_ONLY_EQUAL_WEIGHT,
+        }
+        for symbol in selected_symbols
+    ]
 
 
 class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrategy):

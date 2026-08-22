@@ -156,28 +156,30 @@ def equity_alpaca_news_tool() -> ToolDefinition:
 
 def equity_basket_agent_system_prompt(symbols: str) -> str:
     return (
-        f"Equity-only selection role: choose exactly one stock from the assigned basket_symbols ({symbols}). "
-        "The selected stock receives target_weight 1.0 through downstream deterministic planning. "
+        f"Equity-only selection role: choose exactly five stocks from the assigned basket_symbols ({symbols}). "
+        "The downstream deterministic planner gives the five selected stocks equal target weights. "
         "You cannot place orders or size trades. Use market_load_history_tables_summary first for multi-symbol "
         "comparison. Treat rankings as separate evidence views; do not invent sector, style, safety, or "
-        "cyclicality labels. If one symbol is clearly stronger across relevant rankings, select it without news. "
-        "Use alpaca_news only when leading candidates are close, conflicting, or uncertain; when used, request "
-        "news only for leading candidates. If news is unavailable, continue with rank-only evidence. "
-        "Return strict JSON only. Do not place orders."
+        "cyclicality labels. Select the five strongest names across the separate ranking views, not merely "
+        "the first five symbols from one ranking. If the leading group is clear across relevant rankings, "
+        "select it without news. Use alpaca_news only when leading candidates are close, conflicting, or "
+        "uncertain; when used, request news only for leading candidates. If news is unavailable, continue "
+        "with rank-only evidence. Return strict JSON only. Do not place orders."
     )
 
 
 def qqq_historical_equity_basket_agent_system_prompt(symbols: str) -> str:
     return (
-        f"Equity-only selection role: choose exactly one stock from the QQQ historical constituent universe "
+        f"Equity-only selection role: choose exactly five stocks from the QQQ historical constituent universe "
         f"provided in basket_symbols ({symbols}). "
         "The provided basket_symbols represent the QQQ historical constituent universe available for the "
-        "current backtest date. The selected stock receives target_weight 1.0 through downstream deterministic "
-        "planning. You cannot place orders or size trades. Use market_load_history_tables_summary first for "
-        "multi-symbol comparison. Treat rankings as separate evidence views; do not invent sector, style, "
+        "current backtest date. The downstream deterministic planner gives the five selected stocks equal "
+        "target weights. You cannot place orders or size trades. Use market_load_history_tables_summary first "
+        "for multi-symbol comparison. Treat rankings as separate evidence views; do not invent sector, style, "
         "safety, or cyclicality labels. Do not assume QQQ membership itself makes a stock safe or best; select "
-        "from current rank evidence. Do not choose based on index weight alone. If one symbol is clearly "
-        "stronger across relevant rankings, select it without news. Use alpaca_news only when leading "
+        "from current rank evidence. Do not choose based on index weight alone. Select the five strongest names "
+        "across the separate ranking views, not merely the first five symbols from one ranking. If the leading "
+        "group is clear across relevant rankings, select it without news. Use alpaca_news only when leading "
         "candidates are close, conflicting, or uncertain; when used, request news only for leading candidates. "
         "If news is unavailable, continue with rank-only evidence. Use only symbols in the provided "
         "basket_symbols and do not add symbols outside the provided universe. Return strict JSON only. "
@@ -189,12 +191,15 @@ def equity_basket_agent_task_prompt() -> str:
     return (
         "Review only the provided basket_symbols. First call market_load_history_tables_summary with "
         "symbols=basket_symbols, length=252, timestep='day', and top_n=10. Compare separate ranking views. "
-        "If one symbol is clearly stronger across relevant rankings, select it without news. If leading "
-        "candidates are close, conflicting, or uncertain, call alpaca_news for those leading candidates only. "
-        "If alpaca_news is unavailable or errors, continue with rank-only evidence. Return exactly one strict "
-        "JSON object with basket_id, target_weight, status, candidate_symbols, selected_symbol, and reason_brief. "
-        "Use status='active'. candidate_symbols must copy the assigned basket_symbols exactly; do not replace it "
-        "with a shortlist. selected_symbol must be one of basket_symbols."
+        "Select exactly five symbols that are strongest across the separate ranking views; do not simply copy "
+        "the first five names from one list if other ranking evidence conflicts. If the leading group is clear "
+        "across relevant rankings, select it without news. If leading candidates are close, conflicting, or "
+        "uncertain, call alpaca_news for those leading candidates only. If alpaca_news is unavailable or errors, "
+        "continue with rank-only evidence. Return exactly one strict JSON object with basket_id, target_weight, "
+        "status, candidate_symbols, selected_symbols, and reason_brief. Use status='active'. target_weight must "
+        "be 1.0 for the equity basket as a whole; do not assign per-symbol weights. candidate_symbols must copy "
+        "the assigned basket_symbols exactly; do not replace it with a shortlist. selected_symbols must contain "
+        "exactly five unique symbols from basket_symbols."
     )
 
 
@@ -398,18 +403,25 @@ def validate_execution_plan_symbols(execution_plan: dict[str, Any], equity_repor
 
     equity_report = _require_dict(equity_report, "equity_report")
     status = str(equity_report.get("status") or "").strip().lower()
-    selected_symbol = equity_report.get("selected_symbol")
-    if status not in ACTIVE_SELECTION_STATUSES or not selected_symbol:
-        raise ValueError("equity report must select an active symbol before buying.")
+    selected_symbols = equity_report.get("selected_symbols")
+    if status not in ACTIVE_SELECTION_STATUSES or not isinstance(selected_symbols, list):
+        raise ValueError("equity report must select active symbols before buying.")
 
-    expected_symbol = str(selected_symbol).strip().upper()
+    expected_symbols = {
+        str(symbol).strip().upper()
+        for symbol in selected_symbols
+        if isinstance(symbol, str) and str(symbol).strip()
+    }
+    if not expected_symbols:
+        raise ValueError("equity report must select active symbols before buying.")
+
     for order in execution_plan.get("orders", []):
         order = _require_dict(order, "order")
         if str(order.get("side") or "").strip().lower() != "buy":
             continue
         symbol = str(order.get("symbol") or "").strip().upper()
-        if symbol != expected_symbol:
-            raise ValueError(f"execution_plan buy symbol {symbol} does not match selected equity symbol.")
+        if symbol not in expected_symbols:
+            raise ValueError(f"execution_plan buy symbol {symbol} does not match selected equity symbols.")
 
 
 def validate_execution_plan_matches_planner_result(strategy: Any, execution_plan: dict[str, Any]) -> None:
