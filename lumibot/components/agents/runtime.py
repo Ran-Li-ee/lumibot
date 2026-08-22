@@ -2669,6 +2669,19 @@ def _truncate_preserving_edges(text: str, max_chars: int, *, label: str) -> str:
     return f"{text[:head_chars]}{notice}{text[-tail_chars:] if tail_chars else ''}"
 
 
+def _truncate_preserving_start(text: str, max_chars: int, *, label: str) -> str:
+    if len(text) <= max_chars:
+        return text
+    notice = (
+        f"\n\n[Lumibot input context pruned {len(text) - max_chars} trailing characters from {label} "
+        "to stay within the receiving model context window. Beginning is preserved.]\n\n"
+    )
+    if len(notice) >= max_chars:
+        notice = f"\n[Pruned trailing chars from {label}.]\n"
+    available = max(max_chars - len(notice), 0)
+    return f"{text[:available]}{notice}"
+
+
 def _prune_large_context_strings(value: Any, *, max_string_chars: int, path: str = "context") -> tuple[Any, int]:
     if isinstance(value, str):
         if len(value) <= max_string_chars:
@@ -2795,12 +2808,21 @@ def _prune_tool_response_for_context_window(
     response_chars = _serialized_content_length(tool_response)
     if response_chars <= max_chars:
         return None
-    serialized = json.dumps(_json_safe_value(tool_response), sort_keys=True, default=str)
+    preserve_summary_order = tool_name == "market_load_history_tables_summary"
+    serialized = json.dumps(
+        _json_safe_value(tool_response),
+        sort_keys=not preserve_summary_order,
+        default=str,
+    )
     return {
         "lumibot_tool_result_pruned": True,
         "tool_name": tool_name,
         "original_chars": response_chars,
-        "excerpt": _truncate_preserving_edges(serialized, max_chars, label=f"tool_response.{tool_name or 'unknown'}"),
+        "excerpt": (
+            _truncate_preserving_start(serialized, max_chars, label=f"tool_response.{tool_name or 'unknown'}")
+            if preserve_summary_order
+            else _truncate_preserving_edges(serialized, max_chars, label=f"tool_response.{tool_name or 'unknown'}")
+        ),
         "message": (
             "Tool response was shortened by Lumibot before sending it back to this model "
             "because the provider context window would otherwise be exceeded. Call a targeted tool "

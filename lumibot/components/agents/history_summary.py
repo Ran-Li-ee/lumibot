@@ -337,22 +337,31 @@ def build_universe_history_summary(
         if row.get("symbol")
     }
     candidate_summary = [
-        rows_by_symbol[symbol]
+        _candidate_summary_row(symbol, rows_by_symbol[symbol], ranking_details)
         for symbol in selected_symbols
         if symbol in rows_by_symbol
     ]
+    coverage = {
+        "requested_count": len(symbols),
+        "loaded_count": len(all_universe_rows),
+        "failed_count": max(0, len(symbols) - len(all_universe_rows)),
+        "top_n": top_n,
+        "candidate_summary_limit": candidate_summary_limit,
+        "ranking_count": len(rankings),
+    }
     return {
         "schema_version": SCHEMA_VERSION,
+        "coverage": coverage,
+        "rank_groups": RANK_GROUPS,
+        "ranking_limit": top_n,
+        "candidate_summary_limit": candidate_summary_limit,
+        "rankings": rankings,
+        "ranking_details": ranking_details,
+        "candidate_summary": candidate_summary,
         "symbols": symbols,
         "timestep": timestep,
         "length": length,
         "as_of": as_of,
-        "rank_groups": RANK_GROUPS,
-        "ranking_limit": top_n,
-        "rankings": rankings,
-        "ranking_details": ranking_details,
-        "candidate_summary_limit": candidate_summary_limit,
-        "candidate_summary": candidate_summary,
         "universe_summary_limit": candidate_summary_limit,
         "universe_summary_selection": {
             "mode": "top_rank_union",
@@ -361,14 +370,6 @@ def build_universe_history_summary(
             "priority": CANDIDATE_PRIORITY_RANKINGS + ["multi_ranking_overlap"],
         },
         "universe_summary": candidate_summary,
-        "coverage": {
-            "requested_count": len(symbols),
-            "loaded_count": len(all_universe_rows),
-            "failed_count": max(0, len(symbols) - len(all_universe_rows)),
-            "top_n": top_n,
-            "candidate_summary_limit": candidate_summary_limit,
-            "ranking_count": len(rankings),
-        },
         "loaded_tables": loaded_tables or {},
         "warnings": warnings or [],
     }
@@ -456,6 +457,40 @@ def _ranking_details(
             )
         details[ranking_name] = entries
     return details
+
+
+def _candidate_summary_row(
+    symbol: str,
+    row: dict[str, Any],
+    ranking_details: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    best_rank_by_group: dict[str, int] = {}
+    ranking_count = 0
+    best_rank: int | None = None
+
+    for group_name, ranking_names in RANK_GROUPS.items():
+        group_best_rank: int | None = None
+        for ranking_name in ranking_names:
+            for entry in ranking_details.get(ranking_name, []):
+                if entry.get("symbol") != symbol:
+                    continue
+                rank = entry.get("rank")
+                if not isinstance(rank, int):
+                    continue
+                ranking_count += 1
+                best_rank = rank if best_rank is None else min(best_rank, rank)
+                group_best_rank = rank if group_best_rank is None else min(group_best_rank, rank)
+        if group_best_rank is not None:
+            best_rank_by_group[group_name] = group_best_rank
+
+    return {
+        "symbol": symbol,
+        "latest_close": _compact_number(row.get("latest_close")),
+        "evidence_groups": list(best_rank_by_group),
+        "ranking_count": ranking_count,
+        "best_rank": best_rank,
+        "best_rank_by_group": best_rank_by_group,
+    }
 
 
 def _select_candidate_summary_symbols(rankings: dict[str, list[str]], *, limit: int) -> list[str]:

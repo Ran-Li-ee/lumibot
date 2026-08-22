@@ -7,6 +7,7 @@ import pytest
 
 from lumibot.components.agents.builtins import BuiltinTools
 from lumibot.components.agents.history_summary import build_universe_history_summary, compute_history_summary
+from lumibot.components.agents.runtime import _prune_tool_response_for_context_window
 
 
 def _frame(length: int = 260) -> pd.DataFrame:
@@ -570,22 +571,23 @@ def test_build_universe_history_summary_flattens_rows_and_rankings():
 
     rows = {row["symbol"]: row for row in summary["universe_summary"]}
     assert rows["QQQ"]["latest_close"] == pytest.approx(qqq["price"]["latest_close"])
-    assert rows["QQQ"]["return_21"] == pytest.approx(qqq["momentum"]["return_21"], abs=1e-6)
-    assert rows["QQQ"]["return_5"] == pytest.approx(qqq["momentum"]["return_5"], abs=1e-6)
-    assert rows["QQQ"]["composite_score"] == pytest.approx(qqq["scores"]["composite_score"], abs=1e-6)
-    assert rows["QQQ"]["volume_vs_avg_20"] == pytest.approx(qqq["volume"]["volume_vs_avg_20"], abs=1e-6)
-    assert rows["QQQ"]["drawdown_from_high_60"] == pytest.approx(qqq["range"]["drawdown_from_high_60"], abs=1e-6)
-    assert "sma_20" not in rows["QQQ"]
+    assert rows["QQQ"]["evidence_groups"]
+    assert rows["QQQ"]["ranking_count"] > 0
+    assert "return_21" not in rows["QQQ"]
+    assert "composite_score" not in rows["QQQ"]
     assert rows["SPY"]["latest_close"] == pytest.approx(spy["price"]["latest_close"])
-    assert rows["SPY"]["return_63"] == pytest.approx(spy["momentum"]["return_63"], abs=1e-6)
-    assert rows["SPY"]["momentum_composite"] == pytest.approx(spy["scores"]["momentum_composite"], abs=1e-6)
-    assert rows["SPY"]["trend_alignment"] == pytest.approx(spy["scores"]["trend_alignment"])
+    assert rows["SPY"]["evidence_groups"]
+    assert rows["SPY"]["ranking_count"] > 0
     assert summary["rankings"]["by_return_21"] == ["SPY", "QQQ"]
     assert summary["rankings"]["by_return_63"] == ["SPY", "QQQ"]
     assert summary["rankings"]["by_return_126"] == ["SPY", "QQQ"]
     assert summary["rankings"]["by_momentum_composite"] == ["SPY", "QQQ"]
     assert set(summary["rankings"]["by_composite_score"]) == {"QQQ", "SPY"}
     assert summary["rankings"]["by_trend_alignment"] == ["QQQ", "SPY"]
+    assert summary["ranking_details"]["by_return_21"][0]["value"] == pytest.approx(
+        spy["momentum"]["return_21"],
+        abs=1e-6,
+    )
 
 
 def test_build_universe_history_summary_returns_five_rank_groups_and_details():
@@ -773,6 +775,124 @@ def test_build_universe_history_summary_honors_top_n_and_candidate_summary_limit
     assert all(len(ranking) <= 3 for ranking in summary["rankings"].values())
     assert all(len(details) <= 3 for details in summary["ranking_details"].values())
     assert len(summary["candidate_summary"]) <= 4
+
+
+def test_build_universe_history_summary_pruned_excerpt_starts_with_rank_metadata():
+    symbols = [f"S{i:02d}" for i in range(1, 36)]
+    history_summaries = {
+        symbol: _rankable_summary(
+            symbol,
+            composite_score=index,
+            momentum_composite=index,
+            return_21=index / 100,
+            return_63=index / 90,
+            return_126=index / 80,
+            trend_alignment=index % 4,
+            return_252=index / 70,
+            return_252_ex_skip_21=index / 75,
+            sma_stack_score=index % 5,
+            adjusted_slope_90=index / 60,
+            linear_regression_r2_90=0.5 + index / 100,
+            return_252_over_volatility_63=index / 5,
+            sharpe_like_63=index / 10,
+            calmar_like_126=index / 8,
+            distance_to_high_252=-index / 1000,
+            distance_to_high_63=-index / 1200,
+            breakout_20_high_score=index / 1000,
+            breakout_63_high_score=index / 1100,
+            drawdown_from_high_60=-index / 900,
+            volume_vs_avg_20=index / 50,
+            dollar_volume_20=index * 1_000_000,
+            up_volume_ratio_20=0.4 + index / 1000,
+            volume_confirmed_momentum=index / 100,
+        )
+        for index, symbol in enumerate(symbols, start=1)
+    }
+
+    summary = build_universe_history_summary(
+        history_summaries,
+        symbols=symbols,
+        timestep="day",
+        length=252,
+        as_of=None,
+        loaded_tables={symbol: f"hist_{symbol}" for symbol in symbols},
+        warnings=None,
+        top_n=10,
+        candidate_summary_limit=25,
+    )
+
+    pruned = _prune_tool_response_for_context_window(
+        summary,
+        tool_name="market_load_history_tables_summary",
+        max_chars=1_000,
+    )
+
+    assert pruned is not None
+    excerpt = pruned["excerpt"]
+    for essential_key in ('"coverage"', '"rank_groups"', '"rankings"', '"ranking_details"'):
+        assert essential_key in excerpt
+    serialized = json.dumps(summary, sort_keys=False)
+    assert serialized.index('"coverage"') < serialized.index('"candidate_summary"')
+    assert serialized.index('"rank_groups"') < serialized.index('"candidate_summary"')
+    assert serialized.index('"ranking_details"') < serialized.index('"candidate_summary"')
+
+
+def test_build_universe_history_summary_candidate_summary_rows_are_compact():
+    symbols = [f"S{i:02d}" for i in range(1, 31)]
+    history_summaries = {
+        symbol: _rankable_summary(
+            symbol,
+            composite_score=index,
+            momentum_composite=index,
+            return_21=index,
+            return_63=index,
+            return_126=index,
+            trend_alignment=index,
+            return_252=index,
+            return_252_ex_skip_21=index,
+            sma_stack_score=index,
+            adjusted_slope_90=index,
+            linear_regression_r2_90=index,
+            return_252_over_volatility_63=index,
+            sharpe_like_63=index,
+            calmar_like_126=index,
+            distance_to_high_252=index,
+            distance_to_high_63=index,
+            breakout_20_high_score=index,
+            breakout_63_high_score=index,
+            drawdown_from_high_60=index,
+            volume_vs_avg_20=index,
+            dollar_volume_20=index,
+            up_volume_ratio_20=index,
+            volume_confirmed_momentum=index,
+        )
+        for index, symbol in enumerate(symbols, start=1)
+    }
+
+    summary = build_universe_history_summary(
+        history_summaries,
+        symbols=symbols,
+        timestep="day",
+        length=252,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=10,
+        candidate_summary_limit=25,
+    )
+
+    first_row = summary["candidate_summary"][0]
+    assert set(first_row) == {
+        "symbol",
+        "latest_close",
+        "evidence_groups",
+        "ranking_count",
+        "best_rank",
+        "best_rank_by_group",
+    }
+    assert "return_21" not in first_row
+    assert "composite_score" not in first_row
+    assert len(json.dumps(summary["candidate_summary"], sort_keys=True)) < 6_000
 
 
 def test_build_universe_history_summary_prioritizes_repeated_and_priority_ranking_candidates():
@@ -1081,30 +1201,9 @@ def test_build_universe_history_summary_sanitizes_non_finite_row_values():
     row = summary["universe_summary"][0]
     assert row["symbol"] == "BAD"
     assert row["latest_close"] is None
-    assert row["return_21"] is None
-    assert row["return_63"] is None
-    assert row["return_126"] == 0.12
-    assert row["return_252"] is None
-    assert row["return_252_ex_skip_21"] is None
-    assert row["momentum_composite"] is None
-    assert row["composite_score"] is None
-    assert row["trend_alignment"] is None
-    assert row["sma_stack_score"] is None
-    assert row["adjusted_slope_90"] is None
-    assert row["linear_regression_r2_90"] is None
-    assert row["return_252_over_volatility_63"] is None
-    assert row["sharpe_like_63"] is None
-    assert row["calmar_like_126"] is None
-    assert row["volume_confirmed_momentum"] is None
-    assert row["volatility_20"] is None
-    assert row["distance_to_high_252"] is None
-    assert row["distance_to_high_63"] is None
-    assert row["breakout_20_high_score"] is None
-    assert row["breakout_63_high_score"] is None
-    assert row["volume_vs_avg_20"] is None
-    assert row["dollar_volume_20"] is None
-    assert row["up_volume_ratio_20"] is None
-    assert row["drawdown_from_high_60"] is None
+    assert row["evidence_groups"] == ["momentum"]
+    assert row["ranking_count"] == 1
+    assert row["best_rank"] == 1
     assert summary["rankings"]["by_return_21"] == []
     assert summary["rankings"]["by_return_63"] == []
     assert summary["rankings"]["by_return_126"] == ["BAD"]
@@ -1136,6 +1235,6 @@ def test_compute_history_summary_excludes_non_finite_trend_alignment_from_rankin
 
     assert history_summary["scores"]["trend_alignment"] is None
     assert history_summary["availability"]["trend_alignment"] is False
-    assert summary["universe_summary"][0]["trend_alignment"] is None
+    assert "trend_alignment" not in summary["universe_summary"][0]
     assert summary["rankings"]["by_trend_alignment"] == []
     json.dumps(summary, allow_nan=False)
