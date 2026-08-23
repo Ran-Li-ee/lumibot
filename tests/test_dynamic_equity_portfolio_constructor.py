@@ -175,7 +175,7 @@ def test_constructor_enforces_max_single_weight_and_redistributes():
     )
 
     weights = weights_by_symbol(result)
-    assert max(weights.values()) <= pytest.approx(0.30)
+    assert max(weights.values()) <= 0.30 + 1e-12
     assert sum(weights.values()) == pytest.approx(0.98)
     assert "AAA" in result["diagnostics"]["capped_symbols"]
 
