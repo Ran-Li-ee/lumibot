@@ -1185,7 +1185,7 @@ def test_equity_only_workflow_uses_market_summary_tool_result_for_constructor(mo
     strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
     strategy.parameters["basket_universes"] = {
         **strategy.parameters["basket_universes"],
-        "equity": ["ORCL", "MSFT", "NVDA", "META"],
+        "equity": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN", "META"],
     }
     strategy.agents.summaries["equity_basket_agent"] = json.dumps(
         {
@@ -1193,8 +1193,8 @@ def test_equity_only_workflow_uses_market_summary_tool_result_for_constructor(mo
             "target_weight": 1.0,
             "status": "active",
             "candidate_symbols": strategy.parameters["basket_universes"]["equity"],
-            "selected_symbols": ["ORCL", "MSFT", "NVDA"],
-            "reason_brief": "Three strongest setup names from the LLM.",
+            "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+            "reason_brief": "Five strongest setup names from the LLM.",
         }
     )
     strategy.agents.tool_results["equity_basket_agent"] = [
