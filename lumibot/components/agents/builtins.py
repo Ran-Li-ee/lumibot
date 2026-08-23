@@ -4208,13 +4208,13 @@ def _validate_execution_plan(
             ),
             orders_requested,
         )
-    if intent not in {"rebalance", "hold"}:
+    if intent not in {"rebalance", "hold", "risk_exit"}:
         return (
             _jsonable(intent),
             [],
             _execution_plan_blocker(
                 "UNSUPPORTED_PLAN_INTENT",
-                "execution_plan.intent must be rebalance or hold.",
+                "execution_plan.intent must be rebalance, hold, or risk_exit.",
             ),
             orders_requested,
         )
@@ -4238,6 +4238,16 @@ def _validate_execution_plan(
             ),
             len(raw_orders),
         )
+    if intent == "risk_exit" and not raw_orders:
+        return (
+            intent,
+            [],
+            _execution_plan_blocker(
+                "INVALID_EXECUTION_PLAN",
+                "execution_plan orders are required for risk_exit intent.",
+            ),
+            len(raw_orders),
+        )
 
     sequence_blocker = _validate_execution_plan_sequence(raw_orders)
     if sequence_blocker is not None:
@@ -4250,6 +4260,16 @@ def _validate_execution_plan(
             return intent, [], blocker, len(raw_orders)
         if normalized_order is not None:
             normalized_orders.append(normalized_order)
+    if intent == "risk_exit" and any(order.get("side") != "sell" for order in normalized_orders):
+        return (
+            intent,
+            [],
+            _execution_plan_blocker(
+                "INVALID_EXECUTION_PLAN",
+                "execution_plan risk_exit intent only supports sell orders.",
+            ),
+            len(raw_orders),
+        )
     return intent, normalized_orders, None, len(raw_orders)
 
 

@@ -1636,6 +1636,88 @@ def test_execution_plan_execute_completes_valid_multi_order_plan_in_sequence():
     assert result["blockers"] == []
 
 
+def test_execution_plan_execute_completes_risk_exit_sell_plan():
+    strategy = _OrderReadinessStrategy()
+    strategy.cash = 1000.0
+    strategy.portfolio_value = 2000.0
+    strategy.last_prices = {"NVDA": 100.0}
+    strategy.positions = [_fake_position("NVDA", 10, market_value=1000.0, current_price=100.0)]
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "risk_exit",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "NVDA",
+                    "side": "sell",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "completed"
+    assert result["intent"] == "risk_exit"
+    assert result["orders_requested"] == 1
+    assert result["orders_completed"] == 1
+    assert result["blockers"] == []
+    assert [order.asset.symbol for order in strategy.submitted_orders] == ["NVDA"]
+    assert [order.side for order in strategy.submitted_orders] == ["sell"]
+
+
+def test_execution_plan_execute_rejects_risk_exit_buy_plan_before_submit():
+    strategy = _OrderReadinessStrategy()
+    strategy.last_prices = {"NVDA": 100.0}
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={
+            "schema_version": 1,
+            "intent": "risk_exit",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "NVDA",
+                    "side": "buy",
+                    "quantity_mode": "shares",
+                    "quantity": 10,
+                    "asset_type": "stock",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["plan_status"] == "invalid"
+    assert result["blockers"][0]["code"] == "INVALID_EXECUTION_PLAN"
+    assert "risk_exit intent only supports sell orders" in result["blockers"][0]["message"]
+    assert strategy.submitted_orders == []
+
+
+def test_execution_plan_execute_rejects_empty_risk_exit_plan_before_submit():
+    strategy = _OrderReadinessStrategy()
+    tool_map = _wrap_execute_plan_tools(strategy)
+
+    result = tool_map["execution_plan_execute"](
+        execution_plan={"schema_version": 1, "intent": "risk_exit", "orders": []}
+    )
+
+    assert result["plan_status"] == "invalid"
+    assert result["blockers"][0]["code"] == "INVALID_EXECUTION_PLAN"
+    assert "orders are required for risk_exit" in result["blockers"][0]["message"]
+    assert strategy.submitted_orders == []
+
+
 def test_execution_plan_execute_completed_result_includes_model_facing_summary():
     strategy = _OrderReadinessStrategy()
     strategy.cash = 100000.0
