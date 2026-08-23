@@ -188,6 +188,10 @@ def trailing_stop_to_execution_plan(
             start_date=start_date,
             end_date=end_date,
         )
+        if price_source == "last_price_fallback":
+            warnings.append(
+                f"{symbol}: daily close unavailable; used last_price_fallback for exit-risk check."
+            )
         check_date, check_price = close_points[-1]
         window_peak = max(price for _, price in close_points)
         entry_price = (

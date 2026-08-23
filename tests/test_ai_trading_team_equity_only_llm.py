@@ -83,7 +83,13 @@ class RecordingRunAgent:
     def run(self, *, task_prompt, context):
         self.calls.append({"task_prompt": task_prompt, "context": context})
         summary = self.manager.summaries[self.name]
-        tool_results = self.manager.tool_results.get(self.name, [])
+        tool_results = self.manager.tool_results.get(self.name)
+        if tool_results is None and self.name == "execution_agent":
+            tool_results = [
+                SimpleNamespace(tool_name="execution_plan_execute", payload={"plan_status": "completed"})
+            ]
+        if tool_results is None:
+            tool_results = []
         return SimpleNamespace(summary=summary, tool_calls=[], tool_results=tool_results)
 
 
@@ -745,6 +751,9 @@ def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(mo
         }
     )
     strategy.agents.summaries["execution_agent"] = "Executed plan."
+    strategy.agents.tool_results["execution_agent"] = [
+        SimpleNamespace(tool_name="execution_plan_execute", payload={"plan_status": "completed"})
+    ]
 
     def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
         return {
@@ -1702,12 +1711,86 @@ def test_scheduled_buy_seeds_trailing_stop_state(monkeypatch):
     }
 
 
+def test_scheduled_buy_does_not_seed_stop_state_when_execution_plan_execute_blocks(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    strategy.parameters["basket_universes"] = {
+        **strategy.parameters["basket_universes"],
+        "equity": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN", "META"],
+    }
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": strategy.parameters["basket_universes"]["equity"],
+            "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+            "reason_brief": "Five strongest setup names.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Execution blocked."
+    strategy.agents.tool_results["execution_agent"] = [
+        SimpleNamespace(tool_name="execution_plan_execute", payload={"plan_status": "blocked"})
+    ]
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [
+                {
+                    "symbol": "ORCL",
+                    "planned_side": "buy",
+                    "planned_quantity": 10,
+                    "sizing_price": 100.0,
+                }
+            ],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 1000.0,
+                "cash_after_estimate": 99000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "ORCL",
+                        "asset_type": "stock",
+                        "side": "buy",
+                        "quantity": 10,
+                        "quantity_mode": "shares",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            },
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    assert strategy._equity_trailing_stop_position_state == {}
+    assert "execution_plan_execute did not complete scheduled_rebalance plan" in strategy._last_execution_plan_error
+
+
 def test_trailing_stop_executes_and_skips_weekly_equity_agent(monkeypatch):
     module = load_module()
     strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
     strategy.parameters["run_frequency"] = "daily"
     strategy._run_frequency = "daily"
     strategy.agents.summaries["execution_agent"] = "Executed trailing stop."
+    strategy.agents.tool_results["execution_agent"] = [
+        SimpleNamespace(tool_name="execution_plan_execute", payload={"plan_status": "completed"})
+    ]
 
     def fake_trailing_stop_to_execution_plan(
         strategy_arg, *, date, initial_stop_pct, trailing_stop_pct, position_state
@@ -1787,6 +1870,84 @@ def test_trailing_stop_executes_and_skips_weekly_equity_agent(monkeypatch):
     assert strategy._last_trailing_stop_result["stop_checks"][0]["triggered"] is True
 
 
+def test_risk_exit_preserves_stop_state_when_execution_plan_execute_blocks(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    strategy.parameters["run_frequency"] = "daily"
+    strategy._run_frequency = "daily"
+    original_state = {
+        "NVDA": {
+            "entry_date": "2024-09-02",
+            "entry_price": 100.0,
+            "peak_close": 150.0,
+            "last_check_date": "2024-09-04",
+            "last_check_price": 125.0,
+        }
+    }
+    strategy._equity_trailing_stop_position_state = dict(original_state)
+    strategy.agents.summaries["execution_agent"] = "Execution blocked."
+    strategy.agents.tool_results["execution_agent"] = [
+        SimpleNamespace(
+            tool_name="execution_plan_execute",
+            payload={"plan_status": "blocked", "blockers": ["simulated broker block"]},
+        )
+    ]
+
+    monkeypatch.setattr(
+        module,
+        "trailing_stop_to_execution_plan",
+        lambda strategy_arg, *, date, initial_stop_pct, trailing_stop_pct, position_state: {
+            "schema_version": "1.0",
+            "date": date,
+            "policy": {
+                "initial_stop_pct": initial_stop_pct,
+                "trailing_stop_pct": trailing_stop_pct,
+                "price_basis": "daily_close",
+            },
+            "exit_checks": [
+                {
+                    "symbol": "NVDA",
+                    "triggered": True,
+                    "trigger_reason": "trailing_stop",
+                }
+            ],
+            "stop_checks": [
+                {
+                    "symbol": "NVDA",
+                    "triggered": True,
+                    "trigger_reason": "trailing_stop",
+                }
+            ],
+            "updated_position_state": {},
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "risk_exit",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "NVDA",
+                        "side": "sell",
+                        "quantity_mode": "shares",
+                        "quantity": 10,
+                        "asset_type": "stock",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            },
+            "warnings": [],
+        },
+    )
+
+    strategy.on_trading_iteration()
+
+    assert strategy._equity_trailing_stop_position_state == original_state
+    assert "execution_plan_execute did not complete risk_exit plan" in strategy._last_execution_plan_error
+    assert strategy.agents["equity_basket_agent"].calls == []
+    assert len(strategy.agents["execution_agent"].calls) == 1
+
+
 def test_no_trailing_stop_allows_weekly_equity_workflow(monkeypatch):
     module = load_module()
     strategy = make_running_strategy(module.AITradingTeamQQQHistoricalEquityOnlyLLMStrategy)
@@ -1802,6 +1963,9 @@ def test_no_trailing_stop_allows_weekly_equity_workflow(monkeypatch):
         }
     )
     strategy.agents.summaries["execution_agent"] = "Executed plan."
+    strategy.agents.tool_results["execution_agent"] = [
+        SimpleNamespace(tool_name="execution_plan_execute", payload={"plan_status": "completed"})
+    ]
 
     monkeypatch.setattr(
         module,

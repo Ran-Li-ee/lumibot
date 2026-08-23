@@ -339,8 +339,8 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         current_date: str,
         execution_plan: dict[str, Any],
         reason: str,
-    ) -> None:
-        self.agents["execution_agent"].run(
+    ) -> Any:
+        return self.agents["execution_agent"].run(
             task_prompt=(
                 "Execute the provided execution_plan by calling execution_plan_execute exactly once with the "
                 "complete execution_plan. Use the returned concise execution summary to write the final result. "
@@ -354,6 +354,32 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             },
         )
 
+    def _execution_plan_execute_status(self, agent_result: Any) -> str | None:
+        for event in getattr(agent_result, "tool_results", []) or []:
+            if getattr(event, "tool_name", None) != "execution_plan_execute":
+                continue
+            payload = getattr(event, "payload", None)
+            if isinstance(payload, dict) and set(payload) == {"payload"} and isinstance(payload.get("payload"), dict):
+                payload = payload["payload"]
+            if not isinstance(payload, dict):
+                continue
+            summary = payload.get("model_facing_summary")
+            if isinstance(summary, dict) and summary.get("plan_status") is not None:
+                return str(summary["plan_status"]).strip().lower()
+            if payload.get("plan_status") is not None:
+                return str(payload["plan_status"]).strip().lower()
+        return None
+
+    def _execution_plan_execute_completed(self, agent_result: Any, *, reason: str) -> bool:
+        status = self._execution_plan_execute_status(agent_result)
+        if status == "completed":
+            return True
+        self._last_execution_plan_error = (
+            f"execution_plan_execute did not complete {reason} plan "
+            f"(plan_status={status or 'missing'})."
+        )
+        return False
+
     def _run_daily_trailing_stop_check(self, current_date: str) -> bool:
         result = trailing_stop_to_execution_plan(
             self,
@@ -364,10 +390,10 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         )
         self._last_trailing_stop_result = result
         self._trailing_stop_events.append(result)
-        self._equity_trailing_stop_position_state = dict(result.get("updated_position_state") or {})
 
         execution_plan = normalize_execution_plan(result.get("execution_plan"))
         if execution_plan["intent"] == "hold" or not execution_plan["orders"]:
+            self._equity_trailing_stop_position_state = dict(result.get("updated_position_state") or {})
             return False
 
         self._last_target_portfolio_planner_result = {
@@ -375,11 +401,13 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             "trailing_stop_result": result,
         }
         self._last_execution_plan_error = None
-        self._execute_plan_with_execution_agent(
+        execution_result = self._execute_plan_with_execution_agent(
             current_date=current_date,
             execution_plan=execution_plan,
             reason="risk_exit",
         )
+        if self._execution_plan_execute_completed(execution_result, reason="risk_exit"):
+            self._equity_trailing_stop_position_state = dict(result.get("updated_position_state") or {})
         return True
 
     def _seed_trailing_stop_state_from_scheduled_plan(
@@ -568,16 +596,17 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         if execution_plan["intent"] == "hold" or not execution_plan["orders"]:
             return
 
-        self._execute_plan_with_execution_agent(
+        execution_result = self._execute_plan_with_execution_agent(
             current_date=current_date,
             execution_plan=execution_plan,
             reason="scheduled_rebalance",
         )
-        self._seed_trailing_stop_state_from_scheduled_plan(
-            current_date=current_date,
-            planner_result=planner_result,
-            execution_plan=execution_plan,
-        )
+        if self._execution_plan_execute_completed(execution_result, reason="scheduled_rebalance"):
+            self._seed_trailing_stop_state_from_scheduled_plan(
+                current_date=current_date,
+                planner_result=planner_result,
+                execution_plan=execution_plan,
+            )
 
     def on_trading_iteration(self):
         current_datetime = self.get_datetime()

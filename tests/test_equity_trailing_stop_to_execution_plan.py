@@ -349,6 +349,9 @@ def test_trailing_stop_falls_back_to_last_price_when_daily_close_is_unavailable(
     assert result["exit_checks"][0]["entry_date"] == "2024-09-05"
     assert result["exit_checks"][0]["entry_price"] == 149.0
     assert result["exit_checks"][0]["initial_stop_price"] == pytest.approx(131.12)
+    assert result["warnings"] == [
+        "NVDA: daily close unavailable; used last_price_fallback for exit-risk check."
+    ]
     assert result["updated_position_state"]["NVDA"] == {
         "entry_date": "2024-09-05",
         "entry_price": 149.0,
