@@ -542,8 +542,9 @@ def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_ne
 
     for required in (
         "equity-only",
-        "choose exactly five stocks",
-        "equal target weights",
+        "credible stock candidates",
+        "deterministic constructor",
+        "do not calculate exact per-symbol target weights",
         "market_load_history_tables_summary",
         "evidence interpretation policy",
         "momentum and trend quality as primary selection evidence",
@@ -577,8 +578,39 @@ def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_ne
         "composite_score",
         "duckdb",
         "optimize weights",
+        "choose exactly five",
+        "equal target weights",
     ):
         assert forbidden not in prompt
+
+
+def test_equity_prompts_remove_fixed_five_equal_weight_assumptions():
+    helpers = importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_helpers")
+
+    prompts = [
+        helpers.equity_basket_agent_system_prompt("AAPL, MSFT, NVDA"),
+        helpers.qqq_historical_equity_basket_agent_system_prompt("AAPL, MSFT, NVDA"),
+        helpers.equity_basket_agent_task_prompt(),
+    ]
+
+    for prompt in prompts:
+        lower_prompt = prompt.lower()
+        for forbidden in (
+            "choose exactly five",
+            "exactly five unique",
+            "five selected stocks equal",
+            "equal target weights",
+            "target_weight must be 1.0",
+        ):
+            assert forbidden not in lower_prompt
+
+        for required in (
+            "credible candidates",
+            "between 3 and 10",
+            "deterministic constructor",
+            "do not calculate exact per-symbol target weights",
+        ):
+            assert required in lower_prompt
 
 
 def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(monkeypatch):
@@ -637,14 +669,14 @@ def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(mo
     assert "top_n=10" in task_prompt
     assert "candidate_summary_limit=25" in task_prompt
     assert "evidence interpretation policy" in task_prompt
-    assert "select exactly five unique symbols" in task_prompt
+    assert "selected_symbols must contain between 3 and 10 unique symbols" in task_prompt
+    assert "deterministic constructor" in task_prompt
+    assert "do not calculate exact per-symbol target weights" in task_prompt
     assert "avoid selecting a stock supported by only one evidence group unless" in task_prompt
-    assert "do not assign per-symbol weights" in task_prompt
     assert "alpaca_news" in task_prompt
     assert "close, conflicting, or uncertain" in task_prompt
     assert "leading candidates only" in task_prompt
     assert "candidate_symbols must copy the assigned basket_symbols exactly" in task_prompt
-    assert "selected_symbols must contain exactly five unique symbols" in task_prompt
     assert "return exactly one strict json object" in task_prompt
 
     for forbidden in (
@@ -655,6 +687,7 @@ def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(mo
         "speculative",
         "optimize weights",
         "duckdb",
+        "target_weight",
     ):
         assert forbidden not in task_prompt
 
