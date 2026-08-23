@@ -157,19 +157,20 @@ def test_constructor_enforces_max_single_weight_and_redistributes():
     equity_report = {
         "basket_id": "equity",
         "status": "active",
-        "selected_symbols": ["AAA", "BBB", "CCC"],
+        "selected_symbols": ["AAA", "BBB", "CCC", "DDD"],
     }
     market_summary = summary(
         [
             candidate("AAA", momentum=1, trend_quality=1, ranking_count=20),
             candidate("BBB", momentum=8, trend_quality=8, ranking_count=2),
             candidate("CCC", momentum=9, trend_quality=9, ranking_count=2),
+            candidate("DDD", momentum=9, trend_quality=8, ranking_count=2),
         ]
     )
 
     result = construct_dynamic_equity_target_portfolio(
         equity_report,
-        equity_universe=["AAA", "BBB", "CCC"],
+        equity_universe=["AAA", "BBB", "CCC", "DDD"],
         market_summary=market_summary,
         policy=policy,
     )
