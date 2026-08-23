@@ -12,6 +12,7 @@ from lumibot.example_strategies.target_portfolio_to_execution_plan import (
 )
 
 DEFAULT_TRAILING_STOP_PCT = 0.20
+DEFAULT_INITIAL_STOP_PCT = 0.12
 
 
 def _decimal(value: Any, label: str) -> Decimal:
@@ -136,11 +137,15 @@ def _normalized_state(position_state: dict[str, Any] | None) -> dict[str, dict[s
         if not symbol or not isinstance(raw_payload, dict):
             continue
         entry_date = str(raw_payload.get("entry_date") or "").strip()
+        entry_price = raw_payload.get("entry_price")
         peak_close = raw_payload.get("peak_close")
         if not entry_date or peak_close is None:
             continue
+        if entry_price is None:
+            entry_price = peak_close
         state[symbol] = {
             "entry_date": entry_date,
+            "entry_price": _float(_positive_price(entry_price, f"entry_price for {symbol}")),
             "peak_close": _float(_positive_price(peak_close, f"peak_close for {symbol}")),
         }
     return state
@@ -150,18 +155,22 @@ def trailing_stop_to_execution_plan(
     strategy: Any,
     *,
     date: str,
+    initial_stop_pct: float = DEFAULT_INITIAL_STOP_PCT,
     trailing_stop_pct: float = DEFAULT_TRAILING_STOP_PCT,
     position_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    pct = _decimal(trailing_stop_pct, "trailing_stop_pct")
-    if pct <= 0 or pct >= 1:
-        raise ValueError("trailing_stop_pct must be between 0 and 1.")
+    initial_pct = _decimal(initial_stop_pct, "initial_stop_pct")
+    if initial_pct <= 0 or initial_pct >= 1:
+        raise ValueError("initial_stop_pct must be between 0 and 1")
+    trailing_pct = _decimal(trailing_stop_pct, "trailing_stop_pct")
+    if trailing_pct <= 0 or trailing_pct >= 1:
+        raise ValueError("trailing_stop_pct must be between 0 and 1")
 
     current_positions = _current_positions_by_symbol(strategy)
     state = _normalized_state(position_state)
     end_date = date_type.fromisoformat(date)
     updated_state: dict[str, dict[str, Any]] = {}
-    stop_checks: list[dict[str, Any]] = []
+    exit_checks: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
 
     for symbol in sorted(current_positions):
@@ -177,27 +186,48 @@ def trailing_stop_to_execution_plan(
         )
         check_date, check_price = close_points[-1]
         window_peak = max(price for _, price in close_points)
+        entry_price = (
+            _positive_price(previous["entry_price"], f"entry_price for {symbol}")
+            if previous
+            else check_price
+        )
         previous_peak = (
             _positive_price(previous["peak_close"], f"previous peak close for {symbol}")
             if previous
             else window_peak
         )
         peak_close = max(previous_peak, window_peak)
-        stop_price = peak_close * (Decimal("1") - pct)
-        triggered = check_price <= stop_price
+        initial_stop_price = entry_price * (Decimal("1") - initial_pct)
+        trailing_stop_price = peak_close * (Decimal("1") - trailing_pct)
+        initial_stop_triggered = check_price <= initial_stop_price
+        trailing_stop_triggered = check_price <= trailing_stop_price
+        triggered = initial_stop_triggered or trailing_stop_triggered
+        trigger_reason = (
+            "initial_stop"
+            if initial_stop_triggered
+            else "trailing_stop"
+            if trailing_stop_triggered
+            else None
+        )
         planned_quantity = int(quantity)
 
-        stop_checks.append(
+        exit_checks.append(
             {
                 "symbol": symbol,
                 "quantity": _float(quantity),
-                "holding_start_date": entry_date_text,
+                "entry_date": entry_date_text,
+                "entry_price": _float(entry_price),
                 "previous_peak_close": _float(previous_peak),
                 "peak_close": _float(peak_close),
                 "current_check_price": _float(check_price),
-                "trailing_stop_pct": _float(pct),
-                "stop_price": _float(stop_price),
+                "initial_stop_pct": _float(initial_pct),
+                "trailing_stop_pct": _float(trailing_pct),
+                "initial_stop_price": _float(initial_stop_price),
+                "trailing_stop_price": _float(trailing_stop_price),
+                "initial_stop_triggered": initial_stop_triggered,
+                "trailing_stop_triggered": trailing_stop_triggered,
                 "triggered": triggered,
+                "trigger_reason": trigger_reason,
                 "price_source": price_source,
                 "history_start_date": start_date.isoformat(),
                 "history_end_date": check_date.isoformat() if check_date is not None else date,
@@ -218,6 +248,7 @@ def trailing_stop_to_execution_plan(
 
         updated_state[symbol] = {
             "entry_date": entry_date_text,
+            "entry_price": _float(entry_price),
             "peak_close": _float(peak_close),
             "last_check_date": date,
             "last_check_price": _float(check_price),
@@ -226,12 +257,19 @@ def trailing_stop_to_execution_plan(
     return {
         "schema_version": "1.0",
         "date": date,
-        "trailing_stop_pct": _float(pct),
-        "stop_checks": stop_checks,
+        "policy": {
+            "initial_stop_pct": _float(initial_pct),
+            "trailing_stop_pct": _float(trailing_pct),
+            "price_basis": "daily_close",
+        },
+        "initial_stop_pct": _float(initial_pct),
+        "trailing_stop_pct": _float(trailing_pct),
+        "exit_checks": exit_checks,
+        "stop_checks": exit_checks,
         "updated_position_state": updated_state,
         "execution_plan": {
             "schema_version": 1,
-            "intent": "rebalance" if orders else "hold",
+            "intent": "risk_exit" if orders else "hold",
             "orders": orders,
         },
         "warnings": [],
