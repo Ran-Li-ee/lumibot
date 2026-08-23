@@ -269,6 +269,8 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
                 "Do not manually execute individual orders. "
                 "Do not call lower-level order, account, open-order, or price tools when execution_plan_execute "
                 "is available. Do not research, change fields, reorder orders, split orders, or repair the plan. "
+                "The execution_reason may be scheduled_rebalance or risk_exit; in both cases, execute the provided "
+                "plan and do not second-guess why the plan exists. "
                 "execution_plan_execute returns a concise execution summary for your final answer; "
                 "full audit details are recorded in trace/replay for developer inspection. "
                 "If the tool returns plan_status=completed, summarize completed orders. If it returns "

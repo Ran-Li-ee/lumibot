@@ -650,6 +650,10 @@ def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_ne
         "strict json",
         "do not place orders",
         "cannot place orders or size trades",
+        "existing positions are protected by a deterministic local exit-risk engine",
+        "do not calculate stop-loss",
+        "do not calculate take-profit",
+        "do not create exit orders",
     ):
         assert required in prompt
 
@@ -670,8 +674,28 @@ def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_ne
         "optimize weights",
         "choose exactly five",
         "equal target weights",
+        "set stop-loss",
+        "set take-profit",
+        "calculate stop price",
     ):
         assert forbidden not in prompt
+
+
+def test_execution_agent_prompt_handles_risk_exit_without_second_guessing():
+    module = load_module()
+    strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+
+    strategy.initialize()
+
+    execution_agent = created_agent_config(strategy, "execution_agent")
+    prompt = execution_agent["system_prompt"].lower()
+
+    assert "scheduled_rebalance or risk_exit" in prompt
+    assert "execute only provided execution_plan" in prompt
+    assert "do not research" in prompt
+    assert "do not" in prompt and "second-guess" in prompt
+    assert "calculate stop" not in prompt
+    assert "take-profit" not in prompt
 
 
 def test_equity_prompts_remove_fixed_five_equal_weight_assumptions():
