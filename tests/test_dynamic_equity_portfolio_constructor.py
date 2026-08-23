@@ -204,6 +204,33 @@ def test_constructor_falls_back_to_equal_weights_when_summary_missing():
     assert all(row["target_weight"] == pytest.approx(0.196) for row in result["target_portfolio"])
 
 
+def test_constructor_fallback_weights_reconcile_rounding_residual():
+    policy = DynamicEquityPortfolioPolicy(
+        min_positions=3,
+        max_positions=10,
+        fallback_positions=3,
+        cash_buffer_weight=0.02,
+        max_single_weight=0.50,
+        min_single_weight=0.05,
+    )
+    equity_report = {
+        "basket_id": "equity",
+        "status": "active",
+        "selected_symbols": ["AAA", "BBB", "CCC"],
+    }
+
+    result = construct_dynamic_equity_target_portfolio(
+        equity_report,
+        equity_universe=["AAA", "BBB", "CCC"],
+        market_summary=None,
+        policy=policy,
+    )
+
+    weights = [row["target_weight"] for row in result["target_portfolio"]]
+    assert sum(weights) == pytest.approx(0.98)
+    assert sum(weights) <= 0.98 + 1e-12
+
+
 def test_constructor_rejects_outside_universe_symbol():
     equity_report = {
         "basket_id": "equity",

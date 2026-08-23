@@ -450,7 +450,10 @@ def _cap_feasible(position_count: int, exposure: float, policy: DynamicEquityPor
 def _equal_weights(position_count: int, exposure: float) -> list[float]:
     if position_count <= 0:
         return []
-    return [round(exposure / position_count, 6) for _ in range(position_count)]
+    weights = [round(exposure / position_count, 6) for _ in range(position_count)]
+    residual = round(exposure - sum(weights), 6)
+    weights[-1] = round(weights[-1] + residual, 6)
+    return weights
 
 
 def _round_weights(
