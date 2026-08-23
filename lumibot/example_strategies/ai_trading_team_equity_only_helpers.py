@@ -81,7 +81,7 @@ EQUITY_ALPACA_NEWS_DESCRIPTION = (
     "article."
 )
 
-ALLOWED_INTENTS = {"hold", "rebalance"}
+ALLOWED_INTENTS = {"hold", "rebalance", "risk_exit"}
 ALLOWED_ACTIONS = {"submit_order"}
 ALLOWED_SIDES = {"buy", "sell"}
 ALLOWED_QUANTITY_MODES = {"shares"}
@@ -371,8 +371,8 @@ def normalize_execution_plan(plan: Any) -> dict[str, Any]:
         raise ValueError("execution_plan orders must be a list.")
     if intent == "hold" and orders:
         raise ValueError("hold intent cannot include orders.")
-    if intent == "rebalance" and not orders:
-        raise ValueError("execution_plan orders are required for rebalance intent.")
+    if intent in {"rebalance", "risk_exit"} and not orders:
+        raise ValueError("execution_plan orders are required for rebalance or risk_exit intent.")
 
     normalized_orders = sorted((_normalize_order(order) for order in orders), key=lambda order: order["sequence"])
     order_sequences = [order["sequence"] for order in normalized_orders]

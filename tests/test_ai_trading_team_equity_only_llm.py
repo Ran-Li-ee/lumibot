@@ -258,6 +258,64 @@ def test_validate_execution_plan_symbols_accepts_any_top5_selected_symbol():
     )
 
 
+def test_validate_execution_plan_symbols_ignores_risk_exit_sells():
+    module = load_module()
+
+    module.validate_execution_plan_symbols(
+        {
+            "schema_version": 1,
+            "intent": "risk_exit",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "NVDA",
+                    "asset_type": "stock",
+                    "side": "sell",
+                    "quantity": 10,
+                    "quantity_mode": "shares",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        },
+        {
+            "basket_id": "equity",
+            "status": "active",
+            "selected_symbols": ["AAPL", "MSFT", "ORCL"],
+        },
+    )
+
+
+def test_normalize_execution_plan_accepts_risk_exit_sell_plan():
+    helpers = importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_helpers")
+
+    result = helpers.normalize_execution_plan(
+        {
+            "schema_version": 1,
+            "intent": "risk_exit",
+            "orders": [
+                {
+                    "sequence": 1,
+                    "action": "submit_order",
+                    "symbol": "NVDA",
+                    "asset_type": "stock",
+                    "side": "sell",
+                    "quantity": 10,
+                    "quantity_mode": "shares",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                }
+            ],
+        }
+    )
+
+    assert result["intent"] == "risk_exit"
+    assert result["orders"][0]["symbol"] == "NVDA"
+    assert result["orders"][0]["side"] == "sell"
+    assert result["constraints"]["allow_negative_cash"] is False
+
+
 def test_equity_universe_contains_50_us_stock_symbols_without_old_etfs():
     helpers = importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_helpers")
 
