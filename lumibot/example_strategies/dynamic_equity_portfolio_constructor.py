@@ -391,7 +391,8 @@ def _score_weights(
         return []
 
     scores = [max(candidate["adjusted_score"], 0.0) for candidate in candidates]
-    if sum(scores) <= 0.0:
+    score_total = sum(scores)
+    if score_total <= 0.0:
         equal_weight = exposure / len(candidates)
         if not _cap_feasible(len(candidates), exposure, policy):
             capped_symbols.extend(candidate["symbol"] for candidate in candidates)
@@ -399,11 +400,11 @@ def _score_weights(
         return [equal_weight for _ in candidates]
 
     if not _cap_feasible(len(candidates), exposure, policy):
-        weights = [min(exposure * score / sum(scores), policy.max_single_weight) for score in scores]
+        weights = [min(exposure * score / score_total, policy.max_single_weight) for score in scores]
+        target_total = min(exposure, len(candidates) * policy.max_single_weight)
+        _redistribute_under_cap_capacity(weights, target_total, policy.max_single_weight)
         capped_symbols.extend(
-            candidate["symbol"]
-            for candidate, score in zip(candidates, scores)
-            if exposure * score / sum(scores) > policy.max_single_weight
+            candidate["symbol"] for candidate, weight in zip(candidates, weights) if weight >= policy.max_single_weight
         )
         return weights
 
@@ -437,6 +438,31 @@ def _score_weights(
             remaining_indexes.remove(index)
 
     return weights
+
+
+def _redistribute_under_cap_capacity(weights: list[float], target_total: float, max_single_weight: float) -> None:
+    while True:
+        residual = target_total - sum(weights)
+        if residual <= 1e-12:
+            return
+
+        under_cap_indexes = [
+            index
+            for index, weight in enumerate(weights)
+            if weight < max_single_weight - 1e-12
+        ]
+        if not under_cap_indexes:
+            return
+
+        share = residual / len(under_cap_indexes)
+        added = 0.0
+        for index in under_cap_indexes:
+            capacity = max_single_weight - weights[index]
+            increment = min(share, capacity)
+            weights[index] += increment
+            added += increment
+        if added <= 1e-12:
+            return
 
 
 def _can_drop_position(position_count: int, exposure: float, policy: DynamicEquityPortfolioPolicy) -> bool:

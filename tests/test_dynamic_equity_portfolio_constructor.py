@@ -122,6 +122,7 @@ def test_constructor_selects_broader_set_when_scores_are_close():
 
 
 def test_constructor_downweights_high_volatility_candidate():
+    policy = DynamicEquityPortfolioPolicy(max_single_weight=0.50)
     equity_report = {
         "basket_id": "equity",
         "status": "active",
@@ -139,6 +140,7 @@ def test_constructor_downweights_high_volatility_candidate():
         equity_report,
         equity_universe=["CALM", "WILD", "BASE"],
         market_summary=market_summary,
+        policy=policy,
     )
 
     weights = weights_by_symbol(result)
@@ -183,6 +185,60 @@ def test_constructor_enforces_max_single_weight_and_redistributes():
     assert max(weights.values()) <= 0.30 + 1e-12
     assert sum(weights.values()) == pytest.approx(0.98)
     assert "AAA" in result["diagnostics"]["capped_symbols"]
+
+
+def test_constructor_uses_available_cap_capacity_when_scored_selection_is_cap_infeasible():
+    policy = DynamicEquityPortfolioPolicy(
+        min_positions=3,
+        max_positions=3,
+        fallback_positions=3,
+        cash_buffer_weight=0.02,
+        max_single_weight=0.30,
+        min_single_weight=0.05,
+        leading_score_keep_ratio=0.20,
+        minimum_candidate_score=0.0,
+    )
+    equity_report = {
+        "basket_id": "equity",
+        "status": "active",
+        "selected_symbols": ["AAA", "BBB", "CCC"],
+    }
+    market_summary = summary(
+        [
+            candidate("AAA", momentum=1, trend_quality=1, ranking_count=20),
+            candidate(
+                "BBB",
+                momentum=10,
+                trend_quality=10,
+                risk_adjusted_momentum=10,
+                breakout_near_high=10,
+                volume_confirmation=10,
+                ranking_count=1,
+            ),
+            candidate(
+                "CCC",
+                momentum=10,
+                trend_quality=10,
+                risk_adjusted_momentum=10,
+                breakout_near_high=10,
+                volume_confirmation=10,
+                ranking_count=1,
+            ),
+        ]
+    )
+
+    result = construct_dynamic_equity_target_portfolio(
+        equity_report,
+        equity_universe=["AAA", "BBB", "CCC"],
+        market_summary=market_summary,
+        policy=policy,
+    )
+
+    weights = [row["target_weight"] for row in result["target_portfolio"]]
+    assert result["diagnostics"]["cap_feasible"] is False
+    assert result["diagnostics"]["warnings"]
+    assert all(weight <= 0.30 + 1e-12 for weight in weights)
+    assert sum(weights) == pytest.approx(0.90)
 
 
 def test_constructor_falls_back_to_equal_weights_when_summary_missing():
