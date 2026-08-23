@@ -491,6 +491,7 @@ def _candidate_summary_row(
         "composite_score": _compact_number(row.get("composite_score")),
         "volume_vs_avg_20": _compact_number(row.get("volume_vs_avg_20")),
         "drawdown_from_high_60": _compact_number(row.get("drawdown_from_high_60")),
+        "volatility_20": _compact_number(row.get("volatility_20")),
         "evidence_groups": list(best_rank_by_group),
         "ranking_count": ranking_count,
         "best_rank": best_rank,

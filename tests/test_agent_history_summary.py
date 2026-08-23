@@ -925,13 +925,15 @@ def test_build_universe_history_summary_candidate_summary_rows_are_compact():
         "composite_score",
         "volume_vs_avg_20",
         "drawdown_from_high_60",
+        "volatility_20",
         "evidence_groups",
         "ranking_count",
         "best_rank",
         "best_rank_by_group",
     }
+    assert first_row["volatility_20"] is not None
     assert "return_21" not in first_row
-    assert len(json.dumps(summary["candidate_summary"], sort_keys=True)) < 6_000
+    assert len(json.dumps(summary["candidate_summary"], sort_keys=True)) < 6_500
 
 
 def test_build_universe_history_summary_prioritizes_repeated_and_priority_ranking_candidates():
