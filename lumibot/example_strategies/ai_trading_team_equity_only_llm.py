@@ -33,6 +33,7 @@ from lumibot.example_strategies.dynamic_equity_portfolio_constructor import (
     latest_market_summary_from_agent_result,
 )
 from lumibot.example_strategies.equity_trailing_stop_to_execution_plan import (
+    DEFAULT_INITIAL_STOP_PCT,
     DEFAULT_TRAILING_STOP_PCT,
     trailing_stop_to_execution_plan,
 )
@@ -202,6 +203,9 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         self._last_target_portfolio_planner_result = None
         self._last_dynamic_equity_constructor_result = None
         self._last_execution_plan_error = None
+        self._equity_initial_stop_pct = float(
+            self.parameters.get("equity_initial_stop_pct", DEFAULT_INITIAL_STOP_PCT)
+        )
         self._equity_trailing_stop_pct = float(
             self.parameters.get("equity_trailing_stop_pct", DEFAULT_TRAILING_STOP_PCT)
         )
@@ -352,6 +356,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         result = trailing_stop_to_execution_plan(
             self,
             date=current_date,
+            initial_stop_pct=self._equity_initial_stop_pct,
             trailing_stop_pct=self._equity_trailing_stop_pct,
             position_state=self._equity_trailing_stop_position_state,
         )
@@ -371,7 +376,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         self._execute_plan_with_execution_agent(
             current_date=current_date,
             execution_plan=execution_plan,
-            reason="trailing_stop",
+            reason="risk_exit",
         )
         return True
 
@@ -404,10 +409,38 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
                 continue
             self._equity_trailing_stop_position_state[symbol] = {
                 "entry_date": current_date,
+                "entry_price": sizing_price,
                 "peak_close": sizing_price,
                 "last_check_date": current_date,
                 "last_check_price": sizing_price,
             }
+
+        current_quantities_by_symbol = {}
+        for row in planner_result.get("current_vs_target", []):
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").strip().upper()
+            current_quantity = row.get("current_quantity")
+            if symbol and current_quantity is not None:
+                current_quantities_by_symbol[symbol] = float(current_quantity)
+
+        sell_quantities_by_symbol = {}
+        for order in execution_plan.get("orders", []):
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("side") or "").strip().lower() != "sell":
+                continue
+            symbol = str(order.get("symbol") or "").strip().upper()
+            quantity = order.get("quantity")
+            if symbol and quantity is not None:
+                sell_quantities_by_symbol[symbol] = sell_quantities_by_symbol.get(symbol, 0.0) + float(
+                    quantity
+                )
+
+        for symbol, sell_quantity in sell_quantities_by_symbol.items():
+            current_quantity = current_quantities_by_symbol.get(symbol)
+            if current_quantity is not None and sell_quantity >= current_quantity:
+                self._equity_trailing_stop_position_state.pop(symbol, None)
 
     def _run_equity_only_workflow(
         self,

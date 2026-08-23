@@ -1671,6 +1671,7 @@ def test_scheduled_buy_seeds_trailing_stop_state(monkeypatch):
 
     assert strategy._equity_trailing_stop_position_state["ORCL"] == {
         "entry_date": "2024-09-05",
+        "entry_price": 100.0,
         "peak_close": 100.0,
         "last_check_date": "2024-09-05",
         "last_check_price": 100.0,
@@ -1684,20 +1685,42 @@ def test_trailing_stop_executes_and_skips_weekly_equity_agent(monkeypatch):
     strategy._run_frequency = "daily"
     strategy.agents.summaries["execution_agent"] = "Executed trailing stop."
 
-    def fake_trailing_stop_to_execution_plan(strategy_arg, *, date, trailing_stop_pct, position_state):
+    def fake_trailing_stop_to_execution_plan(
+        strategy_arg, *, date, initial_stop_pct, trailing_stop_pct, position_state
+    ):
         assert strategy_arg is strategy
         assert date == "2024-09-05"
+        assert initial_stop_pct == pytest.approx(0.12)
         assert trailing_stop_pct == pytest.approx(0.20)
         assert position_state == {}
         return {
             "schema_version": "1.0",
             "date": date,
-            "trailing_stop_pct": trailing_stop_pct,
+            "policy": {
+                "initial_stop_pct": initial_stop_pct,
+                "trailing_stop_pct": trailing_stop_pct,
+                "price_basis": "daily_close",
+            },
+            "exit_checks": [
+                {
+                    "symbol": "NVDA",
+                    "quantity": 10.0,
+                    "entry_price": 150.0,
+                    "current_check_price": 118.0,
+                    "initial_stop_pct": initial_stop_pct,
+                    "initial_stop_price": 132.0,
+                    "triggered": True,
+                    "price_source": "daily_close",
+                }
+            ],
             "stop_checks": [
                 {
                     "symbol": "NVDA",
                     "quantity": 10.0,
                     "holding_start_date": "2024-09-02",
+                    "entry_price": 150.0,
+                    "initial_stop_pct": initial_stop_pct,
+                    "initial_stop_price": 132.0,
                     "previous_peak_close": 150.0,
                     "peak_close": 150.0,
                     "current_check_price": 118.0,
@@ -1710,7 +1733,7 @@ def test_trailing_stop_executes_and_skips_weekly_equity_agent(monkeypatch):
             "updated_position_state": {},
             "execution_plan": {
                 "schema_version": 1,
-                "intent": "rebalance",
+                "intent": "risk_exit",
                 "orders": [
                     {
                         "sequence": 1,
@@ -1735,7 +1758,7 @@ def test_trailing_stop_executes_and_skips_weekly_equity_agent(monkeypatch):
     assert strategy.agents["equity_basket_agent"].calls == []
     assert len(strategy.agents["execution_agent"].calls) == 1
     execution_call = strategy.agents["execution_agent"].calls[0]
-    assert execution_call["context"]["execution_reason"] == "trailing_stop"
+    assert execution_call["context"]["execution_reason"] == "risk_exit"
     assert execution_call["context"]["execution_plan"]["orders"][0]["symbol"] == "NVDA"
     assert strategy._last_trailing_stop_result["stop_checks"][0]["triggered"] is True
 
@@ -1759,10 +1782,15 @@ def test_no_trailing_stop_allows_weekly_equity_workflow(monkeypatch):
     monkeypatch.setattr(
         module,
         "trailing_stop_to_execution_plan",
-        lambda strategy_arg, *, date, trailing_stop_pct, position_state: {
+        lambda strategy_arg, *, date, initial_stop_pct, trailing_stop_pct, position_state: {
             "schema_version": "1.0",
             "date": date,
-            "trailing_stop_pct": trailing_stop_pct,
+            "policy": {
+                "initial_stop_pct": initial_stop_pct,
+                "trailing_stop_pct": trailing_stop_pct,
+                "price_basis": "daily_close",
+            },
+            "exit_checks": [],
             "stop_checks": [],
             "updated_position_state": {},
             "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []},
@@ -1802,6 +1830,101 @@ def test_no_trailing_stop_allows_weekly_equity_workflow(monkeypatch):
 
     assert len(strategy.agents["equity_basket_agent"].calls) == 1
     assert strategy._last_trailing_stop_result["execution_plan"]["intent"] == "hold"
+
+
+def test_scheduled_full_exit_removes_trailing_stop_state(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    strategy.parameters["run_frequency"] = "daily"
+    strategy._run_frequency = "daily"
+    strategy.get_positions = lambda: [
+        SimpleNamespace(asset=SimpleNamespace(symbol="ORCL"), quantity=10)
+    ]
+    strategy._equity_trailing_stop_position_state = {
+        "ORCL": {
+            "entry_date": "2024-09-01",
+            "entry_price": 100.0,
+            "peak_close": 125.0,
+            "last_check_date": "2024-09-04",
+            "last_check_price": 120.0,
+        }
+    }
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "status": "active",
+            "selected_symbols": ["MSFT", "NVDA", "AAPL"],
+            "reason_brief": "New target excludes ORCL.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+
+    monkeypatch.setattr(
+        module,
+        "trailing_stop_to_execution_plan",
+        lambda strategy_arg, *, date, initial_stop_pct, trailing_stop_pct, position_state: {
+            "schema_version": "1.0",
+            "date": date,
+            "policy": {
+                "initial_stop_pct": initial_stop_pct,
+                "trailing_stop_pct": trailing_stop_pct,
+                "price_basis": "daily_close",
+            },
+            "exit_checks": [],
+            "stop_checks": [],
+            "updated_position_state": dict(position_state),
+            "execution_plan": {"schema_version": 1, "intent": "hold", "orders": []},
+            "warnings": [],
+        },
+    )
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [
+                {
+                    "symbol": "ORCL",
+                    "current_quantity": 10,
+                    "planned_side": "sell",
+                    "planned_quantity": 10,
+                    "sizing_price": 100.0,
+                }
+            ],
+            "cash_projection": {
+                "cash_before": 0.0,
+                "estimated_sell_proceeds": 1000.0,
+                "estimated_buy_cost": 0.0,
+                "cash_after_estimate": 1000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "ORCL",
+                        "asset_type": "stock",
+                        "side": "sell",
+                        "quantity": 10,
+                        "quantity_mode": "shares",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            },
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    assert "ORCL" not in strategy._equity_trailing_stop_position_state
 
 
 def test_benchmark_runner_exposes_fixed_and_qqq_historical_equity_only_strategies():
