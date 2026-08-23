@@ -1118,7 +1118,38 @@ planner_result = target_portfolio_to_execution_plan(
 )
 ```
 
-- [ ] **Step 9: Run focused strategy wiring tests**
+- [ ] **Step 9: Validate execution symbols against constructor targets**
+
+Because the constructor is allowed to promote high-scoring `market_summary` symbols that were not in the LLM's original `selected_symbols`, build a validation report from the constructor result before running pre-execution validation.
+
+After `target_portfolio = constructor_result["target_portfolio"]`, add:
+
+```python
+validation_equity_report = {
+    **equity_report,
+    "selected_symbols": [
+        row["symbol"]
+        for row in target_portfolio
+        if isinstance(row, dict) and row.get("symbol")
+    ],
+}
+```
+
+Then replace the `validate_execution_plan_symbols` validation callback from:
+
+```python
+lambda: validate_execution_plan_symbols(execution_plan, equity_report),
+```
+
+to:
+
+```python
+lambda: validate_execution_plan_symbols(execution_plan, validation_equity_report),
+```
+
+This keeps the LLM's report immutable for trace review while making the execution guard validate against the deterministic constructor's final target symbols.
+
+- [ ] **Step 10: Run focused strategy wiring tests**
 
 Run:
 
@@ -1128,7 +1159,7 @@ python -m pytest tests/test_ai_trading_team_equity_only_llm.py::test_equity_only
 
 Expected: PASS.
 
-- [ ] **Step 10: Commit strategy wiring**
+- [ ] **Step 11: Commit strategy wiring**
 
 ```bash
 git add lumibot/example_strategies/ai_trading_team_equity_only_llm.py tests/test_ai_trading_team_equity_only_llm.py
