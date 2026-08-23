@@ -31,7 +31,8 @@ python scripts\run_ai_trading_team_examples_benchmark.py --strategy qqq-historic
 
 ## Results
 
-- Focused selected tests: `109 passed, 77 deselected, 1 warning in 15.90s`.
+- Focused selected tests before final review fix: `109 passed, 77 deselected, 1 warning in 15.90s`.
+- Final focused suite after final review fix: `196 passed, 2 warnings in 24.43s`.
 - Full focused strategy tests: `67 passed, 1 warning in 3.33s`.
 - Ruff plan scope: `All checks passed!`.
 - Ruff syntax/undefined guard for execution-tool files: `All checks passed!`.
@@ -49,5 +50,8 @@ python scripts\run_ai_trading_team_examples_benchmark.py --strategy qqq-historic
 
 - Daily risk exits are close-based checks in this first version, not broker-native intraday stop orders.
 - Trigger behavior is covered by deterministic unit tests even though the smoke window did not naturally trigger a stop.
+- Final review follow-up added two safeguards:
+  - Stop state is only updated after `execution_plan_execute` reports `plan_status=completed`.
+  - `last_price_fallback` exit checks now emit an explicit warning.
 - The benchmark `backtest.log` for the smoke artifact was empty, so prompt visibility was validated through prompt unit tests rather than artifact text search.
 - A full-file ruff pass on `lumibot/components/agents/builtins.py` is not currently used as the feature gate because that file has pre-existing style debt unrelated to this feature. The changed execution-tool path was checked with `--select F,E9`.
