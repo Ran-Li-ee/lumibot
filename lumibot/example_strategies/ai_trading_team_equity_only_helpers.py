@@ -378,6 +378,8 @@ def normalize_execution_plan(plan: Any) -> dict[str, Any]:
     order_sequences = [order["sequence"] for order in normalized_orders]
     if len(order_sequences) != len(set(order_sequences)):
         raise ValueError("duplicate order sequence.")
+    if intent == "risk_exit" and any(order["side"] != "sell" for order in normalized_orders):
+        raise ValueError("risk_exit intent only supports sell orders.")
 
     buy_seen = False
     for order in normalized_orders:

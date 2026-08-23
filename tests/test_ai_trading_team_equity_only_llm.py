@@ -316,6 +316,38 @@ def test_normalize_execution_plan_accepts_risk_exit_sell_plan():
     assert result["constraints"]["allow_negative_cash"] is False
 
 
+def test_normalize_execution_plan_rejects_empty_risk_exit_plan():
+    helpers = importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_helpers")
+
+    with pytest.raises(ValueError, match="execution_plan orders are required for rebalance or risk_exit intent"):
+        helpers.normalize_execution_plan({"schema_version": 1, "intent": "risk_exit", "orders": []})
+
+
+def test_normalize_execution_plan_rejects_risk_exit_buy_order():
+    helpers = importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_helpers")
+
+    with pytest.raises(ValueError, match="risk_exit intent only supports sell orders"):
+        helpers.normalize_execution_plan(
+            {
+                "schema_version": 1,
+                "intent": "risk_exit",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "NVDA",
+                        "asset_type": "stock",
+                        "side": "buy",
+                        "quantity": 10,
+                        "quantity_mode": "shares",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            }
+        )
+
+
 def test_equity_universe_contains_50_us_stock_symbols_without_old_etfs():
     helpers = importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_helpers")
 
