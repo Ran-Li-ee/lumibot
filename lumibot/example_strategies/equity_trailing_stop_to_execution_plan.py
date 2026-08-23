@@ -141,11 +141,14 @@ def _normalized_state(position_state: dict[str, Any] | None) -> dict[str, dict[s
         peak_close = raw_payload.get("peak_close")
         if not entry_date or peak_close is None:
             continue
+        entry_price_source = "position_state"
         if entry_price is None:
             entry_price = peak_close
+            entry_price_source = "peak_close_fallback"
         state[symbol] = {
             "entry_date": entry_date,
             "entry_price": _float(_positive_price(entry_price, f"entry_price for {symbol}")),
+            "entry_price_source": entry_price_source,
             "peak_close": _float(_positive_price(peak_close, f"peak_close for {symbol}")),
         }
     return state
@@ -172,6 +175,7 @@ def trailing_stop_to_execution_plan(
     updated_state: dict[str, dict[str, Any]] = {}
     exit_checks: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
+    warnings: list[str] = []
 
     for symbol in sorted(current_positions):
         quantity = current_positions[symbol]
@@ -191,6 +195,7 @@ def trailing_stop_to_execution_plan(
             if previous
             else check_price
         )
+        entry_price_source = str(previous.get("entry_price_source") if previous else "current_check_price")
         previous_peak = (
             _positive_price(previous["peak_close"], f"previous peak close for {symbol}")
             if previous
@@ -199,17 +204,37 @@ def trailing_stop_to_execution_plan(
         peak_close = max(previous_peak, window_peak)
         initial_stop_price = entry_price * (Decimal("1") - initial_pct)
         trailing_stop_price = peak_close * (Decimal("1") - trailing_pct)
-        initial_stop_triggered = check_price <= initial_stop_price
+        initial_stop_triggered = (
+            check_price <= initial_stop_price and entry_price_source != "peak_close_fallback"
+        )
         trailing_stop_triggered = check_price <= trailing_stop_price
         triggered = initial_stop_triggered or trailing_stop_triggered
-        trigger_reason = (
-            "initial_stop"
-            if initial_stop_triggered
-            else "trailing_stop"
-            if trailing_stop_triggered
-            else None
-        )
-        planned_quantity = int(quantity)
+        trigger_reasons = [
+            reason
+            for reason, is_triggered in (
+                ("initial_stop", initial_stop_triggered),
+                ("trailing_stop", trailing_stop_triggered),
+            )
+            if is_triggered
+        ]
+        if initial_stop_triggered and trailing_stop_triggered:
+            trigger_reason = (
+                "initial_stop" if initial_stop_price >= trailing_stop_price else "trailing_stop"
+            )
+        elif initial_stop_triggered:
+            trigger_reason = "initial_stop"
+        elif trailing_stop_triggered:
+            trigger_reason = "trailing_stop"
+        else:
+            trigger_reason = None
+        whole_quantity = quantity == quantity.to_integral_value()
+        blocked_reason = None
+        planned_quantity = int(quantity) if triggered and whole_quantity else 0
+        if triggered and not whole_quantity:
+            blocked_reason = "unsupported_fractional_risk_exit_quantity"
+            warnings.append(
+                f"{symbol}: unsupported fractional risk-exit quantity {_float(quantity)}; no order generated."
+            )
 
         exit_checks.append(
             {
@@ -217,6 +242,7 @@ def trailing_stop_to_execution_plan(
                 "quantity": _float(quantity),
                 "entry_date": entry_date_text,
                 "entry_price": _float(entry_price),
+                "entry_price_source": entry_price_source,
                 "previous_peak_close": _float(previous_peak),
                 "peak_close": _float(peak_close),
                 "current_check_price": _float(check_price),
@@ -228,6 +254,9 @@ def trailing_stop_to_execution_plan(
                 "trailing_stop_triggered": trailing_stop_triggered,
                 "triggered": triggered,
                 "trigger_reason": trigger_reason,
+                "trigger_reasons": trigger_reasons,
+                "planned_quantity": planned_quantity,
+                "blocked_reason": blocked_reason,
                 "price_source": price_source,
                 "history_start_date": start_date.isoformat(),
                 "history_end_date": check_date.isoformat() if check_date is not None else date,
@@ -235,7 +264,7 @@ def trailing_stop_to_execution_plan(
             }
         )
 
-        if triggered and planned_quantity > 0:
+        if triggered and planned_quantity > 0 and blocked_reason is None:
             orders.append(
                 _order(
                     sequence=len(orders) + 1,
@@ -272,5 +301,5 @@ def trailing_stop_to_execution_plan(
             "intent": "risk_exit" if orders else "hold",
             "orders": orders,
         },
-        "warnings": [],
+        "warnings": warnings,
     }

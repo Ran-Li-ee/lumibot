@@ -148,6 +148,85 @@ def test_trailing_stop_generates_full_position_sell_when_threshold_breached():
     assert result["updated_position_state"] == {}
 
 
+def test_legacy_state_without_entry_price_does_not_trigger_initial_stop_from_peak_fallback():
+    module = load_module()
+    strategy = make_strategy(positions=[make_position("NVDA", 10)], prices={"NVDA": 85.0})
+    state = {"NVDA": {"entry_date": "2024-09-02", "peak_close": 100.0}}
+
+    result = module.trailing_stop_to_execution_plan(
+        strategy,
+        date="2024-09-05",
+        initial_stop_pct=0.12,
+        trailing_stop_pct=0.20,
+        position_state=state,
+    )
+
+    assert result["execution_plan"] == {"schema_version": 1, "intent": "hold", "orders": []}
+    check = result["exit_checks"][0]
+    assert check["entry_price"] == 100.0
+    assert check["entry_price_source"] == "peak_close_fallback"
+    assert check["initial_stop_price"] == pytest.approx(88.0)
+    assert check["trailing_stop_price"] == pytest.approx(80.0)
+    assert check["initial_stop_triggered"] is False
+    assert check["trailing_stop_triggered"] is False
+    assert check["triggered"] is False
+    assert check["trigger_reason"] is None
+    assert result["updated_position_state"]["NVDA"]["entry_price"] == 100.0
+
+
+def test_trigger_reason_uses_stricter_stop_when_initial_and_trailing_are_breached():
+    module = load_module()
+    strategy = make_strategy(positions=[make_position("NVDA", 10)], prices={"NVDA": 80.0})
+    state = {"NVDA": {"entry_date": "2024-09-02", "entry_price": 100.0, "peak_close": 200.0}}
+
+    result = module.trailing_stop_to_execution_plan(
+        strategy,
+        date="2024-09-05",
+        initial_stop_pct=0.12,
+        trailing_stop_pct=0.20,
+        position_state=state,
+    )
+
+    check = result["exit_checks"][0]
+    assert check["initial_stop_price"] == pytest.approx(88.0)
+    assert check["trailing_stop_price"] == pytest.approx(160.0)
+    assert check["initial_stop_triggered"] is True
+    assert check["trailing_stop_triggered"] is True
+    assert check["trigger_reason"] == "trailing_stop"
+    assert check["trigger_reasons"] == ["initial_stop", "trailing_stop"]
+    assert result["execution_plan"]["intent"] == "risk_exit"
+
+
+def test_triggered_fractional_quantity_holds_with_warning_and_preserves_state():
+    module = load_module()
+    strategy = make_strategy(positions=[make_position("NVDA", 10.5)], prices={"NVDA": 87.0})
+    state = {"NVDA": {"entry_date": "2024-09-02", "entry_price": 100.0, "peak_close": 105.0}}
+
+    result = module.trailing_stop_to_execution_plan(
+        strategy,
+        date="2024-09-05",
+        initial_stop_pct=0.12,
+        trailing_stop_pct=0.20,
+        position_state=state,
+    )
+
+    assert result["execution_plan"] == {"schema_version": 1, "intent": "hold", "orders": []}
+    check = result["exit_checks"][0]
+    assert check["triggered"] is True
+    assert check["trigger_reason"] == "initial_stop"
+    assert check["quantity"] == 10.5
+    assert check["planned_quantity"] == 0
+    assert check["blocked_reason"] == "unsupported_fractional_risk_exit_quantity"
+    assert "NVDA: unsupported fractional risk-exit quantity 10.5; no order generated." in result["warnings"]
+    assert result["updated_position_state"]["NVDA"] == {
+        "entry_date": "2024-09-02",
+        "entry_price": 100.0,
+        "peak_close": 105.0,
+        "last_check_date": "2024-09-05",
+        "last_check_price": 87.0,
+    }
+
+
 def test_exit_engine_can_sell_multiple_triggered_positions():
     module = load_module()
     strategy = make_strategy(
