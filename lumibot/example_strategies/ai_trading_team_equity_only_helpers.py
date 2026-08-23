@@ -154,19 +154,31 @@ def equity_alpaca_news_tool() -> ToolDefinition:
     )
 
 
+EQUITY_EVIDENCE_INTERPRETATION_POLICY = (
+    "Evidence Interpretation Policy: "
+    "Use momentum and trend quality as primary selection evidence. "
+    "Use risk-adjusted momentum to prefer strength that is not purely volatility-driven. "
+    "Use breakout / near-high evidence as timing and leadership confirmation. "
+    "Use volume confirmation only as supporting evidence, not as a standalone reason to select a stock. "
+    "Prefer candidates that are strong across primary evidence and confirmed by secondary evidence. "
+    "Do not average all ranking groups equally. "
+    "Do not select a stock solely because it leads one ranking list. "
+    "Do not treat any single ranking or combined score as the final answer."
+)
+
+
 def equity_basket_agent_system_prompt(symbols: str) -> str:
     return (
         f"Equity-only selection role: choose exactly five stocks from the assigned basket_symbols ({symbols}). "
         "The downstream deterministic planner gives the five selected stocks equal target weights. "
         "You cannot place orders or size trades. Use market_load_history_tables_summary first for multi-symbol "
-        "comparison. Treat rank groups as separate evidence lenses: momentum, trend quality, risk-adjusted "
-        "momentum, breakout / near-high, and volume confirmation. Prefer stocks supported by multiple relevant "
-        "evidence groups. Do not blindly copy the first five names from one ranking list. Do not treat "
-        "composite_score as the final answer. Do not invent sector, style, safety, or cyclicality labels. "
-        "If the leading group is clear across relevant rank evidence, select it without news. Use alpaca_news "
-        "only when leading candidates are close, conflicting, or uncertain; when used, request news only for "
-        "leading candidates. If news is unavailable, continue with rank-only evidence. Return strict JSON only. "
-        "Do not place orders."
+        "comparison. "
+        f"{EQUITY_EVIDENCE_INTERPRETATION_POLICY} "
+        "Do not invent sector, style, or category labels not provided by tools. "
+        "If the leading candidate set is clear from rank evidence, select without news. "
+        "Use alpaca_news only as a tie-breaker or risk/catalyst check for leading candidates when rank evidence "
+        "is close, conflicting, or uncertain; when used, request news only for leading candidates. "
+        "If news is unavailable, continue with rank-only evidence. Return strict JSON only. Do not place orders."
     )
 
 
@@ -177,16 +189,17 @@ def qqq_historical_equity_basket_agent_system_prompt(symbols: str) -> str:
         "The provided basket_symbols represent the QQQ historical constituent universe available for the "
         "current backtest date. The downstream deterministic planner gives the five selected stocks equal "
         "target weights. You cannot place orders or size trades. Use market_load_history_tables_summary first "
-        "for multi-symbol comparison. Treat rank groups as separate evidence lenses: momentum, trend quality, "
-        "risk-adjusted momentum, breakout / near-high, and volume confirmation. Prefer stocks supported by "
-        "multiple relevant evidence groups. Do not blindly copy the first five names from one ranking list. "
-        "Do not treat composite_score as the final answer. Do not invent sector, style, safety, or cyclicality "
-        "labels. Do not assume QQQ membership itself makes a stock safe or best; select from current rank "
-        "evidence. Do not choose based on index weight alone. If the leading group is clear across relevant "
-        "rank evidence, select it without news. Use alpaca_news only when leading candidates are close, "
-        "conflicting, or uncertain; when used, request news only for leading candidates. If news is unavailable, "
-        "continue with rank-only evidence. Use only symbols in the provided basket_symbols and do not add "
-        "symbols outside the provided universe. Return strict JSON only. Do not place orders."
+        "for multi-symbol comparison. "
+        f"{EQUITY_EVIDENCE_INTERPRETATION_POLICY} "
+        "Do not invent sector, style, or category labels not provided by tools. "
+        "Do not assume QQQ membership itself makes a stock superior; select from current rank evidence. "
+        "Do not choose based on index weight alone. "
+        "If the leading candidate set is clear from rank evidence, select without news. "
+        "Use alpaca_news only as a tie-breaker or risk/catalyst check for leading candidates when rank evidence "
+        "is close, conflicting, or uncertain; when used, request news only for leading candidates. "
+        "If news is unavailable, continue with rank-only evidence. Use only symbols in the provided "
+        "basket_symbols and do not add symbols outside the provided universe. Return strict JSON only. "
+        "Do not place orders."
     )
 
 
@@ -194,18 +207,18 @@ def equity_basket_agent_task_prompt() -> str:
     return (
         "Review only the provided basket_symbols. First call market_load_history_tables_summary with "
         "symbols=basket_symbols, length=252, timestep='day', top_n=10, and candidate_summary_limit=25. "
-        "Compare the five rank groups: momentum, trend quality, risk-adjusted momentum, breakout / near-high, "
-        "and volume confirmation. Select exactly five unique symbols that are strongest across the separate "
-        "evidence groups; do not simply copy the first five names from one list if other evidence conflicts. "
-        "In reason_brief, briefly mention which evidence groups support the selected symbols. If a selected "
-        "symbol is supported by only one group, explain why it still deserves selection. If the leading group is "
-        "clear across relevant rank evidence, select it without news. If leading candidates are close, conflicting, "
-        "or uncertain, call alpaca_news for those leading candidates only. If alpaca_news is unavailable or errors, "
-        "continue with rank-only evidence. Return exactly one strict JSON object with basket_id, target_weight, "
-        "status, candidate_symbols, selected_symbols, and reason_brief. Use status='active'. target_weight must "
-        "be 1.0 for the equity basket as a whole; do not assign per-symbol weights. candidate_symbols must copy "
-        "the assigned basket_symbols exactly; do not replace it with a shortlist. selected_symbols must contain "
-        "exactly five unique symbols from basket_symbols."
+        "Compare the five rank groups using the Evidence Interpretation Policy from your system prompt. "
+        "Select exactly five unique symbols from basket_symbols. Avoid selecting a stock supported by only "
+        "one evidence group unless the other leading candidates are weaker or conflicting; explain the "
+        "exception in reason_brief. "
+        "If the leading candidate set is clear from rank evidence, select without news. "
+        "If leading candidates are close, conflicting, or uncertain, call alpaca_news for those leading "
+        "candidates only. If alpaca_news is unavailable or errors, continue with rank-only evidence. "
+        "Return exactly one strict JSON object with basket_id, target_weight, status, candidate_symbols, "
+        "selected_symbols, and reason_brief. Use status='active'. target_weight must be 1.0 for the equity "
+        "basket as a whole; do not assign per-symbol weights. candidate_symbols must copy the assigned "
+        "basket_symbols exactly; do not replace it with a shortlist. selected_symbols must contain exactly "
+        "five unique symbols from basket_symbols."
     )
 
 
