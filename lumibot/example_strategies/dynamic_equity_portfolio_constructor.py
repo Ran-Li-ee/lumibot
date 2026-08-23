@@ -49,18 +49,29 @@ def construct_dynamic_equity_target_portfolio(
     fallback_used = not any(candidate["usable_score"] for candidate in scored_candidates)
     capped_symbols: list[str] = []
     pruned_symbols: list[str] = []
+    diagnostics_warnings: list[str] = []
     if fallback_used:
         selected_candidates = _fallback_candidates(selected_symbols, policy)
-        weights = _equal_weights(len(selected_candidates), exposure)
+        cap_feasible = _cap_feasible(len(selected_candidates), exposure, policy)
+        if cap_feasible:
+            weights = _equal_weights(len(selected_candidates), exposure)
+        else:
+            weights = [policy.max_single_weight for _ in selected_candidates]
+            capped_symbols = [candidate["symbol"] for candidate in selected_candidates]
         selection_reason = "fallback equal weight from selected symbols"
     else:
-        selected_candidates = _select_candidates(scored_candidates, policy)
-        selected_candidates, pruned_symbols, capped_symbols, weights = _weighted_candidates(
+        selected_candidates = _select_candidates(scored_candidates, exposure, policy)
+        selected_candidates, pruned_symbols, capped_symbols, weights, cap_feasible = _weighted_candidates(
             selected_candidates,
             exposure,
             policy,
         )
         selection_reason = "selected by adjusted evidence score breadth"
+
+    if not cap_feasible:
+        diagnostics_warnings.append(
+            "max_single_weight is infeasible for selected_count and target exposure; capped best-effort weights used."
+        )
 
     final_weights = {candidate["symbol"]: weight for candidate, weight in zip(selected_candidates, weights)}
     target_portfolio = [
@@ -85,8 +96,10 @@ def construct_dynamic_equity_target_portfolio(
             "max_positions": policy.max_positions,
             "max_single_weight": policy.max_single_weight,
             "min_single_weight": policy.min_single_weight,
+            "cap_feasible": cap_feasible,
             "capped_symbols": capped_symbols,
             "pruned_symbols": pruned_symbols,
+            "warnings": diagnostics_warnings,
             "candidate_scores": _candidate_score_rows(scored_candidates, final_weights),
         },
     }
@@ -290,6 +303,7 @@ def _median_volatility(candidates: list[dict[str, Any]]) -> float | None:
 
 def _select_candidates(
     candidates: list[dict[str, Any]],
+    exposure: float,
     policy: DynamicEquityPortfolioPolicy,
 ) -> list[dict[str, Any]]:
     if not candidates:
@@ -308,6 +322,19 @@ def _select_candidates(
             selected_symbols.add(candidate["symbol"])
             if len(selected) >= policy.min_positions:
                 break
+
+    cap_feasible_count = math.ceil(exposure / policy.max_single_weight)
+    required_count = max(policy.min_positions, cap_feasible_count)
+    scored_count = sum(1 for candidate in candidates if candidate["usable_score"])
+    if scored_count >= required_count:
+        selected_symbols = {candidate["symbol"] for candidate in selected}
+        for candidate in candidates:
+            if len(selected) >= required_count:
+                break
+            if candidate["symbol"] in selected_symbols:
+                continue
+            selected.append(candidate)
+            selected_symbols.add(candidate["symbol"])
 
     return selected[: policy.max_positions]
 
@@ -329,7 +356,7 @@ def _weighted_candidates(
     candidates: list[dict[str, Any]],
     exposure: float,
     policy: DynamicEquityPortfolioPolicy,
-) -> tuple[list[dict[str, Any]], list[str], list[str], list[float]]:
+) -> tuple[list[dict[str, Any]], list[str], list[str], list[float], bool]:
     selected = list(candidates)
     pruned_symbols: list[str] = []
     capped_symbols: list[str] = []
@@ -350,7 +377,8 @@ def _weighted_candidates(
         weights = _score_weights(selected, exposure, policy, capped_symbols)
 
     weights = _round_weights(weights, exposure, selected, policy)
-    return selected, pruned_symbols, capped_symbols, weights
+    cap_feasible = _cap_feasible(len(selected), exposure, policy)
+    return selected, pruned_symbols, capped_symbols, weights, cap_feasible
 
 
 def _score_weights(
@@ -364,10 +392,20 @@ def _score_weights(
 
     scores = [max(candidate["adjusted_score"], 0.0) for candidate in candidates]
     if sum(scores) <= 0.0:
-        return _equal_weights(len(candidates), exposure)
+        equal_weight = exposure / len(candidates)
+        if not _cap_feasible(len(candidates), exposure, policy):
+            capped_symbols.extend(candidate["symbol"] for candidate in candidates)
+            equal_weight = policy.max_single_weight
+        return [equal_weight for _ in candidates]
 
-    if len(candidates) * policy.max_single_weight < exposure:
-        return [exposure * score / sum(scores) for score in scores]
+    if not _cap_feasible(len(candidates), exposure, policy):
+        weights = [min(exposure * score / sum(scores), policy.max_single_weight) for score in scores]
+        capped_symbols.extend(
+            candidate["symbol"]
+            for candidate, score in zip(candidates, scores)
+            if exposure * score / sum(scores) > policy.max_single_weight
+        )
+        return weights
 
     weights = [0.0 for _ in candidates]
     remaining_indexes = set(range(len(candidates)))
@@ -405,6 +443,10 @@ def _can_drop_position(position_count: int, exposure: float, policy: DynamicEqui
     return position_count >= policy.min_positions and position_count * policy.max_single_weight >= exposure
 
 
+def _cap_feasible(position_count: int, exposure: float, policy: DynamicEquityPortfolioPolicy) -> bool:
+    return position_count * policy.max_single_weight >= exposure
+
+
 def _equal_weights(position_count: int, exposure: float) -> list[float]:
     if position_count <= 0:
         return []
@@ -418,11 +460,12 @@ def _round_weights(
     policy: DynamicEquityPortfolioPolicy,
 ) -> list[float]:
     rounded = [round(weight, 6) for weight in weights]
-    difference = round(exposure - sum(rounded), 6)
+    target_total = exposure if _cap_feasible(len(candidates), exposure, policy) else sum(weights)
+    difference = round(target_total - sum(rounded), 6)
     if not rounded or difference == 0.0:
         return rounded
 
-    cap_is_feasible = len(candidates) * policy.max_single_weight >= exposure
+    cap_is_feasible = _cap_feasible(len(candidates), exposure, policy)
     best_index = None
     sorted_indexes = sorted(
         enumerate(rounded),

@@ -81,8 +81,12 @@ def test_constructor_selects_small_leading_cluster_and_preserves_cash_buffer():
     )
 
     assert result["portfolio_mode"] == "dynamic_equity"
-    assert result["selected_count"] == 3
-    assert [row["symbol"] for row in result["target_portfolio"]] == ["AAA", "BBB", "CCC"]
+    assert result["selected_count"] == 4
+    assert [row["symbol"] for row in result["target_portfolio"]][:3] == ["AAA", "BBB", "CCC"]
+    assert all(
+        row["target_weight"] <= DEFAULT_DYNAMIC_EQUITY_POLICY.max_single_weight + 1e-12
+        for row in result["target_portfolio"]
+    )
     assert sum(row["target_weight"] for row in result["target_portfolio"]) == pytest.approx(0.98)
     assert result["cash_buffer_weight"] == pytest.approx(0.02)
     assert result["diagnostics"]["fallback_used"] is False
