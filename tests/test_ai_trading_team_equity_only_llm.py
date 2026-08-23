@@ -83,13 +83,15 @@ class RecordingRunAgent:
     def run(self, *, task_prompt, context):
         self.calls.append({"task_prompt": task_prompt, "context": context})
         summary = self.manager.summaries[self.name]
-        return SimpleNamespace(summary=summary, tool_calls=[], tool_results=[])
+        tool_results = self.manager.tool_results.get(self.name, [])
+        return SimpleNamespace(summary=summary, tool_calls=[], tool_results=tool_results)
 
 
 class RecordingRunAgentManager:
     def __init__(self):
         self.created = []
         self.summaries = {}
+        self.tool_results = {}
         self._agents = {}
 
     def create(self, **kwargs):
@@ -1176,6 +1178,149 @@ def test_equity_only_workflow_passes_constructor_target_portfolio_to_planner(mon
     assert len(execution_agent.calls) == 1
     execution_plan = execution_agent.calls[0]["context"]["execution_plan"]
     assert execution_plan["orders"][0]["symbol"] == "ORCL"
+
+
+def test_equity_only_workflow_uses_market_summary_tool_result_for_constructor(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    strategy.parameters["basket_universes"] = {
+        **strategy.parameters["basket_universes"],
+        "equity": ["ORCL", "MSFT", "NVDA", "META"],
+    }
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": strategy.parameters["basket_universes"]["equity"],
+            "selected_symbols": ["ORCL", "MSFT", "NVDA"],
+            "reason_brief": "Three strongest setup names from the LLM.",
+        }
+    )
+    strategy.agents.tool_results["equity_basket_agent"] = [
+        SimpleNamespace(
+            tool_name="market_load_history_tables_summary",
+            payload={
+                "result": {
+                    "ranking_limit": 10,
+                    "candidate_summary": [
+                        {
+                            "symbol": "META",
+                            "ranking_count": 5,
+                            "volatility_20": 0.12,
+                            "best_rank_by_group": {
+                                "momentum": 1,
+                                "trend_quality": 1,
+                                "risk_adjusted_momentum": 1,
+                                "breakout_near_high": 1,
+                                "volume_confirmation": 1,
+                            },
+                        },
+                        {
+                            "symbol": "ORCL",
+                            "ranking_count": 5,
+                            "volatility_20": 0.13,
+                            "best_rank_by_group": {
+                                "momentum": 2,
+                                "trend_quality": 2,
+                                "risk_adjusted_momentum": 2,
+                                "breakout_near_high": 2,
+                                "volume_confirmation": 2,
+                            },
+                        },
+                        {
+                            "symbol": "MSFT",
+                            "ranking_count": 5,
+                            "volatility_20": 0.14,
+                            "best_rank_by_group": {
+                                "momentum": 3,
+                                "trend_quality": 3,
+                                "risk_adjusted_momentum": 3,
+                                "breakout_near_high": 3,
+                                "volume_confirmation": 3,
+                            },
+                        },
+                        {
+                            "symbol": "NVDA",
+                            "ranking_count": 5,
+                            "volatility_20": 0.15,
+                            "best_rank_by_group": {
+                                "momentum": 4,
+                                "trend_quality": 4,
+                                "risk_adjusted_momentum": 4,
+                                "breakout_near_high": 4,
+                                "volume_confirmation": 4,
+                            },
+                        },
+                    ],
+                }
+            },
+        )
+    ]
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+    planner_calls = []
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        planner_calls.append(
+            {
+                "strategy": strategy_arg,
+                "date": date,
+                "target_portfolio": target_portfolio,
+            }
+        )
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [
+                {
+                    "symbol": "META",
+                    "planned_side": "buy",
+                    "planned_quantity": 10,
+                    "sizing_price": 100.0,
+                }
+            ],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 1000.0,
+                "cash_after_estimate": 99000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "META",
+                        "asset_type": "stock",
+                        "side": "buy",
+                        "quantity": 10,
+                        "quantity_mode": "shares",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            },
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    constructor_result = strategy._last_dynamic_equity_constructor_result
+    constructor_symbols = [row["symbol"] for row in constructor_result["target_portfolio"]]
+    planner_symbols = [row["symbol"] for row in planner_calls[0]["target_portfolio"]]
+    assert constructor_result["diagnostics"]["fallback_used"] is False
+    assert "META" in constructor_symbols
+    assert "META" in planner_symbols
+    assert constructor_symbols == planner_symbols
+    assert planner_calls[0]["strategy"] is strategy
+    assert planner_calls[0]["date"] == "2024-09-05"
 
 
 def test_equity_only_workflow_validates_execution_symbols_against_constructor_targets(monkeypatch):
