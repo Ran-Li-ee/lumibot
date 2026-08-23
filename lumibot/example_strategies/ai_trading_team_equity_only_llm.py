@@ -7,7 +7,6 @@ from typing import Any
 
 from lumibot.components.agents.builtins import BuiltinTools
 from lumibot.example_strategies.ai_trading_team_equity_only_helpers import (
-    ACTIVE_SELECTION_STATUSES,
     EQUITY_AGENT_NAME,
     EQUITY_BASKET_ID,
     EQUITY_ONLY_BASKET_UNIVERSES,
@@ -29,6 +28,10 @@ from lumibot.example_strategies.ai_trading_team_growth_execution_test import (
     validate_decision_buy_sizing,
     validate_execution_plan_cash_safety,
 )
+from lumibot.example_strategies.dynamic_equity_portfolio_constructor import (
+    construct_dynamic_equity_target_portfolio,
+    latest_market_summary_from_agent_result,
+)
 from lumibot.example_strategies.equity_trailing_stop_to_execution_plan import (
     DEFAULT_TRAILING_STOP_PCT,
     trailing_stop_to_execution_plan,
@@ -40,13 +43,7 @@ from lumibot.example_strategies.target_portfolio_to_execution_plan import target
 from lumibot.tools.universe.qqq_nport import NoSnapshotAvailableError, resolve_qqq_snapshot
 
 EQUITY_ONLY_TARGET_WEIGHT = 1.0
-EQUITY_ONLY_SELECTION_COUNT = 5
-EQUITY_ONLY_EQUAL_WEIGHT = EQUITY_ONLY_TARGET_WEIGHT / EQUITY_ONLY_SELECTION_COUNT
 ALLOWED_EQUITY_RUN_FREQUENCIES = {"daily", "weekly", "monthly"}
-
-
-def _normalized_universe(equity_universe: list[str]) -> set[str]:
-    return {str(symbol).strip().upper() for symbol in equity_universe if str(symbol).strip()}
 
 
 def _normalized_symbol_list(symbols: Any) -> list[str]:
@@ -63,39 +60,6 @@ def _normalized_symbol_list(symbols: Any) -> list[str]:
         seen.add(clean)
         normalized.append(clean)
     return normalized
-
-
-def _selected_equity_symbols(
-    equity_report: dict[str, Any],
-    *,
-    equity_universe: list[str],
-    expected_count: int = EQUITY_ONLY_SELECTION_COUNT,
-) -> list[str]:
-    raw_symbols = equity_report.get("selected_symbols")
-    if not isinstance(raw_symbols, list):
-        raise ValueError(f"selected_symbols must contain exactly {expected_count} symbols.")
-
-    normalized_symbols = []
-    for symbol in raw_symbols:
-        if not isinstance(symbol, str):
-            raise ValueError("selected_symbols must contain only strings.")
-        clean = symbol.strip().upper()
-        if not clean:
-            raise ValueError("selected_symbols must contain only non-empty symbols.")
-        normalized_symbols.append(clean)
-
-    if len(normalized_symbols) != expected_count:
-        raise ValueError(f"selected_symbols must contain exactly {expected_count} symbols.")
-    if len(set(normalized_symbols)) != len(normalized_symbols):
-        raise ValueError("selected_symbols must be unique.")
-
-    allowed = _normalized_universe(equity_universe)
-    outside = [symbol for symbol in normalized_symbols if symbol not in allowed]
-    if outside:
-        joined = ", ".join(outside)
-        raise ValueError(f"selected equity symbols must be in equity universe: {joined}.")
-
-    return normalized_symbols
 
 
 def _normalize_equity_run_frequency(value: Any) -> str:
@@ -202,28 +166,13 @@ def equity_only_target_portfolio(
     equity_report: dict[str, Any],
     *,
     equity_universe: list[str],
-) -> list[dict[str, Any]]:
-    if not isinstance(equity_report, dict):
-        raise ValueError("equity report must be an object.")
-
-    basket_id = str(equity_report.get("basket_id") or "").strip().lower()
-    if basket_id != EQUITY_BASKET_ID:
-        raise ValueError("basket_id must be 'equity'.")
-
-    status = str(equity_report.get("status") or "").strip().lower()
-    if status not in ACTIVE_SELECTION_STATUSES:
-        raise ValueError("equity report must be active.")
-
-    selected_symbols = _selected_equity_symbols(equity_report, equity_universe=equity_universe)
-
-    return [
-        {
-            "basket_id": EQUITY_BASKET_ID,
-            "symbol": symbol,
-            "target_weight": EQUITY_ONLY_EQUAL_WEIGHT,
-        }
-        for symbol in selected_symbols
-    ]
+    market_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return construct_dynamic_equity_target_portfolio(
+        equity_report,
+        equity_universe=equity_universe,
+        market_summary=market_summary,
+    )
 
 
 class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrategy):
@@ -251,6 +200,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
         self._scheduled_workflow_events: list[dict[str, Any]] = []
         self._last_scheduled_workflow_run_date: str | None = None
         self._last_target_portfolio_planner_result = None
+        self._last_dynamic_equity_constructor_result = None
         self._last_execution_plan_error = None
         self._equity_trailing_stop_pct = float(
             self.parameters.get("equity_trailing_stop_pct", DEFAULT_TRAILING_STOP_PCT)
@@ -493,7 +443,14 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
                 ),
             )
             equity_report = parse_json_summary(equity_result.summary, EQUITY_AGENT_NAME)
-            target_portfolio = equity_only_target_portfolio(equity_report, equity_universe=equity_universe)
+            market_summary = latest_market_summary_from_agent_result(equity_result)
+            constructor_result = equity_only_target_portfolio(
+                equity_report,
+                equity_universe=equity_universe,
+                market_summary=market_summary,
+            )
+            self._last_dynamic_equity_constructor_result = constructor_result
+            target_portfolio = constructor_result["target_portfolio"]
             self._last_target_portfolio_planner_result = None
             planner_result = target_portfolio_to_execution_plan(
                 self,
@@ -538,6 +495,14 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             )
             return
 
+        validation_equity_report = {
+            **equity_report,
+            "selected_symbols": [
+                row["symbol"]
+                for row in target_portfolio
+                if isinstance(row, dict) and row.get("symbol")
+            ],
+        }
         validation_steps = [
             (
                 "validate_execution_plan_matches_planner_result",
@@ -545,7 +510,7 @@ class AITradingTeamEquityOnlyLLMStrategy(AITradingTeamGrowthExecutionTestStrateg
             ),
             (
                 "validate_execution_plan_symbols",
-                lambda: validate_execution_plan_symbols(execution_plan, equity_report),
+                lambda: validate_execution_plan_symbols(execution_plan, validation_equity_report),
             ),
             (
                 "validate_decision_buy_sizing",

@@ -172,7 +172,7 @@ def qqq_resolution(
     )
 
 
-def test_equity_only_target_portfolio_uses_five_selected_symbols_at_equal_weights():
+def test_equity_only_target_portfolio_uses_dynamic_constructor_with_fallback_weights():
     module = load_module()
 
     result = module.equity_only_target_portfolio(
@@ -185,16 +185,20 @@ def test_equity_only_target_portfolio_uses_five_selected_symbols_at_equal_weight
         equity_universe=["AAPL", "AMZN", "MSFT", "NVDA", "ORCL", "TSLA"],
     )
 
-    assert result == [
-        {"basket_id": "equity", "symbol": "ORCL", "target_weight": 0.2},
-        {"basket_id": "equity", "symbol": "MSFT", "target_weight": 0.2},
-        {"basket_id": "equity", "symbol": "NVDA", "target_weight": 0.2},
-        {"basket_id": "equity", "symbol": "AAPL", "target_weight": 0.2},
-        {"basket_id": "equity", "symbol": "AMZN", "target_weight": 0.2},
+    assert result["portfolio_mode"] == "dynamic_equity"
+    assert result["selected_count"] == 5
+    assert result["diagnostics"]["fallback_used"] is True
+    assert result["target_portfolio"] == [
+        {"basket_id": "equity", "symbol": "ORCL", "target_weight": 0.196},
+        {"basket_id": "equity", "symbol": "MSFT", "target_weight": 0.196},
+        {"basket_id": "equity", "symbol": "NVDA", "target_weight": 0.196},
+        {"basket_id": "equity", "symbol": "AAPL", "target_weight": 0.196},
+        {"basket_id": "equity", "symbol": "AMZN", "target_weight": 0.196},
     ]
+    assert sum(row["target_weight"] for row in result["target_portfolio"]) == pytest.approx(0.98)
 
 
-def test_equity_only_target_portfolio_accepts_selected_status_synonym_for_top5():
+def test_equity_only_target_portfolio_accepts_selected_status_synonym_for_dynamic_candidates():
     module = load_module()
 
     result = module.equity_only_target_portfolio(
@@ -207,13 +211,9 @@ def test_equity_only_target_portfolio_accepts_selected_status_synonym_for_top5()
         equity_universe=["SPY", "ORCL", "MSFT", "AAPL", "NVDA", "AMZN"],
     )
 
-    assert result == [
-        {"basket_id": "equity", "symbol": "SPY", "target_weight": 0.2},
-        {"basket_id": "equity", "symbol": "ORCL", "target_weight": 0.2},
-        {"basket_id": "equity", "symbol": "MSFT", "target_weight": 0.2},
-        {"basket_id": "equity", "symbol": "AAPL", "target_weight": 0.2},
-        {"basket_id": "equity", "symbol": "NVDA", "target_weight": 0.2},
-    ]
+    assert result["selected_count"] == 5
+    assert [row["symbol"] for row in result["target_portfolio"]] == ["SPY", "ORCL", "MSFT", "AAPL", "NVDA"]
+    assert sum(row["target_weight"] for row in result["target_portfolio"]) == pytest.approx(0.98)
 
 
 def test_validate_execution_plan_symbols_accepts_any_top5_selected_symbol():
@@ -388,36 +388,37 @@ def test_equity_only_target_portfolio_rejects_inactive_report():
 def test_equity_only_target_portfolio_rejects_missing_selected_symbols():
     module = load_module()
 
-    with pytest.raises(ValueError, match="selected_symbols must contain exactly 5 symbols"):
+    with pytest.raises(ValueError, match="selected_symbols must be a list"):
         module.equity_only_target_portfolio(
             {"basket_id": "equity", "status": "active", "selected_symbol": "ORCL"},
             equity_universe=["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
         )
 
 
-def test_equity_only_target_portfolio_rejects_duplicate_selected_symbols():
+def test_equity_only_target_portfolio_deduplicates_selected_symbols_preserving_order():
     module = load_module()
 
-    with pytest.raises(ValueError, match="selected_symbols must be unique"):
+    result = module.equity_only_target_portfolio(
+        {
+            "basket_id": "equity",
+            "status": "active",
+            "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "ORCL"],
+        },
+        equity_universe=["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+    )
+
+    assert [row["symbol"] for row in result["target_portfolio"]] == ["ORCL", "MSFT", "NVDA", "AAPL"]
+
+
+def test_equity_only_target_portfolio_rejects_too_few_selected_symbols():
+    module = load_module()
+
+    with pytest.raises(ValueError, match="selected_symbols must contain at least 3 symbols"):
         module.equity_only_target_portfolio(
             {
                 "basket_id": "equity",
                 "status": "active",
-                "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "ORCL"],
-            },
-            equity_universe=["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
-        )
-
-
-def test_equity_only_target_portfolio_rejects_wrong_selected_symbol_count():
-    module = load_module()
-
-    with pytest.raises(ValueError, match="selected_symbols must contain exactly 5 symbols"):
-        module.equity_only_target_portfolio(
-            {
-                "basket_id": "equity",
-                "status": "active",
-                "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL"],
+                "selected_symbols": ["ORCL", "MSFT"],
             },
             equity_universe=["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
         )
@@ -971,7 +972,7 @@ def test_qqq_historical_strategy_rejects_selected_symbol_outside_resolved_univer
 
     strategy.on_trading_iteration()
 
-    assert strategy._last_execution_plan_error == "selected equity symbols must be in equity universe: ORCL."
+    assert strategy._last_execution_plan_error == "selected equity symbols must be in equity universe: ORCL"
     assert strategy.agents["execution_agent"].calls == []
 
 
@@ -1076,7 +1077,7 @@ def test_monthly_cadence_runs_once_per_month():
     assert third["should_run"] is True
 
 
-def test_iteration_builds_top5_equal_weight_targets_and_runs_execution(monkeypatch):
+def test_equity_only_workflow_passes_constructor_target_portfolio_to_planner(monkeypatch):
     module = load_module()
     strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
     strategy.parameters["basket_universes"] = {
@@ -1148,19 +1149,23 @@ def test_iteration_builds_top5_equal_weight_targets_and_runs_execution(monkeypat
 
     strategy.on_trading_iteration()
 
+    expected_target_portfolio = [
+        {"basket_id": "equity", "symbol": "ORCL", "target_weight": 0.196},
+        {"basket_id": "equity", "symbol": "MSFT", "target_weight": 0.196},
+        {"basket_id": "equity", "symbol": "NVDA", "target_weight": 0.196},
+        {"basket_id": "equity", "symbol": "AAPL", "target_weight": 0.196},
+        {"basket_id": "equity", "symbol": "AMZN", "target_weight": 0.196},
+    ]
     assert planner_calls == [
         {
             "strategy": strategy,
             "date": "2024-09-05",
-            "target_portfolio": [
-                {"basket_id": "equity", "symbol": "ORCL", "target_weight": 0.2},
-                {"basket_id": "equity", "symbol": "MSFT", "target_weight": 0.2},
-                {"basket_id": "equity", "symbol": "NVDA", "target_weight": 0.2},
-                {"basket_id": "equity", "symbol": "AAPL", "target_weight": 0.2},
-                {"basket_id": "equity", "symbol": "AMZN", "target_weight": 0.2},
-            ],
+            "target_portfolio": expected_target_portfolio,
         }
     ]
+    assert strategy._last_dynamic_equity_constructor_result["target_portfolio"] == expected_target_portfolio
+    assert strategy._last_dynamic_equity_constructor_result["selected_count"] == 5
+    assert sum(row["target_weight"] for row in planner_calls[0]["target_portfolio"]) == pytest.approx(0.98)
     equity_agent = strategy.agents["equity_basket_agent"]
     assert len(equity_agent.calls) == 1
     equity_context = equity_agent.calls[0]["context"]
@@ -1171,6 +1176,95 @@ def test_iteration_builds_top5_equal_weight_targets_and_runs_execution(monkeypat
     assert len(execution_agent.calls) == 1
     execution_plan = execution_agent.calls[0]["context"]["execution_plan"]
     assert execution_plan["orders"][0]["symbol"] == "ORCL"
+
+
+def test_equity_only_workflow_validates_execution_symbols_against_constructor_targets(monkeypatch):
+    module = load_module()
+    strategy = make_running_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
+    strategy.parameters["basket_universes"] = {
+        **strategy.parameters["basket_universes"],
+        "equity": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN", "META"],
+    }
+    strategy.agents.summaries["equity_basket_agent"] = json.dumps(
+        {
+            "basket_id": "equity",
+            "target_weight": 1.0,
+            "status": "active",
+            "candidate_symbols": strategy.parameters["basket_universes"]["equity"],
+            "selected_symbols": ["ORCL", "MSFT", "NVDA", "AAPL", "AMZN"],
+            "reason_brief": "Five strongest setup names.",
+        }
+    )
+    strategy.agents.summaries["execution_agent"] = "Executed plan."
+    constructor_result = {
+        "portfolio_mode": "dynamic_equity",
+        "selected_count": 5,
+        "target_portfolio": [
+            {"basket_id": "equity", "symbol": "ORCL", "target_weight": 0.196},
+            {"basket_id": "equity", "symbol": "MSFT", "target_weight": 0.196},
+            {"basket_id": "equity", "symbol": "NVDA", "target_weight": 0.196},
+            {"basket_id": "equity", "symbol": "AAPL", "target_weight": 0.196},
+            {"basket_id": "equity", "symbol": "META", "target_weight": 0.196},
+        ],
+        "diagnostics": {"fallback_used": False},
+    }
+
+    def fake_equity_only_target_portfolio(equity_report, *, equity_universe, market_summary=None):
+        assert market_summary is None
+        return constructor_result
+
+    def fake_target_portfolio_to_execution_plan(strategy_arg, *, date, target_portfolio):
+        assert target_portfolio == constructor_result["target_portfolio"]
+        return {
+            "schema_version": "1.0",
+            "date": date,
+            "target_portfolio": target_portfolio,
+            "current_vs_target": [
+                {
+                    "symbol": "META",
+                    "planned_side": "buy",
+                    "planned_quantity": 10,
+                    "sizing_price": 100.0,
+                }
+            ],
+            "cash_projection": {
+                "cash_before": 100000.0,
+                "estimated_sell_proceeds": 0.0,
+                "estimated_buy_cost": 1000.0,
+                "cash_after_estimate": 99000.0,
+                "buy_sizing_buffer_pct": 0.02,
+                "negative_cash_allowed": False,
+            },
+            "execution_plan": {
+                "schema_version": 1,
+                "intent": "rebalance",
+                "orders": [
+                    {
+                        "sequence": 1,
+                        "action": "submit_order",
+                        "symbol": "META",
+                        "asset_type": "stock",
+                        "side": "buy",
+                        "quantity": 10,
+                        "quantity_mode": "shares",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                    }
+                ],
+            },
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module, "equity_only_target_portfolio", fake_equity_only_target_portfolio)
+    monkeypatch.setattr(module, "target_portfolio_to_execution_plan", fake_target_portfolio_to_execution_plan)
+
+    strategy.on_trading_iteration()
+
+    assert strategy._last_dynamic_equity_constructor_result == constructor_result
+    assert strategy._last_execution_plan_error is None
+    execution_agent = strategy.agents["execution_agent"]
+    assert len(execution_agent.calls) == 1
+    assert execution_agent.calls[0]["context"]["execution_plan"]["orders"][0]["symbol"] == "META"
 
 
 def test_scheduled_buy_seeds_trailing_stop_state(monkeypatch):
