@@ -1624,6 +1624,67 @@ def test_build_universe_history_summary_pruned_excerpt_includes_candidate_summar
     assert parsed_excerpt["ranking_details"]
 
 
+def test_momentum_stage_pruned_excerpt_preserves_profile_and_benchmark_context():
+    symbols = [f"S{i:02d}" for i in range(1, 36)]
+    history_summaries = {
+        symbol: compute_history_summary(
+            _stage_frame(length=378, start=100 + index, daily_return=0.001 + index / 100_000),
+            symbol=symbol,
+            timestep="day",
+            as_of="2024-09-05",
+        )
+        for index, symbol in enumerate(symbols, start=1)
+    }
+    benchmark_summaries = {
+        "QQQ": compute_history_summary(
+            _stage_frame(length=378, start=100, daily_return=0.001),
+            symbol="QQQ",
+            timestep="day",
+            as_of="2024-09-05",
+        ),
+        "SPY": compute_history_summary(
+            _stage_frame(length=378, start=100, daily_return=0.0008),
+            symbol="SPY",
+            timestep="day",
+            as_of="2024-09-05",
+        ),
+    }
+
+    summary = build_universe_history_summary(
+        history_summaries,
+        symbols=symbols,
+        timestep="day",
+        length=378,
+        as_of="2024-09-05",
+        loaded_tables={symbol: f"hist_{symbol}" for symbol in symbols},
+        warnings=["sample warning"],
+        top_n=10,
+        candidate_summary_limit=25,
+        evidence_profile="momentum_stage",
+        history_frames={
+            symbol: _stage_frame(length=378, start=100 + index, daily_return=0.001 + index / 100_000)
+            for index, symbol in enumerate(symbols, start=1)
+        },
+        benchmark_summaries=benchmark_summaries,
+    )
+
+    pruned = _prune_tool_response_for_context_window(
+        summary,
+        tool_name="market_load_history_tables_summary",
+        max_chars=6_000,
+    )
+
+    assert pruned is not None
+    parsed_excerpt = json.loads(pruned["excerpt"])
+    assert parsed_excerpt["evidence_profile"] == "momentum_stage"
+    assert parsed_excerpt["benchmark_context"]["QQQ"]["return_126"] is not None
+    assert parsed_excerpt["benchmark_context"]["SPY"]["return_126"] is not None
+    assert parsed_excerpt["reference_fields"] == summary["reference_fields"]
+    assert parsed_excerpt["warnings"] == ["sample warning"]
+    assert "by_composite_score" not in parsed_excerpt["rankings"]
+    assert "by_momentum_composite" not in parsed_excerpt["rankings"]
+
+
 def test_market_history_summary_pruning_preserves_error_envelope_fields():
     response = {
         "tool_error": True,

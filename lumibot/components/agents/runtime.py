@@ -2876,6 +2876,7 @@ def _market_history_tables_summary_excerpt(
             "rank_groups": result.get("rank_groups"),
             "ranking_limit": result.get("ranking_limit"),
             "candidate_summary_limit": result.get("candidate_summary_limit"),
+            "evidence_profile": result.get("evidence_profile"),
             "rankings": limited_rankings(),
             "ranking_details": limited_ranking_details(),
             "candidate_summary": (
@@ -2883,6 +2884,9 @@ def _market_history_tables_summary_excerpt(
                 if isinstance(candidate_rows, list)
                 else candidate_rows
             ),
+            "benchmark_context": result.get("benchmark_context"),
+            "reference_fields": result.get("reference_fields"),
+            "warnings": result.get("warnings"),
         }
         if isinstance(ranking_details, dict):
             excerpt_payload["ranking_details_excerpt"] = {
