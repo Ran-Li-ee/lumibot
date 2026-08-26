@@ -45,6 +45,8 @@ def _stage_frame(
     length: int = 320,
     start: float = 100.0,
     daily_return: float = 0.001,
+    down_every: int | None = None,
+    down_return: float = -0.001,
     jump_at: int | None = None,
     jump_return: float = 0.0,
     volume_start: float = 1_000.0,
@@ -54,7 +56,12 @@ def _stage_frame(
     dates = pd.date_range("2024-01-01", periods=length, freq="D")
     close_values = [start]
     for index in range(1, length):
-        move = jump_return if jump_at == index else daily_return
+        if jump_at == index:
+            move = jump_return
+        elif down_every is not None and index % down_every == 0:
+            move = down_return
+        else:
+            move = daily_return
         close_values.append(close_values[-1] * (1.0 + move))
     close = pd.Series(close_values, dtype="float64")
     returns = close.pct_change().fillna(0.0)
@@ -70,6 +77,35 @@ def _stage_frame(
     return pd.DataFrame(
         {
             "Date": dates,
+            "open": close.shift(1).fillna(close.iloc[0]),
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": volume,
+        }
+    )
+
+
+def _stage_frame_from_closes(
+    closes: list[float],
+    *,
+    up_volume: float = 2_000.0,
+    down_volume: float = 1_000.0,
+) -> pd.DataFrame:
+    close = pd.Series(closes, dtype="float64")
+    returns = close.pct_change().fillna(0.0)
+    volume = pd.Series(
+        [
+            1_000.0
+            if index == 0
+            else (up_volume if returns.iloc[index] > 0 else down_volume)
+            for index in range(len(close))
+        ],
+        dtype="float64",
+    )
+    return pd.DataFrame(
+        {
+            "Date": pd.date_range("2024-01-01", periods=len(close), freq="D"),
             "open": close.shift(1).fillna(close.iloc[0]),
             "high": close + 1.0,
             "low": close - 1.0,
@@ -155,6 +191,36 @@ def _rankable_summary(
             "breakout_63_high_score": breakout_63_high_score,
             "drawdown_from_high_60": drawdown_from_high_60,
         },
+    }
+
+
+def _stage_rankable_summary(
+    symbol: str,
+    *,
+    return_126: float,
+    extension_ma50_pct: float = 0.05,
+    atr_extension_20d: float = 1.0,
+    positive_day_ratio_3m: float = 0.5,
+    max_day_return_share_3m: float = 0.1,
+    distance_to_252d_high_pct: float = -0.05,
+    recent_vs_intermediate_momentum: float = 0.0,
+    up_down_volume_ratio_60d: float | None = 1.5,
+    volatility_20: float = 0.01,
+) -> dict:
+    return {
+        "symbol": symbol,
+        "price": {"latest_close": 100.0},
+        "momentum": {"return_126": return_126},
+        "momentum_stage": {
+            "extension_ma50_pct": extension_ma50_pct,
+            "atr_extension_20d": atr_extension_20d,
+            "positive_day_ratio_3m": positive_day_ratio_3m,
+            "max_day_return_share_3m": max_day_return_share_3m,
+            "distance_to_252d_high_pct": distance_to_252d_high_pct,
+            "recent_vs_intermediate_momentum": recent_vs_intermediate_momentum,
+            "up_down_volume_ratio_60d": up_down_volume_ratio_60d,
+        },
+        "risk": {"volatility_20": volatility_20},
     }
 
 
@@ -353,6 +419,23 @@ def test_compute_history_summary_adds_momentum_stage_metrics_and_availability_ke
         "up_down_volume_ratio_60d",
     ):
         assert key in summary["availability"]
+
+
+def test_compute_history_summary_calculates_up_down_volume_ratio_60d():
+    frame = _stage_frame(
+        daily_return=0.002,
+        down_every=3,
+        down_return=-0.001,
+        up_volume=3_000.0,
+        down_volume=1_000.0,
+    )
+    summary = compute_history_summary(frame, symbol="VOL", timestep="day", as_of=None)
+    returns = frame["close"].pct_change().dropna().tail(60)
+    volumes = frame["volume"].iloc[-60:]
+    expected = volumes[returns > 0].sum() / volumes[returns < 0].sum()
+
+    assert summary["momentum_stage"]["up_down_volume_ratio_60d"] == pytest.approx(expected)
+    assert summary["availability"]["up_down_volume_ratio_60d"] is True
 
 
 def test_compute_history_summary_ignores_trailing_rows_without_finite_close_for_dependent_metrics():
@@ -782,6 +865,24 @@ def test_build_universe_history_summary_momentum_stage_shape_excludes_legacy_com
     assert [row["symbol"] for row in summary["candidate_summary"]] == ["AAA", "BBB"]
 
 
+def test_build_universe_history_summary_normalizes_momentum_stage_profile_name():
+    qqq = compute_history_summary(_stage_frame(daily_return=0.001), symbol="QQQ", timestep="day", as_of=None)
+    summary = build_universe_history_summary(
+        {"QQQ": qqq},
+        symbols=["QQQ"],
+        timestep="day",
+        length=320,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        evidence_profile=" Momentum_Stage ",
+        history_frames={"QQQ": _stage_frame(daily_return=0.001)},
+        benchmark_summaries={"QQQ": qqq, "SPY": qqq},
+    )
+
+    assert summary["evidence_profile"] == "momentum_stage"
+
+
 def test_build_universe_history_summary_momentum_stage_low_jump_concentration_ranks_first_and_flags_jump():
     smooth_frame = _stage_frame(daily_return=0.002, up_volume=2_000.0, down_volume=800.0)
     jump_frame = _stage_frame(daily_return=0.002, jump_at=300, jump_return=0.50, up_volume=2_000.0, down_volume=800.0)
@@ -811,6 +912,216 @@ def test_build_universe_history_summary_momentum_stage_low_jump_concentration_ra
     rows = {row["symbol"]: row for row in summary["candidate_summary"]}
     assert "single_day_jump_concentration" in rows["JUMP"]["stage_warning_flags"]
     assert rows["JUMP"]["max_day_return_share_3m"] >= 0.35
+
+
+def test_build_universe_history_summary_momentum_stage_asserts_benchmark_excess_values():
+    aaa = _stage_rankable_summary("AAA", return_126=0.25)
+    qqq = _stage_rankable_summary("QQQ", return_126=0.10)
+    spy = _stage_rankable_summary("SPY", return_126=0.05)
+
+    summary = build_universe_history_summary(
+        {"AAA": aaa},
+        symbols=["AAA"],
+        timestep="day",
+        length=320,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=1,
+        candidate_summary_limit=1,
+        evidence_profile="momentum_stage",
+        benchmark_summaries={"QQQ": qqq, "SPY": spy},
+    )
+
+    row = summary["candidate_summary"][0]
+    assert row["excess_return_vs_qqq_6m"] == pytest.approx(0.15)
+    assert row["excess_return_vs_spy_6m"] == pytest.approx(0.20)
+
+
+def test_build_universe_history_summary_momentum_stage_rank_delta_4w_uses_controlled_universe_ranks():
+    frames = {
+        "AAA": _stage_frame_from_closes([100.0] * 299 + [160.0] * 21),
+        "BBB": _stage_frame_from_closes([100.0] * 194 + [130.0] * 126),
+        "CCC": _stage_frame_from_closes([100.0] * 173 + [160.0] * 147),
+    }
+    summaries = {
+        symbol: compute_history_summary(frame, symbol=symbol, timestep="day", as_of=None)
+        for symbol, frame in frames.items()
+    }
+
+    summary = build_universe_history_summary(
+        summaries,
+        symbols=["AAA", "BBB", "CCC"],
+        timestep="day",
+        length=320,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=3,
+        candidate_summary_limit=3,
+        evidence_profile="momentum_stage",
+        history_frames=frames,
+    )
+
+    rows = {row["symbol"]: row for row in summary["candidate_summary"]}
+    assert summary["rankings"]["by_rank_delta_4w"] == ["AAA", "BBB", "CCC"]
+    assert rows["AAA"]["rank_delta_4w"] == 2
+    assert rows["BBB"]["rank_delta_4w"] == 0
+    assert rows["CCC"]["rank_delta_4w"] == -2
+
+
+def test_build_universe_history_summary_momentum_stage_top_decile_age_weeks_uses_weekly_samples():
+    frames = {"TOP": _stage_frame_from_closes([100.0] * 305 + [150.0] * 15)}
+    for index in range(1, 10):
+        frames[f"S{index}"] = _stage_frame_from_closes([100.0] * 194 + [110.0] * 126)
+    summaries = {
+        symbol: compute_history_summary(frame, symbol=symbol, timestep="day", as_of=None)
+        for symbol, frame in frames.items()
+    }
+
+    summary = build_universe_history_summary(
+        summaries,
+        symbols=list(frames),
+        timestep="day",
+        length=320,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=10,
+        candidate_summary_limit=10,
+        evidence_profile="momentum_stage",
+        history_frames=frames,
+    )
+
+    rows = {row["symbol"]: row for row in summary["candidate_summary"]}
+    assert rows["TOP"]["top_decile_age_weeks"] == 3
+
+
+def test_build_universe_history_summary_momentum_stage_covers_all_ranking_directions():
+    frames = {
+        "AAA": _stage_frame_from_closes([100.0] * 299 + [160.0] * 21),
+        "BBB": _stage_frame_from_closes([100.0] * 194 + [130.0] * 126),
+        "CCC": _stage_frame_from_closes([100.0] * 173 + [160.0] * 147),
+    }
+    summaries = {
+        "AAA": _stage_rankable_summary(
+            "AAA",
+            return_126=0.40,
+            positive_day_ratio_3m=0.90,
+            max_day_return_share_3m=0.20,
+            distance_to_252d_high_pct=-0.03,
+            up_down_volume_ratio_60d=2.0,
+        ),
+        "BBB": _stage_rankable_summary(
+            "BBB",
+            return_126=0.30,
+            positive_day_ratio_3m=0.80,
+            max_day_return_share_3m=0.10,
+            distance_to_252d_high_pct=-0.01,
+            up_down_volume_ratio_60d=1.0,
+        ),
+        "CCC": _stage_rankable_summary(
+            "CCC",
+            return_126=0.20,
+            positive_day_ratio_3m=0.70,
+            max_day_return_share_3m=0.05,
+            distance_to_252d_high_pct=-0.20,
+            up_down_volume_ratio_60d=3.0,
+        ),
+    }
+
+    summary = build_universe_history_summary(
+        summaries,
+        symbols=["AAA", "BBB", "CCC"],
+        timestep="day",
+        length=320,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=3,
+        candidate_summary_limit=3,
+        evidence_profile="momentum_stage",
+        history_frames=frames,
+        benchmark_summaries={
+            "QQQ": _stage_rankable_summary("QQQ", return_126=0.10),
+            "SPY": _stage_rankable_summary("SPY", return_126=0.05),
+        },
+    )
+
+    assert summary["rankings"]["by_rank_delta_4w"] == ["AAA", "BBB", "CCC"]
+    assert summary["rankings"]["by_positive_day_ratio_3m"] == ["AAA", "BBB", "CCC"]
+    assert summary["rankings"]["by_low_max_day_return_share_3m"] == ["CCC", "BBB", "AAA"]
+    assert summary["rankings"]["by_near_252d_high"] == ["BBB", "AAA", "CCC"]
+    assert summary["rankings"]["by_up_down_volume_ratio_60d"] == ["CCC", "AAA", "BBB"]
+    assert summary["rankings"]["by_excess_return_vs_qqq_6m"] == ["AAA", "BBB", "CCC"]
+    assert summary["rankings"]["by_excess_return_vs_spy_6m"] == ["AAA", "BBB", "CCC"]
+
+
+def test_build_universe_history_summary_momentum_stage_candidate_selection_favors_overlap_when_truncated():
+    symbols = ["PRI1", "PRI2", "OVR", "VOL", "HIGH"]
+    summaries = {
+        "PRI1": _stage_rankable_summary(
+            "PRI1",
+            return_126=0.50,
+            positive_day_ratio_3m=0.10,
+            max_day_return_share_3m=0.60,
+            distance_to_252d_high_pct=-0.50,
+            up_down_volume_ratio_60d=0.5,
+        ),
+        "PRI2": _stage_rankable_summary(
+            "PRI2",
+            return_126=0.40,
+            positive_day_ratio_3m=0.20,
+            max_day_return_share_3m=0.50,
+            distance_to_252d_high_pct=-0.40,
+            up_down_volume_ratio_60d=0.6,
+        ),
+        "OVR": _stage_rankable_summary(
+            "OVR",
+            return_126=0.30,
+            positive_day_ratio_3m=0.90,
+            max_day_return_share_3m=0.05,
+            distance_to_252d_high_pct=-0.01,
+            up_down_volume_ratio_60d=3.0,
+        ),
+        "VOL": _stage_rankable_summary(
+            "VOL",
+            return_126=0.20,
+            positive_day_ratio_3m=0.80,
+            max_day_return_share_3m=0.10,
+            distance_to_252d_high_pct=-0.02,
+            up_down_volume_ratio_60d=2.0,
+        ),
+        "HIGH": _stage_rankable_summary(
+            "HIGH",
+            return_126=0.10,
+            positive_day_ratio_3m=0.70,
+            max_day_return_share_3m=0.20,
+            distance_to_252d_high_pct=-0.03,
+            up_down_volume_ratio_60d=1.5,
+        ),
+    }
+
+    summary = build_universe_history_summary(
+        summaries,
+        symbols=symbols,
+        timestep="day",
+        length=320,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=3,
+        candidate_summary_limit=2,
+        evidence_profile="momentum_stage",
+        benchmark_summaries={
+            "QQQ": _stage_rankable_summary("QQQ", return_126=0.0),
+            "SPY": _stage_rankable_summary("SPY", return_126=0.0),
+        },
+    )
+
+    selected = [row["symbol"] for row in summary["candidate_summary"]]
+    assert selected == ["OVR", "VOL"]
+    assert "PRI2" not in selected
 
 
 def test_build_universe_history_summary_returns_five_rank_groups_and_details():

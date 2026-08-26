@@ -404,7 +404,8 @@ def build_universe_history_summary(
     benchmark_summaries: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return a compact, model-facing batch summary for a symbol universe."""
-    if evidence_profile == MOMENTUM_STAGE_EVIDENCE_PROFILE:
+    profile = str(evidence_profile or LEGACY_EVIDENCE_PROFILE).strip().lower()
+    if profile == MOMENTUM_STAGE_EVIDENCE_PROFILE:
         return _build_momentum_stage_universe_history_summary(
             history_summaries,
             symbols=symbols,
@@ -418,7 +419,7 @@ def build_universe_history_summary(
             history_frames=history_frames,
             benchmark_summaries=benchmark_summaries,
         )
-    if evidence_profile != LEGACY_EVIDENCE_PROFILE:
+    if profile != LEGACY_EVIDENCE_PROFILE:
         raise ValueError(f"Unsupported evidence_profile: {evidence_profile}")
 
     top_n = max(1, int(top_n))
@@ -897,20 +898,10 @@ def _select_momentum_stage_candidate_summary_symbols(rankings: dict[str, list[st
     if len(candidates) <= limit:
         return candidates
 
-    selected: list[str] = []
-    seen: set[str] = set()
-    for ranking_name in MOMENTUM_STAGE_CANDIDATE_PRIORITY_RANKINGS:
-        for symbol in rankings.get(ranking_name, []):
-            if symbol in seen:
-                continue
-            selected.append(symbol)
-            seen.add(symbol)
-            if len(selected) >= limit:
-                return selected
-
-    appearance_counts: dict[str, int] = {}
+    overlap_counts: dict[str, int] = {}
     best_rank: dict[str, int] = {}
-    first_seen_order: dict[str, int] = {}
+    best_priority_rank: dict[str, int] = {}
+    best_priority_index: dict[str, int] = {}
     official_rankings = {
         ranking_name
         for ranking_names in MOMENTUM_STAGE_RANK_GROUPS.values()
@@ -918,21 +909,27 @@ def _select_momentum_stage_candidate_summary_symbols(rankings: dict[str, list[st
     }
     for ranking_name, ranking in rankings.items():
         for index, symbol in enumerate(ranking):
-            first_seen_order.setdefault(symbol, len(first_seen_order))
             if ranking_name in official_rankings:
-                appearance_counts[symbol] = appearance_counts.get(symbol, 0) + 1
+                overlap_counts[symbol] = overlap_counts.get(symbol, 0) + 1
             best_rank[symbol] = min(best_rank.get(symbol, index), index)
+            if ranking_name in MOMENTUM_STAGE_CANDIDATE_PRIORITY_RANKINGS:
+                priority_index = MOMENTUM_STAGE_CANDIDATE_PRIORITY_RANKINGS.index(ranking_name)
+                best_priority_rank[symbol] = min(best_priority_rank.get(symbol, index), index)
+                best_priority_index[symbol] = min(best_priority_index.get(symbol, priority_index), priority_index)
 
-    remaining = [symbol for symbol in candidates if symbol not in seen]
-    remaining.sort(
+    # Candidate truncation is intentionally overlap-led, then priority-aware.
+    # This keeps repeated evidence across stage groups from being crowded out by the first priority list.
+    ordered = list(candidates)
+    ordered.sort(
         key=lambda symbol: (
-            -appearance_counts.get(symbol, 0),
+            -overlap_counts.get(symbol, 0),
+            best_priority_rank.get(symbol, len(candidates)),
+            best_priority_index.get(symbol, len(MOMENTUM_STAGE_CANDIDATE_PRIORITY_RANKINGS)),
             best_rank.get(symbol, len(candidates)),
-            first_seen_order.get(symbol, len(candidates)),
             symbol,
         )
     )
-    return (selected + remaining)[:limit]
+    return ordered[:limit]
 
 
 def _unique_ranked_symbols(rankings: dict[str, list[str]]) -> list[str]:
