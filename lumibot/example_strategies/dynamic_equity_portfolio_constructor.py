@@ -331,10 +331,11 @@ def _stage_evidence_score_payload(row: dict[str, Any], ranking_limit: float) -> 
 
     warning_flags = _stage_warning_flags(row.get("stage_warning_flags"))
     penalty = min(0.50, sum(STAGE_WARNING_PENALTIES.get(flag, 0.0) for flag in warning_flags))
-    adjusted_stage_score = _clamp(support_score - penalty, 0.0, 1.0)
+    capped_support_score = _clamp(support_score, 0.0, 1.0)
+    adjusted_stage_score = _clamp(capped_support_score - penalty, 0.0, 1.0)
     return {
         "evidence_score": adjusted_stage_score,
-        "stage_support_score": support_score,
+        "stage_support_score": capped_support_score,
         "stage_penalty": penalty,
         "adjusted_stage_score": adjusted_stage_score,
         "stage_warning_flags": warning_flags,

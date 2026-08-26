@@ -168,6 +168,38 @@ def test_constructor_uses_momentum_stage_scores_and_diagnostics():
     assert score_rows["BBB"]["stage_warning_flags"] == ["extreme_ma50_extension"]
 
 
+def test_constructor_applies_stage_warning_penalty_after_support_cap():
+    equity_report = {
+        "basket_id": "equity",
+        "status": "active",
+        "selected_symbols": ["AAA", "BBB", "CCC"],
+    }
+    market_summary = stage_summary(
+        [
+            stage_candidate(
+                "AAA",
+                stage_ranking_count=20,
+                warnings=["thin_or_missing_volume_support"],
+            ),
+            stage_candidate("BBB", freshness=3, relative_strength=3),
+            stage_candidate("CCC", freshness=4, relative_strength=4),
+        ]
+    )
+
+    result = construct_dynamic_equity_target_portfolio(
+        equity_report,
+        equity_universe=["AAA", "BBB", "CCC"],
+        market_summary=market_summary,
+    )
+
+    aaa_row = next(row for row in result["diagnostics"]["candidate_scores"] if row["symbol"] == "AAA")
+    assert aaa_row["stage_support_score"] == pytest.approx(1.0)
+    assert aaa_row["stage_penalty"] == pytest.approx(0.06)
+    assert aaa_row["adjusted_stage_score"] == pytest.approx(0.94)
+    assert aaa_row["adjusted_stage_score"] < aaa_row["stage_support_score"]
+    assert aaa_row["adjusted_stage_score"] < 1.0
+
+
 def test_constructor_prefers_stage_fields_over_legacy_fields_when_profile_is_momentum_stage():
     equity_report = {
         "basket_id": "equity",
