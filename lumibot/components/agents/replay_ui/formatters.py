@@ -296,6 +296,9 @@ def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -
         f"Loaded market history summaries for {_rows_label(count, 'symbol')}",
         f"{_rows_label(count, 'detailed symbol')} retained",
     ]
+    evidence_profile = result.get("evidence_profile")
+    if evidence_profile is not None:
+        parts.append(f"evidence profile {evidence_profile}")
 
     coverage = _as_dict(result.get("coverage"))
     if coverage:
@@ -369,6 +372,32 @@ def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -
             symbols = _symbol_list(rankings.get(key))
             if symbols:
                 parts.append(f"{label}: {', '.join(symbols[:3])}")
+
+    benchmark_context = _as_dict(result.get("benchmark_context"))
+    benchmark_return_126 = _as_dict(benchmark_context.get("return_126"))
+    if benchmark_return_126:
+        benchmark_symbols = benchmark_context.get("symbols")
+        if not isinstance(benchmark_symbols, list):
+            benchmark_symbols = list(benchmark_return_126)
+        benchmark_pairs = []
+        for symbol in benchmark_symbols:
+            if symbol in benchmark_return_126:
+                benchmark_pairs.append(f"{symbol}={benchmark_return_126[symbol]}")
+        if benchmark_pairs:
+            parts.append(f"benchmark 126-bar returns: {', '.join(benchmark_pairs)}")
+
+    stage_warning_summaries = []
+    for row in candidate_summary[:5]:
+        row_dict = _as_dict(row)
+        flags = row_dict.get("stage_warning_flags")
+        if not isinstance(flags, list) or not flags:
+            continue
+        symbol = row_dict.get("symbol")
+        if symbol is None:
+            continue
+        stage_warning_summaries.append(f"{symbol}: {', '.join(str(flag) for flag in flags)}")
+    if stage_warning_summaries:
+        parts.append(f"stage warning flags: {' | '.join(stage_warning_summaries)}")
 
     warnings = result.get("warnings")
     if isinstance(warnings, list) and warnings:

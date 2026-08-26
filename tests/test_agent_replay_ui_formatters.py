@@ -198,6 +198,52 @@ def test_market_load_history_tables_summary_formatter_shows_rank_groups_and_cand
     assert "trend_quality" in explanation
 
 
+def test_market_load_history_tables_summary_formatter_shows_momentum_stage_profile():
+    explanation = explain_tool_result(
+        "market_load_history_tables_summary",
+        {"symbols": ["AAA", "BBB"], "evidence_profile": "momentum_stage"},
+        {
+            "evidence_profile": "momentum_stage",
+            "coverage": {
+                "requested_count": 2,
+                "loaded_count": 2,
+                "failed_count": 0,
+                "top_n": 2,
+                "candidate_summary_limit": 2,
+                "ranking_count": 2,
+            },
+            "rank_groups": {
+                "freshness": ["by_rank_delta_4w"],
+                "relative_strength": ["by_excess_return_vs_qqq_6m"],
+            },
+            "ranking_details": {
+                "by_rank_delta_4w": [{"rank": 1, "symbol": "AAA", "value": 10}],
+                "by_excess_return_vs_qqq_6m": [
+                    {"rank": 1, "symbol": "BBB", "value": 0.12}
+                ],
+            },
+            "candidate_summary": [
+                {"symbol": "AAA", "stage_warning_flags": ["extreme_atr_extension"]},
+                {"symbol": "BBB", "stage_warning_flags": []},
+            ],
+            "benchmark_context": {
+                "symbols": ["QQQ", "SPY"],
+                "return_126": {"QQQ": 0.08, "SPY": 0.04},
+            },
+            "warnings": [],
+        },
+        None,
+    )
+
+    assert "momentum_stage" in explanation
+    assert "freshness" in explanation
+    assert "by_rank_delta_4w: AAA=10" in explanation
+    assert "relative_strength" in explanation
+    assert "QQQ" in explanation
+    assert "SPY" in explanation
+    assert "extreme_atr_extension" in explanation
+
+
 def test_market_load_history_tables_summary_formatter_shows_empty_candidate_summary_rows():
     explanation = explain_tool_result(
         "market_load_history_tables_summary",
