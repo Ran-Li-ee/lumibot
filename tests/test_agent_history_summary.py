@@ -5,6 +5,7 @@ import json
 import pandas as pd
 import pytest
 
+from lumibot.components.agents import history_summary as history_summary_module
 from lumibot.components.agents.builtins import BuiltinTools
 from lumibot.components.agents.history_summary import (
     _momentum_stage_warning_flags,
@@ -1047,6 +1048,51 @@ def test_build_universe_history_summary_momentum_stage_top_decile_age_weeks_uses
 
     rows = {row["symbol"]: row for row in summary["candidate_summary"]}
     assert rows["TOP"]["top_decile_age_weeks"] == 3
+
+
+def test_build_universe_history_summary_momentum_stage_top_decile_age_reuses_weekly_rank_maps(monkeypatch):
+    frames = {
+        "TOP1": _stage_frame_from_closes([100.0] * 305 + [150.0] * 15),
+        "TOP2": _stage_frame_from_closes([100.0] * 310 + [140.0] * 10),
+    }
+    for index in range(1, 19):
+        frames[f"S{index:02d}"] = _stage_frame_from_closes([100.0] * 194 + [110.0] * 126)
+    summaries = {
+        symbol: compute_history_summary(frame, symbol=symbol, timestep="day", as_of=None)
+        for symbol, frame in frames.items()
+    }
+    calls_by_offset: dict[int, int] = {}
+    original = history_summary_module._return_126_by_symbol_as_of_offset
+
+    def counted_return_126_by_symbol_as_of_offset(close_series_by_symbol, symbols, *, offset):
+        calls_by_offset[offset] = calls_by_offset.get(offset, 0) + 1
+        return original(close_series_by_symbol, symbols, offset=offset)
+
+    monkeypatch.setattr(
+        history_summary_module,
+        "_return_126_by_symbol_as_of_offset",
+        counted_return_126_by_symbol_as_of_offset,
+    )
+
+    summary = build_universe_history_summary(
+        summaries,
+        symbols=list(frames),
+        timestep="day",
+        length=320,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=20,
+        candidate_summary_limit=20,
+        evidence_profile="momentum_stage",
+        history_frames=frames,
+    )
+
+    rows = {row["symbol"]: row for row in summary["candidate_summary"]}
+    assert rows["TOP1"]["top_decile_age_weeks"] == 3
+    assert rows["TOP2"]["top_decile_age_weeks"] == 2
+    assert calls_by_offset
+    assert max(calls_by_offset.values()) == 1
 
 
 def test_build_universe_history_summary_momentum_stage_covers_all_ranking_directions():

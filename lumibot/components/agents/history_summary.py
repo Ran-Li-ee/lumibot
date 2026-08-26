@@ -503,8 +503,18 @@ def _build_momentum_stage_universe_history_summary(
     requested_symbols = [symbol for symbol in symbols if symbol in history_summaries]
     benchmark_summaries = benchmark_summaries or {}
     benchmark_context = _benchmark_context(history_summaries, benchmark_summaries)
-    rank_delta_by_symbol = _rank_delta_4w_by_symbol(history_frames or {}, requested_symbols)
-    top_decile_age_by_symbol = _top_decile_age_weeks_by_symbol(history_frames or {}, requested_symbols)
+    close_series_by_symbol = _close_series_by_symbol(history_frames or {}, requested_symbols)
+    rank_maps_by_offset: dict[int, dict[str, int]] = {}
+    rank_delta_by_symbol = _rank_delta_4w_by_symbol(
+        close_series_by_symbol,
+        requested_symbols,
+        rank_maps_by_offset,
+    )
+    top_decile_age_by_symbol = _top_decile_age_weeks_by_symbol(
+        close_series_by_symbol,
+        requested_symbols,
+        rank_maps_by_offset,
+    )
     qqq_return_126 = benchmark_context["QQQ"]["return_126"]
     spy_return_126 = benchmark_context["SPY"]["return_126"]
 
@@ -964,11 +974,32 @@ def _unique_ranked_symbols_for_priority(rankings: dict[str, list[str]], priority
     return symbols
 
 
-def _rank_delta_4w_by_symbol(history_frames: dict[str, pd.DataFrame], symbols: list[str]) -> dict[str, int | None]:
-    latest_returns = _return_126_by_symbol_as_of_offset(history_frames, symbols, offset=0)
-    prior_returns = _return_126_by_symbol_as_of_offset(history_frames, symbols, offset=21)
-    latest_ranks = _rank_metric_value_map(latest_returns)
-    prior_ranks = _rank_metric_value_map(prior_returns)
+def _close_series_by_symbol(history_frames: dict[str, pd.DataFrame], symbols: list[str]) -> dict[str, pd.Series]:
+    return {
+        symbol: close
+        for symbol in symbols
+        if (frame := history_frames.get(symbol)) is not None
+        if (close := _numeric_series(_truncate_to_last_finite_close(_sort_frame(frame)), "close")) is not None
+    }
+
+
+def _rank_delta_4w_by_symbol(
+    close_series_by_symbol: dict[str, pd.Series],
+    symbols: list[str],
+    rank_maps_by_offset: dict[int, dict[str, int]],
+) -> dict[str, int | None]:
+    latest_ranks = _rank_map_as_of_offset(
+        close_series_by_symbol,
+        symbols,
+        offset=0,
+        rank_maps_by_offset=rank_maps_by_offset,
+    )
+    prior_ranks = _rank_map_as_of_offset(
+        close_series_by_symbol,
+        symbols,
+        offset=21,
+        rank_maps_by_offset=rank_maps_by_offset,
+    )
     return {
         symbol: prior_ranks[symbol] - latest_ranks[symbol]
         if symbol in prior_ranks and symbol in latest_ranks
@@ -978,46 +1009,65 @@ def _rank_delta_4w_by_symbol(history_frames: dict[str, pd.DataFrame], symbols: l
 
 
 def _top_decile_age_weeks_by_symbol(
-    history_frames: dict[str, pd.DataFrame],
+    close_series_by_symbol: dict[str, pd.Series],
     symbols: list[str],
+    rank_maps_by_offset: dict[int, dict[str, int]],
 ) -> dict[str, int | None]:
-    return {
-        symbol: _top_decile_age_weeks(symbol, history_frames, symbols)
-        for symbol in symbols
-    }
-
-
-def _top_decile_age_weeks(symbol: str, history_frames: dict[str, pd.DataFrame], symbols: list[str]) -> int | None:
-    if symbol not in history_frames or not symbols:
-        return None
     top_decile_rank = max(1, math.ceil(len(symbols) * 0.10))
-    age_weeks = 0
+    age_by_symbol: dict[str, int | None] = {symbol: None for symbol in symbols}
+    unresolved = {symbol for symbol in symbols if symbol in close_series_by_symbol}
     offset = 0
-    while True:
-        returns = _return_126_by_symbol_as_of_offset(history_frames, symbols, offset=offset)
-        ranks = _rank_metric_value_map(returns)
-        if symbol not in ranks:
-            return age_weeks if age_weeks > 0 else None
-        if ranks[symbol] > top_decile_rank:
-            return age_weeks
-        age_weeks += 1
+
+    while unresolved:
+        ranks = _rank_map_as_of_offset(
+            close_series_by_symbol,
+            symbols,
+            offset=offset,
+            rank_maps_by_offset=rank_maps_by_offset,
+        )
+        if not ranks:
+            for symbol in list(unresolved):
+                age_by_symbol[symbol] = age_by_symbol[symbol] or None
+            break
+
+        for symbol in list(unresolved):
+            current_age = age_by_symbol[symbol] or 0
+            rank = ranks.get(symbol)
+            if rank is None:
+                age_by_symbol[symbol] = current_age if current_age > 0 else None
+                unresolved.remove(symbol)
+            elif rank <= top_decile_rank:
+                age_by_symbol[symbol] = current_age + 1
+            else:
+                age_by_symbol[symbol] = current_age
+                unresolved.remove(symbol)
         offset += 5
+    return age_by_symbol
+
+
+def _rank_map_as_of_offset(
+    close_series_by_symbol: dict[str, pd.Series],
+    symbols: list[str],
+    *,
+    offset: int,
+    rank_maps_by_offset: dict[int, dict[str, int]],
+) -> dict[str, int]:
+    if offset not in rank_maps_by_offset:
+        returns = _return_126_by_symbol_as_of_offset(close_series_by_symbol, symbols, offset=offset)
+        rank_maps_by_offset[offset] = _rank_metric_value_map(returns)
+    return rank_maps_by_offset[offset]
 
 
 def _return_126_by_symbol_as_of_offset(
-    history_frames: dict[str, pd.DataFrame],
+    close_series_by_symbol: dict[str, pd.Series],
     symbols: list[str],
     *,
     offset: int,
 ) -> dict[str, float | None]:
     return {
-        symbol: _period_return_as_of_offset(
-            _numeric_series(_truncate_to_last_finite_close(_sort_frame(frame)), "close"),
-            126,
-            offset,
-        )
+        symbol: _period_return_as_of_offset(close_series, 126, offset)
         for symbol in symbols
-        if (frame := history_frames.get(symbol)) is not None
+        if (close_series := close_series_by_symbol.get(symbol)) is not None
     }
 
 
