@@ -859,6 +859,12 @@ def test_build_universe_history_summary_momentum_stage_shape_excludes_legacy_com
         qqq["momentum"]["return_126"],
         abs=1e-6,
     )
+    assert summary["reference_fields"] == [
+        "atr_extension_20d",
+        "extension_ma50_pct",
+        "recent_vs_intermediate_momentum",
+        "top_decile_age_weeks",
+    ]
     row = summary["candidate_summary"][0]
     assert set(row) == {
         "symbol",
@@ -1048,6 +1054,37 @@ def test_build_universe_history_summary_momentum_stage_top_decile_age_weeks_uses
 
     rows = {row["symbol"]: row for row in summary["candidate_summary"]}
     assert rows["TOP"]["top_decile_age_weeks"] == 3
+
+
+def test_build_universe_history_summary_momentum_stage_top_decile_age_requires_rankable_universe():
+    frames = {
+        "TOP1": _stage_frame_from_closes([100.0] * 305 + [150.0] * 15),
+        "TOP2": _stage_frame_from_closes([100.0] * 305 + [140.0] * 15),
+    }
+    for index in range(1, 19):
+        frames[f"SHORT{index:02d}"] = _stage_frame_from_closes([100.0] * 100)
+    summaries = {
+        symbol: compute_history_summary(frame, symbol=symbol, timestep="day", as_of=None)
+        for symbol, frame in frames.items()
+    }
+
+    summary = build_universe_history_summary(
+        summaries,
+        symbols=list(frames),
+        timestep="day",
+        length=320,
+        as_of=None,
+        loaded_tables=None,
+        warnings=None,
+        top_n=20,
+        candidate_summary_limit=20,
+        evidence_profile="momentum_stage",
+        history_frames=frames,
+    )
+
+    rows = {row["symbol"]: row for row in summary["candidate_summary"]}
+    assert rows["TOP1"]["top_decile_age_weeks"] is None
+    assert rows["TOP2"]["top_decile_age_weeks"] is None
 
 
 def test_build_universe_history_summary_momentum_stage_top_decile_age_reuses_weekly_rank_maps(monkeypatch):

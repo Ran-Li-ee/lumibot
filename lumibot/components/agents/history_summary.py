@@ -575,6 +575,7 @@ def _build_momentum_stage_universe_history_summary(
         "ranking_details": ranking_details,
         "candidate_summary": candidate_summary,
         "benchmark_context": benchmark_context,
+        "reference_fields": sorted(MOMENTUM_STAGE_REFERENCE_FIELDS),
         "symbols": symbols,
         "timestep": timestep,
         "length": length,
@@ -1013,7 +1014,7 @@ def _top_decile_age_weeks_by_symbol(
     symbols: list[str],
     rank_maps_by_offset: dict[int, dict[str, int]],
 ) -> dict[str, int | None]:
-    top_decile_rank = max(1, math.ceil(len(symbols) * 0.10))
+    min_rankable_universe_size = min(10, len(symbols))
     age_by_symbol: dict[str, int | None] = {symbol: None for symbol in symbols}
     unresolved = {symbol for symbol in symbols if symbol in close_series_by_symbol}
     offset = 0
@@ -1025,11 +1026,12 @@ def _top_decile_age_weeks_by_symbol(
             offset=offset,
             rank_maps_by_offset=rank_maps_by_offset,
         )
-        if not ranks:
+        if len(ranks) < min_rankable_universe_size:
             for symbol in list(unresolved):
                 age_by_symbol[symbol] = age_by_symbol[symbol] or None
             break
 
+        top_decile_rank = max(1, math.ceil(len(ranks) * 0.10))
         for symbol in list(unresolved):
             current_age = age_by_symbol[symbol] or 0
             rank = ranks.get(symbol)
