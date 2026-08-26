@@ -227,8 +227,8 @@ def test_market_load_history_tables_summary_formatter_shows_momentum_stage_profi
                 {"symbol": "BBB", "stage_warning_flags": []},
             ],
             "benchmark_context": {
-                "symbols": ["QQQ", "SPY"],
-                "return_126": {"QQQ": 0.08, "SPY": 0.04},
+                "QQQ": {"return_126": 0.08, "available": True},
+                "SPY": {"return_126": 0.04, "available": True},
             },
             "warnings": [],
         },
@@ -239,8 +239,7 @@ def test_market_load_history_tables_summary_formatter_shows_momentum_stage_profi
     assert "freshness" in explanation
     assert "by_rank_delta_4w: AAA=10" in explanation
     assert "relative_strength" in explanation
-    assert "QQQ" in explanation
-    assert "SPY" in explanation
+    assert "benchmark 126-bar returns: QQQ=0.08, SPY=0.04" in explanation
     assert "extreme_atr_extension" in explanation
 
 

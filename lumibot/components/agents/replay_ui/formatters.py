@@ -374,15 +374,31 @@ def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -
                 parts.append(f"{label}: {', '.join(symbols[:3])}")
 
     benchmark_context = _as_dict(result.get("benchmark_context"))
-    benchmark_return_126 = _as_dict(benchmark_context.get("return_126"))
-    if benchmark_return_126:
+    benchmark_returns = {
+        symbol: value
+        for symbol, value in _as_dict(benchmark_context.get("return_126")).items()
+        if value is not None
+    }
+    for symbol, summary in benchmark_context.items():
+        summary_dict = _as_dict(summary)
+        return_126 = summary_dict.get("return_126")
+        if return_126 is not None:
+            benchmark_returns[symbol] = return_126
+    if benchmark_returns:
         benchmark_symbols = benchmark_context.get("symbols")
         if not isinstance(benchmark_symbols, list):
-            benchmark_symbols = list(benchmark_return_126)
+            benchmark_symbols = [
+                *[symbol for symbol in ("QQQ", "SPY") if symbol in benchmark_returns],
+                *[
+                    symbol
+                    for symbol in benchmark_returns
+                    if symbol not in {"QQQ", "SPY"}
+                ],
+            ]
         benchmark_pairs = []
         for symbol in benchmark_symbols:
-            if symbol in benchmark_return_126:
-                benchmark_pairs.append(f"{symbol}={benchmark_return_126[symbol]}")
+            if symbol in benchmark_returns:
+                benchmark_pairs.append(f"{symbol}={benchmark_returns[symbol]}")
         if benchmark_pairs:
             parts.append(f"benchmark 126-bar returns: {', '.join(benchmark_pairs)}")
 
