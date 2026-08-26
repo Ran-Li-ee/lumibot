@@ -647,6 +647,51 @@ def test_equity_news_tool_description_is_stock_candidate_scoped():
             assert forbidden not in description
 
 
+def test_equity_prompts_use_momentum_stage_profile_and_remove_old_rank_anchors():
+    helpers = importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_helpers")
+
+    prompts = [
+        helpers.equity_basket_agent_system_prompt("AAPL, MSFT, NVDA"),
+        helpers.qqq_historical_equity_basket_agent_system_prompt("AAPL, MSFT, NVDA"),
+        helpers.equity_basket_agent_task_prompt(),
+    ]
+
+    required_phrases = (
+        "momentum-stage evidence",
+        "confirmed but not exhausted",
+        "freshness",
+        "smoothness",
+        "near-high strength",
+        "volume confirmation",
+        "benchmark-relative strength",
+        "stale top-decile age",
+        "ma50 extension",
+        "atr extension",
+        "single-day jump concentration",
+        "recent overheat",
+        "intermediate momentum",
+        "reference fields",
+        "alpaca_news",
+    )
+    forbidden_phrases = (
+        "five rank groups",
+        "five evidence groups",
+        "momentum_composite",
+        "composite_score",
+        "highest raw momentum",
+        "compare the five rank groups",
+        "breakout / near-high evidence as timing and leadership confirmation",
+        "length=252",
+    )
+
+    for prompt in prompts:
+        lower_prompt = prompt.lower()
+        for required in required_phrases:
+            assert required in lower_prompt
+        for forbidden in forbidden_phrases:
+            assert forbidden not in lower_prompt
+
+
 def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_news():
     module = load_module()
     strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)
@@ -659,20 +704,21 @@ def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_ne
     for required in (
         "equity-only",
         "credible stock candidates",
+        "assigned basket_symbols",
+        "confirmed but not exhausted momentum",
         "deterministic constructor",
         "do not calculate exact per-symbol target weights",
         "market_load_history_tables_summary",
+        "evidence_profile='momentum_stage'",
+        "support votes, not automatic answers",
+        "multiple stage groups",
+        "reference fields are not simple ranking fields",
+        "higher is not always better",
         "evidence interpretation policy",
-        "momentum and trend quality as primary selection evidence",
-        "not purely volatility-driven",
-        "timing and leadership confirmation",
-        "supporting evidence, not as a standalone reason",
-        "do not average all ranking groups equally",
-        "do not select a stock solely because it leads one ranking list",
-        "do not treat any single ranking or combined score as the final answer",
+        "stage evidence is clear, select without news",
         "alpaca_news",
         "leading candidates",
-        "close, conflicting, or uncertain",
+        "close, conflicting, or catalyst-sensitive",
         "strict json",
         "do not place orders",
         "cannot place orders or size trades",
@@ -695,7 +741,14 @@ def test_equity_agent_system_prompt_is_equity_only_rank_first_and_conditional_ne
         "cyclical",
         "speculative",
         "leading group",
+        "rank-first",
+        "rank evidence",
+        "five rank groups",
+        "five evidence groups",
+        "momentum_composite",
         "composite_score",
+        "highest raw momentum",
+        "breakout / near-high evidence as timing and leadership confirmation",
         "duckdb",
         "optimize weights",
         "choose exactly five",
@@ -807,24 +860,36 @@ def test_equity_agent_task_prompt_teaches_summary_first_top_n_and_strict_json(mo
     assert equity_call["context"]["basket_symbols"] == EXPECTED_EQUITY_UNIVERSE
     assert "market_load_history_tables_summary" in task_prompt
     assert "first call" in task_prompt
-    assert "length=252" in task_prompt
+    assert "length=378" in task_prompt
     assert "timestep='day'" in task_prompt
     assert "top_n=10" in task_prompt
     assert "candidate_summary_limit=25" in task_prompt
-    assert "evidence interpretation policy" in task_prompt
+    assert "evidence_profile='momentum_stage'" in task_prompt
+    assert "benchmark_symbols=['qqq', 'spy']" in task_prompt
+    assert "momentum-stage evidence" in task_prompt
+    assert "reference fields" in task_prompt
     assert "selected_symbols must contain between 3 and 10 unique symbols" in task_prompt
     assert "deterministic constructor" in task_prompt
     assert "do not calculate exact per-symbol target weights" in task_prompt
-    assert "avoid selecting a stock supported by only one evidence group unless" in task_prompt
+    assert "multiple stage groups" in task_prompt
+    assert "not blocked by strong warning flags" in task_prompt
+    assert "avoid stale, overextended, or single-jump candidates" in task_prompt
     assert "alpaca_news" in task_prompt
-    assert "close, conflicting, or uncertain" in task_prompt
-    assert "leading candidates only" in task_prompt
+    assert "close, conflicting, overextended, stale, or catalyst-sensitive" in task_prompt
+    assert "otherwise skip news" in task_prompt
     assert "candidate_symbols must copy the assigned basket_symbols exactly" in task_prompt
     assert "return exactly one strict json object" in task_prompt
 
     for forbidden in (
         "leading group",
+        "five rank groups",
+        "five evidence groups",
+        "momentum_composite",
         "composite_score",
+        "highest raw momentum",
+        "compare the five rank groups",
+        "breakout / near-high evidence as timing and leadership confirmation",
+        "length=252",
         "defensive",
         "cyclical",
         "speculative",
@@ -1167,18 +1232,16 @@ def test_qqq_historical_equity_agent_prompt_mentions_historical_constituents_wit
         "qqq historical constituent universe",
         "provided basket_symbols",
         "current backtest date",
-        "current rank evidence",
+        "momentum-stage evidence",
+        "confirmed but not exhausted momentum",
         "do not invent sector",
         "do not add symbols",
         "index weight",
+        "evidence_profile='momentum_stage'",
         "evidence interpretation policy",
-        "momentum and trend quality as primary selection evidence",
-        "not purely volatility-driven",
-        "timing and leadership confirmation",
-        "supporting evidence, not as a standalone reason",
-        "do not average all ranking groups equally",
-        "do not select a stock solely because it leads one ranking list",
-        "do not treat any single ranking or combined score as the final answer",
+        "support votes, not automatic answers",
+        "reference fields are not simple ranking fields",
+        "stage evidence is clear, select without news",
         "alpaca_news",
         "leading candidates",
         "strict json",
@@ -1200,6 +1263,10 @@ def test_qqq_historical_equity_agent_prompt_mentions_historical_constituents_wit
         "cyclical",
         "speculative",
         "duckdb",
+        "rank evidence",
+        "five rank groups",
+        "five evidence groups",
+        "momentum_composite",
         "optimize weights",
     ):
         assert forbidden not in prompt
