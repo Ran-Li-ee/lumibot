@@ -13,6 +13,7 @@ from .asset_resolution import resolve_asset_and_quote
 from .history_summary import build_universe_history_summary, compute_history_summary
 
 _READ_ONLY_SQL_RE = re.compile(r"^\s*(select|with|show|describe|pragma|explain)\b", re.IGNORECASE)
+_HISTORY_SUMMARY_EVIDENCE_PROFILES = {"legacy", "momentum_stage"}
 
 
 class _LazyModule:
@@ -417,15 +418,24 @@ class DuckDBQueryLayer:
             duplicates = ", ".join(duplicate_keys)
             raise ValueError(f"duplicate symbols are not allowed: {duplicates}")
         profile = str(evidence_profile or "legacy").strip().lower()
+        if profile not in _HISTORY_SUMMARY_EVIDENCE_PROFILES:
+            raise ValueError(f"Unsupported evidence_profile: {evidence_profile}")
         if benchmark_symbols is not None and not isinstance(benchmark_symbols, list):
             raise ValueError("benchmark_symbols must be a list of non-empty symbol values.")
-        normalized_benchmark_symbols = list(
-            dict.fromkeys(
-                str(symbol).strip().upper()
-                for symbol in (benchmark_symbols or [])
-                if str(symbol).strip()
-            )
-        )
+        normalized_benchmark_symbols: list[str] = []
+        seen_benchmark_symbols: set[str] = set()
+        for raw_symbol in benchmark_symbols or []:
+            if not isinstance(raw_symbol, str):
+                raise ValueError("benchmark_symbols must contain non-empty symbol strings.")
+            symbol = raw_symbol.strip().upper()
+            if not symbol:
+                raise ValueError("benchmark_symbols must contain non-empty symbol strings.")
+            if "," in symbol:
+                raise ValueError("benchmark_symbols entries must be single symbols.")
+            if symbol in seen_benchmark_symbols:
+                continue
+            normalized_benchmark_symbols.append(symbol)
+            seen_benchmark_symbols.add(symbol)
         current_dt = self._current_datetime()
         as_of = current_dt.isoformat() if hasattr(current_dt, "isoformat") else None
         summaries: dict[str, dict[str, Any]] = {}

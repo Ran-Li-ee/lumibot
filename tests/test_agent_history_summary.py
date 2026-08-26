@@ -913,6 +913,109 @@ def test_build_universe_history_summary_normalizes_momentum_stage_profile_name()
     assert summary["evidence_profile"] == "momentum_stage"
 
 
+def test_duckdb_history_tables_summary_rejects_unsupported_profile_before_loading():
+    from datetime import datetime
+
+    from lumibot.components.agents.duckdb_tools import DuckDBQueryLayer
+
+    class FakeStrategy:
+        def __init__(self):
+            self.load_calls = []
+
+        def get_datetime(self):
+            return datetime(2024, 12, 31)
+
+        def get_historical_prices(self, *args, **kwargs):
+            self.load_calls.append((args, kwargs))
+            return None
+
+    strategy = FakeStrategy()
+    layer = DuckDBQueryLayer(strategy)
+
+    with pytest.raises(ValueError, match="Unsupported evidence_profile"):
+        layer.load_history_tables_summary(
+            symbols=["AAA"],
+            length=320,
+            evidence_profile="breakout_only",
+        )
+
+    assert strategy.load_calls == []
+
+
+def test_duckdb_history_tables_summary_rejects_empty_benchmark_symbol():
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from lumibot.components.agents.duckdb_tools import DuckDBQueryLayer
+
+    class FakeStrategy:
+        def get_datetime(self):
+            return datetime(2024, 12, 31)
+
+        def get_historical_prices(self, asset, **kwargs):
+            return SimpleNamespace(pandas_df=_stage_frame())
+
+    layer = DuckDBQueryLayer(FakeStrategy())
+
+    with pytest.raises(ValueError, match="benchmark_symbols"):
+        layer.load_history_tables_summary(
+            symbols=["AAA"],
+            length=320,
+            evidence_profile="momentum_stage",
+            benchmark_symbols=[""],
+        )
+
+
+def test_duckdb_history_tables_summary_momentum_stage_loads_benchmarks_separately():
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from lumibot.components.agents.duckdb_tools import DuckDBQueryLayer
+
+    class FakeStrategy:
+        def __init__(self):
+            self.frames = {
+                "AAA": _stage_frame(daily_return=0.003, down_every=8),
+                "BBB": _stage_frame(daily_return=0.002, down_every=7),
+                "QQQ": _stage_frame(daily_return=0.0015, down_every=6),
+                "SPY": _stage_frame(daily_return=0.001, down_every=5),
+            }
+
+        def get_datetime(self):
+            return datetime(2024, 12, 31)
+
+        def get_historical_prices(self, asset, **kwargs):
+            return SimpleNamespace(pandas_df=self.frames[asset.symbol].copy())
+
+    layer = DuckDBQueryLayer(FakeStrategy())
+
+    summary = layer.load_history_tables_summary(
+        symbols=["AAA", "BBB"],
+        length=320,
+        evidence_profile="momentum_stage",
+        benchmark_symbols=["QQQ", "SPY"],
+        top_n=2,
+        candidate_summary_limit=2,
+    )
+
+    assert summary["evidence_profile"] == "momentum_stage"
+    assert set(summary["benchmark_loaded_tables"]) == {"QQQ", "SPY"}
+    assert set(summary["loaded_tables"]) == {"AAA", "BBB"}
+    assert not {"QQQ", "SPY"} & set(summary["loaded_tables"])
+
+    ranked_symbols = {
+        symbol
+        for ranking in summary["rankings"].values()
+        for symbol in ranking
+    }
+    assert not {"QQQ", "SPY"} & ranked_symbols
+    assert not {"QQQ", "SPY"} & {row["symbol"] for row in summary["candidate_summary"]}
+    assert summary["benchmark_context"]["QQQ"]["available"] is True
+    assert summary["benchmark_context"]["SPY"]["available"] is True
+    assert summary["benchmark_context"]["QQQ"]["return_126"] is not None
+    assert summary["benchmark_context"]["SPY"]["return_126"] is not None
+
+
 def test_build_universe_history_summary_momentum_stage_low_jump_concentration_ranks_first_and_flags_jump():
     smooth_frame = _stage_frame(daily_return=0.002, up_volume=2_000.0, down_volume=800.0)
     jump_frame = _stage_frame(daily_return=0.002, jump_at=300, jump_return=0.50, up_volume=2_000.0, down_volume=800.0)

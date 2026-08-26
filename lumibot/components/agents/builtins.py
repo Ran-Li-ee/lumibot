@@ -12,6 +12,7 @@ from .schemas import BoundTool, ToolDefinition
 from .tool_context import append_agent_tool_context_list_item, current_agent_tool_context
 
 AssetTypeArg = Literal["stock", "option", "future", "cont_future", "forex", "crypto", "index", "multileg", "us_equity"]
+_HISTORY_SUMMARY_EVIDENCE_PROFILES = {"legacy", "momentum_stage"}
 OrderSideArg = Literal[
     "buy",
     "sell",
@@ -1244,6 +1245,8 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
         candidate_summary_limit = _require_positive_int("candidate_summary_limit", candidate_summary_limit)
         timestep = _require_non_empty_text("timestep", timestep)
         evidence_profile = _require_non_empty_text("evidence_profile", evidence_profile).lower()
+        if evidence_profile not in _HISTORY_SUMMARY_EVIDENCE_PROFILES:
+            raise ValueError(f"Unsupported evidence_profile: {evidence_profile}")
         normalized_benchmark_symbols: list[str] | None = None
         if benchmark_symbols is not None:
             if not isinstance(benchmark_symbols, list):

@@ -626,6 +626,8 @@ def test_market_load_history_tables_summary_tool_forwards_and_validates_rank_lim
         tool.function(symbols=["MSFT"], candidate_summary_limit=0)
     with pytest.raises(ValueError, match="evidence_profile"):
         tool.function(symbols=["MSFT"], evidence_profile="")
+    with pytest.raises(ValueError, match="Unsupported evidence_profile"):
+        tool.function(symbols=["MSFT"], evidence_profile="breakout_only")
     with pytest.raises(ValueError, match="benchmark_symbols"):
         tool.function(symbols=["MSFT"], benchmark_symbols="QQQ")
     with pytest.raises(ValueError, match="benchmark_symbols"):
