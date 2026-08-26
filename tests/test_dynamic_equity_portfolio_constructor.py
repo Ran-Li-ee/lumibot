@@ -50,6 +50,50 @@ def summary(rows, *, ranking_limit=10):
     }
 
 
+def stage_candidate(
+    symbol,
+    *,
+    freshness=1,
+    smoothness=1,
+    near_high=1,
+    volume_confirmation=1,
+    relative_strength=1,
+    stage_ranking_count=5,
+    warnings=None,
+    volatility_20=0.02,
+):
+    groups = {
+        "freshness": freshness,
+        "smoothness": smoothness,
+        "near_high": near_high,
+        "volume_confirmation": volume_confirmation,
+        "relative_strength": relative_strength,
+    }
+    return {
+        "symbol": symbol,
+        "stage_best_rank_by_group": groups,
+        "stage_ranking_count": stage_ranking_count,
+        "stage_best_rank": min(groups.values()),
+        "stage_warning_flags": list(warnings or []),
+        "volatility_20": volatility_20,
+    }
+
+
+def stage_summary(rows, *, ranking_limit=10):
+    return {
+        "evidence_profile": "momentum_stage",
+        "ranking_limit": ranking_limit,
+        "candidate_summary": rows,
+        "rank_groups": {
+            "freshness": ["by_rank_delta_4w"],
+            "smoothness": ["by_positive_day_ratio_3m", "by_low_max_day_return_share_3m"],
+            "near_high": ["by_near_252d_high"],
+            "volume_confirmation": ["by_up_down_volume_ratio_60d"],
+            "relative_strength": ["by_excess_return_vs_qqq_6m", "by_excess_return_vs_spy_6m"],
+        },
+    }
+
+
 def weights_by_symbol(result):
     return {
         item["symbol"]: item["target_weight"]
@@ -89,7 +133,61 @@ def test_constructor_selects_small_leading_cluster_and_preserves_cash_buffer():
     )
     assert sum(row["target_weight"] for row in result["target_portfolio"]) == pytest.approx(0.98)
     assert result["cash_buffer_weight"] == pytest.approx(0.02)
+    assert result["weighting_method"] == "evidence_score_with_volatility_adjustment"
     assert result["diagnostics"]["fallback_used"] is False
+    assert result["diagnostics"]["candidate_scores"][0]["evidence_score"] > 0.0
+
+
+def test_constructor_uses_momentum_stage_scores_and_diagnostics():
+    equity_report = {
+        "basket_id": "equity",
+        "status": "active",
+        "selected_symbols": ["AAA", "BBB", "CCC", "DDD"],
+    }
+    market_summary = stage_summary(
+        [
+            stage_candidate("AAA", freshness=1, relative_strength=1),
+            stage_candidate("BBB", freshness=2, relative_strength=2, warnings=["extreme_ma50_extension"]),
+            stage_candidate("CCC", freshness=4, relative_strength=4),
+            stage_candidate("DDD", freshness=8, relative_strength=8),
+        ]
+    )
+
+    result = construct_dynamic_equity_target_portfolio(
+        equity_report,
+        equity_universe=["AAA", "BBB", "CCC", "DDD"],
+        market_summary=market_summary,
+    )
+
+    assert result["weighting_method"] == "momentum_stage_score_with_volatility_adjustment"
+    score_rows = {row["symbol"]: row for row in result["diagnostics"]["candidate_scores"]}
+    assert score_rows["AAA"]["stage_support_score"] > score_rows["BBB"]["stage_support_score"]
+    assert score_rows["BBB"]["stage_penalty"] > 0
+    assert score_rows["BBB"]["adjusted_stage_score"] < score_rows["BBB"]["stage_support_score"]
+    assert "stage_warning_flags" in score_rows["AAA"]
+    assert score_rows["BBB"]["stage_warning_flags"] == ["extreme_ma50_extension"]
+
+
+def test_constructor_prefers_stage_fields_over_legacy_fields_when_profile_is_momentum_stage():
+    equity_report = {
+        "basket_id": "equity",
+        "status": "active",
+        "selected_symbols": ["AAA", "BBB", "CCC"],
+    }
+    row_a = stage_candidate("AAA", freshness=9, relative_strength=9)
+    row_a["best_rank_by_group"] = {"momentum": 1, "trend_quality": 1}
+    row_b = stage_candidate("BBB", freshness=1, relative_strength=1)
+    row_b["best_rank_by_group"] = {"momentum": 9, "trend_quality": 9}
+    row_c = stage_candidate("CCC", freshness=3, relative_strength=3)
+    market_summary = stage_summary([row_a, row_b, row_c])
+
+    result = construct_dynamic_equity_target_portfolio(
+        equity_report,
+        equity_universe=["AAA", "BBB", "CCC"],
+        market_summary=market_summary,
+    )
+
+    assert result["diagnostics"]["candidate_scores"][0]["symbol"] == "BBB"
 
 
 def test_constructor_selects_broader_set_when_scores_are_close():

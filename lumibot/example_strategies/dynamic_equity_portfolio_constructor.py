@@ -33,6 +33,25 @@ GROUP_WEIGHTS = {
     "volume_confirmation": 0.05,
 }
 
+STAGE_GROUP_WEIGHTS = {
+    "freshness": 0.22,
+    "smoothness": 0.20,
+    "near_high": 0.14,
+    "volume_confirmation": 0.14,
+    "relative_strength": 0.30,
+}
+
+STAGE_WARNING_PENALTIES = {
+    "stale_top_decile": 0.12,
+    "extreme_ma50_extension": 0.12,
+    "extreme_atr_extension": 0.12,
+    "recent_overheat_vs_intermediate": 0.08,
+    "single_day_jump_concentration": 0.10,
+    "benchmark_lag": 0.15,
+    "thin_or_missing_volume_support": 0.06,
+    "insufficient_history": 0.10,
+}
+
 
 def construct_dynamic_equity_target_portfolio(
     equity_report: dict[str, Any],
@@ -45,6 +64,16 @@ def construct_dynamic_equity_target_portfolio(
     selected_symbols = _selected_equity_symbols(equity_report, equity_universe, policy)
     scored_candidates = _scored_candidates(selected_symbols, equity_universe, market_summary)
     exposure = 1.0 - policy.cash_buffer_weight
+    evidence_profile = (
+        str(market_summary.get("evidence_profile") or "").strip().lower()
+        if isinstance(market_summary, dict)
+        else ""
+    )
+    weighting_method = (
+        "momentum_stage_score_with_volatility_adjustment"
+        if evidence_profile == "momentum_stage"
+        else "evidence_score_with_volatility_adjustment"
+    )
 
     fallback_used = not any(candidate["usable_score"] for candidate in scored_candidates)
     capped_symbols: list[str] = []
@@ -88,7 +117,7 @@ def construct_dynamic_equity_target_portfolio(
         "selected_count": len(target_portfolio),
         "target_portfolio": target_portfolio,
         "cash_buffer_weight": policy.cash_buffer_weight,
-        "weighting_method": "evidence_score_with_volatility_adjustment",
+        "weighting_method": weighting_method,
         "diagnostics": {
             "fallback_used": fallback_used,
             "selection_reason": selection_reason,
@@ -205,6 +234,7 @@ def _scored_candidates(
     if isinstance(market_summary, dict):
         rows = market_summary.get("candidate_summary")
         ranking_limit = _positive_number(market_summary.get("ranking_limit")) or 1.0
+        evidence_profile = str(market_summary.get("evidence_profile") or "").strip().lower()
         if isinstance(rows, list):
             for row_index, row in enumerate(rows):
                 if not isinstance(row, dict):
@@ -220,7 +250,8 @@ def _scored_candidates(
                     candidate["summary_order"] = row_index
                     candidate["selection_source"] = "llm_selected+market_summary"
                 candidate["row"] = row
-                candidate["evidence_score"] = _evidence_score(row, ranking_limit)
+                score_payload = _evidence_score_payload(row, ranking_limit, evidence_profile)
+                candidate.update(score_payload)
                 candidate["volatility_20"] = _positive_number(row.get("volatility_20"))
                 candidate["usable_score"] = candidate["evidence_score"] > 0.0
 
@@ -249,6 +280,10 @@ def _candidate(symbol: str, source: str, original_order: int, llm_order: int | N
         "volatility_penalty": 1.0,
         "adjusted_score": 0.0,
         "volatility_20": None,
+        "stage_support_score": None,
+        "stage_penalty": None,
+        "adjusted_stage_score": None,
+        "stage_warning_flags": [],
         "usable_score": False,
     }
 
@@ -260,7 +295,59 @@ def _clean_symbol(value: Any) -> str | None:
     return symbol or None
 
 
-def _evidence_score(row: dict[str, Any], ranking_limit: float) -> float:
+def _evidence_score_payload(
+    row: dict[str, Any],
+    ranking_limit: float,
+    evidence_profile: str | None,
+) -> dict[str, Any]:
+    if evidence_profile == "momentum_stage" or isinstance(row.get("stage_best_rank_by_group"), dict):
+        return _stage_evidence_score_payload(row, ranking_limit)
+
+    legacy_score = _legacy_evidence_score(row, ranking_limit)
+    return {
+        "evidence_score": legacy_score,
+        "stage_support_score": None,
+        "stage_penalty": None,
+        "adjusted_stage_score": None,
+        "stage_warning_flags": [],
+    }
+
+
+def _stage_evidence_score_payload(row: dict[str, Any], ranking_limit: float) -> dict[str, Any]:
+    best_rank_by_group = row.get("stage_best_rank_by_group")
+    if not isinstance(best_rank_by_group, dict):
+        best_rank_by_group = {}
+
+    support_score = 0.0
+    for group_name, group_weight in STAGE_GROUP_WEIGHTS.items():
+        rank = _positive_number(best_rank_by_group.get(group_name))
+        if rank is None:
+            continue
+        group_score = 1.0 - ((rank - 1.0) / max(1.0, ranking_limit - 1.0))
+        support_score += group_weight * _clamp(group_score, 0.0, 1.0)
+
+    ranking_count = _positive_number(row.get("stage_ranking_count")) or 0.0
+    support_score += min(0.10, ranking_count * 0.01)
+
+    warning_flags = _stage_warning_flags(row.get("stage_warning_flags"))
+    penalty = min(0.50, sum(STAGE_WARNING_PENALTIES.get(flag, 0.0) for flag in warning_flags))
+    adjusted_stage_score = _clamp(support_score - penalty, 0.0, 1.0)
+    return {
+        "evidence_score": adjusted_stage_score,
+        "stage_support_score": support_score,
+        "stage_penalty": penalty,
+        "adjusted_stage_score": adjusted_stage_score,
+        "stage_warning_flags": warning_flags,
+    }
+
+
+def _stage_warning_flags(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(flag) for flag in value]
+
+
+def _legacy_evidence_score(row: dict[str, Any], ranking_limit: float) -> float:
     best_rank_by_group = row.get("best_rank_by_group")
     if not isinstance(best_rank_by_group, dict):
         best_rank_by_group = {}
@@ -526,11 +613,34 @@ def _candidate_score_rows(
             "evidence_score": round(candidate["evidence_score"], 6),
             "volatility_penalty": round(candidate["volatility_penalty"], 6),
             "adjusted_score": round(candidate["adjusted_score"], 6),
+            "stage_support_score": _round_or_none(candidate.get("stage_support_score")),
+            "stage_penalty": _round_or_none(candidate.get("stage_penalty")),
+            "adjusted_stage_score": _round_or_none(candidate.get("adjusted_stage_score")),
+            "stage_warning_flags": list(candidate.get("stage_warning_flags") or []),
             "final_weight": final_weights.get(candidate["symbol"], 0.0),
             "selection_source": candidate["selection_source"],
         }
         for candidate in candidates
     ]
+
+
+def _round_or_none(value: Any) -> float | None:
+    number = _positive_or_zero_number(value)
+    if number is None:
+        return None
+    return round(number, 6)
+
+
+def _positive_or_zero_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0.0:
+        return None
+    return number
 
 
 def _score_sort_key(candidate: dict[str, Any]) -> tuple[float, int, int]:
