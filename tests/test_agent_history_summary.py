@@ -269,17 +269,22 @@ def test_history_tool_descriptions_are_summary_first():
     assert "summary-first" in single
     assert "cross-symbol comparison" in multi
     assert "default tool for multi-symbol" in multi
-    assert "five evidence groups" in multi
-    assert "momentum" in multi
-    assert "trend quality" in multi
-    assert "risk-adjusted momentum" in multi
-    assert "breakout / near-high" in multi
+    assert "evidence_profile" in multi
+    assert "legacy" in multi
+    assert "momentum_stage" in multi
+    assert "benchmark_symbols" in multi
+    assert "freshness" in multi
+    assert "smoothness" in multi
+    assert "near-high" in multi
+    assert "benchmark-relative" in multi
+    assert "reference fields" in multi
     assert "volume confirmation" in multi
+    assert "five evidence groups" not in multi
     assert "top_n" in multi
     assert "candidate_summary_limit" in multi
     assert "ranking_details" in multi
-    assert "summary-first" in multi
-    assert "duckdb only as targeted follow-up" in multi
+    assert "duckdb sql is only" in multi
+    assert "targeted follow-up" in multi
     assert "by_composite_score" not in multi
     assert "targeted follow-up" in duckdb
     assert "computed summaries or rankings are insufficient" in duckdb
