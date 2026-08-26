@@ -1983,7 +1983,16 @@ def test_builtin_market_history_and_duckdb_descriptions_include_schema_hints():
     assert "Raw rows remain queryable in DuckDB" in history_tool.description
     assert "market_load_history_tables_summary" in tool_names
     assert "cross-symbol summary" in batch_tool.description
-    assert "five evidence groups" in batch_tool.description
+    assert "evidence_profile" in batch_tool.description
+    assert "legacy" in batch_tool.description
+    assert "momentum_stage" in batch_tool.description
+    assert "benchmark_symbols" in batch_tool.description
+    assert "freshness" in batch_tool.description
+    assert "smoothness" in batch_tool.description
+    assert "near-high" in batch_tool.description
+    assert "benchmark-relative" in batch_tool.description
+    assert "reference fields" in batch_tool.description
+    assert "five evidence groups" not in batch_tool.description
     assert "top_n default 10" in batch_tool.description
     assert "candidate_summary_limit default 25" in batch_tool.description
     assert "ranking_details" in batch_tool.description
