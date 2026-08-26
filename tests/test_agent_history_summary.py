@@ -6,7 +6,11 @@ import pandas as pd
 import pytest
 
 from lumibot.components.agents.builtins import BuiltinTools
-from lumibot.components.agents.history_summary import build_universe_history_summary, compute_history_summary
+from lumibot.components.agents.history_summary import (
+    _momentum_stage_warning_flags,
+    build_universe_history_summary,
+    compute_history_summary,
+)
 from lumibot.components.agents.runtime import _prune_tool_response_for_context_window
 
 
@@ -222,6 +226,25 @@ def _stage_rankable_summary(
         },
         "risk": {"volatility_20": volatility_20},
     }
+
+
+def _stage_warning_row(**overrides) -> dict:
+    row = {
+        "rank_delta_4w": 1,
+        "top_decile_age_weeks": 1,
+        "extension_ma50_pct": 0.05,
+        "atr_extension_20d": 1.0,
+        "positive_day_ratio_3m": 0.60,
+        "max_day_return_share_3m": 0.10,
+        "distance_to_252d_high_pct": -0.02,
+        "recent_vs_intermediate_momentum": 0.0,
+        "up_down_volume_ratio_60d": 1.5,
+        "excess_return_vs_qqq_6m": 0.05,
+        "excess_return_vs_spy_6m": 0.06,
+        "volatility_20": 0.01,
+    }
+    row.update(overrides)
+    return row
 
 
 def test_history_tool_descriptions_are_summary_first():
@@ -936,6 +959,34 @@ def test_build_universe_history_summary_momentum_stage_asserts_benchmark_excess_
     row = summary["candidate_summary"][0]
     assert row["excess_return_vs_qqq_6m"] == pytest.approx(0.15)
     assert row["excess_return_vs_spy_6m"] == pytest.approx(0.20)
+
+
+def test_momentum_stage_warning_flags_are_empty_for_clean_row():
+    assert _momentum_stage_warning_flags(_stage_warning_row()) == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_flag"),
+    [
+        ({"top_decile_age_weeks": 12}, "stale_top_decile"),
+        ({"extension_ma50_pct": 0.20}, "extreme_ma50_extension"),
+        ({"atr_extension_20d": 3.0}, "extreme_atr_extension"),
+        ({"recent_vs_intermediate_momentum": 0.15}, "recent_overheat_vs_intermediate"),
+        (
+            {
+                "excess_return_vs_qqq_6m": -0.01,
+                "excess_return_vs_spy_6m": -0.02,
+            },
+            "benchmark_lag",
+        ),
+        ({"up_down_volume_ratio_60d": 0.99}, "thin_or_missing_volume_support"),
+        ({"rank_delta_4w": None}, "insufficient_history"),
+    ],
+)
+def test_momentum_stage_warning_flags_cover_threshold_and_missing_cases(overrides, expected_flag):
+    flags = _momentum_stage_warning_flags(_stage_warning_row(**overrides))
+
+    assert expected_flag in flags
 
 
 def test_build_universe_history_summary_momentum_stage_rank_delta_4w_uses_controlled_universe_ranks():
