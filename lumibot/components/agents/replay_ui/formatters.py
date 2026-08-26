@@ -403,7 +403,7 @@ def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -
             parts.append(f"benchmark 126-bar returns: {', '.join(benchmark_pairs)}")
 
     stage_warning_summaries = []
-    for row in candidate_summary[:5]:
+    for row in candidate_summary:
         row_dict = _as_dict(row)
         flags = row_dict.get("stage_warning_flags")
         if not isinstance(flags, list) or not flags:
@@ -413,7 +413,7 @@ def _market_load_history_tables_summary(args: dict[str, Any], raw_result: Any) -
             continue
         stage_warning_summaries.append(f"{symbol}: {', '.join(str(flag) for flag in flags)}")
     if stage_warning_summaries:
-        parts.append(f"stage warning flags: {' | '.join(stage_warning_summaries)}")
+        parts.append(f"stage warning flags: {' | '.join(stage_warning_summaries[:5])}")
 
     warnings = result.get("warnings")
     if isinstance(warnings, list) and warnings:

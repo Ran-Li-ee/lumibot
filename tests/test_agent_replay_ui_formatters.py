@@ -223,8 +223,12 @@ def test_market_load_history_tables_summary_formatter_shows_momentum_stage_profi
                 ],
             },
             "candidate_summary": [
-                {"symbol": "AAA", "stage_warning_flags": ["extreme_atr_extension"]},
+                {"symbol": "AAA", "stage_warning_flags": []},
                 {"symbol": "BBB", "stage_warning_flags": []},
+                {"symbol": "CCC", "stage_warning_flags": []},
+                {"symbol": "DDD", "stage_warning_flags": []},
+                {"symbol": "EEE", "stage_warning_flags": []},
+                {"symbol": "FFF", "stage_warning_flags": ["extreme_atr_extension"]},
             ],
             "benchmark_context": {
                 "QQQ": {"return_126": 0.08, "available": True},
@@ -240,7 +244,26 @@ def test_market_load_history_tables_summary_formatter_shows_momentum_stage_profi
     assert "by_rank_delta_4w: AAA=10" in explanation
     assert "relative_strength" in explanation
     assert "benchmark 126-bar returns: QQQ=0.08, SPY=0.04" in explanation
+    assert "FFF" in explanation
     assert "extreme_atr_extension" in explanation
+
+
+def test_market_load_history_tables_summary_formatter_supports_flat_benchmark_returns():
+    explanation = explain_tool_result(
+        "market_load_history_tables_summary",
+        {"symbols": ["AAA"], "evidence_profile": "momentum_stage"},
+        {
+            "evidence_profile": "momentum_stage",
+            "candidate_summary": [],
+            "benchmark_context": {
+                "symbols": ["SPY", "QQQ"],
+                "return_126": {"SPY": 0.04, "QQQ": 0.08},
+            },
+        },
+        None,
+    )
+
+    assert "benchmark 126-bar returns: SPY=0.04, QQQ=0.08" in explanation
 
 
 def test_market_load_history_tables_summary_formatter_shows_empty_candidate_summary_rows():
