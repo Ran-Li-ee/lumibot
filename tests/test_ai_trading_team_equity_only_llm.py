@@ -592,6 +592,26 @@ def test_equity_agent_tool_surface_includes_rank_price_and_news_only():
     assert tool_names(execution_agent) == ["execution_plan_execute"]
 
 
+def test_equity_history_summary_tool_defaults_to_momentum_stage_profile():
+    helpers = importlib.import_module("lumibot.example_strategies.ai_trading_team_equity_only_helpers")
+    captured = {}
+
+    class FakeDuckDB:
+        def load_history_tables_summary(self, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+    tool_definition = helpers.equity_basket_agent_tools()[0]
+    bound_tool = tool_definition.binder(SimpleNamespace(), SimpleNamespace(duckdb=FakeDuckDB()))
+
+    assert bound_tool.name == "market_load_history_tables_summary"
+    assert bound_tool.function(symbols=["MSFT", "NVDA"]) == {"ok": True}
+    assert captured["symbols"] == ["MSFT", "NVDA"]
+    assert captured["evidence_profile"] == "momentum_stage"
+    assert captured["benchmark_symbols"] == ["QQQ", "SPY"]
+    assert captured["length"] == 378
+
+
 def test_equity_news_tool_description_is_stock_candidate_scoped():
     module = load_module()
     strategy = make_strategy(module.AITradingTeamEquityOnlyLLMStrategy)

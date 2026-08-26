@@ -1230,6 +1230,8 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
         include_after_hours: bool = True,
         top_n: int = 10,
         candidate_summary_limit: int = 25,
+        evidence_profile: str = "legacy",
+        benchmark_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(symbols, list) or not symbols:
             raise ValueError("symbols must be a non-empty list.")
@@ -1241,6 +1243,15 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
         top_n = _require_positive_int("top_n", top_n)
         candidate_summary_limit = _require_positive_int("candidate_summary_limit", candidate_summary_limit)
         timestep = _require_non_empty_text("timestep", timestep)
+        evidence_profile = _require_non_empty_text("evidence_profile", evidence_profile).lower()
+        normalized_benchmark_symbols: list[str] | None = None
+        if benchmark_symbols is not None:
+            if not isinstance(benchmark_symbols, list):
+                raise ValueError("benchmark_symbols must be a list of non-empty single-symbol strings.")
+            normalized_benchmark_symbols = [
+                _require_single_symbol_text("benchmark_symbols", symbol).upper()
+                for symbol in benchmark_symbols
+            ]
         return manager.duckdb.load_history_tables_summary(
             symbols=symbols,
             length=length,
@@ -1250,6 +1261,8 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
             include_after_hours=include_after_hours,
             top_n=top_n,
             candidate_summary_limit=candidate_summary_limit,
+            evidence_profile=evidence_profile,
+            benchmark_symbols=normalized_benchmark_symbols,
         )
 
     return BoundTool(
@@ -1257,18 +1270,21 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
         description=(
             "Load visible historical bars for multiple symbols into DuckDB and return a cross-symbol summary. "
             "Arguments: symbols, optional length, timestep, asset_type, table_prefix, include_after_hours, "
-            "top_n default 10, and candidate_summary_limit default 25. "
+            "top_n default 10, candidate_summary_limit default 25, optional evidence_profile "
+            "('legacy' or 'momentum_stage'), and optional benchmark_symbols. "
             "This is the default tool for multi-symbol price-history comparison and universe ranking. "
             "Use it before per-symbol raw history tables for common cross-symbol comparison and ranking tasks. "
-            "This summary-first tool returns five evidence groups: momentum, trend quality, risk-adjusted "
-            "momentum, breakout / near-high, and volume confirmation. Each ranking list is capped by top_n "
-            "and includes ranking values in ranking_details. candidate_summary contains a compact top-ranked "
-            "candidate subset capped by candidate_summary_limit. Prefer this tool before writing DuckDB SQL "
-            "for ordinary universe ranking; use DuckDB only as targeted follow-up when the computed summaries "
-            "are insufficient. "
+            "The legacy profile returns standard cross-symbol rank groups. The momentum_stage profile returns "
+            "stage rankings for freshness, smoothness, near-high strength, volume confirmation, and "
+            "benchmark-relative strength, plus reference fields for stale or overextended candidates. "
+            "Each ranking list is capped by top_n and includes ranking values in ranking_details. "
+            "candidate_summary contains a compact top-ranked candidate subset capped by candidate_summary_limit. "
+            "Prefer this tool before writing DuckDB SQL for ordinary universe ranking; DuckDB SQL is only "
+            "targeted follow-up when this summary is missing or contradictory. "
             "Caveat: this only loads bars visible at the current LumiBot runtime datetime. "
             "Example: market_load_history_tables_summary("
-            "symbols=['MSFT', 'AAPL'], length=252, timestep='day', top_n=10, candidate_summary_limit=25)."
+            "symbols=['MSFT', 'AAPL'], length=252, timestep='day', top_n=10, candidate_summary_limit=25, "
+            "evidence_profile='momentum_stage', benchmark_symbols=['QQQ', 'SPY'])."
         ),
         function=load_history_tables_summary,
         metadata={"kind": "builtin", "replay_on_cache": True},

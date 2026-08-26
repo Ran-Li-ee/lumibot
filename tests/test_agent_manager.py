@@ -591,6 +591,10 @@ def test_market_load_history_tables_summary_tool_accepts_rank_limits():
     assert signature.parameters["top_n"].default == 10
     assert "candidate_summary_limit" in signature.parameters
     assert signature.parameters["candidate_summary_limit"].default == 25
+    assert "evidence_profile" in signature.parameters
+    assert signature.parameters["evidence_profile"].default == "legacy"
+    assert "benchmark_symbols" in signature.parameters
+    assert signature.parameters["benchmark_symbols"].default is None
 
 
 def test_market_load_history_tables_summary_tool_forwards_and_validates_rank_limits():
@@ -604,14 +608,28 @@ def test_market_load_history_tables_summary_tool_forwards_and_validates_rank_lim
     manager = SimpleNamespace(duckdb=FakeDuckDB())
     tool = BuiltinTools.market.load_history_tables_summary().binder(DummyStrategy(), manager)
 
-    assert tool.function(symbols=["MSFT"], top_n=7, candidate_summary_limit=11) == {"ok": True}
+    assert tool.function(
+        symbols=["MSFT"],
+        top_n=7,
+        candidate_summary_limit=11,
+        evidence_profile="Momentum_Stage",
+        benchmark_symbols=[" qqq ", "spy"],
+    ) == {"ok": True}
     assert captured["top_n"] == 7
     assert captured["candidate_summary_limit"] == 11
+    assert captured["evidence_profile"] == "momentum_stage"
+    assert captured["benchmark_symbols"] == ["QQQ", "SPY"]
 
     with pytest.raises(ValueError, match="top_n"):
         tool.function(symbols=["MSFT"], top_n=0)
     with pytest.raises(ValueError, match="candidate_summary_limit"):
         tool.function(symbols=["MSFT"], candidate_summary_limit=0)
+    with pytest.raises(ValueError, match="evidence_profile"):
+        tool.function(symbols=["MSFT"], evidence_profile="")
+    with pytest.raises(ValueError, match="benchmark_symbols"):
+        tool.function(symbols=["MSFT"], benchmark_symbols="QQQ")
+    with pytest.raises(ValueError, match="benchmark_symbols"):
+        tool.function(symbols=["MSFT"], benchmark_symbols=[""])
 
 
 def test_execution_agent_with_order_tools_does_not_receive_history_policy():

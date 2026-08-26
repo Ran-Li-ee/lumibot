@@ -81,6 +81,15 @@ EQUITY_ALPACA_NEWS_DESCRIPTION = (
     "article."
 )
 
+EQUITY_HISTORY_SUMMARY_DESCRIPTION = (
+    "Load visible daily equity history for assigned basket_symbols into DuckDB and return an equity-only "
+    "momentum-stage cross-symbol summary. This wrapper defaults to evidence_profile='momentum_stage', "
+    "benchmark_symbols=['QQQ','SPY'], and length=378. It ranks candidates by freshness, smoothness, "
+    "near-high strength, volume confirmation, and benchmark-relative strength, with reference fields for "
+    "stale or overextended candidates. Use it first for equity basket selection; use DuckDB SQL only as "
+    "targeted follow-up when the summary is missing or contradictory."
+)
+
 ALLOWED_INTENTS = {"hold", "rebalance", "risk_exit"}
 ALLOWED_ACTIONS = {"submit_order"}
 ALLOWED_SIDES = {"buy", "sell"}
@@ -123,10 +132,64 @@ def iso_week_key(value: date_type) -> str:
 
 def equity_basket_agent_tools() -> list[ToolDefinition]:
     return [
-        BuiltinTools.market.load_history_tables_summary(),
+        equity_history_summary_tool(),
         BuiltinTools.market.last_price(),
         equity_alpaca_news_tool(),
     ]
+
+
+def equity_history_summary_tool() -> ToolDefinition:
+    base_tool = BuiltinTools.market.load_history_tables_summary()
+
+    def _bind_equity_history_summary(strategy: Any, manager: Any) -> BoundTool:
+        bound = base_tool.binder(strategy, manager)
+
+        def load_history_tables_summary(
+            *,
+            symbols: list[str],
+            length: int = 378,
+            timestep: str = "day",
+            asset_type: str = "stock",
+            table_prefix: str | None = None,
+            include_after_hours: bool = True,
+            top_n: int = 10,
+            candidate_summary_limit: int = 25,
+            evidence_profile: str = "momentum_stage",
+            benchmark_symbols: list[str] | None = None,
+        ) -> dict[str, Any]:
+            if benchmark_symbols is None:
+                benchmark_symbols = ["QQQ", "SPY"]
+            return bound.function(
+                symbols=symbols,
+                length=length,
+                timestep=timestep,
+                asset_type=asset_type,
+                table_prefix=table_prefix,
+                include_after_hours=include_after_hours,
+                top_n=top_n,
+                candidate_summary_limit=candidate_summary_limit,
+                evidence_profile=evidence_profile,
+                benchmark_symbols=benchmark_symbols,
+            )
+
+        metadata = dict(bound.metadata or {})
+        metadata["scope"] = "equity_only"
+        return BoundTool(
+            name=bound.name,
+            description=EQUITY_HISTORY_SUMMARY_DESCRIPTION,
+            function=load_history_tables_summary,
+            source=bound.source,
+            metadata=metadata,
+        )
+
+    metadata = dict(base_tool.metadata or {})
+    metadata["scope"] = "equity_only"
+    return ToolDefinition(
+        name=base_tool.name,
+        description=EQUITY_HISTORY_SUMMARY_DESCRIPTION,
+        binder=_bind_equity_history_summary,
+        metadata=metadata,
+    )
 
 
 def equity_alpaca_news_tool() -> ToolDefinition:

@@ -403,6 +403,8 @@ class DuckDBQueryLayer:
         include_after_hours: bool = True,
         top_n: int = 10,
         candidate_summary_limit: int = 25,
+        evidence_profile: str = "legacy",
+        benchmark_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(symbols, list) or not symbols:
             raise ValueError("symbols must be a non-empty list.")
@@ -414,10 +416,23 @@ class DuckDBQueryLayer:
         if duplicate_keys:
             duplicates = ", ".join(duplicate_keys)
             raise ValueError(f"duplicate symbols are not allowed: {duplicates}")
+        profile = str(evidence_profile or "legacy").strip().lower()
+        if benchmark_symbols is not None and not isinstance(benchmark_symbols, list):
+            raise ValueError("benchmark_symbols must be a list of non-empty symbol values.")
+        normalized_benchmark_symbols = list(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in (benchmark_symbols or [])
+                if str(symbol).strip()
+            )
+        )
         current_dt = self._current_datetime()
         as_of = current_dt.isoformat() if hasattr(current_dt, "isoformat") else None
         summaries: dict[str, dict[str, Any]] = {}
-        loaded_tables: dict[str, dict[str, Any]] = {}
+        loaded_tables: dict[str, str] = {}
+        frames_by_symbol: dict[str, pd.DataFrame] = {}
+        benchmark_summaries: dict[str, dict[str, Any]] = {}
+        benchmark_loaded_tables: dict[str, str] = {}
         warnings: list[str] = []
 
         prefix = self._slugify(table_prefix) if table_prefix else None
@@ -449,10 +464,37 @@ class DuckDBQueryLayer:
             else:
                 summaries[symbol] = summary
             loaded_tables[symbol] = str(table_info.get("table_name") or "")
+            if profile == "momentum_stage":
+                table_name_value = str(table_info.get("table_name") or "")
+                if table_name_value:
+                    frames_by_symbol[symbol] = self._read_registered_table(table_name_value)
 
         if not loaded_tables:
             warning_text = "; ".join(warnings) if warnings else "no successful symbol loads"
             raise ValueError(f"no history tables could be loaded for symbols {normalized_symbols}: {warning_text}")
+
+        if profile == "momentum_stage":
+            for symbol in normalized_benchmark_symbols:
+                try:
+                    table_info = self.load_history_table(
+                        symbol=symbol,
+                        length=length,
+                        timestep=timestep,
+                        asset_type=asset_type,
+                        include_after_hours=include_after_hours,
+                    )
+                except Exception as exc:
+                    warnings.append(f"{symbol}: failed to load benchmark history table: {exc}")
+                    continue
+
+                summary = table_info.get("computed_summary")
+                if not isinstance(summary, dict):
+                    warnings.append(f"{symbol}: loaded benchmark history table did not include computed_summary.")
+                else:
+                    benchmark_summaries[symbol] = summary
+                table_name_value = str(table_info.get("table_name") or "")
+                if table_name_value:
+                    benchmark_loaded_tables[symbol] = table_name_value
 
         result = build_universe_history_summary(
             summaries,
@@ -464,7 +506,12 @@ class DuckDBQueryLayer:
             warnings=warnings,
             top_n=top_n,
             candidate_summary_limit=candidate_summary_limit,
+            evidence_profile=profile,
+            history_frames=frames_by_symbol,
+            benchmark_summaries=benchmark_summaries,
         )
+        if benchmark_loaded_tables:
+            result["benchmark_loaded_tables"] = benchmark_loaded_tables
         return result
 
     def query(self, *, sql: str, limit: int = 200) -> dict[str, Any]:
