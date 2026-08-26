@@ -9,6 +9,8 @@ import pandas as pd
 SCHEMA_VERSION = "1.0"
 DEFAULT_RANKING_LIMIT = 10
 DEFAULT_CANDIDATE_SUMMARY_LIMIT = 25
+LEGACY_EVIDENCE_PROFILE = "legacy"
+MOMENTUM_STAGE_EVIDENCE_PROFILE = "momentum_stage"
 
 RANK_GROUPS = {
     "momentum": [
@@ -79,6 +81,65 @@ CANDIDATE_PRIORITY_RANKINGS = [
     "by_adjusted_slope_90",
     "by_return_252_over_volatility_63",
     "by_composite_score",
+]
+
+MOMENTUM_STAGE_RANK_GROUPS = {
+    "freshness": ["by_rank_delta_4w"],
+    "smoothness": ["by_positive_day_ratio_3m", "by_low_max_day_return_share_3m"],
+    "near_high": ["by_near_252d_high"],
+    "volume_confirmation": ["by_up_down_volume_ratio_60d"],
+    "relative_strength": ["by_excess_return_vs_qqq_6m", "by_excess_return_vs_spy_6m"],
+}
+
+MOMENTUM_STAGE_RANKING_METRICS = {
+    "by_rank_delta_4w": "rank_delta_4w",
+    "by_positive_day_ratio_3m": "positive_day_ratio_3m",
+    "by_low_max_day_return_share_3m": "max_day_return_share_3m",
+    "by_near_252d_high": "distance_to_252d_high_pct",
+    "by_up_down_volume_ratio_60d": "up_down_volume_ratio_60d",
+    "by_excess_return_vs_qqq_6m": "excess_return_vs_qqq_6m",
+    "by_excess_return_vs_spy_6m": "excess_return_vs_spy_6m",
+}
+
+MOMENTUM_STAGE_RANKING_DIRECTIONS = {
+    "by_low_max_day_return_share_3m": "asc",
+}
+
+MOMENTUM_STAGE_REFERENCE_FIELDS = [
+    "top_decile_age_weeks",
+    "extension_ma50_pct",
+    "atr_extension_20d",
+    "recent_vs_intermediate_momentum",
+]
+
+MOMENTUM_STAGE_WARNING_THRESHOLDS = {
+    "stale_top_decile": 12,
+    "extreme_ma50_extension": 0.20,
+    "extreme_atr_extension": 3.0,
+    "recent_overheat_vs_intermediate": 0.15,
+    "single_day_jump_concentration": 0.35,
+    "thin_or_missing_volume_support": 1.0,
+}
+
+MOMENTUM_STAGE_CANDIDATE_PRIORITY_RANKINGS = [
+    "by_rank_delta_4w",
+    "by_excess_return_vs_qqq_6m",
+    "by_excess_return_vs_spy_6m",
+    "by_positive_day_ratio_3m",
+]
+
+MOMENTUM_STAGE_ROW_FIELDS = [
+    "rank_delta_4w",
+    "top_decile_age_weeks",
+    "extension_ma50_pct",
+    "atr_extension_20d",
+    "positive_day_ratio_3m",
+    "max_day_return_share_3m",
+    "distance_to_252d_high_pct",
+    "recent_vs_intermediate_momentum",
+    "up_down_volume_ratio_60d",
+    "excess_return_vs_qqq_6m",
+    "excess_return_vs_spy_6m",
 ]
 
 
@@ -217,6 +278,24 @@ def compute_history_summary(
     if volatility_20 is not None and timestep != "day":
         notes.append("volatility_20 is calculated from the last 20 bars and is not annualized as daily volatility.")
 
+    atr_20 = _atr(high, low, close, 20)
+    atr_extension_20d = None
+    if latest_close is not None and trend["sma_20"] is not None:
+        atr_extension_20d = _ratio(latest_close - trend["sma_20"], atr_20)
+    momentum_stage = {
+        "extension_ma50_pct": _relative_to(latest_close, trend["sma_50"]),
+        "atr_extension_20d": atr_extension_20d,
+        "positive_day_ratio_3m": _positive_day_ratio(close, 63),
+        "max_day_return_share_3m": _max_positive_return_share(close, 63),
+        "distance_to_252d_high_pct": _relative_to(latest_close, high_252),
+        "recent_vs_intermediate_momentum": _finite_float(
+            momentum["return_21"] - momentum["return_252_ex_skip_21"]
+        )
+        if momentum["return_21"] is not None and momentum["return_252_ex_skip_21"] is not None
+        else None,
+        "up_down_volume_ratio_60d": _up_down_volume_ratio(close, volume, 60),
+    }
+
     availability = {
         "latest_close": latest_close is not None,
         "return_5": momentum["return_5"] is not None,
@@ -262,6 +341,13 @@ def compute_history_summary(
         "max_drawdown_126": max_drawdown_126 is not None,
         "volatility_20": volatility_20 is not None,
         "volatility_63": volatility_63 is not None,
+        "extension_ma50_pct": momentum_stage["extension_ma50_pct"] is not None,
+        "atr_extension_20d": momentum_stage["atr_extension_20d"] is not None,
+        "positive_day_ratio_3m": momentum_stage["positive_day_ratio_3m"] is not None,
+        "max_day_return_share_3m": momentum_stage["max_day_return_share_3m"] is not None,
+        "distance_to_252d_high_pct": momentum_stage["distance_to_252d_high_pct"] is not None,
+        "recent_vs_intermediate_momentum": momentum_stage["recent_vs_intermediate_momentum"] is not None,
+        "up_down_volume_ratio_60d": momentum_stage["up_down_volume_ratio_60d"] is not None,
     }
 
     return {
@@ -277,6 +363,7 @@ def compute_history_summary(
         "volume": volume_summary,
         "trend": trend,
         "scores": scores,
+        "momentum_stage": momentum_stage,
         "range": {
             "high_252": high_252,
             "low_252": low_252,
@@ -312,8 +399,28 @@ def build_universe_history_summary(
     warnings: list[str] | None,
     top_n: int = DEFAULT_RANKING_LIMIT,
     candidate_summary_limit: int = DEFAULT_CANDIDATE_SUMMARY_LIMIT,
+    evidence_profile: str = LEGACY_EVIDENCE_PROFILE,
+    history_frames: dict[str, pd.DataFrame] | None = None,
+    benchmark_summaries: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return a compact, model-facing batch summary for a symbol universe."""
+    if evidence_profile == MOMENTUM_STAGE_EVIDENCE_PROFILE:
+        return _build_momentum_stage_universe_history_summary(
+            history_summaries,
+            symbols=symbols,
+            timestep=timestep,
+            length=length,
+            as_of=as_of,
+            loaded_tables=loaded_tables,
+            warnings=warnings,
+            top_n=top_n,
+            candidate_summary_limit=candidate_summary_limit,
+            history_frames=history_frames,
+            benchmark_summaries=benchmark_summaries,
+        )
+    if evidence_profile != LEGACY_EVIDENCE_PROFILE:
+        raise ValueError(f"Unsupported evidence_profile: {evidence_profile}")
+
     top_n = max(1, int(top_n))
     candidate_summary_limit = max(1, int(candidate_summary_limit))
     all_universe_rows = [
@@ -358,6 +465,7 @@ def build_universe_history_summary(
         "rankings": rankings,
         "ranking_details": ranking_details,
         "candidate_summary": candidate_summary,
+        "evidence_profile": LEGACY_EVIDENCE_PROFILE,
         "symbols": symbols,
         "timestep": timestep,
         "length": length,
@@ -372,6 +480,245 @@ def build_universe_history_summary(
         "universe_summary": candidate_summary,
         "loaded_tables": loaded_tables or {},
         "warnings": warnings or [],
+    }
+
+
+def _build_momentum_stage_universe_history_summary(
+    history_summaries: dict[str, dict[str, Any]],
+    *,
+    symbols: list[str],
+    timestep: str | None,
+    length: int | None,
+    as_of: str | None,
+    loaded_tables: dict[str, Any] | None,
+    warnings: list[str] | None,
+    top_n: int,
+    candidate_summary_limit: int,
+    history_frames: dict[str, pd.DataFrame] | None,
+    benchmark_summaries: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    top_n = max(1, int(top_n))
+    candidate_summary_limit = max(1, int(candidate_summary_limit))
+    requested_symbols = [symbol for symbol in symbols if symbol in history_summaries]
+    benchmark_summaries = benchmark_summaries or {}
+    benchmark_context = _benchmark_context(history_summaries, benchmark_summaries)
+    rank_delta_by_symbol = _rank_delta_4w_by_symbol(history_frames or {}, requested_symbols)
+    top_decile_age_by_symbol = _top_decile_age_weeks_by_symbol(history_frames or {}, requested_symbols)
+    qqq_return_126 = benchmark_context["QQQ"]["return_126"]
+    spy_return_126 = benchmark_context["SPY"]["return_126"]
+
+    all_universe_rows = []
+    for symbol in requested_symbols:
+        row = _summary_to_momentum_stage_universe_row(
+            history_summaries[symbol],
+            qqq_return_126=qqq_return_126,
+            spy_return_126=spy_return_126,
+            rank_delta_4w=rank_delta_by_symbol.get(symbol),
+            top_decile_age_weeks=top_decile_age_by_symbol.get(symbol),
+        )
+        all_universe_rows.append(row)
+
+    full_rankings = _rankings(
+        all_universe_rows,
+        MOMENTUM_STAGE_RANKING_METRICS,
+        MOMENTUM_STAGE_RANKING_DIRECTIONS,
+    )
+    rankings = _limit_rankings(full_rankings, top_n)
+    ranking_details = _ranking_details(all_universe_rows, rankings, MOMENTUM_STAGE_RANKING_METRICS)
+    selected_symbols = _select_momentum_stage_candidate_summary_symbols(
+        rankings,
+        limit=candidate_summary_limit,
+    )
+    if not selected_symbols:
+        selected_symbols = [
+            str(row["symbol"])
+            for row in all_universe_rows
+            if row.get("symbol")
+        ][:candidate_summary_limit]
+    rows_by_symbol = {
+        str(row["symbol"]): row
+        for row in all_universe_rows
+        if row.get("symbol")
+    }
+    candidate_summary = [
+        _momentum_stage_candidate_summary_row(symbol, rows_by_symbol[symbol], ranking_details)
+        for symbol in selected_symbols
+        if symbol in rows_by_symbol
+    ]
+    coverage = {
+        "requested_count": len(symbols),
+        "loaded_count": len(all_universe_rows),
+        "failed_count": max(0, len(symbols) - len(all_universe_rows)),
+        "top_n": top_n,
+        "candidate_summary_limit": candidate_summary_limit,
+        "ranking_count": len(rankings),
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "evidence_profile": MOMENTUM_STAGE_EVIDENCE_PROFILE,
+        "coverage": coverage,
+        "rank_groups": MOMENTUM_STAGE_RANK_GROUPS,
+        "ranking_limit": top_n,
+        "candidate_summary_limit": candidate_summary_limit,
+        "rankings": rankings,
+        "ranking_details": ranking_details,
+        "candidate_summary": candidate_summary,
+        "benchmark_context": benchmark_context,
+        "symbols": symbols,
+        "timestep": timestep,
+        "length": length,
+        "as_of": as_of,
+        "universe_summary_limit": candidate_summary_limit,
+        "universe_summary_selection": {
+            "mode": "top_rank_union",
+            "candidate_count_before_limit": len(_unique_ranked_symbols_for_priority(
+                rankings,
+                MOMENTUM_STAGE_CANDIDATE_PRIORITY_RANKINGS,
+            )),
+            "included_symbols": selected_symbols,
+            "priority": MOMENTUM_STAGE_CANDIDATE_PRIORITY_RANKINGS + ["multi_ranking_overlap"],
+        },
+        "universe_summary": candidate_summary,
+        "loaded_tables": loaded_tables or {},
+        "warnings": warnings or [],
+    }
+
+
+def _benchmark_context(
+    history_summaries: dict[str, dict[str, Any]],
+    benchmark_summaries: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    context: dict[str, dict[str, Any]] = {}
+    for symbol in ("QQQ", "SPY"):
+        summary = benchmark_summaries.get(symbol) or history_summaries.get(symbol) or {}
+        return_126 = _compact_number(_dict(summary.get("momentum")).get("return_126"))
+        context[symbol] = {
+            "return_126": return_126,
+            "available": return_126 is not None,
+        }
+    return context
+
+
+def _summary_to_momentum_stage_universe_row(
+    summary: dict[str, Any],
+    *,
+    qqq_return_126: Any,
+    spy_return_126: Any,
+    rank_delta_4w: int | None,
+    top_decile_age_weeks: int | None,
+) -> dict[str, Any]:
+    price = _dict(summary.get("price"))
+    momentum = _dict(summary.get("momentum"))
+    momentum_stage = _dict(summary.get("momentum_stage"))
+    risk = _dict(summary.get("risk"))
+    return_126 = _finite_float(momentum.get("return_126"))
+    excess_return_vs_qqq_6m = _return_difference(return_126, qqq_return_126)
+    excess_return_vs_spy_6m = _return_difference(return_126, spy_return_126)
+    row = {
+        "symbol": summary.get("symbol"),
+        "latest_close": _compact_number(price.get("latest_close")),
+        "rank_delta_4w": _compact_number(rank_delta_4w),
+        "top_decile_age_weeks": _compact_number(top_decile_age_weeks),
+        "extension_ma50_pct": _compact_number(momentum_stage.get("extension_ma50_pct")),
+        "atr_extension_20d": _compact_number(momentum_stage.get("atr_extension_20d")),
+        "positive_day_ratio_3m": _compact_number(momentum_stage.get("positive_day_ratio_3m")),
+        "max_day_return_share_3m": _compact_number(momentum_stage.get("max_day_return_share_3m")),
+        "distance_to_252d_high_pct": _compact_number(momentum_stage.get("distance_to_252d_high_pct")),
+        "recent_vs_intermediate_momentum": _compact_number(
+            momentum_stage.get("recent_vs_intermediate_momentum")
+        ),
+        "up_down_volume_ratio_60d": _compact_number(momentum_stage.get("up_down_volume_ratio_60d")),
+        "excess_return_vs_qqq_6m": _compact_number(excess_return_vs_qqq_6m),
+        "excess_return_vs_spy_6m": _compact_number(excess_return_vs_spy_6m),
+        "volatility_20": _compact_number(risk.get("volatility_20")),
+    }
+    row["stage_warning_flags"] = _momentum_stage_warning_flags(row)
+    return row
+
+
+def _return_difference(left: Any, right: Any) -> float | None:
+    left = _finite_float(left)
+    right = _finite_float(right)
+    if left is None or right is None:
+        return None
+    return _finite_float(left - right)
+
+
+def _momentum_stage_warning_flags(row: dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+    if any(row.get(metric) is None for metric in MOMENTUM_STAGE_ROW_FIELDS):
+        flags.append("insufficient_history")
+    if _threshold_gte(row.get("top_decile_age_weeks"), "stale_top_decile"):
+        flags.append("stale_top_decile")
+    if _threshold_gte(row.get("extension_ma50_pct"), "extreme_ma50_extension"):
+        flags.append("extreme_ma50_extension")
+    if _threshold_gte(row.get("atr_extension_20d"), "extreme_atr_extension"):
+        flags.append("extreme_atr_extension")
+    if _threshold_gte(row.get("recent_vs_intermediate_momentum"), "recent_overheat_vs_intermediate"):
+        flags.append("recent_overheat_vs_intermediate")
+    if _threshold_gte(row.get("max_day_return_share_3m"), "single_day_jump_concentration"):
+        flags.append("single_day_jump_concentration")
+    qqq_excess = _finite_float(row.get("excess_return_vs_qqq_6m"))
+    spy_excess = _finite_float(row.get("excess_return_vs_spy_6m"))
+    if qqq_excess is not None and spy_excess is not None and qqq_excess < 0 and spy_excess < 0:
+        flags.append("benchmark_lag")
+    up_down_volume_ratio = _finite_float(row.get("up_down_volume_ratio_60d"))
+    if up_down_volume_ratio is None or up_down_volume_ratio < MOMENTUM_STAGE_WARNING_THRESHOLDS[
+        "thin_or_missing_volume_support"
+    ]:
+        flags.append("thin_or_missing_volume_support")
+    return flags
+
+
+def _threshold_gte(value: Any, threshold_name: str) -> bool:
+    numeric = _finite_float(value)
+    return numeric is not None and numeric >= MOMENTUM_STAGE_WARNING_THRESHOLDS[threshold_name]
+
+
+def _momentum_stage_candidate_summary_row(
+    symbol: str,
+    row: dict[str, Any],
+    ranking_details: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    best_rank_by_group: dict[str, int] = {}
+    ranking_count = 0
+    best_rank: int | None = None
+
+    for group_name, ranking_names in MOMENTUM_STAGE_RANK_GROUPS.items():
+        group_best_rank: int | None = None
+        for ranking_name in ranking_names:
+            for entry in ranking_details.get(ranking_name, []):
+                if entry.get("symbol") != symbol:
+                    continue
+                rank = entry.get("rank")
+                if not isinstance(rank, int):
+                    continue
+                ranking_count += 1
+                best_rank = rank if best_rank is None else min(best_rank, rank)
+                group_best_rank = rank if group_best_rank is None else min(group_best_rank, rank)
+        if group_best_rank is not None:
+            best_rank_by_group[group_name] = group_best_rank
+
+    return {
+        "symbol": symbol,
+        "latest_close": _compact_number(row.get("latest_close")),
+        "stage_evidence_groups": list(best_rank_by_group),
+        "stage_ranking_count": ranking_count,
+        "stage_best_rank": best_rank,
+        "stage_best_rank_by_group": best_rank_by_group,
+        "rank_delta_4w": _compact_number(row.get("rank_delta_4w")),
+        "top_decile_age_weeks": _compact_number(row.get("top_decile_age_weeks")),
+        "extension_ma50_pct": _compact_number(row.get("extension_ma50_pct")),
+        "atr_extension_20d": _compact_number(row.get("atr_extension_20d")),
+        "positive_day_ratio_3m": _compact_number(row.get("positive_day_ratio_3m")),
+        "max_day_return_share_3m": _compact_number(row.get("max_day_return_share_3m")),
+        "distance_to_252d_high_pct": _compact_number(row.get("distance_to_252d_high_pct")),
+        "recent_vs_intermediate_momentum": _compact_number(row.get("recent_vs_intermediate_momentum")),
+        "up_down_volume_ratio_60d": _compact_number(row.get("up_down_volume_ratio_60d")),
+        "excess_return_vs_qqq_6m": _compact_number(row.get("excess_return_vs_qqq_6m")),
+        "excess_return_vs_spy_6m": _compact_number(row.get("excess_return_vs_spy_6m")),
+        "stage_warning_flags": list(row.get("stage_warning_flags") or []),
+        "volatility_20": _compact_number(row.get("volatility_20")),
     }
 
 
@@ -417,10 +764,19 @@ def _summary_to_universe_row(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _rankings(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+def _rankings(
+    rows: list[dict[str, Any]],
+    ranking_metrics: dict[str, str] = RANKING_METRICS,
+    ranking_directions: dict[str, str] | None = None,
+) -> dict[str, list[str]]:
+    ranking_directions = ranking_directions or {}
     return {
-        ranking_name: _rank_symbols(rows, metric_name)
-        for ranking_name, metric_name in RANKING_METRICS.items()
+        ranking_name: _rank_symbols(
+            rows,
+            metric_name,
+            direction=ranking_directions.get(ranking_name, "desc"),
+        )
+        for ranking_name, metric_name in ranking_metrics.items()
     }
 
 
@@ -434,6 +790,7 @@ def _limit_rankings(rankings: dict[str, list[str]], limit: int) -> dict[str, lis
 def _ranking_details(
     rows: list[dict[str, Any]],
     rankings: dict[str, list[str]],
+    ranking_metrics: dict[str, str] = RANKING_METRICS,
 ) -> dict[str, list[dict[str, Any]]]:
     rows_by_symbol = {
         str(row["symbol"]): row
@@ -442,7 +799,7 @@ def _ranking_details(
     }
     details: dict[str, list[dict[str, Any]]] = {}
     for ranking_name, symbols in rankings.items():
-        metric_name = RANKING_METRICS[ranking_name]
+        metric_name = ranking_metrics[ranking_name]
         entries = []
         for index, symbol in enumerate(symbols, start=1):
             row = rows_by_symbol.get(symbol)
@@ -535,6 +892,49 @@ def _select_candidate_summary_symbols(rankings: dict[str, list[str]], *, limit: 
     return ordered[:limit]
 
 
+def _select_momentum_stage_candidate_summary_symbols(rankings: dict[str, list[str]], *, limit: int) -> list[str]:
+    candidates = _unique_ranked_symbols_for_priority(rankings, MOMENTUM_STAGE_CANDIDATE_PRIORITY_RANKINGS)
+    if len(candidates) <= limit:
+        return candidates
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for ranking_name in MOMENTUM_STAGE_CANDIDATE_PRIORITY_RANKINGS:
+        for symbol in rankings.get(ranking_name, []):
+            if symbol in seen:
+                continue
+            selected.append(symbol)
+            seen.add(symbol)
+            if len(selected) >= limit:
+                return selected
+
+    appearance_counts: dict[str, int] = {}
+    best_rank: dict[str, int] = {}
+    first_seen_order: dict[str, int] = {}
+    official_rankings = {
+        ranking_name
+        for ranking_names in MOMENTUM_STAGE_RANK_GROUPS.values()
+        for ranking_name in ranking_names
+    }
+    for ranking_name, ranking in rankings.items():
+        for index, symbol in enumerate(ranking):
+            first_seen_order.setdefault(symbol, len(first_seen_order))
+            if ranking_name in official_rankings:
+                appearance_counts[symbol] = appearance_counts.get(symbol, 0) + 1
+            best_rank[symbol] = min(best_rank.get(symbol, index), index)
+
+    remaining = [symbol for symbol in candidates if symbol not in seen]
+    remaining.sort(
+        key=lambda symbol: (
+            -appearance_counts.get(symbol, 0),
+            best_rank.get(symbol, len(candidates)),
+            first_seen_order.get(symbol, len(candidates)),
+            symbol,
+        )
+    )
+    return (selected + remaining)[:limit]
+
+
 def _unique_ranked_symbols(rankings: dict[str, list[str]]) -> list[str]:
     symbols: list[str] = []
     seen: set[str] = set()
@@ -551,12 +951,114 @@ def _unique_ranked_symbols(rankings: dict[str, list[str]]) -> list[str]:
     return symbols
 
 
-def _rank_symbols(rows: list[dict[str, Any]], key: str) -> list[str]:
+def _unique_ranked_symbols_for_priority(rankings: dict[str, list[str]], priority_rankings: list[str]) -> list[str]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for ranking_name in priority_rankings:
+        for symbol in rankings.get(ranking_name, []):
+            if symbol not in seen:
+                symbols.append(symbol)
+                seen.add(symbol)
+    for ranking in rankings.values():
+        for symbol in ranking:
+            if symbol not in seen:
+                symbols.append(symbol)
+                seen.add(symbol)
+    return symbols
+
+
+def _rank_delta_4w_by_symbol(history_frames: dict[str, pd.DataFrame], symbols: list[str]) -> dict[str, int | None]:
+    latest_returns = _return_126_by_symbol_as_of_offset(history_frames, symbols, offset=0)
+    prior_returns = _return_126_by_symbol_as_of_offset(history_frames, symbols, offset=21)
+    latest_ranks = _rank_metric_value_map(latest_returns)
+    prior_ranks = _rank_metric_value_map(prior_returns)
+    return {
+        symbol: prior_ranks[symbol] - latest_ranks[symbol]
+        if symbol in prior_ranks and symbol in latest_ranks
+        else None
+        for symbol in symbols
+    }
+
+
+def _top_decile_age_weeks_by_symbol(
+    history_frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+) -> dict[str, int | None]:
+    return {
+        symbol: _top_decile_age_weeks(symbol, history_frames, symbols)
+        for symbol in symbols
+    }
+
+
+def _top_decile_age_weeks(symbol: str, history_frames: dict[str, pd.DataFrame], symbols: list[str]) -> int | None:
+    if symbol not in history_frames or not symbols:
+        return None
+    top_decile_rank = max(1, math.ceil(len(symbols) * 0.10))
+    age_weeks = 0
+    offset = 0
+    while True:
+        returns = _return_126_by_symbol_as_of_offset(history_frames, symbols, offset=offset)
+        ranks = _rank_metric_value_map(returns)
+        if symbol not in ranks:
+            return age_weeks if age_weeks > 0 else None
+        if ranks[symbol] > top_decile_rank:
+            return age_weeks
+        age_weeks += 1
+        offset += 5
+
+
+def _return_126_by_symbol_as_of_offset(
+    history_frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    *,
+    offset: int,
+) -> dict[str, float | None]:
+    return {
+        symbol: _period_return_as_of_offset(
+            _numeric_series(_truncate_to_last_finite_close(_sort_frame(frame)), "close"),
+            126,
+            offset,
+        )
+        for symbol in symbols
+        if (frame := history_frames.get(symbol)) is not None
+    }
+
+
+def _period_return_as_of_offset(series: pd.Series | None, window: int, offset: int) -> float | None:
+    if series is None or len(series) <= window + offset:
+        return None
+    endpoint_index = len(series) - 1 - offset
+    start_index = endpoint_index - window
+    endpoint = _finite_float(series.iloc[endpoint_index])
+    start = _finite_float(series.iloc[start_index])
+    if endpoint is None or start in (None, 0):
+        return None
+    return _finite_float(endpoint / start - 1.0)
+
+
+def _rank_metric_value_map(values_by_symbol: dict[str, float | None]) -> dict[str, int]:
+    rankable = [
+        (symbol, float(value))
+        for symbol, value in values_by_symbol.items()
+        if _is_rankable(value)
+    ]
+    return {
+        symbol: index
+        for index, (symbol, _) in enumerate(
+            sorted(rankable, key=lambda item: (-item[1], item[0])),
+            start=1,
+        )
+    }
+
+
+def _rank_symbols(rows: list[dict[str, Any]], key: str, *, direction: str = "desc") -> list[str]:
     rankable = [
         (str(row["symbol"]), float(row[key]))
         for row in rows
         if row.get("symbol") and _is_rankable(row.get(key))
     ]
+    if direction == "asc":
+        return [symbol for symbol, _ in sorted(rankable, key=lambda item: (item[1], item[0]))]
     return [symbol for symbol, _ in sorted(rankable, key=lambda item: (-item[1], item[0]))]
 
 
@@ -822,6 +1324,67 @@ def _volatility_strict(series: pd.Series | None, window: int) -> float | None:
     return _finite_float(returns.std())
 
 
+def _atr(
+    high_series: pd.Series | None,
+    low_series: pd.Series | None,
+    close_series: pd.Series | None,
+    window: int,
+) -> float | None:
+    if high_series is None or low_series is None or close_series is None:
+        return None
+    data = pd.DataFrame({"high": high_series, "low": low_series, "close": close_series}).dropna()
+    data = data[
+        data["high"].map(lambda value: _finite_float(value) is not None)
+        & data["low"].map(lambda value: _finite_float(value) is not None)
+        & data["close"].map(lambda value: _finite_float(value) is not None)
+    ].reset_index(drop=True)
+    if len(data) < window:
+        return None
+    previous_close = data["close"].shift(1)
+    true_range = pd.concat(
+        [
+            data["high"] - data["low"],
+            (data["high"] - previous_close).abs(),
+            (data["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = _finite_float(true_range.tail(window).mean())
+    if atr in (None, 0):
+        return None
+    return atr
+
+
+def _recent_returns(series: pd.Series | None, window: int) -> pd.Series | None:
+    if series is None or len(series) <= 1:
+        return None
+    returns = series.pct_change().dropna()
+    returns = returns[returns.map(lambda value: _finite_float(value) is not None)].tail(window)
+    if returns.empty:
+        return None
+    return returns
+
+
+def _positive_day_ratio(series: pd.Series | None, window: int) -> float | None:
+    returns = _recent_returns(series, window)
+    if returns is None:
+        return None
+    return _finite_float((returns > 0).sum() / len(returns))
+
+
+def _max_positive_return_share(series: pd.Series | None, window: int) -> float | None:
+    returns = _recent_returns(series, window)
+    if returns is None:
+        return None
+    positive_returns = returns[returns > 0]
+    if positive_returns.empty:
+        return None
+    total_positive_return = _finite_float(positive_returns.sum())
+    if total_positive_return in (None, 0):
+        return None
+    return _finite_float(positive_returns.max() / total_positive_return)
+
+
 def _period_return_excluding_recent(series: pd.Series | None, *, total_window: int, skip_recent: int) -> float | None:
     if series is None or len(series) <= total_window:
         return None
@@ -943,3 +1506,24 @@ def _up_volume_ratio(close_series: pd.Series | None, volume_series: pd.Series | 
     if up_volume is None:
         return None
     return _finite_float(up_volume / total_volume)
+
+
+def _up_down_volume_ratio(close_series: pd.Series | None, volume_series: pd.Series | None, window: int) -> float | None:
+    if close_series is None or volume_series is None or len(close_series) <= 1:
+        return None
+    data = pd.DataFrame({"close": close_series, "volume": volume_series}).dropna().tail(window + 1)
+    data = data[
+        data["close"].map(lambda value: _finite_float(value) is not None)
+        & data["volume"].map(lambda value: _finite_float(value) is not None)
+    ].reset_index(drop=True)
+    if len(data) <= window:
+        return None
+    returns = data["close"].pct_change().dropna()
+    volumes = data["volume"].iloc[1:]
+    if len(returns) < window or len(volumes) < window:
+        return None
+    up_volume = _finite_float(volumes[returns > 0].sum())
+    down_volume = _finite_float(volumes[returns < 0].sum())
+    if up_volume is None or down_volume in (None, 0):
+        return None
+    return _finite_float(up_volume / down_volume)
