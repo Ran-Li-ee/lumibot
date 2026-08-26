@@ -972,6 +972,7 @@ def test_momentum_stage_warning_flags_are_empty_for_clean_row():
         ({"extension_ma50_pct": 0.20}, "extreme_ma50_extension"),
         ({"atr_extension_20d": 3.0}, "extreme_atr_extension"),
         ({"recent_vs_intermediate_momentum": 0.15}, "recent_overheat_vs_intermediate"),
+        ({"max_day_return_share_3m": 0.35}, "single_day_jump_concentration"),
         (
             {
                 "excess_return_vs_qqq_6m": -0.01,
