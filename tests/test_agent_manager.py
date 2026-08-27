@@ -12,6 +12,7 @@ from lumibot.components.agents.schemas import (
     BoundTool,
     ToolDefinition,
 )
+from lumibot.components.agents.tool_context import agent_tool_context
 
 
 class DummyVars(dict):
@@ -632,6 +633,67 @@ def test_market_load_history_tables_summary_tool_forwards_and_validates_rank_lim
         tool.function(symbols=["MSFT"], benchmark_symbols="QQQ")
     with pytest.raises(ValueError, match="benchmark_symbols"):
         tool.function(symbols=["MSFT"], benchmark_symbols=[""])
+
+
+def test_market_load_history_tables_summary_uses_context_basket_for_full_universe_calls():
+    captured = {}
+
+    class FakeDuckDB:
+        def load_history_tables_summary(self, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+    manager = SimpleNamespace(duckdb=FakeDuckDB())
+    tool = BuiltinTools.market.load_history_tables_summary().binder(DummyStrategy(), manager)
+    basket_symbols = [
+        "AAPL",
+        "MSFT",
+        "NVDA",
+        "AVGO",
+        "PANW",
+        "COST",
+        "AMZN",
+        "GOOGL",
+        "META",
+        "TSLA",
+    ]
+
+    with agent_tool_context({"request_context": {"basket_symbols": basket_symbols}}):
+        assert tool.function(
+            symbols=[
+                "AAPL",
+                "MSFT",
+                "NVDA",
+                "AVVO",
+                "PANW",
+                "PANW",
+                "COST",
+                "AMZN",
+                "GOOGL",
+                "META",
+                "TSLA",
+            ]
+        ) == {"ok": True}
+
+    assert captured["symbols"] == basket_symbols
+
+
+def test_market_load_history_tables_summary_keeps_targeted_subset_calls():
+    captured = {}
+
+    class FakeDuckDB:
+        def load_history_tables_summary(self, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+    manager = SimpleNamespace(duckdb=FakeDuckDB())
+    tool = BuiltinTools.market.load_history_tables_summary().binder(DummyStrategy(), manager)
+    basket_symbols = ["AAPL", "MSFT", "NVDA", "AVGO", "PANW", "COST"]
+
+    with agent_tool_context({"request_context": {"basket_symbols": basket_symbols}}):
+        assert tool.function(symbols=["AAPL", "MSFT"]) == {"ok": True}
+
+    assert captured["symbols"] == ["AAPL", "MSFT"]
 
 
 def test_execution_agent_with_order_tools_does_not_receive_history_policy():

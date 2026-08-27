@@ -239,6 +239,58 @@ def _normalized_order_text(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _assigned_basket_symbols_from_tool_context() -> list[str]:
+    context = current_agent_tool_context()
+    request_context = context.get("request_context")
+    if not isinstance(request_context, dict):
+        return []
+    raw_symbols = request_context.get("basket_symbols")
+    if not isinstance(raw_symbols, list):
+        return []
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in raw_symbols:
+        symbol = str(raw_symbol or "").strip()
+        if not symbol:
+            continue
+        key = symbol.upper()
+        if key in seen:
+            continue
+        symbols.append(symbol)
+        seen.add(key)
+    return symbols
+
+
+def _dedupe_symbols_preserving_order(symbols: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        key = symbol.upper()
+        if key in seen:
+            continue
+        deduped.append(symbol)
+        seen.add(key)
+    return deduped
+
+
+def _normalize_history_summary_symbols_for_context(symbols: list[str]) -> list[str]:
+    assigned_symbols = _assigned_basket_symbols_from_tool_context()
+    if not assigned_symbols:
+        return _dedupe_symbols_preserving_order(symbols)
+
+    requested_keys = {symbol.upper() for symbol in symbols}
+    assigned_keys = {symbol.upper() for symbol in assigned_symbols}
+    if not assigned_keys:
+        return _dedupe_symbols_preserving_order(symbols)
+
+    overlap_ratio = len(requested_keys & assigned_keys) / len(assigned_keys)
+    full_basket_sized = len(symbols) >= max(1, int(len(assigned_symbols) * 0.8))
+    if full_basket_sized and overlap_ratio >= 0.8:
+        return assigned_symbols
+
+    return _dedupe_symbols_preserving_order(symbols)
+
+
 def _normalized_order_quantity(value: Any) -> float | None:
     try:
         parsed = float(value)
@@ -1237,9 +1289,7 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
         if not isinstance(symbols, list) or not symbols:
             raise ValueError("symbols must be a non-empty list.")
         symbols = [_require_single_symbol_text("symbols", symbol) for symbol in symbols]
-        normalized_symbol_keys = [symbol.upper() for symbol in symbols]
-        if len(normalized_symbol_keys) != len(set(normalized_symbol_keys)):
-            raise ValueError("duplicate symbols are not allowed.")
+        symbols = _normalize_history_summary_symbols_for_context(symbols)
         length = _require_positive_int("length", length)
         top_n = _require_positive_int("top_n", top_n)
         candidate_summary_limit = _require_positive_int("candidate_summary_limit", candidate_summary_limit)
@@ -1284,6 +1334,8 @@ def _bind_load_history_tables_summary(strategy: Any, manager: Any) -> BoundTool:
             "candidate_summary contains a compact top-ranked candidate subset capped by candidate_summary_limit. "
             "Prefer this tool before writing DuckDB SQL for ordinary universe ranking; DuckDB SQL is only "
             "targeted follow-up when this summary is missing or contradictory. "
+            "When an agent calls this with its full assigned basket universe, the local runtime normalizes copied "
+            "symbol lists against the current basket_symbols context to avoid duplicate or mistyped tickers. "
             "Caveat: this only loads bars visible at the current LumiBot runtime datetime. "
             "Example: market_load_history_tables_summary("
             "symbols=['MSFT', 'AAPL'], length=252, timestep='day', top_n=10, candidate_summary_limit=25, "

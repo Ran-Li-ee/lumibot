@@ -5090,6 +5090,7 @@ class GoogleADKRuntime:
             "agent_name": request.agent_name,
             "model_call_id": request.model_call_id,
             "enforce_order_readiness": True,
+            "request_context": request.context if isinstance(request.context, dict) else {},
             "tool_calls": [],
         }
         tools = [
